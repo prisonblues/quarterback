@@ -193,6 +193,9 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, provenance_restored_dropped]
                                                                     [, since_sha_dropped]
                                                                     [, harness_rev_dropped]
+                                                                    [, nul_replaced]
+                                                                    [, nul_dropped]
+                                                                    [, nonfinite_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
@@ -1115,6 +1118,42 @@ what a recalibration groups a population by must not cost one fetch per run; the
 detail-only. There is deliberately no release NUMBER among them — `package.nix` ships no
 `pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
 a merge, so a running harness has none to report and a branch's harness never had one.
+
+**And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
+A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;
+`json.loads` accepts all four, so a round carrying one passed every validator and 500ed at the
+INSERT — which the panel records as "the board did not answer", indistinguishable from a board that
+was down. #643, #647 and #112 fixed four fields between them, each in its own validator; a probe
+found the same 500 in twenty-eight further places. It is now one pass over the whole body, before
+any coercer runs, and the per-field checks that predate it are gone rather than left beside it — a
+chokepoint with exceptions is not one. The answer differs by what the value is FOR:
+
+* a token **matched by exact string** — `unread_files`, `changed_files[].path`, a finding's `file`,
+  the removed convention files, `harness_path` and `harness_digest` — is **dropped**, because a
+  marked token is not a shorter one but a *different* one, and it answers its comparison wrongly and
+  silently forever, where NULL answers *unknown*;
+* an **opaque policy record** (`review_panel`, `rules`, `provenance_restored`) keeps its
+  **whole-object refusal** and the pass does not reach inside it: half a dial set is not a smaller
+  policy but one no round ran under — so #78's `threshold_by_severity` is refused with the dial set
+  rather than edited inside it;
+* **everything else** — prose, names, identities, vocabulary words, mapping keys — keeps its value
+  with the NUL replaced by `␦`, the mark `_echo` has always used on the way out, because storing
+  nothing loses a reviewer's account and an unmarked strip is a silent edit of evidence;
+* a **non-finite number** becomes NULL, "nobody said";
+* and **nothing is a 422**, because refusing the request loses the findings, the scorecards and the
+  accounts along with the byte. `repo` is the exception and already was one: it is the row's
+  identity, and a marked spelling would be a second repository nothing ever asks about.
+
+A marked value is not thereby believed where a coercer follows it: `head_sha`, `harness_rev`,
+`provenance` and `pr_state` meet theirs immediately after and are refused under the drop signal they
+already had. Where none follows, the marked value is stored — `scope` and `fix_range_source` are the
+deliberate case, because they are read against no vocabulary on purpose and a marked one is an extra
+group a consumer can SEE rather than a value folded into "the panel did not say".
+
+All of it is reported by dotted position under `nul_replaced`, `nul_dropped` and `nonfinite_dropped`.
+`POST /review/outcomes` has the same defect and the opposite remedy — the item is **refused** and the
+reason names the field — because its rule is that a fixer recording an outcome can simply be told,
+where the panel cannot be failed over the board being fussy.
 
 ## Releases
 
@@ -2428,6 +2467,10 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
   test_review_harness_identity.py    which harness produced the round —
                    rev/dirty/digest/path, what each says and what each cannot,
                    and the NUL a text column refuses (#112)
+  test_review_unstorable_values.py   a NUL or a NaN in every position a caller
+                   can put one, and which of mark / drop / refuse each gets (#646)
+  test_outcome_unstorable_values.py  the same class on POST /review/outcomes,
+                   where the item is refused and named instead (#646)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)

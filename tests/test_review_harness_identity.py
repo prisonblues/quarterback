@@ -308,25 +308,51 @@ async def test_a_nul_in_a_harness_path_is_refused_at_ingest(client):
     on a panel round that had done nothing wrong. That is the opposite of "a
     dropped field says so", and it is the same class #643 and #647 both found on
     the JSONB side.
+
+    **The refusal moved in #646 and the answer did not.** #112 caught this inside
+    `_word_or_none`; #646 found the same 500 in thirty places and moved the check
+    to one whole-body pass that runs before any coercer here, so the per-field test
+    became dead code and was removed. The value still lands on NULL, for the reason
+    this file gives — `harness_path` is a LOCATOR, and a marked one names a
+    directory that does not exist — and the drop is now reported under
+    `nul_dropped`, which says WHY, rather than under `unreadable_fields`, which can
+    only say the value was not the shape this field takes. It was.
     """
     posted = await record(client, 17, harness_path=CHECKOUT + "\x00")
-    assert "harness_path" in posted["unreadable_fields"]
+    assert posted["nul_dropped"] == ["harness_path"]
+    assert "harness_path" not in posted.get("unreadable_fields", [])
     assert (await detail(client, posted["id"]))["harness_path"] is None
 
 
-async def test_a_nul_in_a_scope_is_refused_at_ingest(client):
-    """...and the same hole in #647's two words, closed by the shared coercer.
+async def test_a_nul_in_a_scope_is_marked_rather_than_nulled(client):
+    """...and the same hole in #647's two words, which #646 answers differently.
 
     `scope` and `fix_range_source` have gone through `_word_or_none` since #647
     and it checked shape, blankness and length — not this. `scope: "pr\\u0000"` was
-    therefore a 500 at INSERT on a round with one bad character in it. #112 shares
-    that function for its own two fields, so the fix lands on all four at once;
-    the test lives here because this is the change that made it.
+    therefore a 500 at INSERT on a round with one bad character in it. #112 found
+    that and refused the value; the test lives here because this is the change that
+    made it.
+
+    **#646 keeps the value and marks it, and the argument is `_word_or_none`'s
+    own.** These two are read against no vocabulary on purpose — that docstring
+    says a frozen set here would have dropped `reconstructed` on the release that
+    introduced it — and its conclusion is that a value outside the set reclassifies
+    nothing, because a consumer grouping a population by this field gets an extra
+    group it can SEE rather than one folded into a group it cannot. NULL is that
+    fold: it is what every round recorded before #647 carries, so refusing the word
+    makes a corrupted round indistinguishable from an old one. `increment␦` is
+    visibly not a scope, is reported under `nul_replaced`, and cannot be mistaken
+    for either.
+
+    `harness_path` one test up goes the other way, which is the distinction #646
+    draws: that field is MATCHED, and a marked token answers its comparison wrongly
+    forever, where an unmatched grouping word answers nothing at all.
     """
     posted = await record(client, 18, scope="increment\x00", fix_range_source="compare")
-    assert "scope" in posted["unreadable_fields"]
+    assert posted["nul_replaced"] == ["scope"]
+    assert "scope" not in posted.get("unreadable_fields", [])
     run = await detail(client, posted["id"])
-    assert run["scope"] is None
+    assert run["scope"] == "increment\u2426"
     assert run["fix_range_source"] == "compare"
 
 

@@ -417,6 +417,62 @@ Stored verbatim and never interpreted: this board has no checkout of the harness
 to resolve a rev against, does not recompute a digest and does not parse a store
 path. The first three ride every view because a recalibration slices a
 population on them; the path is detail-only, on ``unread_files``' rule.
+
+**#646 — a value Postgres will not store, anywhere in the body, and the round is
+still recorded.** Every note above fixed the instance it created: ``review_panel``
+refused a NUL and a ``NaN`` in its own validator, #647's two blocks joined it, and
+#112 found the same 500 on ``scope`` while adding two fields that would have had
+it. A probe found it in twenty-eight further places — every free-text field, every
+path list, the ``reviewers`` mapping's own KEYS, every finding title, every
+per-reviewer account. Postgres holds a NUL in neither ``text`` nor a ``JSONB``
+string and holds no non-finite number at all; ``json.loads`` accepts all four. So
+the refusal happened at the INSERT: a 500 on a round that had passed every check
+this module makes, which the panel records as "the board did not answer" and
+nothing distinguishes from a board that was down.
+
+So it is ONE pass over the whole body — :func:`_storable_body`, called first thing
+in :meth:`ReviewIn._count_files_sent`, the only place that sees every nested value
+while it is still a plain mapping. Thirty coercers each remembering is not a rule,
+and the per-coercer checks that predate it are removed rather than left beside it
+(see :func:`_word_or_none`): a chokepoint with exceptions is not one.
+
+The decision the issue was filed to settle is what to do with each value, and it
+is three answers rather than one, each decided on what a wrong one would silently
+assert.
+
+* A value whose whole purpose is to be **MATCHED** is dropped
+  (:data:`_MATCHED_KEYS`) — the path lists, a finding's ``file``, ``harness_path``
+  and ``harness_digest``. Each is compared with ``==`` somewhere nothing reports
+  the miss: an unread path against the next round's diff, a changed file against
+  another PR's, a digest against the previous round's to answer "same code, or
+  not". A marked token is not a shortened one, it is a DIFFERENT token, and it
+  answers that comparison wrongly forever.
+* An **opaque policy record** keeps its whole-object refusal and the pass does not
+  reach it (:data:`_OPAQUE_FIELDS`), so #78's ``threshold_by_severity`` inside
+  ``review_panel`` is refused with the dial set rather than edited inside it.
+* **Everything else** — prose, names, identities, vocabulary words, mapping keys —
+  keeps its value with the NUL replaced by :data:`UNPRINTABLE`, because the
+  alternative for a reviewer's account is to store nothing, and the mark is what
+  keeps it from being a silent edit.
+
+A marked value is not thereby believed **where a coercer follows**: ``head_sha``,
+``harness_rev``, ``provenance`` and ``pr_state`` meet theirs immediately afterwards
+and are refused there, under the drop signal they already had. Where none follows,
+the marked value is STORED, and ``scope``/``fix_range_source`` are the deliberate
+case: :func:`_word_or_none` argues at length that those two must be read against no
+vocabulary, and its own conclusion — that a value outside the set gives a consumer
+"an extra group it can SEE, rather than a value folded into a group it cannot" — is
+the argument for marking them rather than nulling them.
+
+Nothing is a **422**: refusing the request loses the findings, the scorecards and
+the accounts along with the byte, which is the loss the issue is about. ``repo`` is
+the one exception, and it was already refusing.
+
+All of it reported, in ``nul_replaced`` / ``nul_dropped`` / ``nonfinite_dropped``,
+by dotted position. ``POST /review/outcomes`` has the same defect and the opposite
+remedy — per-item refusal, see :meth:`OutcomeIn._no_nul` — because that endpoint's
+rule, stated in :func:`_outcome_reason`, is that a fixer can simply be told where
+the panel cannot.
 """
 
 from __future__ import annotations
@@ -429,6 +485,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from math import isfinite
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -707,6 +764,12 @@ MAX_BUCKET_ECHO = 64
 #: carriage return forge log entries; the C1 range covers the single-byte ANSI
 #: escapes as well as ESC itself. See :func:`_echo`.
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+#: What stands in for a character that arrived and cannot be shown. One spelling,
+#: used by :func:`_echo` on the way OUT and by :func:`_storable` on the way IN
+#: (#646), because a reader meeting it in a stored ``detail`` and in a drop signal
+#: naming that same field should not have to learn that they are two marks.
+UNPRINTABLE = "␦"
 
 #: How many distinct unrecognised names one response will list. ``MAX_BUCKET_ECHO``
 #: bounds each name and nothing bounded the COUNT, so a tally with ten thousand
@@ -999,7 +1062,7 @@ def _echo(v: object) -> str:
     of a drift signal should see that it did.
     """
     s = v.strip() if isinstance(v, str) else str(v)
-    s = _CONTROL_RE.sub("␦", s)
+    s = _CONTROL_RE.sub(UNPRINTABLE, s)
     return s[:MAX_BUCKET_ECHO] + "…" if len(s) > MAX_BUCKET_ECHO else s
 
 
@@ -1579,6 +1642,202 @@ def _has_nul(node: object) -> bool:
     return False
 
 
+#: The three blocks :func:`_storable` does not walk into, because they are refused
+#: WHOLE and a whole-body normalisation would quietly make them storable (#646).
+#:
+#: This is the exception the rest of that pass exists to justify. ``review_panel``
+#: (#643), ``rules`` and ``provenance_restored`` (#647) are policy records kept
+#: verbatim and never interpreted, and :func:`_opaque_or_none` argues at length
+#: that half a dial set is not a smaller policy but one no round ran under. A
+#: normalisation that reached inside one would produce exactly that: a stored
+#: policy differing by a character from the policy that ran, with the row saying
+#: it was stored intact. So they keep their own refusal and their own
+#: ``*_dropped`` signal, and the walk leaves them alone.
+_OPAQUE_FIELDS = frozenset({"review_panel", "rules", "provenance_restored"})
+
+#: Keys whose value is a token MATCHED BY EXACT STRING — the one class
+#: :func:`_storable` drops rather than marks.
+#:
+#: The test is not "is this a path", it is **"is this compared with ``==`` somewhere
+#: that will not report the miss"**, and every member fails that test the same way.
+#: ``unread_files`` is matched against the next round's diff to fill the
+#: ``missed-unread`` bucket; ``changed_files`` is what ``GET /review/collisions``
+#: joins two pull requests on; a finding's ``file`` is half of :func:`_derive_key`;
+#: ``harness_digest`` is held against the previous round's to answer "same code, or
+#: not", which the module note above calls the one thing that field is never wrong
+#: about; ``harness_path`` is a locator a reader follows to a directory.
+#:
+#: A marked token is not a shortened one, it is a DIFFERENT one — it sits in the
+#: column looking like data and answers its comparison wrongly, silently, forever.
+#: A dropped one lands on NULL, and a comparison against NULL is *unknown* rather
+#: than *unequal*, which is the honest answer and the only difference that matters.
+#: That is the argument :func:`_unread_paths` already makes for dropping an
+#: over-long path rather than truncating it, and #112's :func:`_word_or_none` makes
+#: in the same words about a truncated store path naming a directory that does not
+#: exist; this is that rule one character along.
+#:
+#: ``scope`` and ``fix_range_source`` are deliberately NOT here even though a
+#: population is grouped on them. :func:`_word_or_none` reads them against no
+#: vocabulary on purpose and argues that an out-of-set value gives a consumer "an
+#: extra group it can SEE" — so a marked one is a visible extra group rather than a
+#: silent mismatch, which is the whole distinction this set is drawn on.
+#:
+#: Written out rather than inferred from the field type, because "is this string
+#: matched" is not a property of ``str``, and each place it is true is a place a
+#: wrong answer costs a comparison nobody would see fail.
+_MATCHED_KEYS = frozenset({"unread_files", "convention_files_removed", "path",
+                           "file", "harness_digest", "harness_path"})
+
+#: The three answers :func:`_storable` can give, as the response keys that report
+#: them. Written out so :meth:`ReviewIn._count_files_sent` and
+#: :func:`record_review` cannot disagree about which signals exist.
+_STORABLE_SIGNALS = ("nul_replaced", "nul_dropped", "nonfinite_dropped")
+
+
+def _blank_report() -> dict[str, list[str]]:
+    return {name: [] for name in _STORABLE_SIGNALS}
+
+
+def _storable(v: object, *, at: str, report: dict[str, list[str]],
+              is_path: bool = False, in_list: bool = False) -> object:
+    """One caller-supplied value as Postgres will take it, and where it was (#646).
+
+    Postgres refuses two things this endpoint's own parser accepts. A NUL cannot
+    live in a ``text`` column (``invalid byte sequence for encoding "UTF8": 0x00``)
+    nor inside a ``JSONB`` string (``unsupported Unicode escape sequence``), and
+    ``NaN``/``Infinity``/``-Infinity`` — which ``json.loads`` accepts as
+    non-standard literals, so starlette hands them straight through — are neither a
+    JSON number nor an ``INTEGER``. Either one, anywhere in the body, was a 500 at
+    INSERT: a round that had passed every check this module makes, reported by the
+    panel as "the board did not answer" and left out of the cycle's record.
+
+    **One pass over the whole body rather than a check in each coercer.** #643
+    fixed ``review_panel``, #647 fixed two more, #112 fixed ``scope`` in passing,
+    and the probe behind #646 found the same 500 in twenty-eight further places —
+    every free-text field, every path list, the reviewer keys, the finding titles.
+    A rule that has to be remembered thirty times is not a rule, so the per-coercer
+    checks that predate this are removed rather than left beside it: a chokepoint
+    with exceptions is not one, and :func:`_word_or_none` records what was taken out
+    of it and why.
+
+    **Three answers, because a matched token and a policy record do not want the
+    same one.**
+
+    * A token **MATCHED BY EXACT STRING** (:data:`_MATCHED_KEYS`) is dropped —
+      a path, and ``harness_digest``. Marking it would invent a different token
+      that answers its comparison wrongly and silently, where NULL answers
+      *unknown*. See that constant.
+    * An **opaque policy block** (:data:`_OPAQUE_FIELDS`) is not reached at all and
+      keeps :func:`_opaque_or_none`'s whole-object refusal.
+    * **Everything else** — prose, names, identities, vocabulary words, mapping
+      KEYS — keeps its value with the NUL replaced by :data:`UNPRINTABLE`. This is
+      the choice this issue existed to make, and it is made on consequence. The
+      alternative for a reviewer's ``account`` or a stop's ``veto`` is to store
+      nothing, and a lost account is a worse record than a marked one; the
+      alternative for the request is a 422, which loses the round, the findings,
+      the scorecards and the accounts over one byte — the exact loss this whole
+      issue is about. The mark is what keeps it from being a silent edit: a reader
+      of a stored reason can see that a character arrived and could not be shown,
+      which a stripped one could not. It is deliberately NOT ``_echo``'s full
+      C0/C1 replacement: a ``detail`` legitimately holds newlines, and normalising
+      those on the way into a column would rewrite text nobody objected to.
+
+    A marked value is not thereby believed **where a coercer follows it**.
+    ``head_sha``, ``harness_rev``, ``provenance`` and ``pr_state`` meet theirs
+    immediately afterwards and are refused there, under the drop signal they
+    already had — which is why this pass adds no per-field cleverness for them.
+    Where no coercer follows, the marked value is STORED, and ``scope`` /
+    ``fix_range_source`` are the deliberate case: :func:`_word_or_none` reads them
+    against no vocabulary on purpose, and its own conclusion — an out-of-set value
+    gives a consumer "an extra group it can SEE, rather than a value folded into a
+    group it cannot" — is the argument for marking them rather than nulling them.
+
+    A non-finite number becomes ``None`` — "nobody said", the value
+    :func:`_count_or_none` and :func:`_cost_or_none` already give an unbelievable
+    figure. That also closes a second 500 the probe found and the issue did not
+    name: ``changed_lines: NaN`` reaches a plain ``int`` field, and FastAPI renders
+    the resulting 422 by quoting the input back, so the *refusal* fails to
+    serialise and the request 500s having never touched the database.
+
+    ``at`` is the dotted position, for the response to name back — rendered
+    through :func:`_echo` like every other value this endpoint quotes, so a
+    reviewer name that is itself hostile cannot forge a log line out of the
+    position it appears at, and a very long one is cut and marked ``…`` rather
+    than handed back whole.
+
+    ``in_list`` decides what a dropped path becomes: ``""`` inside a list, where
+    a ``None`` entry would 422 ``convention_files_removed``'s ``list[str]`` and
+    blank is already what :func:`_unread_paths` counts as unusable, and ``None``
+    for a scalar, which every model here turns into its own no-path state.
+
+    Bounded by the recursion the JSON parser already survived to hand this value
+    over, exactly as :func:`_has_nul` above is.
+    """
+    if isinstance(v, str):
+        if "\x00" in v:
+            if is_path:
+                report["nul_dropped"].append(_echo(at))
+                return "" if in_list else None
+            report["nul_replaced"].append(_echo(at))
+            return v.replace("\x00", UNPRINTABLE)
+        return v
+    # `isfinite` and not `!= v`, so an infinity is caught beside a NaN. A bool is
+    # not a float and an int cannot be non-finite, so this reaches exactly the
+    # values `json.loads` produced from the three non-standard literals.
+    if isinstance(v, float) and not isfinite(v):
+        report["nonfinite_dropped"].append(_echo(at))
+        return None
+    if isinstance(v, Mapping):
+        out: dict[Any, Any] = {}
+        for k, val in v.items():
+            key = k
+            # A KEY reaches a column too: `reviewers` is keyed by vendor name and
+            # that name is `review_reviewers.name`, so a NUL in a key was the same
+            # 500 as a NUL in a value. `_has_nul` learned this in #647 for the
+            # opaque blocks; this is the writing half of it.
+            if isinstance(k, str) and "\x00" in k:
+                report["nul_replaced"].append(_echo(f"{at}.{k}" if at else k))
+                key = k.replace("\x00", UNPRINTABLE)
+            where = f"{at}.{key}" if at else str(key)
+            # Last one wins where marking makes two keys one — `{"a\x00b": …,
+            # "a␦b": …}`, which nothing real sends. It is what a dict
+            # comprehension over the same coercion does everywhere else in this
+            # module, and `_prov_counts` states the rule for `Introduced` beside
+            # `introduced`: inventing a merge here would be composing a value
+            # nobody stated. The mark is reported either way, so a sender is not
+            # told its payload arrived intact.
+            out[key] = _storable(val, at=where, report=report,
+                                 is_path=isinstance(key, str) and key in _MATCHED_KEYS)
+        return out
+    if isinstance(v, list):
+        return [_storable(x, at=f"{at}[{i}]", report=report, is_path=is_path,
+                          in_list=True)
+                for i, x in enumerate(v)]
+    return v
+
+
+def _storable_body(v: Mapping) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    """The whole ``POST /review`` body as Postgres will take it, and what was done.
+
+    Top level only in one respect: :data:`_OPAQUE_FIELDS` is checked here rather
+    than inside :func:`_storable`, because those three keys are refused whole where
+    they sit and a ``rules`` nested under something else is not that field.
+    """
+    report = _blank_report()
+    out: dict[str, Any] = {}
+    for k, val in v.items():
+        if k in _OPAQUE_FIELDS:
+            out[k] = val
+            continue
+        key = k
+        if isinstance(k, str) and "\x00" in k:
+            report["nul_replaced"].append(_echo(k))
+            key = k.replace("\x00", UNPRINTABLE)
+        out[key] = _storable(val, at=str(key), report=report,
+                             is_path=isinstance(key, str) and key in _MATCHED_KEYS)
+    return out, {name: sorted(set(names)) for name, names in report.items()}
+
+
 def _opaque_or_none(v: object, *, field: str, cap: int,
                     why_whole: str) -> tuple[dict[str, Any] | None, str]:
     """A block this board stores VERBATIM and never interprets, or why it did not.
@@ -1744,21 +2003,33 @@ def _word_or_none(v: object, *, cap: int = MAX_SCOPE_CHARS) -> str | None:
     a second copy of this function differing in one integer. See
     :data:`MAX_HARNESS_DIGEST_CHARS` and :data:`MAX_HARNESS_PATH_CHARS`.
 
-    **A NUL is refused here and not at INSERT** (#112). Postgres cannot store
-    ``\u0000`` in a ``text`` column any more than in a JSONB string, and Python's
-    ``str`` holds one happily — so ``scope: "pr\u0000"`` passed every check this
-    function made and became a 500 on a round that had done nothing else wrong.
-    That is the failure :func:`_has_nul` was written for on the JSONB side in #647,
-    arriving on the scalar side; it is fixed for ``scope`` and ``fix_range_source``
-    at the same time as it is prevented for the two fields #112 adds, because they
-    share this coercer and a bug fixed on one of them is fixed on all four.
+    **The NUL check that was here is gone, and where it went matters** (#112,
+    #646). #112 found the real 500 this function had — Postgres cannot store
+    ``\u0000`` in a ``text`` column any more than in a JSONB string, Python's
+    ``str`` holds one happily, so ``scope: "pr\u0000"`` passed every check made here
+    and took the round down at the INSERT — and fixed it with an ``"\x00" in s``
+    test on this line. #646 then found the same 500 in thirty places and moved the
+    answer to :func:`_storable_body`, one pass over the whole body that runs before
+    any coercer on this model. By the time this function is called there is no NUL
+    left to find, so the test was dead, and a dead check in ONE of thirty coercers
+    is worse than none: it reads as though this were a place NUL is handled, which
+    is the per-field habit #646 exists to end.
+
+    What replaced it is not weaker and is not the same answer. ``scope`` and
+    ``fix_range_source`` are MARKED rather than nulled — ``pr\u0000`` is stored as
+    ``pr␦`` — and the argument is this docstring's own, four paragraphs up: a value
+    outside the set reclassifies nothing here, because a consumer grouping a
+    population by this field gets an extra group it can SEE rather than one folded
+    into a group it cannot. NULL would fold it into "the panel did not say", which
+    is a claim about the payload's AGE. ``harness_digest`` and ``harness_path`` go
+    the other way and are DROPPED, because both are matched with ``==`` and a marked
+    token answers that comparison wrongly forever — see :data:`_MATCHED_KEYS`. Each
+    is named back to the sender either way.
     """
     if not isinstance(v, str):
         return None
     s = v.strip()
-    if not s or len(s) > cap or "\x00" in s:
-        return None
-    return s
+    return s if s and len(s) <= cap else None
 
 
 def _unread_paths(v: object) -> tuple[list[str] | None, int]:
@@ -2114,6 +2385,20 @@ class ReviewIn(BaseModel):
     #: nowhere else. See :func:`_word_or_none`.
     rules_dropped: str = ""
     provenance_restored_dropped: str = ""
+    #: #646, and set by :func:`_storable_body` rather than by any one field's
+    #: coercer: where in this body a NUL arrived and was replaced by
+    #: :data:`UNPRINTABLE`, where a matched token was dropped for holding one, and
+    #: where a number was not finite. Dotted positions (``to_fix[0].detail``),
+    #: because a whole-body pass is the only thing that knows where it was and a
+    #: sender told only "something was marked" has to re-read its own payload.
+    #:
+    #: Three lists and not one, on ``base_sha_dropped``'s standing rule here: the
+    #: three have different remedies. A marked value was stored and can be read
+    #: back; a dropped token was not stored at all; a non-finite number means the
+    #: producer's arithmetic went wrong upstream of this request.
+    nul_replaced: list[str] = Field(default_factory=list)
+    nul_dropped: list[str] = Field(default_factory=list)
+    nonfinite_dropped: list[str] = Field(default_factory=list)
     #: Tally keys that are not a bucket this board knows.
     provenance_counts_unknown: list[str] = Field(default_factory=list)
     #: Tally keys that ARE a known bucket and whose count could not be believed —
@@ -2190,7 +2475,17 @@ class ReviewIn(BaseModel):
         defence against a large body.
         """
         if not isinstance(v, Mapping):
-            return v
+            # Not a body this model can bind, so FastAPI is about to 422 it — and
+            # it renders that refusal by quoting the input back, which cannot be
+            # serialised if a non-finite number is in there. Walked anyway, so the
+            # refusal is a 422 and not a 500 (#646).
+            return _storable(v, at="", report=_blank_report())
+        # FIRST, before every count and drop signal below, so all of them are
+        # computed on the values that will actually be stored (#646). A NUL'd path
+        # dropped here lands on the blank `_unread_paths` already counts as
+        # unusable, and a marked bucket name is reported under the spelling the
+        # column will not hold rather than under one nothing can print.
+        v, unstorable = _storable_body(v)
         files, unread = v.get("changed_files"), v.get("unread_files")
         counts = v.get("provenance_counts")
         recurs, premise = v.get("recurrence_counts"), v.get("premise_counts")
@@ -2328,7 +2623,12 @@ class ReviewIn(BaseModel):
                         # producer that sent nothing at all.
                         ("recurrence_counts", recurs, isinstance(recurs, Mapping)),
                         ("premise_counts", premise, isinstance(premise, Mapping)),
-                    ) if val is not None and not ok)}
+                    ) if val is not None and not ok),
+                # #646's three, spread last so a caller that spells one of them
+                # itself has its own account overwritten. They are evidence about
+                # what arrived, and evidence the sender can write is not evidence —
+                # the rule `FindingIn._keep_provenance_sent` states.
+                **unstorable}
 
     @field_validator("repo")
     @classmethod
@@ -3374,6 +3674,22 @@ async def record_review(
         dropped["rules_dropped"] = body.rules_dropped
     if body.provenance_restored_dropped:
         dropped["provenance_restored_dropped"] = body.provenance_restored_dropped
+    # #646. Where in this payload a value arrived that Postgres would not have
+    # taken, and what this board did with it. Reported for the reason every drop on
+    # this path is, and with one extra: these are the only signals whose absence
+    # would leave a sender reading a MARKED value back as the one it sent. A
+    # `detail` holding `␦` and a `detail` whose author typed `␦` are the same row,
+    # and only this says which of the two was recorded.
+    #
+    # Bounded like the bucket echoes above and with the same `_total` companion: a
+    # payload can be wrong in five hundred places, and naming all of them costs one
+    # enormous log line to say what the first twenty-five already said.
+    for signal in _STORABLE_SIGNALS:
+        names = getattr(body, signal)
+        if names:
+            dropped[signal] = names[:MAX_UNKNOWN_BUCKETS]
+            if len(names) > MAX_UNKNOWN_BUCKETS:
+                dropped[f"{signal}_total"] = len(names)
     # ...and the base end, each named rather than one flag for "a commit id was
     # refused". These two are what a pre-land verdict resolves against the repo,
     # so a producer sending a base it thinks was stored has to be told it was not.
@@ -3607,6 +3923,36 @@ class OutcomeIn(BaseModel):
             raise ValueError(f"too long: {caps}")
         return self
 
+    @model_validator(mode="after")
+    def _no_nul(self) -> OutcomeIn:
+        """A NUL is refused here, where ``POST /review`` marks it (#646).
+
+        Postgres will not hold a NUL in a ``text`` column, so an item carrying one
+        was a 500 at INSERT that took the whole batch with it — every sibling
+        outcome lost to one byte in one ``note``.
+
+        **Refused rather than marked, and the difference is the endpoint's own
+        stated rule** one class down (:func:`_outcome_reason`): the panel must
+        never fail a review because the board was fussy, so ingest takes what it
+        can read; a fixer recording an outcome can simply be told, and a rejection
+        here costs that item and nothing else. Marking would be worse than useless
+        on ``key``, which is a defect identity matched with ``==`` — a marked key
+        names no finding — and on ``note``, which is the evidence behind a
+        refutation and is the last thing this board should edit silently.
+
+        Named field by field, on ``_bounds``' rule directly above: a caller told
+        only that *something* held a NUL has to go and diff its own payload. The
+        names come FIRST in the message and the explanation after, because
+        :func:`_outcome_item` bounds each rendered error at
+        :data:`MAX_BUCKET_ECHO` and it is the explanation that can be spared.
+        """
+        bad = [f for f in ("key", "outcome", *OUTCOME_FIELDS)
+               if "\x00" in (getattr(self, f) or "")]
+        if bad:
+            raise ValueError(
+                f"NUL in {', '.join(bad)} — no text column holds one")
+        return self
+
 
 class OutcomesIn(BaseModel):
     """A batch of outcomes for one PR.
@@ -3651,6 +3997,37 @@ class OutcomesIn(BaseModel):
         json_schema_extra=lambda f: f.update(items=OutcomeIn.model_json_schema()),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _finite(cls, v: object) -> object:
+        """Drop ``NaN``/``Infinity`` from this REQUEST's own fields (#646).
+
+        Not about storage — no column here takes a float. It is about the REFUSAL.
+        ``pr`` is a plain ``int`` and ``repo`` a plain ``str``, so a non-finite one
+        raises, and FastAPI renders that 422 by quoting the offending input back
+        into JSON, which cannot represent it. The request then 500s having never
+        reached the database and the caller is told nothing at all about a batch
+        that was refused before it began.
+
+        **The request's own keys only, never inside an item, and that boundary is
+        the whole care of this method.** A ``note`` is ``str | None`` where ``None``
+        is an explicit CLEAR — ``model_fields_set`` is what tells a retraction from
+        an absent key — so nulling ``note: NaN`` would turn a garbled value into a
+        deliberate erasure of the evidence already on the row. Left alone, the item
+        fails :class:`OutcomeIn` and becomes that item's rejection instead, which is
+        this endpoint's rule and the answer the caller actually wants. Nothing there
+        can 500 on the way: :func:`_outcome_item` renders an item's errors from
+        their location and message and never quotes the input.
+
+        NULs are left alone here too, for the same reason and one class up: they are
+        refused per item by :meth:`OutcomeIn._no_nul`, which can name the field, and
+        a body-wide mark would make them storable behind its back.
+        """
+        if not isinstance(v, Mapping):
+            return v
+        return {k: None if isinstance(x, float) and not isfinite(x) else x
+                for k, x in v.items()}
+
     @field_validator("repo")
     @classmethod
     def _repo(cls, v: str) -> str:
@@ -3673,6 +4050,15 @@ class OutcomesIn(BaseModel):
         s = _trimmed_or_none(v)
         if s and len(s) > MAX_REF_CHARS:
             raise ValueError(f"session over {MAX_REF_CHARS} characters")
+        # And refused for a NUL on the same terms (#646): this is a contact
+        # address a peer is meant to reach the recorder on, so a marked one
+        # resolves to nothing while looking like the real thing — the argument
+        # directly above, one character along. A 422 rather than a per-item
+        # rejection because the field is the request's, not an item's, and it
+        # would otherwise be a 500 at INSERT that lost the whole batch anyway.
+        if s and "\x00" in s:
+            raise ValueError("session holds a NUL, which Postgres refuses in a "
+                             "text column")
         return s
 
 
