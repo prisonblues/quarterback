@@ -1069,6 +1069,9 @@ class Dash(App):
         # client had already made.
         self.board: dict = {}
         self.seats: list[dict] = []           # the seat PANES, off tmux
+        # ...and why that list is empty, when the reason is the machine rather
+        # than the screen. None means the list is the truth.
+        self.seats_error: str | None = None
         # session id -> the board's live agent, which is the id the pane carries
         # as `@qb_session`. One key and no narrowing: it was (machine, scope, seat
         # number) while a pane could only be identified through the agent's name,
@@ -1311,8 +1314,8 @@ class Dash(App):
 
     @work(thread=True, exclusive=True, group="seats")
     def refresh_seats(self) -> None:
-        seats = qd.tmux_seats()
-        self.call_from_thread(self.render_seats, seats)
+        seats, err = qd.tmux_seats()
+        self.call_from_thread(self.render_seats, seats, err)
 
     @work(thread=True, exclusive=True, group="limits")
     def refresh_limits(self) -> None:
@@ -1375,7 +1378,7 @@ class Dash(App):
 
     # ---- rendering -------------------------------------------------------
 
-    def render_seats(self, seats: list[dict]) -> None:
+    def render_seats(self, seats: list[dict], err: str | None = None) -> None:
         """The panes of the screen this dashboard is sitting in.
 
         They are rows of AGENTS now rather than a panel of their own, and the
@@ -1385,6 +1388,7 @@ class Dash(App):
         has a pane, still shows, and is still exactly the one worth closing.
         """
         self.seats = seats
+        self.seats_error = err
         self.render_agents()
 
 
@@ -1854,8 +1858,12 @@ class Dash(App):
                                 Text(""), Text(""), *blank, Text(""), Text(""),
                                 key="seat:add").value
         self.rows[str(add_key)] = {"kind": "add", "add": True}
+        # A tmux we cannot reach belongs on the title of the panel whose rows are
+        # missing because of it, not in a status line that scrolls away: the whole
+        # failure is that this panel looked complete when it was not.
+        blind = f" · tmux: {qd.clip(self.seats_error, 40)}" if self.seats_error else ""
         self.query_one("#t_agents", Static).update(
-            f"AGENTS · {qd.agent_tally(rows)}{qd.elsewhere(hidden)}")
+            f"AGENTS · {qd.agent_tally(rows)}{qd.elsewhere(hidden)}{blind}")
 
     def work_action(self, row: dict) -> tuple[str, str | None]:
         """``('⚖', 'panel')`` — the icon this row's verb column wears, and what a
@@ -2305,6 +2313,10 @@ class Dash(App):
                         f"close seat {seat['seat']}? the agent in it goes too")
 
     def add_seat(self) -> None:
+        if self.seats_error:
+            self.say(f"cannot reach tmux ({self.seats_error}) — "
+                     "the seat panel is blind, not empty")
+            return
         session = self.seat_session()
         if not session:
             self.say("no seat screen on this server — start one with qb-seats")
@@ -2323,6 +2335,10 @@ class Dash(App):
         NOT CONFIRMED, unlike the ✕. Nothing is killed, no process is touched —
         the dash keeps polling across the move — and the same key puts it back.
         """
+        if self.seats_error:
+            self.say(f"cannot reach tmux ({self.seats_error}) — "
+                     "the seat panel is blind, not empty")
+            return
         session = self.seat_session()
         if not session:
             self.say("no seat screen on this server — nothing to expand into")
@@ -2689,7 +2705,7 @@ class Dash(App):
         if not os.environ.get("TMUX"):
             self.say(f"not inside tmux — run it yourself: {command}")
             return
-        seats = qd.tmux_seats()
+        seats, _ = qd.tmux_seats()
         if not seats:
             self.run_in_window(name, command)
             return

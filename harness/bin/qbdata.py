@@ -4278,8 +4278,8 @@ def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> li
 SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "agent")
 
 
-def tmux_seats() -> list[dict]:
-    """Every seat pane on this tmux server, lowest seat number first.
+def tmux_seats() -> tuple[list[dict], str | None]:
+    """(every seat pane on this tmux server, or why we cannot say).
 
     A seat is a pane carrying the @qb_seat option, which is how qb-seats marks
     them and the only handle that survives a pane being added or closed — the
@@ -4300,19 +4300,43 @@ def tmux_seats() -> list[dict]:
     screen: the dashboard runs inside the screen most of the time and in a bare
     terminal the rest, and an empty SEATS panel is the honest answer to the
     second case.
+
+    THE ERROR HALF IS THE POINT. This used to return a bare [] whatever went
+    wrong, so "this screen has no seats" and "tmux could not be run at all" were
+    the same answer. When an audit shim on PATH ahead of the real tmux hardcoded
+    a profile path that stopped existing, every tmux call on the box exited 127 —
+    and the dashboard reported "no seat screen on this server" beside a screen
+    with three seats in it, while its ＋ refused to add one. An empty list is a
+    fact about the SCREEN; a failure is a fact about the MACHINE, and a panel
+    that cannot tell them apart sends its reader to look in the wrong place. It
+    is #244's rule — being idle and being broken must not look alike — about a
+    pane rather than a queue.
+
+    BEING OUTSIDE TMUX IS NOT AN ERROR, and that is a deliberate departure from
+    the first cut of this fix, which reported "not inside tmux" as one. The
+    dashboard full-screen in a bare terminal is a first-class way to run it
+    rather than a degraded one, and an error there would put a permanent
+    complaint on the panel of every such run — burying the failures this exists
+    to surface under a message that fires whenever nothing is wrong. No tmux
+    around us is a screen we cannot see, not a machine that is broken.
     """
     if not os.environ.get("TMUX"):
-        return []
+        return [], None
     fmt = "\t".join("#{%s}" % f for f in
                     ("pane_id", "@qb_seat", "session_name", "window_index",
                      "pane_current_command", "pane_current_path", "@qb_session"))
     try:
         got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=5)
-    except Exception:                             # noqa: BLE001
-        return []
+    except FileNotFoundError:
+        return [], "tmux is not on PATH"
+    except Exception as exc:                      # noqa: BLE001
+        return [], f"tmux could not be run ({type(exc).__name__})"
     if got.returncode != 0:
-        return []
+        # stderr before the exit code: the shim that prompted this printed the
+        # path it could not find, and a bare "exited 127" would have said nothing
+        # about WHICH tmux was broken.
+        return [], (clip(got.stderr.strip(), 60) or f"tmux exited {got.returncode}")
     seats = []
     for line in got.stdout.splitlines():
         parts = line.split("\t")
@@ -4325,7 +4349,7 @@ def tmux_seats() -> list[dict]:
     # interleave their 1, 2, 3 otherwise — which reads as one screen with every
     # seat number twice.
     return sorted(seats, key=lambda s: (s["session"],
-                                        int(s["seat"]) if s["seat"].isdigit() else 0))
+                                        int(s["seat"]) if s["seat"].isdigit() else 0)), None
 
 
 # ---- claude code's own limits ------------------------------------------------
