@@ -99,10 +99,12 @@ with these parallel-mode overrides:
   the patch*, and a premise declared once the pass is written and pushed is an
   annotation. So the agent makes its own `mktemp -d` register at the start, declares
   after reading each round's `round_stop` and **before** editing anything, and passes
-  the same path to every round's `--premise-file`. The round stamps each declaration
-  with the tree it was made from and reports one made after its own fix pass in
-  `config_notes` (#560) — so an agent that declares late is recorded as having done
-  so, whatever its summary says.
+  the same path to every round's `--premise-file`. `--premise` records the commit that
+  tree was on AND whether it already had uncommitted changes in it, and a later round
+  names either shape of late declaration in `config_notes` (#560) — declared after the
+  pass was committed, or declared with the pass already sitting in the tree. Both are
+  read out of the directory the declaration runs in, so this catches the ordering
+  slipping rather than an agent working around it (#622).
 - **Always worktree mode, never fix-in-place** — concurrent agents cannot share
   your checkout. Each opens its own throwaway worktree at the PR's head
   (`git worktree add <tmpdir> <remote>/<branch>`, detached — this works even

@@ -619,17 +619,34 @@ HEADS = {1: R1_HEAD, 2: R2_HEAD, 3: R3_HEAD}
 @pytest.fixture
 def at(monkeypatch):
     """Where the tree stood when `--premise` ran. Patched rather than driven through a
-    real checkout, because what is being pinned is the comparison and not `git`."""
+    real checkout, because what is being pinned is the comparison and not `git`.
+
+    It stubs the tree-state read as well, so a declaration made in a test never shells
+    out to `git status` in whatever checkout the suite happens to be running from —
+    which would make these assertions depend on whether the developer had edited
+    anything."""
     def use(sha):
         monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: sha)
+    monkeypatch.setattr(panel_rounds, "working_tree_dirty", lambda *a, **k: False)
     use(R1_HEAD)
     return use
 
 
-def _stamped(rounds_and_heads, limit=2):
+@pytest.fixture
+def tree(monkeypatch):
+    """Whether that same tree already had uncommitted work in it, patched for `at`'s
+    reason. `False` is the honest default: the fix pass has not started."""
+    def use(dirty):
+        monkeypatch.setattr(panel_rounds, "working_tree_dirty", lambda *a, **k: dirty)
+    use(False)
+    return use
+
+
+def _stamped(rounds_and_heads, limit=2, dirty=None):
     reg = panel_rounds.new_premise_register("acme/board", 34)
     for r, head in rounds_and_heads:
-        panel_rounds.declare_premise(reg, LANDED, r, [KEY_A], limit, head=head)
+        panel_rounds.declare_premise(reg, LANDED, r, [KEY_A], limit, head=head,
+                                     dirty=dirty)
     return reg
 
 
@@ -755,6 +772,166 @@ def test_the_payload_says_how_many_declarations_could_be_checked_at_all():
     state = panel_rounds.premise_state(_stamped([(1, R1_HEAD), (2, "")]), 3, 2, True,
                                        HEADS, wired=True)
     assert state["stamped"] == 1 and state["retroactive"] == []
+
+
+# ------------------------------ #560 reopened: declared after the patch was WRITTEN
+
+# The head stamp above answers "which commit was this tree on", and a second-opinion
+# review of PR #669 established that this is a narrower question than the mechanism
+# claimed to settle. A fix pass that edits the working tree and declares BEFORE
+# committing has not moved HEAD: its stamp is its own round's head, `at == was`, and
+# every assertion in the block above reads that as the honest shape. Edit, then commit
+# is the ORDINARY shape of a fix pass, so what the stamp alone caught was "declared
+# after the fix was COMMITTED" while #560 is about "declared after the fix was
+# WRITTEN". These pin the second reading — the tree state — that separates them.
+
+
+def test_a_premise_declared_into_a_tree_its_own_pass_had_already_edited():
+    """The reopening in one assertion. Same round, same head, and the only difference
+    from the honest declaration is that the patch was already in the tree when the
+    sentence was said. Before this the two were indistinguishable."""
+    late, = panel_rounds.retroactive_declarations(
+        _stamped([(1, R1_HEAD)], dirty=True), HEADS)
+    assert (late["round"], late["head_round"], late["shape"]) == (1, 1, "uncommitted")
+    assert late["head"] == R1_HEAD and late["text"] == LANDED
+
+
+def test_the_same_stamp_from_an_unedited_tree_is_still_the_honest_shape():
+    """The declaration this must never be aimed at: read `round_stop`, declare, THEN
+    edit. Identical head, and the tree state is the whole of what tells them apart."""
+    assert panel_rounds.retroactive_declarations(
+        _stamped([(1, R1_HEAD)], dirty=False), HEADS) == []
+
+
+def test_a_stamp_with_no_tree_state_beside_it_is_not_read_as_edited():
+    """Every register the first version of #560 wrote carries a head and no `dirty` at
+    all. That is ordinary history, and reading a missing field as an accusation would
+    fire this on every cycle recorded before the field existed."""
+    reg = _stamped([(1, R1_HEAD)], dirty=None)
+    assert reg["premises"][0]["dirty"] == {}
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+
+
+def test_git_failing_is_not_recorded_as_an_unedited_tree():
+    """`None` is "nobody looked" and `False` is "nobody had edited anything", and only
+    the second reads as a clean pass. A `False` minted from a failed subprocess would
+    be this mechanism's first exoneration, and it would be one nothing observed."""
+    reg = panel_rounds.new_premise_register("acme/board", 34)
+    panel_rounds.declare_premise(reg, LANDED, 1, [KEY_A], 2, head=R1_HEAD, dirty=None)
+    assert reg["premises"][0]["dirty"] == {}
+
+
+def test_an_earlier_rounds_head_is_not_late_however_edited_the_tree_was():
+    """A declaration for round 2 made from the tree round 1 reviewed is BEHIND the
+    round it answers — a stale checkout, a reset — and "which pass had been written
+    when this was said" has no answer there that does not involve guessing."""
+    assert panel_rounds.retroactive_declarations(
+        _stamped([(2, R1_HEAD)], dirty=True), HEADS) == []
+
+
+def test_the_two_shapes_are_named_apart():
+    """They are found by different evidence and a reader checks different things
+    against them: `committed` is read off commit ids the cycle recorded, `uncommitted`
+    off the tree state the declaration itself observed."""
+    committed, = panel_rounds.retroactive_declarations(
+        _stamped([(1, R2_HEAD)], dirty=False), HEADS)
+    edited, = panel_rounds.retroactive_declarations(
+        _stamped([(1, R1_HEAD)], dirty=True), HEADS)
+    assert committed["shape"] == "committed" and edited["shape"] == "uncommitted"
+
+
+def test_the_tree_state_is_recorded_only_beside_the_stamp_and_the_first_one_wins():
+    """One reading of one tree at one moment, and the check reads the two halves
+    together. If a restatement moved the tree state forward without the head, a fixer
+    that declared in order and stated it again mid-pass would carry round 1's head
+    beside the dirt of a tree it had since edited — which is the honest case wearing
+    the exact accusation this field exists to make."""
+    reg = _stamped([(1, R1_HEAD)], dirty=False)
+    panel_rounds.declare_premise(reg, LANDED, 1, [KEY_A], 2, head=R2_HEAD, dirty=True)
+    assert reg["premises"][0]["heads"] == {1: R1_HEAD}
+    assert reg["premises"][0]["dirty"] == {1: False}
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+
+
+def test_the_tree_state_survives_the_register_file(repo, at, tree, tmp_path):
+    """`heads`' rule and its reason: JSON has no integer keys, so an unconverted round
+    number makes the state unreadable the moment the next declaration loads it."""
+    tree(True)
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A)
+    assert register(reg)["premises"][0]["dirty"] == {"1": True}
+    back, problems = panel_rounds.load_premises(str(reg), "acme/board", 34)
+    assert back["premises"][0]["dirty"] == {1: True} and problems == []
+
+
+def test_a_tree_state_on_disk_that_is_not_a_bool_is_dropped_and_not_reported(tmp_path):
+    """A hand edit or another harness wrote it. JSON `1` and `"yes"` are somebody
+    else's idea of this field, and reading them as an answer is how a guess gets
+    recorded as an observation — `heads`' rule for a bad value on disk."""
+    path = tmp_path / "premises.json"
+    path.write_text(json.dumps({
+        "version": panel_rounds.PREMISE_REGISTER_VERSION, "repo": "acme/board", "pr": 34,
+        "premises": [{"text": LANDED, "rounds": [1], "heads": {"1": R1_HEAD},
+                      # A truthy non-bool, a round this entry does not claim, and a key
+                      # that is not a round at all.
+                      "dirty": {"1": 1, "2": True, "later": True}}]}))
+    reg, problems = panel_rounds.load_premises(str(path), "acme/board", 34)
+    assert reg["premises"][0]["dirty"] == {} and problems == []
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+
+
+def test_the_declaration_says_when_the_tree_was_already_edited(repo, at, tree,
+                                                               tmp_path, capsys):
+    """Said at the moment it is recorded, on the `at` line's rule. A fixer that sees
+    this on the screen it is about to act on can still put the ordering right next
+    round; the same fact in somebody else's payload two rounds later cannot."""
+    tree(True)
+    assert declare(tmp_path / "premises.json", LANDED, 1, KEY_A) == 0
+    out = capsys.readouterr().out
+    assert "tree     ALREADY EDITED" in out and "DO NOT WRITE THE PATCH" in out
+
+
+def test_a_tree_state_that_could_not_be_read_says_so_rather_than_reading_as_clean(
+        repo, at, tree, tmp_path, capsys):
+    """The screen has to distinguish "not read" from "clean" for the same reason the
+    register does: only one of them is evidence that the pass had not started."""
+    tree(None)
+    declare(tmp_path / "premises.json", LANDED, 1, KEY_A)
+    assert "tree     NOT READ" in capsys.readouterr().out
+
+
+def test_an_unedited_tree_is_not_announced_as_a_clean_bill(repo, at, tree, tmp_path,
+                                                            capsys):
+    """Positive identification only, on the screen as well as in the payload. There is
+    no field and no line anywhere here that says a declaration was made in order —
+    every value it reads came out of the actor's own environment, and an exoneration
+    minted from that would be the one claim this cannot support."""
+    declare(tmp_path / "premises.json", LANDED, 1, KEY_A)
+    out = capsys.readouterr().out
+    assert [ln for ln in out.splitlines() if ln.startswith("at ")]
+    assert not [ln for ln in out.splitlines() if ln.startswith("tree ")]
+
+
+def test_the_dirty_read_is_the_tree_and_not_the_untracked_furniture(monkeypatch):
+    """`--untracked-files=no`, and the gap it leaves is named in the docstring rather
+    than left to be found: build output, a virtualenv and an editor's scratch file are
+    the ordinary furniture of a checkout, and a check that fires on them is one an
+    orchestrator learns to read past."""
+    seen = []
+    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
+                        lambda path, *args: (seen.append(args), " M f.py\n")[1])
+    assert panel_rounds.working_tree_dirty("/somewhere") is True
+    assert seen == [("status", "--porcelain", "--untracked-files=no")]
+
+
+def test_a_clean_tree_and_a_git_that_could_not_run_are_different_answers(monkeypatch):
+    """`_git` returns `None` for no git on PATH, no checkout and no commit alike, and
+    `""` for a checkout with nothing modified. Collapsing them would turn every
+    environment this cannot read into a declaration that looks well-ordered."""
+    monkeypatch.setattr(panel_rounds.panel_scope, "_git", lambda *a, **k: "")
+    assert panel_rounds.working_tree_dirty(".") is False
+    monkeypatch.setattr(panel_rounds.panel_scope, "_git", lambda *a, **k: None)
+    assert panel_rounds.working_tree_dirty(".") is None
 
 
 # --------------------------------------------------------------- the stop rule's half
@@ -1054,6 +1231,46 @@ def test_a_round_names_a_premise_that_followed_its_own_fix_pass(
                for n in payload["config_notes"])
 
 
+def test_a_round_names_a_premise_declared_into_a_tree_its_own_pass_had_edited(
+        repo, at, tree, monkeypatch, capsys, tmp_path):
+    """#560 reopened, end to end and through the whole loop rather than through the
+    comparison alone. Round 1 reviews the PR's head, the fixer edits, declares against
+    round 1 from that same unmoved head, and round 2 reads the register. The head is
+    round 1's own, so the check the first version of #560 shipped says nothing; the
+    tree state is what makes the ordering visible."""
+    _, _, r1 = _round(monkeypatch, capsys, tmp_path, round_no=1)
+    reg = tmp_path / "premises.json"
+    # "abc" is the head `stub` gives the PR, so this stamp is round 1's own head — the
+    # value an honest declaration produces too, which is exactly the point.
+    at("abc")
+    tree(True)
+    declare(reg, LANDED, 1, KEY_A)
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=2, baseline=[r1],
+                           premise_file=str(reg))
+    late, = payload["round_stop"]["premises"]["retroactive"]
+    assert (late["round"], late["shape"]) == (1, "uncommitted")
+    assert any("uncommitted changes to tracked files already in it" in n
+               and "not a brake" in n for n in payload["config_notes"])
+
+
+def test_that_round_still_does_not_end_the_cycle_on_it(
+        repo, at, tree, monkeypatch, capsys, tmp_path):
+    """Evidence, not a rung, and the second shape does not change that. A stop taken
+    here would be the late half again, which `repeated` and `undecidable` already
+    occupy — what was missing was never another way to end a cycle."""
+    _, _, r1 = _round(monkeypatch, capsys, tmp_path, round_no=1)
+    reg = tmp_path / "premises.json"
+    at("abc")
+    tree(True)
+    declare(reg, LANDED, 1, KEY_A)
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=2, baseline=[r1],
+                           premise_file=str(reg))
+    stop = payload["round_stop"]
+    assert stop["premises"]["retroactive"]
+    assert not [v for v in stop["veto"] if "premise" in v]
+    assert "premise" not in stop["reason"]
+
+
 def test_naming_it_does_not_end_the_cycle(repo, monkeypatch, capsys, tmp_path):
     """Evidence, not a rung. The brake's whole claim is that it refuses a fix before the
     fix is written; a stop taken here would be the late half again, which `repeated` and
@@ -1164,6 +1381,25 @@ def test_both_briefs_place_the_declaration_where_the_fixer_is_the_orchestrator()
     # cycle's fixer was given none, so `--premise` was uncallable during the pass.
     assert "Choose the register\npath yourself" in REVIEW_PR
     assert "passes\n  the same path to every round's `--premise-file`" in PANEL_REVIEW_PR
+
+
+def test_both_briefs_say_which_tree_the_declaration_has_to_be_made_in():
+    """#560 reopened, documentation half. Both readings are taken from the directory
+    `--premise` runs in, so a declaration made anywhere else records a tree that has
+    nothing to do with the fix pass — and neither brief said where to stand. Saying it
+    is the only part of that hole this can close; an actor that would rather not be
+    measured still picks its own directory, which is #622."""
+    assert "from the tree the patch lands in" in REVIEW_PR
+    assert "read out of the directory the declaration runs in" in PANEL_REVIEW_PR
+
+
+def test_neither_brief_claims_the_check_survives_an_actor_working_around_it():
+    """The claim PR #669 made and this branch withdraws. Both readings come out of the
+    actor's own environment, so what the record supports is that the ORDERING slipped,
+    not that nobody could have arranged for it not to show."""
+    assert "(#622)" in PANEL_REVIEW_PR
+    assert "whatever its summary says" not in PANEL_REVIEW_PR
+    assert "matter of your own account of it" not in REVIEW_PR
 
 
 def test_both_briefs_carry_the_limit_rather_than_implying_coverage():

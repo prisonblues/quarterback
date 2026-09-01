@@ -3436,9 +3436,63 @@ def working_head(repo_path: str = ".") -> str:
     commit yet. All of them mean "nobody recorded where the tree was", which reads
     downstream as unknown and accuses nobody. Inferring it from the PR instead would
     mint a stamp for a tree the declaration was never made in, and the ordering check
-    would then say something false rather than nothing."""
+    would then say something false rather than nothing.
+
+    **WHAT THIS IS NOT, said plainly because the first version of #560 overstated
+    it.** The directory is the one the declaring PROCESS was launched in, and that is
+    the tree the patch lands in only when the declaration was made there. Run from
+    the canonical checkout, from a sibling worktree, or outside a repository
+    altogether, this records some other tree's head or none — and the ordering check
+    then reports nothing, because a stamp matching no round's head is silence. So an
+    actor that would rather not be stamped does not have to falsify an argument; it
+    can pick a directory. That is #622 — every brake on the fix pass is measured by
+    the actor it constrains — and it is not closed here. What IS closed is the
+    accident this issue was opened on: an orchestrator-that-is-also-the-fixer
+    declaring in its own patch tree, after the pass, with no intent to deceive."""
     sha = (panel_scope._git(repo_path, "rev-parse", "HEAD") or "").strip()
     return sha if _SHA_RE.fullmatch(sha) else ""
+
+
+def working_tree_dirty(repo_path: str = ".") -> bool | None:
+    """Whether that same tree ALREADY carried uncommitted changes to tracked files
+    when the declaration was made, or ``None`` when it could not be read.
+
+    #560, reopened. :func:`working_head` answers "which commit was this tree on", and
+    a second-opinion review established that this answers a narrower question than
+    the mechanism was built to answer. A fix pass that edits the working tree and
+    declares BEFORE committing has not moved `HEAD`: its stamp is its own round's
+    head, :func:`retroactive_declarations` reads that as in order, and the entry is
+    byte-identical to the honest declaration made before the first edit. Edit, then
+    commit is the ORDINARY shape of a fix pass, so the head stamp on its own detects
+    "declared after the fix was committed" while #560 is about "declared after the
+    fix was written". Separating those two needs evidence about the working TREE, and
+    this is the cheapest piece of it that exists.
+
+    **Tracked modifications only** (`--untracked-files=no`), and the omission is a
+    decision rather than an oversight. Untracked files are the ordinary furniture of
+    a working checkout — build output, a virtualenv, an editor's scratch file, the
+    round payloads when a caller wrote them under the repo — so counting them would
+    put this check in exactly the state :func:`retroactive_declarations` refuses to
+    be in: firing on cycles where nothing is wrong until an orchestrator learns to
+    read past it. The price is a real gap and it is named here rather than left to be
+    discovered — a fix pass whose entire output is NEW files is invisible to this
+    until something stages them.
+
+    ``None`` and never ``False`` when git could not run, on :func:`working_head`'s
+    contract and for a sharper reason than that function has. "Nobody looked" and
+    "nobody had edited anything yet" are different facts and only the second reads as
+    a clean pass, so they must not share a value: a `False` minted from a failed
+    subprocess would be this mechanism's first exoneration, and it would be one
+    nothing observed.
+
+    Read from the process's own directory, with :func:`working_head`'s limitation
+    and one more of its own: `git stash`, a declaration run somewhere clean, or a
+    commit made before declaring all produce an honest-looking read. Neither this nor
+    the head stamp is a defence against an actor choosing what the evidence about it
+    says — that is #622 — and this one only has to be better than the nothing that
+    was there before."""
+    out = panel_scope._git(repo_path, "status", "--porcelain", "--untracked-files=no")
+    return None if out is None else bool(out.strip())
 
 
 def _declared_heads(raw: object, rounds: Iterable[int]) -> dict[int, str]:
@@ -3466,6 +3520,35 @@ def _declared_heads(raw: object, rounds: Iterable[int]) -> dict[int, str]:
             continue
         if was in claimed and isinstance(sha, str) and _SHA_RE.fullmatch(sha):
             out[was] = sha
+    return out
+
+
+def _declared_dirty(raw: object, rounds: Iterable[int]) -> dict[int, bool]:
+    """Whether each of one declaration's rounds was declared from a tree that already
+    had uncommitted work in it (#560).
+
+    :func:`_declared_heads`' rule, its shape and its silence — string keys read back
+    to ints, anything naming a round this entry does not claim dropped, anything that
+    is not a real bool dropped, and none of it REPORTED. The extra reason for the
+    silence here is that this field is younger than the stamp beside it: a register
+    written by the first version of #560 carries `heads` and no `dirty` at all, which
+    is ordinary history rather than a malformed register. A stamp with no tree state
+    beside it is one the second half of the check cannot read, which is the same
+    "not checkable" an unstamped declaration already means."""
+    out: dict[int, bool] = {}
+    if not isinstance(raw, dict):
+        return out
+    claimed = set(rounds)
+    for key, flag in raw.items():
+        try:
+            was = int(key)
+        except (TypeError, ValueError):
+            continue
+        # `isinstance(flag, bool)` and not a truthiness read: JSON `1`, `"yes"` and
+        # `[]` are a hand edit or another harness's idea of this field, and reading
+        # them as an answer is how a guess gets recorded as an observation.
+        if was in claimed and isinstance(flag, bool):
+            out[was] = flag
     return out
 
 
@@ -3544,6 +3627,7 @@ def load_premises(path: str, repo: str = "", pr: int | None = None
                      "norm": _norm_title(text), "rounds": sorted(rounds),
                      "decidable": answer if answer in DECIDABILITY else "unknown",
                      "heads": _declared_heads(entry.get("heads"), rounds),
+                     "dirty": _declared_dirty(entry.get("dirty"), rounds),
                      "findings": sorted({_key_norm(k) for k in (entry.get("findings") or [])
                                          if _is_key(k)})})
     reg["premises"] = kept
@@ -3564,7 +3648,8 @@ def find_premise(reg: dict, text: str) -> dict | None:
 def declare_premise(reg: dict, text: str, round_no: int,
                     findings: Iterable[str] = (), limit: int | None = None,
                     decidable: str = "unknown",
-                    undecidable_brake: bool = False, head: str = "") -> dict:
+                    undecidable_brake: bool = False, head: str = "",
+                    dirty: bool | None = None) -> dict:
     """Record that a fix pass is about to be written against ``text``, and say
     whether it may be.
 
@@ -3614,10 +3699,15 @@ def declare_premise(reg: dict, text: str, round_no: int,
     being refused lift its own refusal by changing its answer.
 
     ``head`` is where the tree stood when this was declared (#560), from
-    :func:`working_head`. It records nothing about the premise and everything about
-    WHEN the sentence was said, which is the property the brake rests on and the only
-    one the register did not hold: a declaration made after its own fix pass was
-    written is an annotation, and it used to be indistinguishable from a brake."""
+    :func:`working_head`, and ``dirty`` is whether that tree already had uncommitted
+    work in it, from :func:`working_tree_dirty`. Neither records anything about the
+    premise and both record WHEN the sentence was said, which is the property the
+    brake rests on and the only one the register did not hold: a declaration made
+    after its own fix pass was written is an annotation, and it used to be
+    indistinguishable from a brake. They are two halves of one reading and answer
+    the two shapes that failure comes in — the head alone catches only the pass that
+    was already COMMITTED when the premise was declared, and the ordinary fix pass
+    edits first and commits afterwards."""
     text = " ".join(str(text).split())
     answer = str(decidable or "unknown").strip().lower()
     if answer not in DECIDABILITY:
@@ -3632,7 +3722,8 @@ def declare_premise(reg: dict, text: str, round_no: int,
     entry = find_premise(reg, text)
     if entry is None:
         entry = {"key": premise_key(text), "text": text, "norm": _norm_title(text),
-                 "rounds": [], "findings": [], "decidable": "unknown", "heads": {}}
+                 "rounds": [], "findings": [], "decidable": "unknown", "heads": {},
+                 "dirty": {}}
         reg.setdefault("premises", []).append(entry)
     if round_no not in entry["rounds"]:
         entry["rounds"] = sorted([*entry["rounds"], round_no])
@@ -3648,8 +3739,21 @@ def declare_premise(reg: dict, text: str, round_no: int,
     # declaration could be back-dated by re-declaring from a stale checkout.
     stamp = str(head or "").strip()
     entry.setdefault("heads", {})
+    entry.setdefault("dirty", {})
     if stamp and _SHA_RE.fullmatch(stamp) and round_no not in entry["heads"]:
         entry["heads"][round_no] = stamp
+        # **The tree state is written ONLY beside a stamp, and by the same first-wins
+        # rule.** They are one reading of one tree at one moment and the check reads
+        # them together — "the tree round R reviewed, already edited" is the whole
+        # claim — so a `dirty` recorded on its own, or updated later than the head it
+        # belongs to, would let the two halves describe different moments. That is
+        # the shape of every accusation this must not make: a fixer that declared in
+        # order and restated mid-pass would then carry round R's head with the tree
+        # state of a tree it had since edited, which is precisely the honest case.
+        # `None` is git having failed and is recorded as nothing at all — see
+        # :func:`working_tree_dirty` for why it must not become a `False`.
+        if isinstance(dirty, bool):
+            entry["dirty"][round_no] = dirty
     # **A `no` is STICKY, and the brake reads the ENTRY rather than this declaration.**
     # Both halves close the same hole, and it is the hole every self-reported signal in
     # this loop has: the agent whose fix is being refused is the one supplying the
@@ -3700,6 +3804,7 @@ def declare_premise(reg: dict, text: str, round_no: int,
             "repeated": repeated, "undecidable": undecidable,
             "undecidable_brake": bool(undecidable_brake),
             "head": entry["heads"].get(round_no, ""),
+            "dirty": entry["dirty"].get(round_no),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -3717,15 +3822,32 @@ def undeclared_passes(reg: dict, round_no: int) -> list[int]:
 
 
 def retroactive_declarations(reg: dict, heads: Mapping[int, str] | None) -> list[dict]:
-    """Declarations the register can PROVE were made after the fix pass they explain
-    (#560), as ``[{key, text, round, head, head_round}, …]``.
+    """Declarations the register can show were made after the fix pass they explain
+    (#560), as ``[{key, text, round, head, head_round, shape}, …]``.
 
     ``heads`` is round -> the commit that round reviewed, which the round already has:
     every earlier round's from `Baseline.head_shas`, and this round's from its own
     `head_sha`. A declaration for round R was made in order when the tree it was
-    declared from is the tree round R reviewed. If the stamp is instead the head of
-    some LATER round, the fix pass for round R had already been written and pushed
-    when the sentence was said, and exit 4 could not have meant anything.
+    declared from is the tree round R reviewed, unedited.
+
+    **Two shapes, because the ordering fails in two ways and the first version of
+    this function only saw one of them.**
+
+    - ``committed``: the stamp is the head of some LATER round. The round-R fix pass
+      was written AND pushed before the sentence was said, and exit 4 had no patch
+      left to refuse.
+    - ``uncommitted``: the stamp is round R's own head and the tree was already
+      dirty. This is the shape #560 was actually opened on and the one the head
+      stamp alone cannot see: a fix pass that edits and then commits has not moved
+      `HEAD`, so its stamp equals its own round's head — the same value an honest
+      declaration made before the first edit produces. `dirty` is what separates
+      them, and without it every fix pass with the ordinary edit-then-commit shape
+      read as in order.
+
+    A stamp on an EARLIER round's head is neither, dirty or not. It is a declaration
+    made from a tree behind the round it answers — a stale checkout, a reset — and
+    "which pass had been written when this was said" has no answer there that does
+    not involve guessing.
 
     **Positive identification only, and everything else is silence.** A stamp
     matching no round's head is not reported — a fixer that declared from an
@@ -3734,8 +3856,20 @@ def retroactive_declarations(reg: dict, heads: Mapping[int, str] | None) -> list
     the ordering was not checkable. The alternative rule — "anything that is not the
     round's own head is late" — would accuse an honest fixer for a rebase it did not
     perform, and a check that cries wolf on ordinary history is one an orchestrator
-    learns to pass over. This one fires on a fact: the tree was carrying a commit
-    that the cycle itself recorded as arriving after the round in question.
+    learns to pass over. Both shapes fire on a fact rather than on an absence: the
+    tree was carrying a commit the cycle itself recorded as arriving after the round
+    in question, or it was carrying edits to tracked files that the round it answers
+    had not reviewed.
+
+    **What it still cannot see, so that a clean list is not read as a clean cycle.**
+    A fixer that commits locally and declares before pushing leaves a stamp on a
+    commit no round recorded, which is silence by the rule above. A fix pass whose
+    entire output is new, unstaged files leaves the tree clean to
+    :func:`working_tree_dirty`. And every value read here came out of the actor's own
+    environment: choosing a directory, or stashing, produces an honest-looking
+    reading and nothing here would know. That last one is #622 and is not closed by
+    any stamp — this detects the accident, which is what #560 observed, not the
+    evasion.
 
     Ties go to the EARLIEST round holding a head, which matters when a fix pass
     pushed nothing and two rounds reviewed the same commit. Then "which round does
@@ -3753,12 +3887,23 @@ def retroactive_declarations(reg: dict, heads: Mapping[int, str] | None) -> list
     late = []
     for e in reg.get("premises") or []:
         stamps = e.get("heads") or {}
+        dirt = e.get("dirty") or {}
         for was in sorted(e.get("rounds") or []):
-            at = first_at.get(stamps.get(was) or "")
-            if at is None or at <= was:
+            stamp = stamps.get(was) or ""
+            at = first_at.get(stamp)
+            if at is None:
+                continue
+            if at > was:
+                shape = "committed"
+            # `is True` and not truthiness: the value is absent on every register the
+            # first version of #560 wrote, and absent has to keep meaning "the second
+            # half of this check could not run on that declaration".
+            elif at == was and dirt.get(was) is True:
+                shape = "uncommitted"
+            else:
                 continue
             late.append({"key": e["key"], "text": e["text"], "round": was,
-                         "head": stamps[was], "head_round": at})
+                         "head": stamp, "head_round": at, "shape": shape})
     return sorted(late, key=lambda d: (d["round"], d["key"]))
 
 
@@ -3786,18 +3931,30 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
     # #560's two halves, and they answer two different questions a reader of
     # `undeclared_rounds` alone cannot tell apart.
     #
-    # `wired` is whether this round was given a register AT ALL. Without it, a cycle
-    # that never wired one and a cycle whose fixer skipped a declaration produce the
-    # same `undeclared_rounds` list, and on lexray#1697 the first happened: the
-    # orchestrator handed the fixer no register path, so `panel.py --premise` was
-    # uncallable during the pass and the premise was declared afterwards. That was
-    # only visible because the fixer said so. This makes it a fact in the payload —
-    # `wired: false` with rounds listed is a cycle in which no fix pass COULD have
-    # been braked, and nobody has to be honest for it to say so.
+    # `wired` is whether THIS ROUND'S INVOCATION was given a `--premise-file` path,
+    # and that sentence is the whole of what it claims. It is worth carrying because
+    # without it a cycle that never wired a register and a cycle whose fixer skipped a
+    # declaration produce the same `undeclared_rounds` list, and on lexray#1697 the
+    # first happened: the orchestrator handed the fixer no register path, `panel.py
+    # --premise` was uncallable during the pass, and that was visible only because the
+    # fixer said so.
+    #
+    # **It does NOT establish that the fixer could reach the register**, and the first
+    # version of #560 claimed it drew that distinction. The round and the fix pass are
+    # separate invocations: a round can be handed a path the fixer was never told
+    # about, or a path the fixer could not write. What the payload does hold about the
+    # fixer's side is `declared` — a register with entries in it was reached by
+    # somebody — and `undeclared_rounds`, which names the passes that left none. The
+    # honest reading of `wired: false` with rounds listed is "the reader of this
+    # cycle was not even pointed at a register", not "the fixer had no brake".
     #
     # `stamped` is how many round-declarations carried a head, which is what makes
     # `retroactive`'s silence readable: zero stamps means the ordering was not
-    # checkable on this cycle, not that it checked out.
+    # checkable on this cycle, not that it checked out. It counts HEADS, and a
+    # register written by the first version of #560 has heads with no tree state
+    # beside them — so on those, `stamped` overstates what the `uncommitted` half of
+    # the check could see. Going forward the two are written together or not at all
+    # (:func:`declare_premise`), which is what keeps the one number honest for both.
     return {"limit": limit,
             "declared": len(entries),
             "repeated": repeated,
@@ -4479,6 +4636,21 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
         out.append(f"at       {verdict['head'][:12]} — the tree this was declared "
                    "from. A later round reads it to tell a premise declared before "
                    "its own fix pass from one declared after it (#560)")
+        # Said at the moment it is recorded and worded as what it will be read as. A
+        # fixer that sees "tree ALREADY EDITED" on the line it is about to act on can
+        # still put the ordering right on the next round; the same fact arriving in
+        # somebody else's payload two rounds later cannot be acted on by anyone.
+        if verdict.get("dirty") is True:
+            out.append("tree     ALREADY EDITED — this tree had uncommitted changes "
+                       "to tracked files when the premise was declared, so the fix "
+                       "pass this premise explains was under way before the sentence "
+                       "was said. Exit 4 means DO NOT WRITE THE PATCH, and it can "
+                       "only mean that before the patch exists (#560)")
+        elif verdict.get("dirty") is None:
+            out.append("tree     NOT READ — this tree's uncommitted state could not "
+                       "be read, so a round can only check the ordering against "
+                       "commits, which misses a pass declared before it committed "
+                       "(#560)")
     else:
         out.append("at       NOT RECORDED — this tree's HEAD could not be read, so no "
                    "round can tell whether this premise preceded its own fix pass or "
@@ -4738,11 +4910,15 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     limit = premise_repeat_limit(cfg["review_panel"], notes)
     undecidable_brake = premise_undecidable_brake(cfg["review_panel"], notes)
     reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
-    # #560's stamp, read here rather than taken from the caller. The declaration is
-    # made from the tree the patch is about to be written in, so that tree's HEAD is
-    # the fact — see :func:`working_head` for why it is not a flag.
+    # #560's two readings of the tree the declaration is being made from, read here
+    # rather than taken from the caller — see :func:`working_head` for why neither is
+    # a flag. The head says which commit that tree was on; the dirt says whether the
+    # patch this premise explains had already been written into it. The head alone
+    # only ever caught the pass that was already committed, and edit-then-commit is
+    # the ordinary shape of a fix pass.
     verdict = declare_premise(reg, premise, round_no, findings or [], limit,
-                              decidable, undecidable_brake, working_head())
+                              decidable, undecidable_brake, working_head(),
+                              working_tree_dirty())
     if verdict["decidable"] == "no" and not undecidable_brake:
         # The repo switched it off, and the declaration still says the fix cannot be
         # verified where it runs. Recorded and reported rather than swallowed, on
@@ -6592,6 +6768,6 @@ __all__ = [
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",
-    "working_head", "retroactive_declarations",
+    "working_head", "working_tree_dirty", "retroactive_declarations",
     "premise_report", "declare", "announce_escalation",
 ]
