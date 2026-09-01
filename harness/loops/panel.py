@@ -1486,16 +1486,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # argument: twenty unnamed arguments in source order is a block where an
         # insertion shifts every argument after it by one, silently.
         #
-        # Most of those shifts WOULD raise or misbehave loudly, because the types
-        # alternate — `escalated` is separated from `narrowed` by
-        # `escalated_from_board: bool`, so a shift across it hands a bool where a
-        # list is wanted. The dangerous case is narrower and is the one worth
-        # naming: `narrowed` and `acknowledge` are adjacent AND both
-        # `list[str] | None`, so an insertion between them passes every type check
-        # and silently swaps two registers whose confusion no test would catch.
+        # FIVE of those boundaries are type-silent, counted off the signature's own
+        # annotations rather than by reading down it: `post`/`json_out`,
+        # `force`/`no_code_access` and `new_cycle`/`no_pr_claim` are adjacent bools,
+        # `scope`/`since` adjacent strs, and `narrowed`/`acknowledge` adjacent
+        # `list[str] | None`. An insertion at any of the five passes every type
+        # check the interpreter makes.
         #
-        # One silent pair is the whole argument. Keeping new flags last and
-        # keyword-only is what makes the block safe to extend.
+        # `narrowed`/`acknowledge` is the worst of them, and not because of the
+        # type: they are two REGISTERS of the same shape, so a swap sends escalated
+        # keys to the acknowledgement door and back, and both doors accept the
+        # other's keys without complaint. The three bool pairs would at least
+        # flip an observable behaviour.
+        #
+        # Keeping new flags last and keyword-only is what makes the block safe to
+        # extend past all five.
         no_pr_claim: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of

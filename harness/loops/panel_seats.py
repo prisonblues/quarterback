@@ -2005,10 +2005,14 @@ def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
 
     **The empty string is null too**, said here because the paragraph below reads as
     though `null` were the only off spelling and a reviewer took it that way (#686).
-    It is not a quirk of this key: SEVENTEEN resolvers in this module read `""` as
-    null, so it is the module's convention rather than this dial's behaviour, and
-    refusing it here alone would make this the one dial that answers a cleared value
-    differently from the other sixteen.
+    It is not a quirk of this key. EVERY dial resolver in this module reads `""` as
+    null — all seventeen of them, with no exception — so it is the module's
+    convention rather than this dial's behaviour, and refusing it here alone would
+    make this the only dial in the file that answers an emptied value differently
+    from every other. Stated as "every" rather than as a bare count deliberately: a
+    count is what three earlier drafts of this paragraph each got wrong, because the
+    answer moves with what you decide to grep for, while "every resolver, no
+    exception" is checkable against the list of resolvers itself.
 
     WHY the convention exists is not recorded anywhere and is deliberately not guessed
     at here. Two routes DO deliver one, so it is not unreachable: a hand-written
