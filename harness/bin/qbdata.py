@@ -2849,12 +2849,16 @@ def blocker_cell(blockers: list[dict], width: int = 17) -> tuple[str, str]:
 #   WORK   — what is in flight, and where has it got to.
 #            Was PLANS + REVIEW QUEUE + OPEN PRs + ISSUES.
 #
-# THE ROW MODELS LIVE HERE and not in either renderer, because there are two
-# renderers and they have to agree about what a merged row means. They already
-# shared every cell helper — `agent_state`, `stage_cell`, `plan_state`,
-# `plan_who`, `claim_label`, `ci_state` — and the row is the one thing they did
-# not, which is how `qb-dash.py` and `qb-dash-tui.py` came to hold six pairs of
-# panel functions that drifted a word at a time (#280 is the residue).
+# THE ROW MODELS LIVE HERE and not in the renderer, which is worth keeping now
+# that there is only one of those. They were pulled out when there were two and
+# the two had to agree about what a merged row means: the cell helpers were
+# already shared — `agent_state`, `stage_cell`, `plan_state`, `plan_who`,
+# `claim_label`, `ci_state` — and the row was the one thing they were not, which
+# is how `qb-dash.py` and `qb-dash-tui.py` came to hold six pairs of panel
+# functions that drifted a word at a time (#280 is the residue). The plain
+# renderer is retired and the drift cannot recur, but a row that knows what it
+# says independently of what draws it is still what makes these testable without
+# building a `Console`.
 #
 # They return PLAIN DICTS carrying `(text, style)` pairs, and no Rich object
 # anywhere. Textual wants `Text`, the printed renderer wants `Text` clipped to

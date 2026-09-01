@@ -1479,9 +1479,9 @@ def test_a_queue_that_could_not_be_fetched_says_so_in_a_row():
     The first cut of this port put the error in `#t_queue`, clipped to 24
     characters, and drew no row at all. The title is bounded by the pane, and a
     panel whose entire job is saying WHY something is waiting must not truncate
-    the one message that says why it cannot tell you. The plain renderer has
-    drawn this as a row since #273 (qb-dash.py:377) and parity is the whole
-    argument for flipping the default in #426.
+    the one message that says why it cannot tell you. The now-retired plain
+    renderer drew it as a row from #273, and matching that was the whole argument
+    for flipping the default in #426.
     """
     err = "board unreachable: HTTPConnectionPool(host='board.invalid', port=80)"
     rows, title, _, _ = asyncio.run(

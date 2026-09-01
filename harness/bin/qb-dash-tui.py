@@ -21,8 +21,18 @@ TWO TABLES WHERE THERE WERE SEVEN (#589). SEATS, FLEET and CLAIMED were three
 views of one subject — a seat is an agent with a pane in front of you, a claim is
 what an agent holds — and PLANS, OPEN PRs, REVIEW QUEUE and ISSUES were four
 answers to one question, two of which printed the same rows: the review queue is
-DERIVED from the open-PR list, so it was a subset by construction. `qb-dash.py`'s
-module docstring has the measurement and what is deliberately still not merged.
+DERIVED from the open-PR list (`qbdata.fetch_review_queue`), so it was a subset by
+construction, and all the PR panel added was the CI glyph — which is now the WORK
+table's state cell for a PR row.
+
+The split cost more than the borders. On the frame this was measured against,
+`#578` was on the pane four times — a claim, a plan rank, and twice more as its PR
+— and OPEN PRs and REVIEW QUEUE printed the same three PRs in ten lines.
+
+WHAT IS NOT MERGED, and why: a plan item names its ISSUE and nothing anywhere
+records which PR implements it (#396). So an issue and the PR that closes it are
+two rows, `#578` goes from four rows to two rather than to one, and the missing
+edge is a fact about the board rather than a shortcut taken here.
 
 The ⚒ goes through `qb-start` (#371), so what it starts is counted by `qb-admit`,
 holds a claim taken before the process exists, is endable by session id from the
@@ -3358,7 +3368,10 @@ def main(argv: list[str] | None = None) -> int:
     the same `QB_SEATS_DASH`, so a screen that can be pointed at a project one way
     has to be pointable the other way too. Everything else about this app is keys.
     """
-    ap = argparse.ArgumentParser(prog="qb-dash-tui",
+    # `qb-dash` and not this file's own name: with the plain renderer retired the
+    # launcher is the command people type, and a usage line naming the alias sends
+    # a reader looking for a second thing to run.
+    ap = argparse.ArgumentParser(prog="qb-dash",
                                  description="the fleet dashboard, clickable")
     ap.add_argument("--scope", choices=("repo", "all"), default=None,
                     help="repo (default): only this screen's repos, and no repo column; "

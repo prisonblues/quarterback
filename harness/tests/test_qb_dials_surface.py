@@ -1,10 +1,10 @@
-"""What the dashboards say about the dials in force — #477.
+"""What the dashboard says about the dials in force — #477.
 
 A dial is a setting: the repo supplies a default, the board states the value IN
 FORCE, and the layer that answered is part of the answer (#305). Until this
-landed, nothing a person or an agent looks at showed one — not `qb-dash`, not
-`qb-dash-tui`, not `qb-board`, not the web board — so the value governing every
-round on the fleet was set from an endpoint, read back by one function in
+landed, nothing a person or an agent looks at showed one — not the dashboard,
+not `qb-board`, not the web board — so the value governing every round on the
+fleet was set from an endpoint, read back by one function in
 `panel_seats.py`, and invisible everywhere else.
 
 Three things are pinned here and each is a distinct way of being wrong:
@@ -27,8 +27,6 @@ Run: pytest harness/tests/test_qb_dials_surface.py
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import sys
 from datetime import UTC, datetime, timedelta
@@ -43,20 +41,6 @@ import qbdata as qd                                       # noqa: E402
 
 REPO = "prisonblues/quarterback"
 OTHER = "prisonblues/lexray"
-
-
-def _load(name: str, filename: str):
-    loader = importlib.machinery.SourceFileLoader(name, str(BIN / filename))
-    spec = importlib.util.spec_from_loader(name, loader)
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
-
-
-@pytest.fixture(scope="module")
-def dash():
-    pytest.importorskip("rich", reason="the printed renderer needs rich")
-    return _load("qb_dash_dials", "qb-dash.py")
 
 
 @pytest.fixture
@@ -278,110 +262,6 @@ def test_the_detail_spells_out_what_the_cell_can_only_abbreviate():
 def test_the_detail_of_an_expiring_dial_counts_down_instead():
     said = qd.dial_detail(dial(expires=in_hours(2)))
     assert "expires in" in said and "indefinitely" not in said
-
-
-# ---- the printed panel -------------------------------------------------------
-
-def _lines(panel) -> list[str]:
-    """The panel's rows. One column by construction — see `qb-dash.dial_row` for
-    why this table is hand-aligned where every other one is a grid."""
-    return [str(c) for c in panel.renderable.columns[0].cells]
-
-
-def cfg():
-    return qd.BoardConfig("https://qb.fo.ls", "t", "hermes")
-
-
-def test_the_panel_always_says_where_to_turn_one(dash, watched):
-    """Even — especially — with nothing in force. The reader who most needs it is
-    the one who has just found out that the tempo is not what they want.
-
-    BOTH surfaces that can, because this renderer is neither: it has no keyboard,
-    which is the whole of what the printed panels are. The verb is the clickable
-    renderer's `✎` or the board's page, and naming only one of them would send
-    somebody to a browser they did not need."""
-    panel = dash.panel_dials({"asked": True, "dials": []}, 80, cfg(), None)
-    assert any("dials/view" in line for line in _lines(panel))
-    assert any("qb-dash-tui" in line for line in _lines(panel))
-
-
-def test_the_panel_draws_the_argument_for_every_value(dash, watched):
-    """The board REQUIRES a reason on every write — "a dial nobody can read an
-    argument for is a dial nobody can decide to remove" — so a surface that renders
-    the value and drops the reason throws away the thing that lets anybody undo
-    it."""
-    panel = dash.panel_dials(
-        {"asked": True, "dials": [dial(reason="draining the PR backlog")]},
-        80, cfg(), None)
-    assert any("draining the PR backlog" in line for line in _lines(panel))
-
-
-def test_an_unanswered_board_does_not_report_zero_dials_in_force(dash, watched):
-    """A COUNT IS A CLAIM. "0 in force" over an unreachable board says the fleet is
-    running on its defaults, which is the one thing an unanswered read cannot
-    establish."""
-    panel = dash.panel_dials({"asked": True, "error": "URLError"}, 80, cfg(), None)
-    assert "unreadable" in str(panel.title)
-    assert "0 in force" not in str(panel.title)
-
-
-def test_a_panel_that_has_not_asked_yet_says_so_rather_than_answering(dash, watched):
-    panel = dash.panel_dials({}, 80, cfg(), None)
-    assert "asking" in str(panel.title)
-    assert any("asking" in line for line in _lines(panel))
-
-
-def test_an_answered_empty_board_says_the_defaults_are_in_force(dash, watched):
-    """Not "no dials": every dial HAS a value, and this is the state where the
-    repo's own default is the one in force."""
-    panel = dash.panel_dials({"asked": True, "dials": []}, 80, cfg(), None)
-    assert "0 in force" in str(panel.title)
-    assert any("default" in line for line in _lines(panel))
-
-
-def test_an_overridden_fleet_dial_is_counted_even_though_it_is_not_drawn(dash, watched):
-    """Silence would leave the person who set it fleet-wide unable to see what
-    became of it."""
-    panel = dash.panel_dials({"asked": True, "dials": [dial(repo=REPO)],
-                              "shadowed": [dial(repo=None)]}, 80, cfg(), None)
-    assert "1 overridden" in str(panel.title)
-
-
-def test_the_dial_row_keeps_its_columns_aligned_at_every_width(dash):
-    """Hand-aligned, because Rich has no colspan and the two lines that must run
-    the panel's whole width are the reason and the URL. So the padding is this
-    file's to check — a `Table.grid` is not doing it."""
-    rows = [dash.dial_row(dial(name=n, value=v, repo=r, expires=e), 24, True)
-            for n, v, r, e in (("tempo", "eager", None, None),
-                               ("review_panel.max_rounds", 2, REPO, in_hours(3)))]
-    assert len({len(r.plain) for r in rows}) == 1, "every row is the same width"
-
-
-def _printed(renderable, width: int = 80) -> str:
-    from rich.console import Console
-    console = Console(width=width, no_color=True)
-    with console.capture() as got:
-        console.print(renderable)
-    return got.get()
-
-
-def test_the_tempo_rides_the_caps_line_where_the_budget_is(dash, watched):
-    """The caps say what the seats MAY spend; this says whether they are supposed
-    to be spending it at all, and a reader glancing at one is asking about the
-    other — so they share a line rather than living two panels apart."""
-    printed = _printed(dash.header(cfg(), {}, 80, [], False, None,
-                                   {"depth": 2, "open": 3},
-                                   {"asked": True, "dials": [dial(value="eager")]}))
-    line = next(l for l in printed.splitlines() if "TEMPO" in l)
-    assert "eager" in line
-    assert "REVIEW" in line, "the throttle and the queue share the caps line"
-
-
-def test_the_caps_line_still_draws_before_the_board_has_answered(dash, watched):
-    """A cell that is not there yet must not take the row with it — and must not
-    print an answer it has not got."""
-    assert dash.tempo_line({}).plain == ""
-    assert "TEMPO" not in _printed(dash.header(cfg(), {}, 80, [], False, None, {}, {}))
 
 
 # ---- the credential the writes go out on (#479) -------------------------------
