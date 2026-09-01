@@ -2201,6 +2201,30 @@ class CodeAccessIn(BaseModel):
     convention_files_removed: list[str] | None = None
 
 
+class PrClaimIn(BaseModel):
+    """Whether this round was primed by the PR's own words (#550).
+
+    A nested object rather than two flat fields because the panel sends it as one,
+    and on :class:`CodeAccessIn`'s precedent directly above: the two answer one
+    question at different grains — what was ASKED for (``setting``) and what the
+    seats actually got (``sent``), which differ whenever the block is dropped to a
+    seat's diff budget.
+
+    Both are stored, and that is the difference from ``CodeAccessIn.seats``: there is
+    no other row carrying either. They are what lets a population of rounds be
+    partitioned by arm at all — #550's measurement compares finding counts with and
+    without the block, and before these the arm was a sentence in ``config_notes``.
+    A round that asked and dropped is in neither arm; ``setting`` and ``sent``
+    together are what say so."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: What the repo (or `--no-pr-claim`) asked for. None = the panel didn't say.
+    setting: bool | None = None
+    #: What the seats got. None = the panel didn't say.
+    sent: bool | None = None
+
+
 class ReviewIn(BaseModel):
     """The panel's ``--json`` payload, accepted verbatim.
 
@@ -2885,6 +2909,11 @@ class ReviewIn(BaseModel):
     #: Whether the seats could read the code (#113). Optional: a panel that predates
     #: the setting sends none, and every field inside it is independently nullable.
     code_access: CodeAccessIn | None = None
+    #: Whether the seats were shown the PR's own title and body (#550). Optional: a
+    #: panel that predates the block sends none, and both fields inside it are
+    #: independently nullable — a round that asked and dropped says so with the two
+    #: disagreeing.
+    pr_claim: PrClaimIn | None = None
 
     to_fix: list[FindingIn] = Field(default_factory=list)
     dismissed: list[FindingIn] = Field(default_factory=list)
@@ -3441,6 +3470,14 @@ async def record_review(
         code_access=body.code_access.setting if body.code_access else None,
         convention_files_removed=(body.code_access.convention_files_removed
                                   if body.code_access else None),
+        # #550's two, flattened from their nested object on the same terms as the
+        # pair above — and BOTH kept, unlike `code_access.seats`, because neither has
+        # another row to live on. NULL where the panel sent no block at all, which is
+        # every producer older than #631 and every skip path: a round that dispatched
+        # no seat did not decline to prime one, and a guessed `false` would put it in
+        # the unprimed arm of a comparison it was never in.
+        pr_claim=body.pr_claim.setting if body.pr_claim else None,
+        pr_claim_sent=body.pr_claim.sent if body.pr_claim else None,
         round=body.round,
         cycle=body.cycle or None,
         new_findings=body.new_findings,
@@ -4559,6 +4596,16 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "harness_rev": r.harness_rev,
         "harness_dirty": r.harness_dirty,
         "harness_digest": r.harness_digest,
+        # #550's two, here for #112's reason with the emphasis turned up: these are
+        # GROUPING KEYS and nothing else. Their whole existence is a comparison over
+        # a population — finding counts on rounds that were primed by the PR's own
+        # words against rounds that were not — and a field a reader has to fetch one
+        # round at a time cannot partition one. Both, because a round that ASKED for
+        # the block and dropped it to a seat's budget belongs to neither arm and only
+        # the pair says so. Two booleans, so the `limit=500` size argument that keeps
+        # `harness_path` and `unread_files` off this view does not arise.
+        "pr_claim": r.pr_claim,
+        "pr_claim_sent": r.pr_claim_sent,
         # The COUNT, not the paths — the same trade `changed_files_total` makes
         # two lines down, and for the same reason. The cost `changed_files` was
         # kept out of this view for is response SIZE: `unread_files` is bounded

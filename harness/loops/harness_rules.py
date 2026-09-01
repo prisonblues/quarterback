@@ -479,6 +479,33 @@ DEFAULTS: dict = {
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.
         "reviewer_code_access": True,
+        # Are the seats shown what the PR CLAIMS to be for — its own title and body
+        # (#550)? **On**, which is what #631 shipped: the reviewer prompt used to
+        # carry five keys and none of them was the claim, so "this change asserts a
+        # measured result and ships nothing that produces it" was invisible to the
+        # panel by construction.
+        #
+        # **The key exists to be turned OFF, and only for one job.** #550 shipped the
+        # mechanism with its own condition unmet: handing a reviewer a body that says
+        # "this is safe because X" primes it to accept X, a primed seat reports FEWER
+        # findings, and fewer findings look like a clean PR — so whether the framing
+        # holds has to be MEASURED, by running the same PRs with and without the
+        # block and comparing finding counts. Without an off switch there is no
+        # control arm and the measurement cannot be run at all. That is this key.
+        #
+        # It is therefore NOT a thoroughness dial a repo is expected to turn down:
+        # `false` is the pre-#550 posture, in which a claim the diff does not deliver
+        # is not a reviewable finding. A repo that never writes the key runs exactly
+        # the round it ran before.
+        #
+        # Absent from `BOARD_DIALS` on `reviewer_code_access`' precedent and for its
+        # reason: what the board may set is a judgement about COST, and this is a
+        # judgement about what evidence a seat is given. `panel.py --no-pr-claim` is
+        # the per-run override, and for this key that is the instrument rather than a
+        # convenience — the control arm has to be produced on the SAME PR, and this
+        # file lives in the repo under review, so flipping it here to get the control
+        # arm would change the diff whose findings are being counted.
+        "pr_claim": True,
         # Must the branch be able to MERGE before a round is worth running? **On.**
         # The merged state a review is implicitly reasoning about does not exist
         # while GitHub reports the branch CONFLICTING, and the rebase that resolves

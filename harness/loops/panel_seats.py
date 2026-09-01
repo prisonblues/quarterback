@@ -487,6 +487,55 @@ def code_access_wanted(panel: dict, no_code_access: bool, notes: list[str]) -> b
     return False
 
 
+def pr_claim_wanted(panel: dict, no_pr_claim: bool, notes: list[str]) -> bool:
+    """Whether this round shows its seats what the PR CLAIMS to be for (#550).
+
+    #631 shipped the block and shipped it always-on, which is one arm of an
+    experiment #550 asked for before the mechanism was trusted: **compare finding
+    counts on the same PRs with and without the body**, because a body that says
+    "this is safe because X" primes a reviewer to accept X, a primed seat reports
+    FEWER findings, and fewer findings look like a clean PR. That failure is
+    invisible from inside a round. It is only visible across two arms, and until
+    this function existed the control arm could not be produced at all — there was
+    no supported way to run a round without the block.
+
+    So this is the OFF switch, and it is the whole reason it exists. It is not a
+    thoroughness dial anybody is expected to turn down: `pr_claim: false` is the
+    pre-#550 posture, where a claim the diff does not deliver is unreviewable by
+    construction, and a repo that leaves the key unwritten gets #631's behaviour
+    unchanged.
+
+    **A value this cannot read as a boolean falls CLOSED**, exactly as
+    :func:`code_access_wanted` does and for its reason rather than a new one:
+    `bool("false")` is True, so the intuitive read turns a hand-written
+    `"pr_claim": "false"` into the setting's opposite on the one key where the
+    author was trying to stop the seats being primed. The closed posture is also
+    the one that ran for months. It is reported, never silent — a round that did
+    not send the claim has to say so, because #550's own measurement cannot be read
+    off rounds whose arm is a guess.
+
+    `--no-pr-claim` is a one-run override in the OFF direction only, and here that
+    is not merely symmetry with `--no-code-access`: it is the instrument. The
+    control arm has to be produced on the SAME PR as the primed arm, and the dial
+    lives in `.harness-rules` in the repo under review — so producing the control
+    arm by editing that file would change the very diff whose findings are being
+    counted. A flag changes nothing the seats can see except the block itself."""
+    if no_pr_claim:
+        return False
+    raw = panel.get("pr_claim", True)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None or raw == "":
+        # Unset means unset, the reading `code_access_wanted` gives an absent
+        # setting: silent, and the default applies.
+        return True
+    notes.append(f"`pr_claim`={raw!r} is not true or false — the seats were NOT shown "
+                 "the PR's own title and body this round (#550). A setting whose "
+                 "whole purpose is to decide whether a reviewer is primed by the "
+                 "author's words is not guessed at")
+    return False
+
+
 def strip_convention_files(root: Path) -> list[str]:
     """Remove every vendor instruction file and config directory under `root`,
     returning what was removed, repo-relative and sorted.
@@ -4869,7 +4918,8 @@ __all__ = [
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
-    "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
+    "code_access_wanted", "pr_claim_wanted",
+    "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "severity_floor", "deferral_issue_gate", "reviewer_scope",
