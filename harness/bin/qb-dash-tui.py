@@ -1082,6 +1082,9 @@ class Dash(App):
         # hit, and on a one-row table that index is the whole of the answer.
         self.repo_filter: str | None = None
         self.chips: list[str] = []
+        #: What the bar was last drawn from — see render_chips for why it is not
+        #: redrawn on every tick.
+        self.chip_sig: tuple | None = None
         # session id -> the board's live agent, which is the id the pane carries
         # as `@qb_session`. One key and no narrowing: it was (machine, scope, seat
         # number) while a pane could only be identified through the agent's name,
@@ -1908,23 +1911,73 @@ class Dash(App):
         on — an empty table with no visible control to clear it.
         """
         chips = qd.chip_repos(rows)
-        if self.repo_filter and self.repo_filter not in chips:
+        # A HIDDEN CONTROL MUST NOT LEAVE STATE SET, which is the whole of why the
+        # filter is dropped here and not only when its own repo goes quiet. Two
+        # ways to be stranded, and the obvious one is the one that misled the first
+        # cut of this: a filter for a repo no longer on the bar is easy to see and
+        # is dropped below. The other is filtering to `lexray` and watching every
+        # OTHER repo go quiet — `lexray` is still on the bar, so the filter looks
+        # live and correct, and the bar hides because one chip is not a choice.
+        # Filter set, no chip drawn, nothing to click.
+        if len(chips) < 2 or (self.repo_filter and self.repo_filter not in chips):
             self.repo_filter = None
-        self.chips = chips
+        self.chips = chips if len(chips) > 1 else []
         table = self.query_one("#chips", ClickTable)
         table.set_class(len(chips) < 2, "empty")
         if len(chips) < 2:
-            self.chips = []
             return
-        # Rebuilt rather than updated: the columns ARE the chips, and a DataTable
-        # has no way to drop one. Two repos becoming three is a new bar.
+        # REBUILT ONLY WHEN IT WOULD LOOK DIFFERENT. render_agents runs on the
+        # board's timer, so an unguarded rebuild here is `clear(columns=True)`
+        # every four seconds — throwing away the row a click is being dispatched
+        # against, and the cursor and hover with it. The signature carries the
+        # filter as well as the names because the active chip is drawn differently
+        # from the others.
+        sig = (tuple(chips), self.repo_filter)
+        if sig == self.chip_sig and table.row_count:
+            return
+        self.chip_sig = sig
+        # Columns rebuilt rather than updated: the columns ARE the chips, and a
+        # DataTable has no way to drop one. Two repos becoming three is a new bar.
         table.clear(columns=True)
-        table.add_columns(*[str(i) for i in range(len(chips))])
+        # KEYED BY REPO, not by position. `dispatch_row` gets a column NUMBER, and
+        # resolving that against `self.chips` means two lists that have to stay in
+        # step — one held by this app, one held by the widget. They came apart in
+        # the obvious way (the bar hidden with `self.chips` emptied while the
+        # widget still had columns) and would come apart again on the next state
+        # either of them grew. The key travels with the column, so what a click
+        # resolves to is what that column IS.
+        for name in chips:
+            table.add_column(name, key=name)
         table.add_row(*[
             Text(f" {name} ",
                  style="bold black on cyan" if name == self.repo_filter
                  else qd.repo_colour(name))
             for name in chips], key="chips")
+
+    def chip_clicked(self, column: int | None) -> None:
+        """Which chip a click on the bar landed on, read off the WIDGET.
+
+        Off the widget rather than off `self.chips` because the column key is the
+        repo itself, so a number that no longer names the chip it was rendered
+        against cannot quietly name a different one — it names nothing and does
+        nothing.
+
+        THE RESIDUAL RACE IS NOT CLOSED HERE and cannot be from this side. A click
+        carries the coordinate baked into the cell when it was DRAWN, so a rebuild
+        landing between the draw and the dispatch resolves an old coordinate
+        against a new bar. `render_chips` only rebuilds when the repo set or the
+        filter changes, which makes the window rare rather than every fourth
+        second, and the worst outcome is a filter on the neighbouring repo that
+        one more click undoes. Textual's DataTable has the same property for every
+        table here; this is not a chip-bar defect to fix twice.
+        """
+        if column is None:
+            return
+        table = self.query_one("#chips", ClickTable)
+        columns = table.ordered_columns
+        if not 0 <= column < len(columns):
+            return
+        self.filter_repo(str(columns[column].key.value))
 
     def filter_repo(self, repo: str | None) -> None:
         """Set the filter, or clear it when it is already what was clicked.
@@ -2221,8 +2274,7 @@ class Dash(App):
         # answered before anything below reaches for `self.rows`: a chip has no
         # record there, and every other row does.
         if key == "chips":
-            if column is not None and 0 <= column < len(self.chips):
-                self.filter_repo(self.chips[column])
+            self.chip_clicked(column)
             return
         """What a click does, by what the row IS rather than by which table it is in.
 
@@ -2787,7 +2839,14 @@ class Dash(App):
         if not os.environ.get("TMUX"):
             self.say(f"not inside tmux — run it yourself: {command}")
             return
-        seats, _ = qd.tmux_seats()
+        seats, err = qd.tmux_seats()
+        if err:
+            # The whole of #675 is that these are different facts. Falling through
+            # to `run_in_window` here would decide the topology from a query that
+            # failed — and then run the same broken tmux to make the window,
+            # failing again with a second, less useful message.
+            self.say(f"cannot reach tmux ({err}) — not starting {name}")
+            return
         if not seats:
             self.run_in_window(name, command)
             return

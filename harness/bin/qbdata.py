@@ -4337,10 +4337,11 @@ def tmux_seats() -> tuple[list[dict], str | None]:
     state worth showing rather than a gap: those are exactly the seats free to be
     given something to do.
 
-    Returns [] rather than raising when there is no tmux, no server, or no
-    screen: the dashboard runs inside the screen most of the time and in a bare
-    terminal the rest, and an empty SEATS panel is the honest answer to the
-    second case.
+    Returns ``([], None)`` rather than raising when there is no tmux around us
+    and no screen to list: the dashboard runs inside the screen most of the time
+    and in a bare terminal the rest, and an empty SEATS panel is the honest
+    answer to the second case. A tmux that is THERE and fails is the other half,
+    below, and is not an empty screen.
 
     THE ERROR HALF IS THE POINT. This used to return a bare [] whatever went
     wrong, so "this screen has no seats" and "tmux could not be run at all" were

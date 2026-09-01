@@ -2757,6 +2757,11 @@ class _Sink:
 
     def add_columns(self, *a, **k): return []
 
+    #: Keyed, singular — `render_chips` names each column after its repo so that a
+    #: click resolves by identity rather than by position. Every seat test reaches
+    #: render_agents, and render_agents draws the chip bar.
+    def add_column(self, label, key=None, **k): return key
+
     def add_row(self, *a, key=None, **k):
         """Hands back a key like the real one does.
 
@@ -4075,9 +4080,14 @@ def _bar(app, board, seats=None):
     said: list[str] = []
 
     class Bar:
+        #: Zero, so the signature guard in `render_chips` reads this stub as a bar
+        #: that has not been drawn yet and rebuilds it — which is what every test
+        #: through this helper wants to observe.
+        row_count = 0
+
         def set_class(self, on, *names): hidden.append(bool(on))
         def clear(self, **k): pass
-        def add_columns(self, *a): return []
+        def add_column(self, label, key=None, **k): return key
 
         def add_row(self, *cells, key=None, **k):
             chips.append([str(getattr(c, "plain", c)).strip() for c in cells])
@@ -4176,12 +4186,20 @@ def test_a_filter_whose_repo_goes_quiet_is_dropped_rather_than_stranding_you():
     assert app.repo_filter is None
 
 
+def _columned(app, *names):
+    """A `#chips` widget carrying columns keyed by repo, as `render_chips` builds
+    them. The keys are the subject: a click resolves through them."""
+    cols = [SimpleNamespace(key=SimpleNamespace(value=n)) for n in names]
+    app.render_agents = lambda: None
+    app.query_one = lambda sel, *a, **k: (
+        SimpleNamespace(ordered_columns=cols) if sel == "#chips" else _Sink())
+    return app
+
+
 def test_a_click_on_the_bar_reaches_the_chip_under_the_pointer():
     """The bar is one row, so the COLUMN is the whole of which chip was hit — and
     a chip has no record in `self.rows`, which everything below this reaches for."""
-    app = _wide(_dash())
-    app.chips = ["lexray", "quarterback"]
-    app.render_agents = lambda: None
+    app = _columned(_wide(_dash()), "lexray", "quarterback")
     app.dispatch_row("chips", 1)
     assert app.repo_filter == "quarterback"
     app.dispatch_row("chips", 0)
@@ -4190,9 +4208,111 @@ def test_a_click_on_the_bar_reaches_the_chip_under_the_pointer():
 
 def test_a_click_past_the_last_chip_does_nothing():
     """A stale column index — the bar rebuilt between the render and the click —
-    must not index into the list it no longer matches."""
-    app = _wide(_dash())
-    app.chips = ["lexray"]
-    app.render_agents = lambda: None
+    must not index into the columns it no longer matches."""
+    app = _columned(_wide(_dash()), "lexray")
     app.dispatch_row("chips", 7)
     assert app.repo_filter is None
+
+
+def test_the_chip_a_click_lands_on_is_read_off_the_widget_not_off_self_chips():
+    """Two lists that have to stay in step is two lists that come apart, and this
+    pair already did: the bar hides and empties `self.chips` while the widget
+    keeps its columns until the next rebuild. The column KEY is the repo, so what
+    a click resolves to is what that column is."""
+    app = _columned(_wide(_dash()), "lexray", "quarterback")
+    app.chips = []                      # out of step with the widget, as it gets
+    app.dispatch_row("chips", 1)
+    assert app.repo_filter == "quarterback"
+
+
+def test_a_tmux_that_failed_does_not_send_a_pane_to_a_window_instead(monkeypatch):
+    """#675's distinction, in the caller that still discarded it. Falling through
+    to `run_in_window` decides the topology from a query that failed — and then
+    runs the same broken tmux to make the window, failing again with a second and
+    less useful message."""
+    app = _dash()
+    said: list[str] = []
+    windowed: list[str] = []
+    app.say = said.append
+    app.run_in_window = lambda name, command: windowed.append(name)
+    app_module = _load_app()
+    real = app_module.qd.tmux_seats
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+    try:
+        app_module.qd.tmux_seats = lambda: ([], "tmux exited 127")
+        app.run_in_pane("panel-42", "claude -- '/panel-review-pr 42'")
+    finally:
+        app_module.qd.tmux_seats = real
+    assert not windowed, "a failed query was read as a screen with no seats"
+    assert said and "cannot reach tmux" in said[0], said
+
+
+def test_the_bar_hiding_takes_the_filter_with_it():
+    """The stranding case the obvious one hides.
+
+    Filter to `lexray` while three repos are live, then watch every OTHER repo go
+    quiet. `lexray` is still on the bar, so the "its repo went quiet" rule does
+    not fire — and the bar hides anyway, because one chip is not a choice. Filter
+    set, no chip drawn, nothing to click.
+    """
+    app = _wide(_dash())
+    app.repo_filter = "lexray"
+    _, hid, _ = _bar(app, _fleet("lexray", "lexray"))
+    assert hid, "the bar drew a single chip"
+    assert app.repo_filter is None, "a hidden bar left its filter on"
+
+
+def test_the_bar_is_not_rebuilt_when_it_would_look_the_same():
+    """`render_agents` runs on the board's timer. An unguarded rebuild is
+    `clear(columns=True)` every four seconds — throwing away the row a click is
+    being dispatched against, and the cursor and hover with it."""
+    app = _wide(_dash())
+    builds: list[int] = []
+
+    class Bar:
+        row_count = 1
+        def set_class(self, *a, **k): pass
+        def clear(self, **k): builds.append(1)
+        def add_column(self, label, key=None, **k): return key
+        def add_row(self, *cells, key=None, **k): return SimpleNamespace(value=key)
+
+    class Rows(Bar):
+        row_count = 0
+        def clear(self, **k): pass
+
+    app.board = _fleet("quarterback", "lexray")
+    app.seats = []
+    app.query_one = lambda sel, *a, **k: (
+        Bar() if sel == "#chips" else Rows() if sel == "#agents" else _Sink())
+    app.render_agents()
+    app.render_agents()
+    app.render_agents()
+    assert builds == [1], f"the bar was rebuilt {len(builds)} times for one state"
+
+
+def test_a_changed_filter_does_redraw_the_bar():
+    """The active chip is drawn differently from the others, so the filter is part
+    of what the bar looks like — a signature of the names alone would leave the
+    lit chip on the repo you just stopped filtering to."""
+    app = _wide(_dash())
+    builds: list[int] = []
+
+    class Bar:
+        row_count = 1
+        def set_class(self, *a, **k): pass
+        def clear(self, **k): builds.append(1)
+        def add_column(self, label, key=None, **k): return key
+        def add_row(self, *cells, key=None, **k): return SimpleNamespace(value=key)
+
+    class Rows(Bar):
+        row_count = 0
+        def clear(self, **k): pass
+
+    app.board = _fleet("quarterback", "lexray")
+    app.seats = []
+    app.query_one = lambda sel, *a, **k: (
+        Bar() if sel == "#chips" else Rows() if sel == "#agents" else _Sink())
+    app.render_agents()
+    app.repo_filter = "lexray"
+    app.render_agents()
+    assert len(builds) == 2, builds
