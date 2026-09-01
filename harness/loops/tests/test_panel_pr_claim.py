@@ -242,14 +242,21 @@ def test_a_brace_in_the_body_is_inert_rather_than_a_KeyError(hostile):
 # ------------------------------------------------------- what the seats receive
 
 def _round(monkeypatch, capsys, tmp_path, *, prompts=None, seats=None,
-           title=TITLE, body=BODY, diff=PR_DIFF, judged=None, judge_budget=None):
+           title=TITLE, body=BODY, diff=PR_DIFF, judged=None, judge_budget=None,
+           rules=None, no_pr_claim=False):
     """One panel run. `seats` maps reviewer name to its `max_diff_chars` (None for
     uncapped); the default is one uncapped claude. `judged` is a dict the judge's own
-    material is recorded into, and `judge_budget` sets `judge_max_diff_chars`."""
+    material is recorded into, and `judge_budget` sets `judge_max_diff_chars`.
+    `rules` overlays `review_panel` keys (the dial, `pr_claim`) and `no_pr_claim` is
+    the one-run flag — the two routes to the control arm, kept apart here because
+    they are kept apart in the source: the flag is the one that does not touch the
+    repo whose diff is being counted."""
     cfg = dict(CFG)
     if judge_budget is not None:
         cfg["review_panel"] = {**CFG["review_panel"],
                                "judge_max_diff_chars": judge_budget}
+    if rules is not None:
+        cfg["review_panel"] = {**cfg["review_panel"], **rules}
     if seats is not None:
         cfg["reviewers"] = {
             name: {"enabled": True, "model": "sonnet",
@@ -281,7 +288,8 @@ def _round(monkeypatch, capsys, tmp_path, *, prompts=None, seats=None,
 
     monkeypatch.setattr(panel, "adjudicate", adjudicate)
     out = tmp_path / "r.json"
-    assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
+    assert panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     no_pr_claim=no_pr_claim) == 0
     return capsys.readouterr().out, json.loads(out.read_text())
 
 
@@ -713,3 +721,143 @@ def test_a_judge_with_room_for_it_gets_no_such_note(monkeypatch, capsys, tmp_pat
     # And the note above is the only thing that separates the two rounds: this one
     # really did read it.
     assert f"TITLE: {TITLE}" in judged["diff"]
+
+
+# ----------------------------- the OFF switch, and why the block needs one (#550)
+#
+# #631 shipped the block always-on, which left #550's own condition unmet. The
+# framing is the whole of the feature — the body arrives labelled as an assertion to
+# be TESTED — and #550 recorded the honest caveat with it: a model given a plausible
+# rationale tends to reason from it whatever the label says. A primed seat reports
+# FEWER findings, and fewer findings look like a clean PR, so the failure is
+# invisible from inside any one round. It is only visible across two arms of the same
+# PR, which is why the recommendation was to measure rather than assert.
+#
+# Two things had to exist before that measurement was runnable at all, and both are
+# tested here: something that turns the block off, and something on the RECORD that
+# says which arm a round was in. A sentence in `config_notes` is not the second — no
+# aggregation can partition a population on prose.
+
+def test_the_dial_turns_the_block_off_and_leaves_the_prompt_as_it_was(
+        monkeypatch, capsys, tmp_path):
+    """`review_panel.pr_claim: false` is the pre-#631 posture, and it has to be the
+    posture EXACTLY: the control arm of a comparison whose measured quantity is the
+    finding count must differ from the primed arm in the block and in nothing else."""
+    off, on = {}, {}
+    _round(monkeypatch, capsys, tmp_path, prompts=off, rules={"pr_claim": False})
+    _round(monkeypatch, capsys, tmp_path, prompts=on)
+    assert block_in(off["claude"]) == ""
+    assert TITLE not in off["claude"] and BODY not in off["claude"]
+    # Byte-identical once the primed round's block is taken out, which is the only
+    # way to say "nothing else moved" rather than "the header I checked is absent".
+    assert on["claude"].replace(block_in(on["claude"]), "") == off["claude"]
+
+
+def test_the_flag_turns_it_off_for_ONE_run_without_touching_the_repo(
+        monkeypatch, capsys, tmp_path):
+    """`--no-pr-claim`, and it is the instrument rather than a convenience: the dial
+    lives in `.harness-rules` in the repo under review, so producing the control arm
+    by editing that file would change the very diff whose findings are being
+    counted. The flag changes nothing a seat can see except the block."""
+    off, on = {}, {}
+    _round(monkeypatch, capsys, tmp_path, prompts=off, no_pr_claim=True)
+    _round(monkeypatch, capsys, tmp_path, prompts=on)
+    assert block_in(off["claude"]) == ""
+    assert on["claude"].replace(block_in(on["claude"]), "") == off["claude"]
+
+
+def test_a_round_that_was_not_primed_SAYS_which_reason(monkeypatch, capsys, tmp_path):
+    """Never silent (#52), and the two off-routes are told apart in the note: a
+    reader looking at one round's report has to be able to see whether the repo is
+    configured this way or whether somebody ran one arm of an experiment."""
+    _r, by_dial = _round(monkeypatch, capsys, tmp_path, rules={"pr_claim": False})
+    _r, by_flag = _round(monkeypatch, capsys, tmp_path, no_pr_claim=True)
+    dial = [n for n in by_dial["config_notes"] if "#550" in n]
+    flag = [n for n in by_flag["config_notes"] if "#550" in n]
+    assert len(dial) == 1 and len(flag) == 1, (dial, flag)
+    assert "`review_panel.pr_claim` is off" in dial[0]
+    assert "`--no-pr-claim` was passed" in flag[0]
+    # NOT the budget note. An allowance that never bound is not why these rounds went
+    # unprimed, and a note blaming it would put the wrong reason on the arm.
+    assert "tightest seat budget" not in dial[0] + flag[0]
+
+
+def test_an_unprimed_round_is_never_blamed_on_a_budget(monkeypatch, capsys, tmp_path):
+    """The same point where the budget is real: a tight panel with the dial OFF gets
+    the dial's reason and only it. Two notes for one absence would double-count the
+    round in whichever partition a reader built out of them."""
+    _report, payload = _round(monkeypatch, capsys, tmp_path,
+                              rules={"pr_claim": False}, seats={"claude": 3_000})
+    said = [n for n in payload["config_notes"] if "#550" in n]
+    assert len(said) == 1, said
+    assert "`review_panel.pr_claim` is off" in said[0]
+
+
+def test_a_PR_that_said_nothing_gets_no_off_note_either(monkeypatch, capsys, tmp_path):
+    """A round with the dial on and an empty PR was not turned off by anything, and a
+    note reporting the control arm there would put a round in an arm it is not in."""
+    _report, payload = _round(monkeypatch, capsys, tmp_path, title="", body="")
+    assert not [n for n in payload["config_notes"] if "#550" in n]
+
+
+def test_an_unreadable_setting_falls_CLOSED_and_reports_itself(monkeypatch, capsys,
+                                                               tmp_path):
+    """`bool("false")` is True, so the intuitive read turns a hand-written
+    `"pr_claim": "false"` into the setting's opposite on the one key where the author
+    was trying to stop the seats being primed. JSON has real booleans; a string here
+    is a mistake, reported as one, and the safe posture is the one that ran for
+    months."""
+    prompts = {}
+    _report, payload = _round(monkeypatch, capsys, tmp_path, prompts=prompts,
+                              rules={"pr_claim": "false"})
+    assert block_in(prompts["claude"]) == ""
+    assert [n for n in payload["config_notes"] if "is not true or false" in n]
+
+
+def test_an_unset_key_is_unset(monkeypatch, capsys, tmp_path):
+    """A repo that never wrote the key runs exactly the round it ran before, and says
+    nothing about a setting it does not have."""
+    prompts = {}
+    _report, payload = _round(monkeypatch, capsys, tmp_path, prompts=prompts,
+                              rules={"pr_claim": None})
+    assert block_in(prompts["claude"]) != ""
+    assert not [n for n in payload["config_notes"] if "#550" in n]
+
+
+# ------------------------------------------- which arm the round was in, on the RECORD
+
+def test_the_payload_records_the_arm_and_whether_it_was_delivered(
+        monkeypatch, capsys, tmp_path):
+    """The half `config_notes` cannot do. #550's measurement compares finding counts
+    across a POPULATION of rounds, and a population is partitioned by a field, not by
+    a sentence somebody has to read."""
+    _report, primed = _round(monkeypatch, capsys, tmp_path)
+    _report, control = _round(monkeypatch, capsys, tmp_path, no_pr_claim=True)
+    assert primed["pr_claim"] == {"setting": True, "sent": True}
+    assert control["pr_claim"] == {"setting": False, "sent": False}
+
+
+def test_a_round_that_ASKED_and_dropped_is_in_neither_arm(monkeypatch, capsys,
+                                                          tmp_path):
+    """Why two fields rather than one. A panel too tight to carry the block asked for
+    it and sent none; told only `sent`, an aggregation would score that round as a
+    control and read a budget effect as evidence about the framing — which is the
+    exact class of error the measurement exists to avoid making."""
+    _report, payload = _round(monkeypatch, capsys, tmp_path, seats={"claude": 3_000})
+    assert payload["pr_claim"] == {"setting": True, "sent": False}
+
+
+def test_an_empty_PR_asked_and_sent_nothing(monkeypatch, capsys, tmp_path):
+    """The other way a primed arm delivers nothing, and it is honest about both
+    halves: the setting was on, and there was nothing to show."""
+    _report, payload = _round(monkeypatch, capsys, tmp_path, title="", body="")
+    assert payload["pr_claim"] == {"setting": True, "sent": False}
+
+
+def test_a_round_that_reviewed_NOTHING_claims_neither_arm():
+    """The skip and refusal payloads, which every non-reviewing exit is built from. A
+    skip dispatched no seat, so it did not decline to prime one: `false` there would
+    put a round that reviewed nothing into the unprimed arm of a comparison it was
+    never in — the reading rule `code_access` states one key over, and the null is
+    the same null."""
+    assert panel._payload_defaults()["pr_claim"] == {"setting": None, "sent": None}

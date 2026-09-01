@@ -1109,6 +1109,11 @@ def _payload_defaults() -> dict:
         # ran one.
         "code_access": {"setting": None, "seats": None,
                         "convention_files_removed": None},
+        # Nulls for `code_access`' reason one line up (#550): a round that dispatched
+        # no seat did not decline to prime one, and `sent: false` there would put a
+        # skip into the unprimed arm of a comparison it was never in. `reviewed`
+        # already says the round measured nothing; this must not say something else.
+        "pr_claim": {"setting": None, "sent": None},
         # #165's dials as this round applied them. Null on the paths that reviewed
         # nothing, for the reason `code_access` is: a round that never dispatched a
         # seat, never briefed a fixer and never computed a stop did not apply a
@@ -1466,7 +1471,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         narrowed: list[str] | None = None,
         acknowledge: list[str] | None = None,
         premise_file: str = "",
-        new_cycle: bool = False) -> int:
+        new_cycle: bool = False,
+        # #550's control arm. Last and keyword-only in practice rather than beside
+        # `no_code_access` where it reads best: every caller here passes the first
+        # fourteen positionally, and a parameter inserted mid-list silently shifts
+        # `escalated` into it.
+        no_pr_claim: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -2962,17 +2972,53 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # seat's own, because the claim is one string shown to every seat: a panel whose
     # members read different amounts of the author's words is a panel whose
     # disagreements cannot be attributed to the code any more.
+    #
+    # **AND IT CAN BE TURNED OFF, which is what makes the framing measurable rather
+    # than asserted (#550, #623).** #631 shipped this block always-on, leaving #550's
+    # own condition unmet: a body that says "this is safe because X" primes a seat to
+    # accept X, a primed seat reports FEWER findings, and fewer findings look like a
+    # clean PR — so the hazard is invisible from inside any one round and only shows
+    # up across two arms of the same PR. Until `pr_claim_wanted` there was no
+    # supported way to run the control arm at all. `--no-pr-claim` is the instrument
+    # rather than a convenience: the dial lives in `.harness-rules` in the repo under
+    # review, so producing the control arm by editing it would change the diff whose
+    # findings are being counted.
+    #
+    # Resolved HERE rather than beside `code_access_wanted` a few hundred lines down,
+    # because that is past the point the claim is rendered — and read on every round,
+    # off or on, so a `pr_claim` this cannot read as a boolean is reported by the
+    # round that carried it instead of staying silent until somebody wonders why the
+    # seats are quiet.
+    want_claim = pr_claim_wanted(panel, no_pr_claim, notes)
     capped = [b for b in budgets.values() if b is not None]
     allowance = (PR_CLAIM_CHARS if not capped
                  else min(PR_CLAIM_CHARS, min(capped) // PR_CLAIM_BUDGET_SHARE))
-    claim = pr_claim(title, body, allowance)
+    claim = pr_claim(title, body, allowance) if want_claim else ""
+    if not want_claim and (title or body):
+        # Said out loud, on the drop note's rule below and for a sharper version of
+        # it: this round is one arm of #550's comparison, and an arm nobody declared
+        # is a round whose finding count cannot be attributed to anything. The
+        # PAYLOAD is what the measurement actually reads (`pr_claim.setting`); this
+        # note is for the human reading one round's report and wondering where the
+        # block went.
+        notes.append(
+            "the PR's own title and body were NOT shown to the seats (#550): "
+            + ("`--no-pr-claim` was passed for this run" if no_pr_claim
+               else "`review_panel.pr_claim` is off in this repo's rules")
+            + ". This is the pre-#550 posture — a claim the diff does not deliver "
+              "is not a reviewable finding on this round, and the round is the "
+              "unprimed arm of #550's own comparison")
     if claim:
         budgets = {n: (b if b is None else max(0, b - len(claim)))
                    for n, b in budgets.items()}
-    elif capped and (title or body):
+    elif want_claim and capped and (title or body):
         # `capped` guards the `min()` below and is not decoration: with no capped
         # seat the allowance is the full ceiling, so an empty block there means the
         # PR said nothing — which is not a budget decision and has no note to make.
+        # `want_claim` for the same shape of reason one rung up: a round that never
+        # asked for the block did not have it taken away by an allowance, and a
+        # budget note on that round would report a number that never bound and put
+        # the wrong reason on the arm it belongs to.
         #
         # The drop is a `config_notes` line and the truncation is not, and that is
         # the split rather than an omission: a cut says so IN the block, where the
@@ -5123,6 +5169,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # never fetched a tree records.
             "convention_files_removed": stripped if code_tree_used else None,
         },
+        # WHETHER THIS ROUND WAS PRIMED (#550), at the grain the measurement needs.
+        # Two fields, on `code_access`' precedent directly above and for its reason
+        # rather than a new one: `setting` is what was ASKED for, `sent` is what the
+        # seats actually got, and a round with the setting on and the block dropped
+        # is a configuration doing nothing — visible in the difference and invisible
+        # in either half alone.
+        #
+        # **Both, because the experiment needs both and one boolean would confound
+        # it.** #550's measurement compares finding counts on the same PRs with and
+        # without the block; `setting` is the arm a round belongs to and `sent` is
+        # whether that arm was delivered. A round whose block fell to the budget
+        # floor is neither arm and must be excluded, and told only `sent` a reader
+        # would score it as a control — which is the exact class of error the
+        # measurement exists to avoid making about the framing.
+        #
+        # The JUDGE's copy is not a third field here. It is downstream of `sent` (a
+        # judge is never shown a claim the seats were not), the population being
+        # compared is the seats', and the round already says in `config_notes` where
+        # the judge's own budget could not carry it.
+        "pr_claim": {"setting": want_claim, "sent": bool(claim)},
         "reviewers_selected": sorted(selected),
         "reviewers_override": override_note,
         # `new_this_round` is added HERE rather than on the record: it is a fact
@@ -6224,6 +6290,16 @@ def main() -> int:
                          "deliberately no flag the other way, because turning code "
                          "access ON for a repo that switched it off is a decision about "
                          "trusting that repo's contributors and belongs in its config")
+    ap.add_argument("--no-pr-claim", action="store_true", dest="no_pr_claim",
+                    help="don't show the seats the PR's own title and body (#550) — "
+                         "the pre-#631 posture, and the CONTROL ARM of #550's own "
+                         "measurement: a body that says 'this is safe because X' "
+                         "primes a reviewer to accept X, a primed seat reports fewer "
+                         "findings, and fewer findings look like a clean PR. Run the "
+                         "same PR with and without this and compare the counts. A "
+                         "flag rather than only `review_panel.pr_claim` because that "
+                         "key lives in the repo under review, so flipping it to get "
+                         "the control arm would change the diff being counted")
     ap.add_argument("--json-file", metavar="PATH", default="", dest="json_file",
                     help="also write the JSON payload here, keeping the report "
                          "(and --post) — unlike --json, which replaces them")
@@ -6561,7 +6637,8 @@ def main() -> int:
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
                args.no_code_access, args.escalated, args.escalated_from_board,
-               args.narrowed, args.acknowledge, args.premise_file, args.new_cycle)
+               args.narrowed, args.acknowledge, args.premise_file, args.new_cycle,
+               no_pr_claim=args.no_pr_claim)
 
 
 if __name__ == "__main__":

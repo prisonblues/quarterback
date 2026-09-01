@@ -179,6 +179,46 @@ class ReviewRun(Base):
     #: indistinguishable from one that shipped nothing. ``[]`` = a tree was built
     #: and carried none; NULL = no tree was built (access off, or the fetch failed).
     convention_files_removed: Mapped[list[Any] | None] = mapped_column(JSONB)
+    #: WHETHER THIS ROUND WAS PRIMED BY THE PR'S OWN WORDS (#550, under #621).
+    #:
+    #: :attr:`pr_claim` is what the round ASKED for — ``review_panel.pr_claim``, or
+    #: ``panel.py --no-pr-claim`` for one run. :attr:`pr_claim_sent` is what the
+    #: seats actually got: the block is charged against the tightest seat's diff
+    #: budget and dropped whole where that budget cannot carry it, so a round can
+    #: ask and still send nothing.
+    #:
+    #: **Two columns because the question they exist for cannot be answered by
+    #: one.** #631 shipped the claim block always-on and left #550's own condition
+    #: unmet: a body that says "this is safe because X" primes a reviewer to accept
+    #: X, a primed seat reports FEWER findings, and fewer findings look like a clean
+    #: PR — so whether the framing holds has to be measured across two arms of the
+    #: same PRs rather than asserted. Until this pair existed the arm a round
+    #: belonged to was a sentence in ``config_notes``, which no aggregation can
+    #: partition on; ``pr_claim`` is the arm and ``pr_claim_sent`` is whether it was
+    #: delivered. A round that asked and dropped is in NEITHER arm and has to be
+    #: excluded, which a single boolean would silently score as a control.
+    #:
+    #: The same split, and the same argument, as :attr:`code_access` above it: the
+    #: setting and what actually happened are different facts, and a configuration
+    #: doing nothing is visible only in the difference.
+    #:
+    #: **It is also what #623's merge gate has to read before it can mean anything.**
+    #: One of that gate's conditions is "no claim-miss outstanding at any severity",
+    #: and a claim-miss is only a finding a seat could have raised on a round that
+    #: was shown the claim. On an unprimed round the condition is satisfied by
+    #: construction and says nothing — which is the shape of clean result this whole
+    #: epic exists to stop producing. :attr:`pr_claim_sent` is what tells the gate
+    #: which kind of silence it is looking at.
+    #:
+    #: NULL = the panel did not say, on both. That is every run recorded before
+    #: these columns, and — by design rather than by accident — every skip and
+    #: refusal path, which dispatches no seat and so primes none: ``false`` there
+    #: would put a round that reviewed nothing into the unprimed arm of a comparison
+    #: it was never in. No backfill: the block landed mid-population and attributing
+    #: today's setting to rounds that ran before it is the exact mixing these
+    #: columns exist to make visible.
+    pr_claim: Mapped[bool | None] = mapped_column(Boolean)
+    pr_claim_sent: Mapped[bool | None] = mapped_column(Boolean)
     #: The panel's own tally of :data:`app.api.reviews.PROVENANCE` buckets over
     #: the findings the cycle still has to clear, verbatim (v2.26).
     #:
