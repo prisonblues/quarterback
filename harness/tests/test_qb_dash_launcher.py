@@ -5,6 +5,11 @@ the shell script in front of it, which is a gap that mattered the moment the pla
 renderer was retired: everything the script does now is compatibility, and
 compatibility is exactly the kind of code that breaks silently.
 
+WHAT THESE PROVE IS ARGV ROUTING AND THE INTERPRETER SEARCH, and not that a
+dashboard comes up. The stub interpreter prints its arguments and the target file
+is empty, so a test here would pass against a `qb-dash-tui.py` that could not run
+at all — that end is `test_qb_dash.py`'s. Read the names with that bound on them.
+
 `--tui` USED TO SELECT A RENDERER and now selects nothing, because there is only
 one. It is still accepted, and that is not politeness: an installed `qb-seats`
 older than this change still emits `qb-dash --tui`, and `qb-dash-tui` execs it too.
@@ -76,11 +81,16 @@ def run(pkg, *args, importable=True, **env):
     shadow.mkdir(exist_ok=True)
     (shadow / "python3").write_text(STUB_PY % (0 if importable else 1))
     (shadow / "python3").chmod(0o755)
+    base = {"HOME": str(pkg.parent),
+            "PATH": f"{shadow}:{os.environ['PATH']}",
+            "QB_DASH_PYTHON": str(stub)}
+    base.update(env)
+    # A value of None means "leave this one out of the environment entirely",
+    # which is the only way to ask for an UNSET variable rather than an empty one
+    # — and empty is not the case that broke.
     return subprocess.run(
         [str(pkg / "qb-dash"), *args], capture_output=True, text=True,
-        env={"HOME": str(pkg.parent),
-             "PATH": f"{shadow}:{os.environ['PATH']}",
-             "QB_DASH_PYTHON": str(stub), **env})
+        env={k: v for k, v in base.items() if v is not None})
 
 
 def argv(done) -> list[str]:
@@ -137,3 +147,34 @@ def test_an_unimportable_dashboard_fails_loudly_rather_than_falling_back(pkg):
     assert "QB_DASH_PYTHON" in done.stderr
     assert "textual" in done.stderr
     assert not argv(done), "the dashboard was launched on an interpreter that fails"
+
+
+def test_a_missing_HOME_does_not_take_the_search_down_with_it(pkg):
+    """`$HOME` names one candidate among several, so an unset one must cost that
+    candidate and nothing else.
+
+    It used to cost the whole run. The candidate list was a fixed array holding a
+    bare `$HOME`, and under `set -u` building it aborted the script — `HOME:
+    unbound variable`, a line number where the dependency error should have been,
+    and `python3` never tried although it might have worked. `env -i`, a cron job
+    and a systemd unit all define no HOME.
+
+    `qb-board` builds the same list by appending only the candidates that exist
+    and says in a comment that this is partly to keep `set -u` happy about $HOME.
+    This is that fix, arriving in the other launcher.
+    """
+    done = run(pkg, "--scope", "all", QB_DASH_PYTHON=None, HOME=None)
+    assert done.returncode == 0, done.stderr
+    assert "unbound variable" not in done.stderr
+    # Fell through to the shadowed `python3`, which is the candidate that was
+    # being skipped: the launch happened, on the interpreter furthest down.
+    assert argv(done) == [str(pkg / "qb-dash-tui.py"), "--scope", "all"]
+
+
+def test_a_missing_HOME_still_reaches_the_dependency_error(pkg):
+    """The other half: when nothing can import it, the reason has to be the reason
+    — not the shell's complaint about an unset variable."""
+    done = run(pkg, importable=False, QB_DASH_PYTHON=None, HOME=None)
+    assert done.returncode == 1
+    assert "unbound variable" not in done.stderr
+    assert "QB_DASH_PYTHON" in done.stderr

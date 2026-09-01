@@ -70,15 +70,25 @@ usable() { [ -x "$1" ] && "$1" -c 'import rich, textual' >/dev/null 2>&1; }
 # instead, in the pane least able to afford it. Sets $PY; empty means none.
 find_python() {
   local candidate
-  CANDIDATES=(
-    "${QB_DASH_PYTHON:-}"
-    "${QUARTERBACK_REPO:-}/mcp/.venv/bin/python"
-    "$BIN_DIR/../../mcp/.venv/bin/python"
-    "$HOME/source/quarterback/mcp/.venv/bin/python"
-  )
+  # Built by APPENDING only the candidates that exist, which is how `qb-board`
+  # builds the same list and for the reasons its comment gives. The fixed-list
+  # form this replaces skipped its empties with a `case` naming them literally —
+  # a sentinel string that stops matching the moment the expression above it is
+  # edited, leaving a bogus path probed on every launch.
+  #
+  # It also read `$HOME` unguarded under `set -u`, so a launch with HOME unset
+  # died on `HOME: unbound variable` before it could try `python3` — which might
+  # have worked. A cron job, a systemd unit and `env -i` all define no HOME, and
+  # the message a person got was a line number rather than the dependency error
+  # this script exists to print.
+  CANDIDATES=()
+  [ -n "${QB_DASH_PYTHON:-}" ] && CANDIDATES+=("$QB_DASH_PYTHON")
+  [ -n "${QUARTERBACK_REPO:-}" ] && CANDIDATES+=("$QUARTERBACK_REPO/mcp/.venv/bin/python")
+  CANDIDATES+=("$BIN_DIR/../../mcp/.venv/bin/python")
+  [ -n "${HOME:-}" ] && CANDIDATES+=("$HOME/source/quarterback/mcp/.venv/bin/python")
   PY=""
-  for candidate in "${CANDIDATES[@]}"; do
-    case "$candidate" in ""|"/mcp/.venv/bin/python") continue ;; esac
+  # `${arr[@]+…}`: bash before 4.4 treats an empty array as unset under `set -u`.
+  for candidate in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
     usable "$candidate" && { PY="$candidate"; return 0; }
   done
   command -v python3 >/dev/null 2>&1 && usable "$(command -v python3)" \

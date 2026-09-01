@@ -27,3 +27,17 @@ On a box where `textual` will not import there is nothing lesser left to fall ba
 `qb-dash` now says so and exits 1 rather than quietly running something else. A packaged
 harness carries its own interpreter, so that is a checkout's problem and `QB_DASH_PYTHON` is
 its answer.
+
+### A candidate list that no longer needs `$HOME` to exist
+
+Found by a second-opinion review of this change, and older than it: `qb-dash` built its
+interpreter candidates as a fixed array containing a bare `$HOME`. Under `set -u` that is not a
+skipped candidate, it is the end of the script — `HOME: unbound variable`, at a line number,
+where the dependency error should have been, with `python3` never tried although it might have
+worked. `env -i`, a cron job and a systemd unit all define no HOME.
+
+The list is now built by appending only the candidates that exist, which is how `qb-board`
+builds the same list and for the reasons its own comment gives — including that this keeps
+`set -u` happy about `$HOME`. That also retires the `case` that skipped the fixed list's
+empties by naming them literally: a sentinel string stops matching the moment the expression
+above it is edited, and then a bogus path is probed on every launch.
