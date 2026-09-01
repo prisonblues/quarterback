@@ -608,6 +608,155 @@ def test_round_one_has_no_earlier_fix_pass_to_have_declared_anything():
     assert panel_rounds.undeclared_passes({"premises": []}, 1) == []
 
 
+# ------------------------------------------------- #560: declared before, or afterwards
+
+# Four commits, in the order a cycle would produce them: the head round 1 reviewed, the
+# head round 2 reviewed (so the round-1 fix pass is everything between them), and so on.
+R1_HEAD, R2_HEAD, R3_HEAD = "a" * 40, "b" * 40, "c" * 40
+HEADS = {1: R1_HEAD, 2: R2_HEAD, 3: R3_HEAD}
+
+
+@pytest.fixture
+def at(monkeypatch):
+    """Where the tree stood when `--premise` ran. Patched rather than driven through a
+    real checkout, because what is being pinned is the comparison and not `git`."""
+    def use(sha):
+        monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: sha)
+    use(R1_HEAD)
+    return use
+
+
+def _stamped(rounds_and_heads, limit=2):
+    reg = panel_rounds.new_premise_register("acme/board", 34)
+    for r, head in rounds_and_heads:
+        panel_rounds.declare_premise(reg, LANDED, r, [KEY_A], limit, head=head)
+    return reg
+
+
+def test_a_premise_declared_from_the_tree_its_round_reviewed_is_in_order():
+    """The ordinary, honest shape: round 1 reports, the fixer reads `round_stop`,
+    declares from the tree round 1 reviewed, and only then edits. Nothing to say."""
+    reg = _stamped([(1, R1_HEAD)])
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+
+
+def test_a_premise_declared_from_a_later_rounds_head_followed_its_own_fix_pass():
+    """#560, and the whole issue in one assertion. A declaration for round 1 made from
+    the commit round 2 reviewed was said after the round-1 fix pass was written and
+    pushed — so exit 4 had no patch left to refuse, and the brake was an annotation."""
+    late, = panel_rounds.retroactive_declarations(_stamped([(1, R2_HEAD)]), HEADS)
+    assert (late["round"], late["head_round"], late["head"]) == (1, 2, R2_HEAD)
+    assert late["text"] == LANDED
+
+
+def test_a_stamp_matching_no_round_is_silence_and_not_an_accusation():
+    """Positive identification only. An unpushed local commit, a rebase and a
+    declaration run from the wrong directory all land here, and a check that accuses an
+    honest fixer over ordinary history is one an orchestrator learns to skip past."""
+    assert panel_rounds.retroactive_declarations(_stamped([(1, "f" * 40)]), HEADS) == []
+
+
+def test_an_unstamped_declaration_is_not_read_as_late():
+    """Every declaration made before this field existed carries no stamp, and the
+    ordering simply was not recorded on it. Reporting those would make the note fire on
+    all of history and say nothing about this cycle."""
+    reg = _stamped([(1, "")])
+    assert reg["premises"][0]["heads"] == {}
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+
+
+def test_a_round_that_knows_no_heads_reports_nothing():
+    """A cycle with no earlier payload to read heads off is one where the ordering is
+    unknown, which is not the same claim as "it was in order"."""
+    assert panel_rounds.retroactive_declarations(_stamped([(1, R2_HEAD)]), {}) == []
+
+
+def test_the_first_stamp_for_a_round_wins():
+    """The rule the round count already applies to a restatement, for its reason: a
+    fixer that declares, is interrupted and states it again has proposed ONE fix pass.
+    If the restatement moved the stamp forward, an honest fixer that declared first and
+    restated mid-pass would be recorded as having declared after its own patch — the
+    exact accusation this field exists to make, aimed at the one case it must never be
+    aimed at. It also stops a late declaration being back-dated from a stale checkout."""
+    reg = _stamped([(1, R1_HEAD), (1, R2_HEAD)])
+    assert reg["premises"][0]["heads"] == {1: R1_HEAD}
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+
+
+def test_two_rounds_on_one_head_credit_the_earliest():
+    """A fix pass that pushed nothing leaves two rounds reviewing one commit, and then
+    "which round does this stamp belong to" has more than one answer. The earliest is
+    the only one that cannot manufacture an accusation out of a pass that changed
+    nothing."""
+    unmoved = {1: R1_HEAD, 2: R1_HEAD, 3: R2_HEAD}
+    assert panel_rounds.retroactive_declarations(_stamped([(2, R1_HEAD)]),
+                                                 unmoved) == []
+
+
+def test_the_declaration_reports_the_tree_it_was_made_from(repo, at, tmp_path, capsys):
+    """Printed on every declaration, not only a late one: a fixer that never sees the
+    stamp does not know the ordering is being recorded, and an unreadable checkout has
+    to be visible now rather than three rounds later in somebody else's payload."""
+    assert declare(tmp_path / "premises.json", LANDED, 1, KEY_A) == 0
+    assert R1_HEAD[:12] in capsys.readouterr().out
+
+
+def test_a_checkout_that_could_not_be_read_says_so_rather_than_guessing(
+        repo, at, tmp_path, capsys):
+    """`working_head` returns "" for no git, no checkout and no commit alike, and the
+    honest reading of all three is that nobody recorded where the tree was. Inferring it
+    from the PR would mint a stamp for a tree the declaration was never made in."""
+    at("")
+    declare(tmp_path / "premises.json", LANDED, 1, KEY_A)
+    assert "at       NOT RECORDED" in capsys.readouterr().out
+
+
+def test_the_stamp_survives_the_register_file(repo, at, tmp_path):
+    """JSON has no integer keys, so the round number goes out as a string and has to
+    come back as an int — otherwise every stamp is unreadable the moment the next
+    declaration loads the register."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A)
+    assert register(reg)["premises"][0]["heads"] == {"1": R1_HEAD}
+    back, problems = panel_rounds.load_premises(str(reg), "acme/board", 34)
+    assert back["premises"][0]["heads"] == {1: R1_HEAD} and problems == []
+
+
+def test_a_malformed_stamp_on_disk_reads_as_unstamped_and_is_not_reported(tmp_path):
+    """`decidable`'s rule for a bad value on disk: a later harness or a hand edit wrote
+    it and it must not stop the cycle. A `problems` line per stale entry would fire on
+    every register written before this field and say nothing a caller can act on."""
+    path = tmp_path / "premises.json"
+    path.write_text(json.dumps({
+        "version": panel_rounds.PREMISE_REGISTER_VERSION, "repo": "acme/board", "pr": 34,
+        "premises": [{"text": LANDED, "rounds": [1],
+                      # A branch name, a round this entry does not claim, and a key that
+                      # is not a round at all.
+                      "heads": {"1": "main", "2": R2_HEAD, "later": R3_HEAD}}]}))
+    reg, problems = panel_rounds.load_premises(str(path), "acme/board", 34)
+    assert reg["premises"][0]["heads"] == {} and problems == []
+
+
+def test_the_payload_says_whether_a_register_was_wired_at_all():
+    """`undeclared_rounds` alone cannot tell a cycle whose fixer skipped a declaration
+    from one where `--premise` was never callable, and on lexray#1697 it was the second:
+    the orchestrator handed the fixer no register path. That was visible only because
+    the fixer said so. This makes it a fact the payload carries."""
+    empty = panel_rounds.new_premise_register("acme/board", 34)
+    unwired = panel_rounds.premise_state(empty, 3, 2, True)
+    wired = panel_rounds.premise_state(empty, 3, 2, True, wired=True)
+    assert unwired["wired"] is False and wired["wired"] is True
+    assert unwired["undeclared_rounds"] == wired["undeclared_rounds"] == [1, 2]
+
+
+def test_the_payload_says_how_many_declarations_could_be_checked_at_all():
+    """What makes `retroactive: []` readable. Zero stamps means the ordering was not
+    checkable on this cycle, which is not the same claim as "it checked out"."""
+    state = panel_rounds.premise_state(_stamped([(1, R1_HEAD), (2, "")]), 3, 2, True,
+                                       HEADS, wired=True)
+    assert state["stamped"] == 1 and state["retroactive"] == []
+
+
 # --------------------------------------------------------------- the stop rule's half
 
 def _state(rounds, limit=2, round_no=3):
@@ -662,6 +811,7 @@ def test_a_round_with_no_register_still_answers_the_question():
     got = panel_rounds.round_stop(3, 5, [], [], [])
     assert got["premises"] == {"limit": None, "declared": 0, "repeated": [],
                               "undecidable": [], "undecidable_brake": False,
+                              "wired": False, "stamped": 0, "retroactive": [],
                               "undeclared_rounds": [1, 2]}
 
 
@@ -879,6 +1029,46 @@ def test_a_cycle_that_never_wired_the_brake_is_not_nagged_every_round(
     _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=3)
     assert not [n for n in payload["config_notes"] if "premise" in n]
     assert payload["round_stop"]["premises"]["undeclared_rounds"] == [1, 2]
+    # #560's half of that fact, and the reason the silence above is safe to keep: the
+    # payload says the register was never wired, so an auditor never has to read a
+    # missing note as evidence of anything.
+    assert payload["round_stop"]["premises"]["wired"] is False
+
+
+def test_a_round_names_a_premise_that_followed_its_own_fix_pass(
+        repo, monkeypatch, capsys, tmp_path):
+    """#560 end to end. The declaration for round 2 was made from the commit THIS round
+    is reviewing, so the round-2 fix pass was written and pushed before the premise was
+    stated — the shape the collapsed orchestrator-is-fixer configuration produces, and
+    the one that used to leave a register entry indistinguishable from an honest one."""
+    reg = tmp_path / "premises.json"
+    # "abc" is the head `stub` gives the PR, so this is a declaration made from the tree
+    # round 3 reviews — after round 2's fix pass had already landed.
+    monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: "abc")
+    declare(reg, LANDED, 2, KEY_A)
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=3,
+                           premise_file=str(reg))
+    late, = payload["round_stop"]["premises"]["retroactive"]
+    assert (late["round"], late["head_round"]) == (2, 3)
+    assert any("BEFORE the premise was declared" in n and "not a brake" in n
+               for n in payload["config_notes"])
+
+
+def test_naming_it_does_not_end_the_cycle(repo, monkeypatch, capsys, tmp_path):
+    """Evidence, not a rung. The brake's whole claim is that it refuses a fix before the
+    fix is written; a stop taken here would be the late half again, which `repeated` and
+    `undecidable` already occupy. What was missing was never another way to stop."""
+    reg = tmp_path / "premises.json"
+    monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: "abc")
+    declare(reg, LANDED, 2, KEY_A)
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=3,
+                           premise_file=str(reg))
+    stop = payload["round_stop"]
+    # The one veto this round has is the missing baseline, which every `_round` here
+    # carries and which has nothing to do with the premise.
+    assert stop["premises"]["retroactive"]
+    assert not [v for v in stop["veto"] if "premise" in v]
+    assert "premise" not in stop["reason"]
 
 
 # ---------------------------------------------------------------------- the two briefs
@@ -961,6 +1151,19 @@ def test_both_briefs_say_the_counter_is_blind_rather_than_leaving_it_to_discipli
     A brief that offered only the instruction would be promising a detector again."""
     assert "does not depend on your wording" in REVIEW_PR
     assert "restates" in PANEL_REVIEW_PR and "the answer to this flag is" in PANEL_REVIEW_PR
+
+
+def test_both_briefs_place_the_declaration_where_the_fixer_is_the_orchestrator():
+    """#560's documentation half. Both briefs put the declaration ahead of the patch by
+    assuming a fixer that somebody else briefs, and `panel-review-pr.md` §2 recommends
+    the configuration where nobody does the briefing. Left there, "before the patch" is
+    an instruction addressed to a role that is not present."""
+    assert "you are running the panel and the fix yourself" in REVIEW_PR
+    assert "declares before its\n  first edit" in PANEL_REVIEW_PR
+    # And the register path, which is the concrete thing that went missing: the live
+    # cycle's fixer was given none, so `--premise` was uncallable during the pass.
+    assert "Choose the register\npath yourself" in REVIEW_PR
+    assert "passes\n  the same path to every round's `--premise-file`" in PANEL_REVIEW_PR
 
 
 def test_both_briefs_carry_the_limit_rather_than_implying_coverage():

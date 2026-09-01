@@ -664,6 +664,17 @@ python3 ~/.claude/loops/panel.py --premise "$premise" --pr <n> --round <r> \
     --premise-for <each finding key the premise explains>
 ```
 
+**If nobody briefed you — because you are running the panel and the fix yourself —
+the moment is still there and it is yours to take.** Read `round_stop`, decide what
+the next pass will do, declare it, *then* make the first edit. Choose the register
+path yourself (one file per PR, alongside the payloads) and pass the same path to
+every round's `--premise-file`, because a register the round cannot read counts
+nothing. Declaring after the pass is written is not a late brake, it is no brake:
+exit 4 means *do not write the patch*, and there is no patch left to refuse. The
+round records the tree each declaration was made from and names one that followed
+its own fix pass in `config_notes` (#560), so this is checkable rather than a
+matter of your own account of it.
+
 `--premise-decidable` is **test 4, answered where it can brake something**. Pass
 `no` when the runtime the assertion runs in cannot observe the property the fix
 asserts, `yes` when it can. Omit it and the declaration is recorded as *not

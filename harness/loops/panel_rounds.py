@@ -3167,6 +3167,66 @@ def same_premise(a: str, b: str) -> bool:
             and _same_words(a, b))
 
 
+def working_head(repo_path: str = ".") -> str:
+    """The commit the tree a fix is about to be written in is sitting on, or ``""``.
+
+    #560. The brake derives its whole value from running BEFORE the patch — it fires
+    on the FIRST declaration and exit 4 means *do not write this fix* — and that
+    ordering is unobservable in the one configuration `panel-review-pr.md` recommends
+    for more than one PR. Where the orchestrator IS the fixer there is no brief handed
+    to a second agent, so no moment between "decide the premise" and "start editing"
+    for the brake to occupy, and the premise gets declared against the round it
+    followed once the pass is already written and pushed. That declaration and an
+    honest one produce byte-identical register entries, so nothing downstream can tell
+    a brake from an annotation. This is the one field that can.
+
+    **Read from the current working directory, not from a flag.** A flag was the
+    obvious shape and it is the wrong one for the reason `declare_premise` gives for
+    making a `no` sticky: the actor supplying the evidence is the actor the evidence is
+    about, and a fixer that has to pass `--premise-head` can pass the head it wishes it
+    had. `cfg["path"]` was the other candidate and it is wrong differently — in
+    worktree mode, which is the mode the collapsed case runs in, the canonical checkout
+    is not the tree the patch lands in, so it would stamp a commit that has nothing to
+    do with this fix pass.
+
+    **Unreadable is `""` and never a guess**, on :func:`panel_scope._git`'s contract:
+    no `git` on PATH, a declaration made outside a checkout, a repository with no
+    commit yet. All of them mean "nobody recorded where the tree was", which reads
+    downstream as unknown and accuses nobody. Inferring it from the PR instead would
+    mint a stamp for a tree the declaration was never made in, and the ordering check
+    would then say something false rather than nothing."""
+    sha = (panel_scope._git(repo_path, "rev-parse", "HEAD") or "").strip()
+    return sha if _SHA_RE.fullmatch(sha) else ""
+
+
+def _declared_heads(raw: object, rounds: Iterable[int]) -> dict[int, str]:
+    """The heads a register recorded against one declaration's rounds (#560).
+
+    JSON has no integer keys, so the rounds come back as strings and are read to ints
+    here — the same round numbers `rounds` already carries, and anything naming a
+    round this entry does not claim is dropped along with anything that is not a
+    commit id.
+
+    DROPPED, not reported, unlike every other malformed thing `load_premises` finds.
+    The register field is younger than the register: every declaration made before
+    this existed carries no `heads` at all, and a `problems` line for each of them
+    would fire on ordinary history and say nothing a caller can act on. A missing or
+    unreadable stamp already has a meaning — the ordering was not checkable on that
+    declaration — and it is the meaning that accuses nobody."""
+    out: dict[int, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    claimed = set(rounds)
+    for key, sha in raw.items():
+        try:
+            was = int(key)
+        except (TypeError, ValueError):
+            continue
+        if was in claimed and isinstance(sha, str) and _SHA_RE.fullmatch(sha):
+            out[was] = sha
+    return out
+
+
 def new_premise_register(repo: str = "", pr: int | None = None) -> dict:
     """An empty register for one PR's cycle."""
     return {"version": PREMISE_REGISTER_VERSION, "repo": repo, "pr": pr,
@@ -3241,6 +3301,7 @@ def load_premises(path: str, repo: str = "", pr: int | None = None
         kept.append({"key": premise_key(text), "text": text,
                      "norm": _norm_title(text), "rounds": sorted(rounds),
                      "decidable": answer if answer in DECIDABILITY else "unknown",
+                     "heads": _declared_heads(entry.get("heads"), rounds),
                      "findings": sorted({_key_norm(k) for k in (entry.get("findings") or [])
                                          if _is_key(k)})})
     reg["premises"] = kept
@@ -3261,7 +3322,7 @@ def find_premise(reg: dict, text: str) -> dict | None:
 def declare_premise(reg: dict, text: str, round_no: int,
                     findings: Iterable[str] = (), limit: int | None = None,
                     decidable: str = "unknown",
-                    undecidable_brake: bool = False) -> dict:
+                    undecidable_brake: bool = False, head: str = "") -> dict:
     """Record that a fix pass is about to be written against ``text``, and say
     whether it may be.
 
@@ -3308,7 +3369,13 @@ def declare_premise(reg: dict, text: str, round_no: int,
     STICKS. Neither a later ``"yes"`` nor a later silence clears it, and the brake
     reads the entry rather than the declaration in front of it. See the comment on
     the assignment for why: everything else here would let the one agent whose fix is
-    being refused lift its own refusal by changing its answer."""
+    being refused lift its own refusal by changing its answer.
+
+    ``head`` is where the tree stood when this was declared (#560), from
+    :func:`working_head`. It records nothing about the premise and everything about
+    WHEN the sentence was said, which is the property the brake rests on and the only
+    one the register did not hold: a declaration made after its own fix pass was
+    written is an annotation, and it used to be indistinguishable from a brake."""
     text = " ".join(str(text).split())
     answer = str(decidable or "unknown").strip().lower()
     if answer not in DECIDABILITY:
@@ -3323,12 +3390,24 @@ def declare_premise(reg: dict, text: str, round_no: int,
     entry = find_premise(reg, text)
     if entry is None:
         entry = {"key": premise_key(text), "text": text, "norm": _norm_title(text),
-                 "rounds": [], "findings": [], "decidable": "unknown"}
+                 "rounds": [], "findings": [], "decidable": "unknown", "heads": {}}
         reg.setdefault("premises", []).append(entry)
     if round_no not in entry["rounds"]:
         entry["rounds"] = sorted([*entry["rounds"], round_no])
     entry["findings"] = sorted({*entry["findings"], *keys})
     entry.setdefault("decidable", "unknown")
+    # **THE FIRST STAMP FOR A ROUND WINS**, which is the same rule the round count
+    # already applies to a restatement and for the same reason. A fixer that states
+    # its premise, is interrupted and states it again has proposed one fix pass; if
+    # the second statement moved the stamp forward, an honest fixer that declared
+    # first and restated mid-pass would be recorded as having declared after its own
+    # patch — the exact accusation this field exists to make, aimed at the one case
+    # it must never be aimed at. Overwriting also hands the actor the eraser: any
+    # declaration could be back-dated by re-declaring from a stale checkout.
+    stamp = str(head or "").strip()
+    entry.setdefault("heads", {})
+    if stamp and _SHA_RE.fullmatch(stamp) and round_no not in entry["heads"]:
+        entry["heads"][round_no] = stamp
     # **A `no` is STICKY, and the brake reads the ENTRY rather than this declaration.**
     # Both halves close the same hole, and it is the hole every self-reported signal in
     # this loop has: the agent whose fix is being refused is the one supplying the
@@ -3378,6 +3457,7 @@ def declare_premise(reg: dict, text: str, round_no: int,
             "decidable": entry["decidable"], "answered": answer,
             "repeated": repeated, "undecidable": undecidable,
             "undecidable_brake": bool(undecidable_brake),
+            "head": entry["heads"].get(round_no, ""),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -3394,8 +3474,56 @@ def undeclared_passes(reg: dict, round_no: int) -> list[int]:
     return [r for r in range(1, max(round_no, 1)) if r not in declared]
 
 
+def retroactive_declarations(reg: dict, heads: Mapping[int, str] | None) -> list[dict]:
+    """Declarations the register can PROVE were made after the fix pass they explain
+    (#560), as ``[{key, text, round, head, head_round}, …]``.
+
+    ``heads`` is round -> the commit that round reviewed, which the round already has:
+    every earlier round's from `Baseline.head_shas`, and this round's from its own
+    `head_sha`. A declaration for round R was made in order when the tree it was
+    declared from is the tree round R reviewed. If the stamp is instead the head of
+    some LATER round, the fix pass for round R had already been written and pushed
+    when the sentence was said, and exit 4 could not have meant anything.
+
+    **Positive identification only, and everything else is silence.** A stamp
+    matching no round's head is not reported — a fixer that declared from an
+    unpushed local commit, a rebase, a stray checkout and a declaration made from
+    the wrong directory all land there, and the honest reading of all four is that
+    the ordering was not checkable. The alternative rule — "anything that is not the
+    round's own head is late" — would accuse an honest fixer for a rebase it did not
+    perform, and a check that cries wolf on ordinary history is one an orchestrator
+    learns to pass over. This one fires on a fact: the tree was carrying a commit
+    that the cycle itself recorded as arriving after the round in question.
+
+    Ties go to the EARLIEST round holding a head, which matters when a fix pass
+    pushed nothing and two rounds reviewed the same commit. Then "which round does
+    this stamp belong to" has more than one answer and the earliest is the only one
+    that cannot manufacture an accusation out of a pass that changed nothing.
+
+    Compares commit ids and asks `git` nothing. Every sha here was recorded by the
+    cycle itself, so this costs a round no subprocess, no network call and no local
+    checkout — which is what lets it run on every round rather than on the terminal
+    one, the way :func:`panel_scope.fix_pass_commits` has to."""
+    first_at: dict[str, int] = {}
+    for was, sha in sorted((heads or {}).items()):
+        if isinstance(sha, str) and sha:
+            first_at.setdefault(sha, was)
+    late = []
+    for e in reg.get("premises") or []:
+        stamps = e.get("heads") or {}
+        for was in sorted(e.get("rounds") or []):
+            at = first_at.get(stamps.get(was) or "")
+            if at is None or at <= was:
+                continue
+            late.append({"key": e["key"], "text": e["text"], "round": was,
+                         "head": stamps[was], "head_round": at})
+    return sorted(late, key=lambda d: (d["round"], d["key"]))
+
+
 def premise_state(reg: dict, round_no: int, limit: int | None = None,
-                  undecidable_brake: bool = False) -> dict:
+                  undecidable_brake: bool = False,
+                  heads: Mapping[int, str] | None = None,
+                  wired: bool = False) -> dict:
     """What the cycle's declarations say, for `round_stop` and for the payload."""
     entries = reg.get("premises") or []
 
@@ -3413,11 +3541,29 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
     # runtime can observe. `round_stop` is what gates on the flag.
     undecidable = [view(e) for e in entries
                    if (e.get("decidable") or "unknown") == "no"]
+    # #560's two halves, and they answer two different questions a reader of
+    # `undeclared_rounds` alone cannot tell apart.
+    #
+    # `wired` is whether this round was given a register AT ALL. Without it, a cycle
+    # that never wired one and a cycle whose fixer skipped a declaration produce the
+    # same `undeclared_rounds` list, and on lexray#1697 the first happened: the
+    # orchestrator handed the fixer no register path, so `panel.py --premise` was
+    # uncallable during the pass and the premise was declared afterwards. That was
+    # only visible because the fixer said so. This makes it a fact in the payload —
+    # `wired: false` with rounds listed is a cycle in which no fix pass COULD have
+    # been braked, and nobody has to be honest for it to say so.
+    #
+    # `stamped` is how many round-declarations carried a head, which is what makes
+    # `retroactive`'s silence readable: zero stamps means the ordering was not
+    # checkable on this cycle, not that it checked out.
     return {"limit": limit,
             "declared": len(entries),
             "repeated": repeated,
             "undecidable": undecidable,
             "undecidable_brake": bool(undecidable_brake),
+            "wired": bool(wired),
+            "stamped": sum(len(e.get("heads") or {}) for e in entries),
+            "retroactive": retroactive_declarations(reg, heads),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -3993,6 +4139,18 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
         out.append(f"decidable  {answer} — the runtime this assertion runs in "
                    + ("can" if answer == "yes" else "CANNOT")
                    + " observe the property the fix asserts")
+    # #560, on the line above's rule: said on every declaration, because a fixer that
+    # never sees the stamp does not know the ordering is being recorded, and an
+    # unreadable checkout has to be visible at the moment it happens rather than three
+    # rounds later in somebody else's payload.
+    if verdict.get("head"):
+        out.append(f"at       {verdict['head'][:12]} — the tree this was declared "
+                   "from. A later round reads it to tell a premise declared before "
+                   "its own fix pass from one declared after it (#560)")
+    else:
+        out.append("at       NOT RECORDED — this tree's HEAD could not be read, so no "
+                   "round can tell whether this premise preceded its own fix pass or "
+                   "followed it (#560)")
     if verdict["undeclared_rounds"]:
         # #84: an undeclared fix pass is UNESCALATABLE, and saying so is the point.
         # A cycle nobody could have braked reads exactly like one that did not need
@@ -4248,8 +4406,11 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     limit = premise_repeat_limit(cfg["review_panel"], notes)
     undecidable_brake = premise_undecidable_brake(cfg["review_panel"], notes)
     reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
+    # #560's stamp, read here rather than taken from the caller. The declaration is
+    # made from the tree the patch is about to be written in, so that tree's HEAD is
+    # the fact — see :func:`working_head` for why it is not a flag.
     verdict = declare_premise(reg, premise, round_no, findings or [], limit,
-                              decidable, undecidable_brake)
+                              decidable, undecidable_brake, working_head())
     if verdict["decidable"] == "no" and not undecidable_brake:
         # The repo switched it off, and the declaration still says the fix cannot be
         # verified where it runs. Recorded and reported rather than swallowed, on
@@ -5782,6 +5943,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
               # answered the question.
               "undecidable": list(premises.get("undecidable") or []),
               "undecidable_brake": bool(premises.get("undecidable_brake")),
+              # #560. `wired` is whether this round was handed a register at all,
+              # kept apart from `undeclared_rounds` on exactly the terms
+              # `undecidable_brake` is kept apart from `undecidable`: one is what
+              # the cycle said and the other is whether it was ever in a position
+              # to say it. `retroactive` is the declarations the register can prove
+              # were written after the pass they explain — evidence about the
+              # cycle, not a rung. Nothing here stops anything, deliberately: the
+              # brake's whole claim is that it runs before the patch, and a stop
+              # taken on a round is the late half that `repeated` and
+              # `undecidable` already occupy.
+              "wired": bool(premises.get("wired")),
+              "stamped": int(premises.get("stamped") or 0),
+              "retroactive": list(premises.get("retroactive") or []),
               "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
         # #489's measurement as this round read it, and ALWAYS present for the reason
         # `premises` is: a payload with no key and a round with nothing to attribute
@@ -5934,5 +6108,6 @@ __all__ = [
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",
+    "working_head", "retroactive_declarations",
     "premise_report", "declare", "announce_escalation",
 ]

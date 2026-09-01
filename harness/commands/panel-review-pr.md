@@ -91,6 +91,18 @@ with these parallel-mode overrides:
   step 3 describes — that is fan-out *within* its own fix, not a nested
   pipeline. With several PRs already in flight it should be stingier about it:
   count its siblings against the ~4-concurrent budget.)
+- **The premise register is the per-PR agent's own, and it declares before its
+  first edit — including the pass after round 1.** §5's declaration rule assumes an
+  orchestrator that briefs a separate fixer, so it starts at round 2 and leaves the
+  round-1 pass to the path in §4's brief. Collapse the two roles and there is no
+  brief and no path: the whole point of the brake is that exit 4 means *do not write
+  the patch*, and a premise declared once the pass is written and pushed is an
+  annotation. So the agent makes its own `mktemp -d` register at the start, declares
+  after reading each round's `round_stop` and **before** editing anything, and passes
+  the same path to every round's `--premise-file`. The round stamps each declaration
+  with the tree it was made from and reports one made after its own fix pass in
+  `config_notes` (#560) — so an agent that declares late is recorded as having done
+  so, whatever its summary says.
 - **Always worktree mode, never fix-in-place** — concurrent agents cannot share
   your checkout. Each opens its own throwaway worktree at the PR's head
   (`git worktree add <tmpdir> <remote>/<branch>`, detached — this works even
