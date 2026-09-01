@@ -4508,8 +4508,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # ends a cycle whose premise was declared twice and reached a
                       # round anyway, and it reports the fix passes that declared
                       # nothing and so could not have been braked at all.
+                      # `heads` and `wired` are #560's half. The brake's value is
+                      # that it runs BEFORE the patch, and in the collapsed
+                      # orchestrator-is-fixer configuration nothing observed that:
+                      # a premise declared after its own pass produced the same
+                      # entry as one declared before it. The heads this cycle
+                      # already recorded — every earlier round's, plus this one's —
+                      # are enough to tell them apart, so the check costs no call.
                       premises=premise_state(premises, round_no, premise_limit,
-                                             premise_undecidable),
+                                             premise_undecidable,
+                                             heads={**prior.head_shas,
+                                                    round_no: head_sha},
+                                             wired=bool(premise_file)),
                       # #489's injection gate. The measurement is `provenance_counts`
                       # above — `introduced` over every new outstanding finding — and
                       # `injection_state` turns it into the verdict `round_stop`
@@ -4588,6 +4598,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "declared no premise (`panel.py --premise`), so #84's futility brake could "
             "not be evaluated on it — those passes are UNESCALATABLE, which is a gap "
             "in this cycle's record rather than a clean one")
+    # #560, and NOT gated the way the line above is. That gate exists because a note
+    # about an unwired cycle would fire on every round of every cycle that never wired
+    # a register and tell its reader nothing to act on; this list can only be non-empty
+    # when a register was read AND carried a stamped declaration, so it is quiet by
+    # construction on exactly the cycles that gate was protecting.
+    #
+    # A note and not a rung, deliberately. The whole claim of `premise_undecidable` is
+    # that it refuses a fix before the fix is written, and a stop taken here would be
+    # the late half again — the half `repeated` and `undecidable` already occupy, which
+    # #491 itself prices as "worse than stopping before the fix, better than the cap".
+    # What was missing was not another way to end a cycle. It was a way for anyone
+    # downstream to tell a brake from an annotation, and that is a fact in the record.
+    for late in stop["premises"]["retroactive"]:
+        notes.append(
+            f"premise {late['key']} was declared against round {late['round']} — "
+            f"{late['text']!r} — from a tree that was already on "
+            f"{late['head'][:12]}, the commit round {late['head_round']} reviewed. The "
+            "fix pass it explains was written and pushed BEFORE the premise was "
+            "declared, so `panel.py --premise` could not have refused it: for that "
+            "pass the brake was an annotation, not a brake (#560). Where the "
+            "orchestrator is also the fixer, declare the premise after reading "
+            "`round_stop` and before the first edit")
     for repeated in stop["premises"]["repeated"]:
         notes.append(
             f"premise {repeated['key']} was declared in rounds "
