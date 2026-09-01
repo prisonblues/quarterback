@@ -281,6 +281,37 @@ DEFAULT_UNREFEREED_LINE_WEIGHT = 2
 #: which is what keeps every caller that has not heard of them on the old
 #: behaviour rather than on the new default.
 NO_SEVERITY_FLOOR = SEVERITIES[-1]
+#: The severities `panel_rounds.round_stop`'s rule 2 treats as blockers, at every
+#: setting of every floor a repo can write. Named rather than spelled twice: rule 2
+#: is where the tuple has always been hardcoded, and #78's corroboration threshold
+#: has to read the SAME set to know which findings it may never stand down. Two
+#: literals would be one refactor away from a threshold that suppresses a finding
+#: rule 2 goes on demanding, which is the jam :func:`panel_seats.Dials.threshold_for`
+#: exists to make unreachable.
+BLOCKING_SEVERITIES = ("P1", "P2")
+#: #78's corroboration threshold: how many DISTINCT seats must independently raise a
+#: finding at a given severity before it is this round's work — `{"P3": 2}` for "a
+#: solo P3 is reported, not fixed". A severity absent from the mapping needs one
+#: seat, which is today's behaviour, so `{}` is off and is what ships.
+#:
+#: **`{}`, and it is UNSET rather than off**, on `max_fix_guard_lines`' precedent
+#: (#618). The evidence that corroboration predicts a real finding is #78's own
+#: table — every finding Rich refuted on 2026-08-20 was single-seat and no
+#: multi-seat finding failed — and that is eight findings on two pull requests, with
+#: `32-F01` a genuine solo P1 sitting inside it. Eight is an observation, not a
+#: calibration, and #67's rule is that an instrument earns a gate over a few dozen
+#: cycles or not at all. So the seat count is recorded per finding every round
+#: (`reviewers` on the payload, and the `⋆consensus` notation in the report have both
+#: carried it since long before this key) and nothing is stood down until a repo
+#: writes a number it can defend.
+#:
+#: **What it may never do**, and this is a property of the mechanism rather than of
+#: the default — see :meth:`panel_seats.Dials.corroboration_applies`. A threshold can
+#: only stand down a severity BELOW `round_trigger_floor` that is also not one of
+#: :data:`BLOCKING_SEVERITIES`. A single seat finding a genuine P1 nobody else spotted
+#: is the case the panel exists for, and a count is the wrong instrument for deciding
+#: whether to act on it.
+DEFAULT_THRESHOLD_BY_SEVERITY: dict[str, int] = {}
 #: How many times the first round's reviewed size a later round may review before
 #: the cycle stops and says the change wants splitting. None disables it.
 DEFAULT_MAX_FIX_GROWTH = 3.0
@@ -2844,6 +2875,7 @@ __all__ = [
     "RAW_DETAIL_CHARS", "CLUSTER_WINDOW", "ACCOUNT_CHARS", "DEFAULT_MAX_ROUNDS",
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
+    "BLOCKING_SEVERITIES", "DEFAULT_THRESHOLD_BY_SEVERITY",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",

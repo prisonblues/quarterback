@@ -73,6 +73,13 @@ report prints them on its **Panel dials** line). Five of them define this pass:
   handed is the list you clear. Where a repo has raised the floor, a panel report puts
   what falls below it under its own heading, *Reported, not this round's work*, marked
   🔽; do not lift those into your list.
+- **`threshold_by_severity`** (default `{}` — off) — how many members must
+  independently have raised a finding before the round asks for it to be fixed (#78).
+  Where a repo has written it, a panel report puts what fell short under a second
+  *Reported, not this round's work* heading, marked 👥, with the seat count beside each
+  one; do not lift those into your list either. It can never apply to a P1 or a P2, nor
+  to anything at or above `round_trigger_floor` — a blocker reaches you however few
+  seats raised it.
 - **`low_severity_fix_lines`** (default `40`) — the churned lines the WHOLE pass may
   spend on findings below `round_trigger_floor` (`P2` by default, so at the shipped
   floors this band is the P3s and the P4s together),

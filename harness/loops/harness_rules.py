@@ -914,6 +914,69 @@ DEFAULTS: dict = {
         # to switch this off; there is no `null` spelling for the same thing, because
         # one written value with two meanings is worse than one.
         "unrefereed_line_weight": 2,
+        # #78: how many DISTINCT members must independently raise a finding at a given
+        # severity before it is this round's work. `{"P3": 2}` reads "a P3 one seat
+        # raised is reported, not fixed". A band the mapping does not name needs one
+        # seat, which is what every band needed before this key existed, so `{}` is the
+        # whole off switch.
+        #
+        # **The reviewer-side half of the convergence problem.** The fixer-side brakes
+        # — `low_severity_fix_lines`, `unrefereed_line_weight`, `max_fix_guard_lines`,
+        # #616's name-the-consumer rule — all act after a finding has been accepted as
+        # work. This one acts before it: it is the only dial here that asks whether the
+        # finding should have become work at all.
+        #
+        # **The evidence it rests on, and why it is not enough to ship armed.** #78's
+        # table, from 2026-08-20: of eight findings Rich adjudicated by hand, the four
+        # he refuted (`32-F06`, `64-F02`, `64-F03`, `64-F04`) were each raised by ONE
+        # seat, and every multi-seat finding was real. Corroboration looks like it
+        # carries signal. Two things in the same table say a count cannot be trusted
+        # with the decision: `32-F01` was solo and real, and #64's round 1 was a panel
+        # of ONE (#68), where every finding is solo by construction and a threshold of
+        # 2 would have discarded the round entire. And judge confirmation demonstrably
+        # does not filter these — on lexray#1780 round 3 a P2 was raised by a seat AND
+        # confirmed by the master judge and was still wrong, and complying with it
+        # introduced the entitlement leak round 4 then found (see the comment at
+        # `panel.py`'s judge call: "the wrong findings #113 was filed over were
+        # CONFIRMED, not merely raised").
+        #
+        # So this ships `{}` on `max_fix_guard_lines`' precedent: eight findings on two
+        # pull requests is an observation, and #67's rule is that an instrument earns a
+        # gate over a few dozen cycles or not at all. The instrument is already
+        # published — `reviewers` on every finding in the payload, and the `⋆consensus`
+        # notation the report has carried since #62 — so a repo can measure its own
+        # precision-by-seat-count before writing a number here.
+        #
+        # **A THRESHOLD IS THE ONE DIAL IN THIS BLOCK THAT CAN HIDE A REAL DEFECT**,
+        # and that is why it is bounded in code rather than by the default. Every other
+        # brake here declines to SPEND; this one declines to LOOK. So
+        # `panel_seats.Dials.corroboration_applies` refuses to apply a threshold to any
+        # severity at or above `round_trigger_floor`, or to `P1`/`P2` at any floor
+        # (`panel_core.BLOCKING_SEVERITIES`, which is `round_stop` rule 2's own bar).
+        # A repo that writes `{"P1": 2}` gets a round that applies 1 and a
+        # `config_notes` line saying the key was ignored. Two consequences fall out of
+        # that bound, and both are the point:
+        #
+        #   * a single seat finding a genuine P1 is handed to the fixer exactly as it
+        #     always was — that is the case the panel exists for, and a head count is
+        #     the wrong instrument for deciding whether to act on it;
+        #   * anything a threshold CAN stand down is a finding rules 1, 2 and 3 of
+        #     `round_stop` already ignore, so a stood-down finding cannot hold the cycle
+        #     open and `round_stop` needs no new parameter to know about this dial.
+        #
+        # **Reported, never suppressed.** A finding under its band's threshold keeps
+        # its master verdict, keeps its board row, and is printed under its own heading
+        # with the seat count that stood it down — the same disposal a below-floor
+        # finding gets (#165), for the same reason: a finding that vanishes is a
+        # finding nobody can argue with. It carries `below_threshold` and
+        # `seats_required` in the payload so an orchestrator building a fixer's brief
+        # can see the suppression rather than reconstruct it.
+        #
+        # `1` at a band is legal and is the identity, for a repo that wants to say a
+        # band is deliberately left at one seat beside a band that is not. `0` is
+        # refused: no finding is raised by fewer than one seat, so a hand that wrote it
+        # meant either `1` or the off switch, and nothing can tell which.
+        "threshold_by_severity": {},
         # #508: how many days back a defect confirmed on ANOTHER pull request may be
         # carried in front of this round's reviewers as context. `0` is off.
         #
@@ -2984,6 +3047,22 @@ BOARD_DIALS: dict[str, Dial] = {
     # thing would be one written value with two meanings.
     "review_panel.next_door_days": Dial("number", False, "either",
         'how many days back a defect confirmed on another PR may be shown to the reviewers'),
+    # #78's corroboration threshold, and the only dial here whose value is a MAPPING —
+    # hence a `kind` of its own rather than four `number` dials named after bands. One
+    # dial because it is one policy: a repo answers "how much agreement does a finding
+    # need" once, and four independently-settable rows would let a board write half of
+    # one. NOT nullable, on `unrefereed_line_weight`'s rule: `{}` already spells "no
+    # threshold anywhere", so a `null` for the same thing would be one written value
+    # with two meanings — and clearing the dial is the same answer with nothing left
+    # behind saying otherwise.
+    #
+    # `either`, and it is worth saying which two directions those are. Raising a
+    # threshold makes a round DO LESS, which is the direction a settings channel is
+    # usually trusted with; lowering it makes a round do more. Neither is the safe one,
+    # exactly as with the floors — and the bound that makes this dial safe is not a
+    # direction at all but `Dials.corroboration_applies`, which no layer can move.
+    "review_panel.threshold_by_severity": Dial("severity_counts", False, "either",
+        'how many seats must independently raise a finding at each band before it is fixed'),
     "review_panel.max_fix_growth": Dial("number", True, "either",
         'how many times its round-1 size the change may grow before the cycle stops'),
     # #492's absolute half of that ceiling. Settable on its own and nullable on its
@@ -3428,6 +3507,40 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
     if dial.kind == "text":
         return "" if isinstance(value, str) else (
             f"`{path}` must be a string, not {type(value).__name__}")
+    if dial.kind == "severity_counts":
+        # The same judgement `panel_seats.threshold_by_severity` makes, asked one step
+        # earlier and at the layer that cannot see a rules file — which is exactly the
+        # split `test_the_write_side_judge_is_the_read_side_judge` pins. Bands are
+        # matched through `_is_band` so a board value is read the way a rules-file value
+        # is; counts are whole numbers >= 1, with the bool excluded explicitly because
+        # `True` is an int in Python and `{"P3": true}` would resolve to one seat.
+        #
+        # It does NOT ask whether a band is one this round may act on. That depends on
+        # `round_trigger_floor`, which is a separate dial the same board can move, so
+        # answering it here would refuse a value that becomes correct the moment the
+        # dial beside it changes — and would answer it from a layer holding neither the
+        # repo's rules nor the resolved round. `Dials.corroboration_applies` is where
+        # that question belongs and `config_notes` is where its answer is reported.
+        if not isinstance(value, dict):
+            return (f"`{path}` must be an object keyed by severity band, not "
+                    f"{value!r} — e.g. `{{\"P3\": 2}}`, or `{{}}` for no threshold")
+        seen: set[str] = set()
+        for band, count in value.items():
+            if not _is_band(band):
+                return (f"`{path}` must be keyed by severity band "
+                        f"{', '.join(_SEVERITY_BANDS)}, and {band!r} is not one")
+            # Two spellings of one band, refused here as well as in the resolver.
+            # `dial_layers` upper-cases the keys so a board and a rules file agree
+            # about a band, and that same normalisation is what silently collapses
+            # `{"P3": 2, " p3 ": 3}` to whichever the iteration order reached last.
+            if band.strip().upper() in seen:
+                return (f"`{path}` must have one entry per severity band, and "
+                        f"{band.strip().upper()} is written twice")
+            seen.add(band.strip().upper())
+            if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+                return (f"`{path}[{band}]` must be a whole number of seats, 1 or "
+                        f"more, not {count!r} — leave the band out for no threshold")
+        return ""
     # "number": int or float, and bools are excluded explicitly because `True` is
     # an int in Python and `max_rounds: true` would otherwise resolve to one round.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -3462,6 +3575,12 @@ _KIND_HINTS = {
     "flag": "true or false, unquoted",
     "number": "a number",
     "text": "a string",
+    # The one kind whose value is an object, so the hint has to carry an EXAMPLE
+    # rather than a vocabulary: there is no closed set to offer, and "an object keyed
+    # by severity" leaves a person guessing at what the values are.
+    "severity_counts": (f"an object keyed by severity band "
+                        f"({', '.join(_SEVERITY_BANDS)}) with a whole number of "
+                        f"seats, 1 or more — e.g. {{\"P3\": 2}}, or {{}} for none"),
 }
 
 #: Said whenever a `narrow` dial is about to be typed into, because the direction
@@ -3693,6 +3812,12 @@ def board_dials(github: str) -> tuple[dict[str, dict], str, list[str], bool]:
                      else value.strip().lower())
         elif dial.kind == "scope":
             value = value.strip().lower()
+        elif dial.kind == "severity_counts":
+            # KEYS upper-cased, on the same rule as a floor: `panel_seats` normalises
+            # every severity entering the panel, so a board that stored `{"p3": 2}`
+            # and a rules file that wrote `{"P3": 2}` must resolve to one band. The
+            # counts are already ints — `_dial_problem` refused anything else.
+            value = {k.strip().upper(): v for k, v in value.items()}
         scope = "repo" if row.get("scope") == "repo" else "fleet"
         prior = out.get(name)
         if prior is not None and (prior["scope"] == "repo" or scope != "repo"):

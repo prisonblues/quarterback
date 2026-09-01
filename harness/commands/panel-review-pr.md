@@ -262,8 +262,10 @@ From its output collect:
   the cycle on whichever is crossed first. Read it BEFORE §4: the brief you build
   depends on it, and it is the only place the round's policy is written down where
   you can see it (#165).
-- **To fix** — the master-confirmed findings the fix round is asked to clear (any
-  reviewer count, at or above the round's `fix_severity_floor`). The ones marked 💸
+- **To fix** — the master-confirmed findings the fix round is asked to clear (at or
+  above the round's `fix_severity_floor`, and — where the repo has written
+  `threshold_by_severity` — corroborated by at least as many members as its band asks
+  for; the heading says which of the two rules the list was filtered by). The ones marked 💸
   are below `round_trigger_floor` and share the round's `low_severity_fix_lines`
   budget rather than being unconditional (#297); the note under the heading states
   the number and the rule.
@@ -271,6 +273,18 @@ From its output collect:
   floor, marked 🔽. Present only where the floor left something under it. These are
   recorded and relayed and **never pasted into the fixer's brief**; §4b says what
   becomes of them.
+- **Reported, not this round's work — under the corroboration threshold** — a SECOND
+  section under the same words, marked 👥, and it is not the same list (#78). These
+  findings are above every floor; what they are short of is agreement, having been
+  raised by fewer members than `review_panel.threshold_by_severity` asks for at their
+  band. Present only where a repo has written that key, which no repo does by default.
+  **Never pasted into the fixer's brief either**, and for a sharper reason than the
+  floor's: the round has said the evidence for these is one seat, and a fix pass that
+  takes them on is spending churn on the class of finding least likely to be real.
+  Unlike a below-floor deferral they get **no GitHub issue** — a threshold is a bar on
+  evidence rather than a judgement that the finding is not worth fixing, so the record
+  is the board row and the report, and the next round can raise it again with a second
+  seat behind it.
 - **SonarCloud** — the hard-gate issues, **if the `sonarqube` seat ran**. Where it did,
   they MUST end up resolved: that is what "hard gate" means, and it is the one part of a
   round that is not a judgement. **Where it did not, there is no gate on this round and
@@ -388,7 +402,9 @@ with these overrides:
   improve" standard. Paste the **To fix** list and those Sonar issues, and
   **not** the 🔽 *Reported, not this round's work* list: a fix pass that takes those
   on is the growth the floor exists to stop, and the floor has already made that
-  judgement (#165).
+  judgement (#165). The 👥 list under the same words is out for the same reason and a
+  different rule — one seat's evidence, and the round has said that is not enough to
+  spend a pass on (#78).
 - **On a round with no `sonarqube` seat, say nothing about a hard gate at all** — do not
   paste an empty SonarCloud block, and do not tell the fixer the gate is clear. An empty
   list under a heading reads as a gate that looked and found nothing, and the fixer has

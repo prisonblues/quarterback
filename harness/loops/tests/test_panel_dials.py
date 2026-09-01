@@ -79,6 +79,7 @@ DIALS = {
     "next_door_days": "DEFAULT_NEXT_DOOR_DAYS",
     "require_failing_test": "DEFAULT_REQUIRE_FAILING_TEST",
     "max_rounds": "DEFAULT_MAX_ROUNDS",
+    "threshold_by_severity": "DEFAULT_THRESHOLD_BY_SEVERITY",
 }
 
 
