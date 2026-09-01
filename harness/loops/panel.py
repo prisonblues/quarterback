@@ -4265,6 +4265,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     refereeing = referee_state(referee_split(fix_diff) if fix_diff else None,
                                unrefereed_armed)
 
+    # #622's reader, off the SAME split and the SAME dial values the fixer's brief
+    # relays. `low_severity_fix_lines` was the one bound on a fix pass whose only
+    # counter was the fix pass: the brief tells the fixer to run `git diff --numstat`
+    # after each fix and stop when the budget is gone, and until now nothing checked.
+    # One expression here rather than a second resolution of the dials, so the number
+    # the brief states and the number the payload measures against cannot drift.
+    budgeting = fix_budget_state(refereeing, dials.low_severity_fix_lines,
+                                 dials.unrefereed_line_weight, dials.budgeted_band)
+
     # ---- #490: this round's own row of the cross-round trend block, and the earlier
     # rounds' rows beside it.
     #
@@ -4541,6 +4550,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       guard_churn=guard_churn_state(refereeing,
                                                     dials.max_fix_guard_lines,
                                                     guard_lines_armed),
+                      # #622's spend, assembled above off the same split. It decides
+                      # nothing — no gate and no flag to arm one, which is #67 for the
+                      # first and #621's "not a 29th dial" for the second — and its
+                      # whole job is that the round's budget is now counted by a reader
+                      # that is not the agent the budget constrains.
+                      fix_budget=budgeting,
                       # #619's surface, on the contract `round_stop` states: the
                       # files the pass touched, the ones no earlier round had seen,
                       # the count, and the size of the set it was differenced
@@ -5595,6 +5610,33 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append(f"**Guard churn in the last fix pass:** {gc['lines']} test and "
                      f"prose line(s) — {said}. Counted over THAT pass and nothing "
                      "earlier, so a quiet round cannot fund a loud one.")
+    # ---- the round's churn budget, counted from outside the fixer (#622). Printed
+    # only where a budget was actually IN FORCE and a pass was read: at
+    # `low_severity_fix_lines: null`, or where `fix_severity_floor` meets the trigger
+    # cut and the band is empty, there is no budget to be under, and a line saying so
+    # on every round of every such repo is the loud-and-wrong a reader learns to skip.
+    # The number is in `round_stop.fix_budget` either way.
+    #
+    # The two readings get DIFFERENT sentences, because the one-sidedness is the whole
+    # point and a single template would flatten it: under the budget is a fact about
+    # the pass, over it is the absence of that fact and not an accusation. A reader who
+    # takes the second for a breach will go and scold a round that cleared two P1s.
+    fb = (payload.get("round_stop") or {}).get("fix_budget") or {}
+    if fb.get("within") is not None:
+        priced = (f"{fb['production']} production + {fb['unrefereed']} unrefereed "
+                  f"at x{fb['weight']}")
+        said = (f"priced at {fb['spend']} line(s) ({priced}) against the "
+                f"{fb['limit']}-line `low_severity_fix_lines` budget — "
+                + ("the WHOLE pass fits inside it, so the 💸 band did too, whatever "
+                   "the fixer counted"
+                   if fb["within"] else
+                   "which the whole pass does NOT fit inside. That is not a breach: "
+                   "the budget bounds only the 💸 band and a diff cannot say which "
+                   "lines paid for which finding, so this round simply cannot show "
+                   "the budget was kept"))
+        lines.append(f"**Budget spend of the last fix pass:** {said}. Counted here "
+                     "rather than by the fixer (#622). Reported, not a threshold — "
+                     "nothing stops on this (#67).")
     # ---- new surface (#619), in the same register as the two above it: reported,
     # gating nothing. Printed from the round's own `surface` rather than back out of
     # `payload["round_stop"]`, because that block is null on a review-only run and
@@ -5888,7 +5930,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "nothing tests a test (#554). "
             "Count, do not estimate, "
             "and do not ask yourself whether a fix risks ballooning — the budget is "
-            "the answer to that question and it has already been given. What the "
+            "the answer to that question and it has already been given. "
+            # #622. The paragraph above is an instruction to the actor and cannot
+            # refuse; this sentence says that the instruction is no longer also the
+            # only counter. Stated to the fixer rather than left in the payload
+            # because a measurement the measured party does not know about is a trap,
+            # and the point is a brake rather than a gotcha — the next round prices
+            # this pass whatever the fixer's own arithmetic said.
+            "The next round prices this pass itself — production at 1 and test or "
+            "prose at the weight above, over `git diff --numstat` churn — and "
+            "publishes it at `round_stop.fix_budget`, so the count does not rest on "
+            "your arithmetic (#622). What the "
             "budget does not reach is reported and recorded exactly like a below-floor "
             "finding: not dropped, and not this round's work (#297). Everything "
             "unmarked is unconditional._")

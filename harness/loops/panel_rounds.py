@@ -3699,6 +3699,96 @@ def guard_churn_state(referee: dict | None, limit: int | None, armed: bool) -> d
             "over": bool(limit is not None and lines is not None and lines > limit)}
 
 
+def fix_budget_state(referee: dict | None, limit: int | None, weight: int,
+                     band: bool) -> dict:
+    """#622's measurement as this round read it, for `round_stop` and the payload —
+    what the last fix pass SPENT, priced the way `low_severity_fix_lines` is spent,
+    counted by something that is not the fixer.
+
+    Every other bound on a fix pass in this file is measured from outside it. This one
+    was not: `low_severity_fix_lines` is resolved here, relayed into the fixer's brief
+    as a paragraph ("measure each fix's churned lines (`git diff --numstat`) … stop
+    when the budget is spent"), and then counted by the agent it constrains. On
+    lexray#1780 the relayed number was correct at every round and the passes came out
+    at 850, 322, 356 and 142 added lines against a budget of 40 — and nothing anywhere
+    recorded that, because the only reader was the actor. `harness_rules.py` already
+    says the principle beside the dial: the fixer "is never asked 'does this risk
+    ballooning?', because that is a judgement by the actor whose judgement the 85%
+    impugns". The counting was delegated to that same actor. This is the reader.
+
+    ``referee`` is :func:`referee_state`'s own output and nothing else, on
+    :func:`guard_churn_state`'s rule and for its reason: `low_severity_fix_lines`,
+    `max_fix_guard_lines` and #554's predicate are three readings of ONE split, and a
+    second derivation here would let the report print two numbers for the same lines.
+    ``limit`` and ``weight`` are `low_severity_fix_lines` and `unrefereed_line_weight`
+    off the resolved dials — the very values relayed in the brief, so the reader and
+    the actor are held to one number by construction rather than by two copies.
+
+    ``spend`` prices the pass exactly as the brief prices it: production at 1 and test
+    plus prose at ``weight``, over churn (insertions plus deletions), which is the unit
+    `git diff --numstat` reports and :func:`panel_seats._referee_kind_lines` already
+    counts in.
+
+    **``within`` IS ONE-SIDED, AND SAYING SO IS THE WHOLE HONESTY OF THIS BLOCK.** The
+    budget does not bound the pass; it bounds the part of the pass spent on the 💸 band
+    — findings at or above `fix_severity_floor` and below the `round_trigger_floor`
+    cut — and a diff cannot attribute a line to the finding it was written for. So the
+    priced total is an UPPER BOUND on the budgeted spend, and only one of its two
+    readings is a fact:
+
+    * ``within: True`` — the WHOLE pass, mandatory work included, priced under the
+      budget. The budgeted part is under it too, whatever anybody counted. That is
+      decidable from the diff alone and it is the verdict this block exists to
+      publish.
+    * ``within: False`` — the pass cannot be SHOWN to have stayed inside its budget.
+      Not a breach: a round clearing two P1s may spend three hundred production lines
+      the budget never applied to. It is the absence of the assurance above, and a
+      reader must not read it as an accusation.
+    * ``within: None`` — nothing was measured. Round 1, an unreadable fix range, a
+      repo with no budget written, or a repo whose `fix_severity_floor` meets the
+      trigger cut so there is no band to pay for (``band``).
+
+    **The sharper measurement that was considered and left out.** Where a round's
+    entire To fix list is budgeted — no mandatory finding in it at all — every line of
+    the pass answering it IS budget spend, and ``spend > limit`` is then a breach
+    outright rather than an unproven one. That needs the PRIOR round's list and the
+    dials it was banded under, read back out of a baseline payload, and it would put
+    this block's verdict at the mercy of a payload written under different dials by a
+    different version. #622 asks for the cheap half first and says so; the upper bound
+    needs nothing but the split already in hand, and the strict form can be added over
+    it later without either number changing meaning.
+
+    **Reported, never gated, on #67's rule** — and unlike `max_fix_guard_lines` there
+    is not even a flag to arm, because arming one would be the 29th dial #621 forbids.
+    Nothing in :func:`round_stop` reads this to move ``stop``. What it does is put the
+    count somewhere a human and an orchestrator can both read it, in the same register
+    `unrefereed_fix` and `fix_surface` already occupy: a pass that overspent is
+    evidence about the pass.
+
+    Every field is present on every round, its three siblings' rule. ``spend`` is
+    ``None`` and never ``0`` where nobody read the pass, on
+    :func:`guard_churn_state`'s argument and with its presence test (``churn``): a
+    published ``0`` for round 1 would say a fix pass spent nothing when what happened
+    is that there was no fix pass, and "spent nothing" is the flattering direction on
+    exactly the claim this block exists to make."""
+    referee = referee or {}
+    measured = _nonneg_int(referee.get("churn"))
+    production = int(referee.get("production") or 0) if measured else None
+    unrefereed = int(referee.get("unrefereed") or 0) if measured else None
+    spend = (None if production is None or unrefereed is None
+             else production + weight * unrefereed)
+    # `limit` is published as null wherever nothing is being paid for out of it, which
+    # is a repo with no budget AND a repo whose bands meet (`Dials.budgeted_band`). A
+    # reader must not be able to tell those apart from the number alone — both mean
+    # "there is no budget in force on this round" — and `band` is beside it for the
+    # one who needs to know which.
+    in_force = limit if band else None
+    return {"limit": in_force, "weight": int(weight), "band": bool(band),
+            "production": production, "unrefereed": unrefereed, "spend": spend,
+            "within": (None if in_force is None or spend is None
+                       else spend <= in_force)}
+
+
 def fix_surface_state(surface: object) -> dict | None:
     """#619's measurement as `round_stop` publishes it, or ``None`` where there was
     none to make.
@@ -4309,6 +4399,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                not_falling: dict | None = None,
                unrefereed: dict | None = None,
                guard_churn: dict | None = None,
+               fix_budget: dict | None = None,
                surface: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
@@ -4865,6 +4956,29 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     deliberately NOT ``max_fix_growth``'s: that ceiling is applied by the caller and
     forces a stop unconditionally, on years of measurement. This one may only turn a ``go
     again`` into a STOP, and only the round rule 1 was buying.
+
+    ``fix_budget`` is #622, and it is the argument here that closes a gap rather than
+    opening a measurement: `low_severity_fix_lines` is the one bound on a fix pass that
+    was counted by the pass itself. The dial is resolved in `panel.py`, relayed into
+    the fixer's brief as a paragraph asking the fixer to run `git diff --numstat` after
+    each fix and stop when the budget is gone, and read by nobody else. On lexray#1780
+    the relayed number was right every round and the passes came out at 850, 322, 356
+    and 142 lines against a budget of 40; the only reason anyone knows is that the
+    fixer said so. :func:`fix_budget_state` prices the same split ``unrefereed`` and
+    ``guard_churn`` read — production at 1, test and prose at `unrefereed_line_weight`
+    — and puts the number beside the limit.
+
+    **Its verdict is one-sided and the payload says which side.** The budget bounds the
+    💸 band and not the pass, and a diff cannot attribute a line to the finding it paid
+    for, so ``within: True`` is a fact (the whole pass priced under the budget, so the
+    budgeted part is too) and ``within: False`` is the absence of one, never an
+    accusation. :func:`fix_budget_state` has the argument and the stricter form that
+    was left for later.
+
+    **Reported, never gated, and with no flag to arm** — #67's rule for the first half
+    of that and #621 for the second: an `escalate_on` key here would be the new dial
+    that epic is explicit about not adding. It moves ``stop`` in neither direction and
+    files no veto line.
 
     ``surface`` is #619, and it is the second argument to this function that decides
     nothing — reported, never gated. It is the set of files the last fix pass touched
@@ -5849,6 +5963,15 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # kept apart on `referee_state`'s terms; `fired` is the verdict, kept apart from
         # both on `fix_injection`'s.
         "guard_churn": {**guarding, "fired": overguarded},
+        # #622's measurement, ALWAYS present for the reason its siblings are, and with
+        # no `fired` field for `fix_surface`'s: there is no verdict to have, because
+        # nothing above reads this to move `stop`. `within` is the field a consumer
+        # wants and it is THREE-STATE on purpose — true is "the pass priced under the
+        # budget", false is "that could not be shown", null is "nothing was measured or
+        # no budget was in force" — so a reader that treats false as a breach is wrong
+        # about a round that cleared two P1s. `fix_budget_state` has the argument.
+        "fix_budget": (fix_budget_state(None, None, 1, False)
+                       if fix_budget is None else fix_budget),
         # #619's measurement, and the ONE block here whose key can be null: the files
         # the last fix pass touched that no earlier round had read. Reported and not
         # gated — #67's instrument-before-gate rule, and the gate has not been decided
@@ -5929,7 +6052,7 @@ __all__ = [
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
-    "unrefereed_fix_brake", "referee_state", "fix_surface_state",
+    "unrefereed_fix_brake", "referee_state", "fix_surface_state", "fix_budget_state",
     "guard_lines_brake", "guard_churn_state", "_pass_churn", "churn_cells",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",

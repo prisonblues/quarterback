@@ -327,6 +327,25 @@ From its output collect:
   says so on the line. Absent on round 1 and on a round with no readable fix range,
   because there was then no pass to measure and a line of zeroes would claim one
   wrote nothing.
+- **Budget spend of the last fix pass** — the line printed under that name
+  (`round_stop.fix_budget` in the JSON, #622): what the pass that landed between the last
+  round and this one COST, priced the way `low_severity_fix_lines` is spent — production
+  at 1, test and prose at `unrefereed_line_weight`, over `git diff --numstat` churn — set
+  against the budget that was in force. Every other bound on a fix pass is measured from
+  outside it; this one used to be counted by the fix pass, out of the paragraph you relay
+  in §4. It is now counted here as well, and the two are held to one number because both
+  read the same resolved dials.
+
+  **`within` is three-state and you must not flatten it.** `true` means the WHOLE pass —
+  mandatory work included — priced under the budget, so the 💸 band did too whatever the
+  fixer's own arithmetic said: that is a fact and it is the reading worth carrying into
+  §6. `false` means only that the budget cannot be SHOWN to have been kept, because the
+  budget bounds the 💸 band and a diff cannot say which lines paid for which finding — a
+  round clearing two P1s can spend three hundred production lines the budget never
+  applied to. **Do not treat `false` as a breach and do not brief the next fixer as
+  though it were.** `null` means there was nothing to measure: round 1, an unreadable fix
+  range, or no budget in force. REPORTED and gates nothing (#67), and there is no flag to
+  arm one — the epic this came from is explicit that it adds no dial.
 - **Fix surface** — `round_stop.fix_surface` in the JSON (#619): `files`, the files the
   last fix pass touched; `new_files` and `count`, the subset no earlier round had read;
   `prior_files`, what the rounds before it had. Like Guard-to-guarded it is REPORTED and
@@ -1580,6 +1599,12 @@ Then the part that is new, and is the point of running more than one round:
   the two should agree, and a disagreement is worth a sentence of its own. It gates
   nothing, so this is a report and not a verdict — but a P1 in a file that entered the PR
   through a fix pass is the shape both halves of this exist to make visible.
+- **Budget spend (#622):** `fix_budget` from each round that measured one. Report
+  `within: true` as what it is — the pass was shown from outside to fit inside the round's
+  budget — and `within: false` as what it is not: the budget could not be shown to have
+  been kept, which on a round that cleared a P1 says nothing about the 💸 band at all.
+  Where the fixer's own summary counted a spend and this priced a different one, say both
+  numbers; that disagreement is the entire reason the count moved out of the fixer.
 - **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
   answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
   fix, which finding it answered (now back on the board as reported-and-not-fixed), and
