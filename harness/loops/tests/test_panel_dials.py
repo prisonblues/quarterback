@@ -1,4 +1,4 @@
-"""#165's seven `review_panel` dials, #297's eighth and #492's ninth — thoroughness against convergence, per repo.
+"""#165's seven `review_panel` dials, #297's eighth, #492's ninth and #664's tenth — thoroughness against convergence, per repo.
 
 The panel had one behaviour and no dials. Every choice it made about what counts as
 worth reporting, what a fix round has to clear, and what buys another round was a
@@ -8,10 +8,12 @@ had and **128 of them — 63.7% — were created by the fix pass immediately bef
 against a ~7% industry baseline for bad-fix injection. Every one of those panels
 terminated on the round cap, each saying in its own output "a stop, not convergence".
 
-So there are now nine settings — seven from #165, `low_severity_fix_lines` from #297,
-which answers a second measurement taken five days later on the same panel, and
+So there are now ten settings — seven from #165, `low_severity_fix_lines` from #297,
+which answers a second measurement taken five days later on the same panel,
 `max_fix_growth_chars` from #492, which answers a field report that the growth ceiling
-scales its rope with the starting size — and
+scales its rope with the starting size, and `min_fix_growth_chars` from #664, which
+answers the same proportionality read downward: a PR small enough that the multiple's
+whole allowance is less than one honest fix's diff framing — and
 this suite is what says they are settings rather than documentation. Each one gets three tests, because there are exactly three ways a
 setting fails:
 
@@ -63,7 +65,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The thirteen, and where each one's default is written twice. `skip_title_patterns`
+#: The fifteen, and where each one's default is written twice. `skip_title_patterns`
 #: and the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
@@ -74,6 +76,7 @@ DIALS = {
     "unrefereed_line_weight": "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
     "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "min_fix_growth_chars": "DEFAULT_MIN_FIX_GROWTH_CHARS",
     "max_fix_guard_lines": "DEFAULT_MAX_FIX_GUARD_LINES",
     "reviewer_scope": "DEFAULT_REVIEWER_SCOPE",
     "next_door_days": "DEFAULT_NEXT_DOOR_DAYS",
@@ -246,6 +249,7 @@ BAD_VALUES = [
     ("low_severity_fix_lines", "a few", "a whole number"),
     ("max_fix_growth", "lots", "is not a number"),
     ("max_fix_growth_chars", "a lot", "a whole number"),
+    ("min_fix_growth_chars", "a bit", "a whole number"),
     ("reviewer_scope", "everything", "diff, repo"),
     ("next_door_days", "soon", "a whole number of days"),
     ("require_failing_test", "sometimes", "true or false"),
@@ -294,7 +298,7 @@ def test_unset_is_still_the_silent_not_configured_reading(key, unset):
     ceiling are nulled independently, which is most of why it is a second key."""
     dials = panel_seats.resolve_dials({key: unset}, None, [])
     expected = (None if key in ("max_fix_growth", "max_fix_growth_chars",
-                                "low_severity_fix_lines")
+                                "min_fix_growth_chars", "low_severity_fix_lines")
                 else harness_rules.DEFAULTS["review_panel"][key])
     assert getattr(dials, key) == expected
 
@@ -952,10 +956,12 @@ def test_the_absolute_ceiling_stops_growth_the_multiple_waves_through(monkeypatc
 
 def test_the_absolute_half_does_not_swallow_the_multiple_that_already_bound(
         monkeypatch, capsys, tmp_path):
-    """The pair can only ever TIGHTEN, and a cycle the multiple already stopped must
-    still be told that is what stopped it. `SMALL` -> `HUGE` is 6.5x on a growth of
-    ~5,800 chars — nowhere near the absolute — so this is the case where the two
-    halves disagree in the other direction."""
+    """The PAIR OF CEILINGS can only ever TIGHTEN — a claim about these two keys and
+    not about the growth check, which since #664 has a floor in it that loosens — and a
+    cycle the multiple already stopped must still be told that is what stopped it.
+    `SMALL` -> `HUGE` is 6.5x on a growth of ~5,800 chars: nowhere near the absolute,
+    and well clear of the 2,000-char floor, so this is the case where the two ceilings
+    disagree in the other direction and the floor is not what decides it."""
     _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
                    max_rounds=3, diff=SMALL)
     _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
@@ -1093,12 +1099,188 @@ def test_the_dials_line_names_both_halves_of_the_growth_ceiling(monkeypatch, cap
     it. A line that named only the multiple would make the absolute stop, when it
     fires, read as an arithmetic bug."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
-    assert "fix growth cap 3x or +30,000 chars" in report
+    assert "fix growth cap 3x over +2,000 or +30,000 chars" in report
     # And "off" only where BOTH are null — a line that vanishes at some settings is one
     # a reader cannot tell from a dial that was never applied.
     off, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="off",
                     config=cfg(max_fix_growth=None, max_fix_growth_chars=None))
     assert "fix growth cap off" in off
+
+
+# ------------------------------------------------------- 4c. min_fix_growth_chars
+
+#: A PR small enough that the multiple's whole allowance is less than one honest fix.
+#: 30 churned lines to 100: 3.22x, which the multiple stops, on a growth of 1,190 chars
+#: — under a two-file fix's framing, so nothing here can be a second change. This is the
+#: shape #664 measured, where 49% of a 878-char allowance went on `diff --git`, `index`,
+#: `---`/`+++`, `@@` and the context lines a hunk must carry.
+TINY = "diff --git a/a.py b/a.py\n" + LINE * 30
+TINY_FIXED = "diff --git a/a.py b/a.py\n" + LINE * 100
+
+
+def test_the_floor_holds_a_ratio_only_stop_off_a_pr_too_small_to_afford_a_fix(
+        monkeypatch, capsys, tmp_path):
+    """A multiple's allowance shrinks with the PR and diff framing does not. On the
+    439-char PR #664 measured, the 3.0x allowance was 878 chars, the smallest honest
+    single-hunk fix cost 827 of it and ~430 of that was framing; the fixer named two
+    corrections it could not pay for and the round after found one of them. So below
+    the floor the ratio half does not fire, and the cycle goes on to spend the round it
+    already bought on the fix rather than on rediscovering the fix's absence."""
+    # Properties of the fixture, or this test asserts nothing: the multiple IS crossed,
+    # so against the pre-#664 code this run stops.
+    assert len(TINY_FIXED) / len(TINY) > 3.0
+    assert len(TINY_FIXED) - len(TINY) < 2000
+
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=TINY)
+    report, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                             round_no=2, baseline=[r1], max_rounds=3, diff=TINY_FIXED,
+                             scope="pr")
+    stop = payload["round_stop"]
+    growth = stop["fix_growth"]
+    assert growth["over"] is False and growth["over_ratio"] is False
+    assert growth["floor_chars"] == 2000
+    # The suppression is RECORDED, because it leaves no other trace: a round at 3.2x
+    # that did not stop looks identical in this record to one under a null floor, there
+    # is no veto line on a round that did not stop, and `config_notes` never reaches
+    # the board.
+    assert growth["floor_held"] is True
+    assert growth["ratio"] > 3.0 and growth["grown"] == len(TINY_FIXED) - len(TINY)
+    assert stop["stop"] is False
+    assert "max_fix_growth" not in stop["reason"]
+    assert not any("max_fix_growth" in v for v in stop["veto"])
+    assert "a stop, not convergence" not in report
+
+
+def test_nulling_the_floor_is_the_pre_664_behaviour_exactly(monkeypatch, capsys,
+                                                            tmp_path):
+    """What makes the SHAPE reversible while it is still a decision (#664 is
+    `needs-human/decision`): one `null` and the multiple binds on its own again, on the
+    same PR, with no other key touched. A floor that could only be lowered would be a
+    loosening term nobody could take back."""
+    conf = cfg(min_fix_growth_chars=None)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=TINY, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=TINY_FIXED, scope="pr",
+                        config=conf)
+    stop = payload["round_stop"]
+    assert payload["review_panel"]["min_fix_growth_chars"] is None
+    assert stop["fix_growth"]["floor_chars"] is None
+    assert stop["fix_growth"]["floor_held"] is False
+    assert stop["fix_growth"]["over_ratio"] is True
+    assert stop["stop"] is True and stop["confident"] is False
+    assert "`max_fix_growth` ceiling" in stop["reason"]
+
+
+def test_the_floor_guards_the_ratio_and_never_the_absolute_ceiling(monkeypatch, capsys,
+                                                                   tmp_path):
+    """The one way a loosening term could do real damage: applied to the stop as a
+    whole it would put a hole the size of the floor in `max_fix_growth_chars` too — a
+    ceiling already stated in the units the floor is written in, which needs no help
+    from it.
+
+    Written with the floor above the absolute ceiling so the two are unambiguously
+    separable: the ratio half is suppressed at 32.6x, and the cycle stops anyway,
+    on +32,980 chars past a 30,000-char ceiling."""
+    conf = cfg(min_fix_growth_chars=100_000)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=SMALL, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BOTH_OVER, scope="pr",
+                        config=conf)
+    stop = payload["round_stop"]
+    growth = stop["fix_growth"]
+    assert growth["over_ratio"] is False and growth["floor_held"] is True
+    assert growth["over_chars"] is True and growth["over"] is True
+    assert stop["stop"] is True and stop["confident"] is False
+    assert "`max_fix_growth_chars` ceiling" in stop["reason"]
+    assert "`max_fix_growth` ceiling" not in stop["reason"]
+    # And the conclusion follows the half that fired, as it did before the floor
+    # existed: "a fix pass that multiplies the change" is what the record must NOT say
+    # when the multiple was not the half that bound.
+    veto, = [v for v in stop["veto"] if "`max_fix_growth_chars`" in v]
+    assert "whatever the ratio says" in veto and "multiplies the change" not in veto
+
+
+def test_a_floor_at_or_above_the_absolute_ceiling_is_said_rather_than_refused(
+        monkeypatch, capsys, tmp_path):
+    """The pair inverting is #664's one configuration hazard: past that point every
+    growth clearing the floor has already crossed the absolute half, so the multiple
+    can never be the ceiling crossed FIRST and becomes a key that reads as configured
+    and stops nothing (#169).
+
+    Said and not refused, because both values are individually legal and the
+    combination is a policy a repo may actually want — "absolute ceiling only" — which
+    is exactly why it is worth writing down rather than guessing at."""
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")],
+                        config=cfg(min_fix_growth_chars=100_000))
+    note, = notes_about(payload, "min_fix_growth_chars")
+    assert "can never be the half that stops a cycle first" in note
+    # Not at the shipped defaults, where nothing anyone wrote has changed meaning.
+    _, plain, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="plain")
+    assert not notes_about(plain, "min_fix_growth_chars")
+
+
+def test_a_floor_under_two_null_ceilings_is_still_no_growth_check_at_all(monkeypatch,
+                                                                        capsys,
+                                                                        tmp_path):
+    """The pre-#165 behaviour, and the floor must not resurrect it. It is a condition
+    on when the multiple applies, not a check of its own, so with both ceilings nulled
+    there is nothing for it to condition — and the block that applies the ceiling still
+    runs on EITHER ceiling being set rather than on any of the three."""
+    conf = cfg(max_fix_growth=None, max_fix_growth_chars=None,
+               min_fix_growth_chars=2000)
+    _, _, r1 = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=1,
+                   max_rounds=3, diff=SMALL, config=conf)
+    _, payload, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], round_no=2,
+                        baseline=[r1], max_rounds=3, diff=BOTH_OVER, scope="pr",
+                        config=conf)
+    assert payload["round_stop"]["fix_growth"] is None
+    assert payload["round_stop"]["stop"] is False
+    # And the report says "off" rather than naming a floor that bounds nothing.
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="off",
+                       config=conf)
+    assert "fix growth cap off" in report
+
+
+def test_an_absent_min_fix_growth_chars_is_the_default_not_off():
+    """The reading the two keys beside it already have, drawn a third time: the default
+    is a number, so an absent key read as `null` would silently drop the only term in
+    this mechanism that protects a small PR."""
+    assert panel_seats.fix_growth_floor_chars({}, []) == 2000
+    assert panel_seats.fix_growth_floor_chars({"min_fix_growth_chars": None}, []) is None
+
+
+@pytest.mark.parametrize("bad,why", [
+    (False, "a whole number"),
+    ("a bit", "a whole number"),
+    (1.5, "a whole number"),
+    (0, "above zero"),
+    (-2000, "above zero"),
+])
+def test_a_bad_min_fix_growth_chars_is_refused_and_never_read_as_a_floor(bad, why):
+    """`0` is refused rather than read as "no floor": a floor every growth clears the
+    moment a fix pass writes a character is the OFF position written in a spelling that
+    does not say so, and `null` is that spelling. `false` is refused before the numeric
+    read for `max_fix_growth`'s reason (`isinstance(True, int)`), and a fractional value
+    because half a char is not a size any diff has."""
+    notes: list[str] = []
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.fix_growth_floor_chars({"min_fix_growth_chars": bad}, notes)
+    assert why in str(refusal.value)
+    assert "null to let the multiple bind on its own" in str(refusal.value)
+    assert notes == []
+
+
+def test_the_floor_is_settable_from_the_board_and_nullable_there():
+    """A shape decision that can only be reversed by a release is not reversible in the
+    sense #664 needs. `null` is the pre-#664 behaviour exactly, so the board layer has
+    to be able to write it — the same argument `max_fix_guard_lines` makes for its own
+    nullability."""
+    assert not harness_rules.unknown_keys({"review_panel": {"min_fix_growth_chars": 2000}})
+    assert "review_panel.min_fix_growth_chars" in harness_rules.BOARD_DIALS
+    assert harness_rules.BOARD_DIALS["review_panel.min_fix_growth_chars"].nullable
 
 
 def test_the_orchestrator_is_told_that_naming_findings_does_not_lift_the_budget():
@@ -2131,7 +2313,7 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     assert ("**Panel dials** (`review_panel`): fix at/above P4 · below-P2 fix budget "
             "40 lines, unrefereed x2 · another round at/above P2 · reviewer scope diff "
             "· fix growth "
-            "cap 3x or +30,000 chars · fixer may defer yes · failing test "
+            "cap 3x over +2,000 or +30,000 chars · fixer may defer yes · failing test "
             "required no · a deferral naming a category or one substantive item gets "
             "a GitHub issue; a batch of leftovers gets board rows and no issue at any "
             "severity, and so does a deferral nobody classified (an escalation and an "

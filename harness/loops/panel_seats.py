@@ -1931,6 +1931,66 @@ def fix_growth_chars_limit(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
+    """`min_fix_growth_chars` — a positive whole number of chars, or ``None`` for "the
+    multiple binds on its own".
+
+    #664's floor under the MULTIPLE, and the one value resolved in this module that
+    LOOSENS a check: the ratio half of the growth ceiling fires only where the PR has
+    also grown past this. :func:`fix_growth_chars_limit` is untouched by it, so an
+    absolute stop still fires on a PR of any size.
+
+    **Why a floor at all**, since the two functions above are both ceilings. Diff
+    framing is fixed per file-hunk — `diff --git`, `index`, `---`/`+++`, `@@` and a
+    hunk's context lines are ~430 chars before any repair — while a multiple's
+    allowance scales with the PR. On the 439-char PR #664 measured, the whole 3.0x
+    allowance was 878 chars and the smallest honest single-hunk fix cost 827 of it,
+    49% of that being framing; below ~413 chars the ceiling cannot afford one truthful
+    one-file fix at all. The fixer on that cycle named two corrections it could not
+    pay for and the next round found one of them, so the ceiling did not merely
+    prevent a fix — it caused a regression and then bought a round to rediscover it.
+
+    **Absent inherits the default and a written ``null`` switches it off**, on the
+    reading the two keys beside it already have. ``null`` here is the exact pre-#664
+    behaviour, which is what makes a shape decision reversible without a release.
+
+    ``0`` is refused rather than read as "no floor". A floor of zero is one every
+    growth clears the moment a fix pass writes a character, so it is the OFF position
+    written in a spelling that does not say so, and `null` is already that spelling —
+    the same argument the two keys above make about `0` from the ceiling side. A bool
+    is refused before the numeric read for their reason (``isinstance(True, int)``),
+    and a fractional value because half a char is not a size any diff has."""
+    raw = panel.get("min_fix_growth_chars", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_MIN_FIX_GROWTH_CHARS
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("min_fix_growth_chars", raw,
+                      f"{what} — chars the PR must have grown before the MULTIPLE may "
+                      "stop the cycle, or null to let the multiple bind on its own")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
 def fix_guard_lines_limit(panel: dict, notes: list[str]) -> int | None:
     """`max_fix_guard_lines` — a positive whole number of test and prose lines ONE
     fix pass may churn, or ``None`` for "do not check" (#618).
@@ -2221,7 +2281,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The fourteen #165/#297/#492/#482/#554/#508/#618/#78 settings as this round
+    """The fifteen #165/#297/#492/#482/#554/#508/#618/#78/#664 settings as this round
     applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
@@ -2238,6 +2298,11 @@ class Dials:
     unrefereed_line_weight: int = DEFAULT_UNREFEREED_LINE_WEIGHT
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
+    #: #664's floor under the MULTIPLE, and the one field on this object that loosens a
+    #: check rather than tightening one: the ratio half fires only where the growth also
+    #: clears this. Carried here for its siblings' reason — the stop rule, the report
+    #: and the payload have to be reading ONE number.
+    min_fix_growth_chars: int | None = DEFAULT_MIN_FIX_GROWTH_CHARS
     #: #618's per-PASS guard ceiling, and the one dial here whose shipped value is
     #: `None` because nobody has calibrated it rather than because off is the right
     #: answer. Carried on this object for its siblings' reason: the stop rule, the
@@ -2265,6 +2330,7 @@ class Dials:
                 "unrefereed_line_weight": self.unrefereed_line_weight,
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
+                "min_fix_growth_chars": self.min_fix_growth_chars,
                 "max_fix_guard_lines": self.max_fix_guard_lines,
                 "reviewer_scope": self.reviewer_scope,
                 "next_door_days": self.next_door_days,
@@ -2272,7 +2338,7 @@ class Dials:
                 "max_rounds": self.max_rounds,
                 # A COPY, not the object this round is applying. `as_dict` is the
                 # payload's view and a payload is serialised, posted and stored; the
-                # other twelve are immutable scalars and cannot be edited through it,
+                # other fourteen are immutable scalars and cannot be edited through it,
                 # and a mapping handed out by reference could be — which would make
                 # the recorded policy and the applied policy the same mutable thing.
                 "threshold_by_severity": dict(self.threshold_by_severity)}
@@ -2525,7 +2591,18 @@ class Dials:
         # absolute stop, when it fires, for a bug in the arithmetic (#492). "off" only
         # where BOTH are null, since a line that vanishes at some settings is one a
         # reader cannot tell from a dial that was never applied.
-        halves = [f"{self.max_fix_growth:g}x" if self.max_fix_growth is not None else "",
+        #
+        # #664's floor rides ON the multiple's clause rather than getting one of its
+        # own, because it is not a third thing this round bounds — it is a condition on
+        # when the first clause applies, and a reader who saw "3x" alone would take a
+        # PR sitting at 4x with no stop for the same arithmetic bug. Printed only where
+        # the multiple is live: a floor under a null multiple bounds nothing, and a
+        # policy line that says otherwise is worse than one that omits it.
+        floor = (f" over +{self.min_fix_growth_chars:,}"
+                 if self.max_fix_growth is not None
+                 and self.min_fix_growth_chars is not None else "")
+        halves = [f"{self.max_fix_growth:g}x{floor}"
+                  if self.max_fix_growth is not None else "",
                   f"+{self.max_fix_growth_chars:,} chars"
                   if self.max_fix_growth_chars is not None else ""]
         growth = " or ".join(h for h in halves if h) or "off"
@@ -2607,6 +2684,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
+        min_fix_growth_chars=fix_growth_floor_chars(panel, notes),
         max_fix_guard_lines=fix_guard_lines_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
         next_door_days=next_door_days(panel, notes),
@@ -2650,6 +2728,24 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
             "ceiling only — since #492 there is an absolute half beside it, and "
             f"`max_fix_growth_chars` is in force at {dials.max_fix_growth_chars:,} "
             "chars. Null that too for the pre-#492 'no growth check at all'")
+    # #664's one inversion hazard, said rather than refused. A floor at or above the
+    # absolute ceiling leaves the multiple unable to fire FIRST at any PR size: every
+    # growth that clears the floor has already crossed the absolute half, so the pair
+    # stops behaving as crossed-first and the multiple becomes a key that reads as
+    # configured and stops nothing (#169). Not a hard exit, because both values are
+    # individually legal and the combination is a policy a repo may actually want —
+    # "absolute ceiling only, and say so" — which is what makes it worth SAYING rather
+    # than guessing at. Silent where either is null: there is no pair to invert.
+    if (dials.max_fix_growth is not None
+            and dials.min_fix_growth_chars is not None
+            and dials.max_fix_growth_chars is not None
+            and dials.min_fix_growth_chars >= dials.max_fix_growth_chars):
+        notes.append(
+            f"`min_fix_growth_chars` at {dials.min_fix_growth_chars:,} is at or above "
+            f"the {dials.max_fix_growth_chars:,}-char `max_fix_growth_chars` ceiling, "
+            f"so the {dials.max_fix_growth:g}x multiple can never be the half that "
+            "stops a cycle first — any growth clearing the floor has already crossed "
+            "the absolute half. Lower the floor, or null the multiple and mean it")
     if dials.require_failing_test:
         notes.append("`require_failing_test: true` is recorded and NOT enforced — the "
                      "reviewer-emitted failing test it needs is not built (#92, #114), "
@@ -4779,6 +4875,7 @@ __all__ = [
     "severity_floor", "deferral_issue_gate", "reviewer_scope",
     "low_severity_budget",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
+    "fix_growth_floor_chars",
     "fix_guard_lines_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "REFEREE_KINDS", "_LINE_COMMENTS", "_DOCSTRING_FENCES",

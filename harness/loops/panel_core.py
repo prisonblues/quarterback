@@ -317,12 +317,24 @@ DEFAULT_THRESHOLD_BY_SEVERITY: dict[str, int] = {}
 DEFAULT_MAX_FIX_GROWTH = 3.0
 #: The ABSOLUTE half of that ceiling (#492): chars the PR may GROW past the size the
 #: cycle's first round read it at, before the same stop fires. Whichever of this and
-#: the multiple is crossed FIRST binds, so it can only ever tighten the check. A pure
+#: the multiple is crossed FIRST binds, so THIS KEY can only ever tighten the check —
+#: a claim about the pair of ceilings and not about the mechanism, which since #664 has
+#: a floor in it that loosens (see below). A pure
 #: multiple hands its rope out in proportion to the starting size — 226 lines on a
 #: 113-line PR, 4,000 on a 2,000-line one — and the second is the case most in need of
 #: a ceiling. None disables this half and leaves the multiple; `harness_rules` carries
 #: the calibration.
 DEFAULT_MAX_FIX_GROWTH_CHARS = 30_000
+#: The FLOOR under the multiple (#664), and the one term in this mechanism that
+#: LOOSENS: the ratio half fires only where the PR has also grown by more than this
+#: many chars. Proportionality bites at both ends — the ceilings above answer the top,
+#: where a multiple's rope grows with the starting size, and this answers the bottom,
+#: where a fixed per-hunk diff framing cost (~430 chars of `diff --git`, `index`,
+#: `---`/`+++`, `@@` and context) is charged against a PR too small to afford it. On a
+#: 439-char PR the 3.0x allowance is 878 chars and the smallest honest one-file fix
+#: measured 827, half of it framing. None switches the floor off and restores the
+#: pre-#664 behaviour exactly; `harness_rules` carries the calibration.
+DEFAULT_MIN_FIX_GROWTH_CHARS = 2_000
 #: The GUARD half of the same question, per PASS rather than per PR (#618): test and
 #: prose lines ONE fix pass may churn before the ceiling reports — or, where the repo
 #: arms `escalate_on.guard_lines`, ends the cycle.
@@ -3086,6 +3098,7 @@ __all__ = [
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "DEFAULT_MIN_FIX_GROWTH_CHARS",
     "DEFAULT_MAX_FIX_GUARD_LINES",
     "DEFAULT_MAX_FIX_GUARD_LINES",
     "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
