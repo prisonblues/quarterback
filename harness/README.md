@@ -586,6 +586,54 @@ The commands are thin, guarded drivers over these. The scripts hold the determin
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
 
+#### Databases the sweep must not touch — `.database.protect`
+
+`prune-worktrees` calls a database orphaned when no live worktree maps to it, and the
+mapping is per-worktree (`<project>_<create-name>`). Anything a project generates on some
+*other* axis therefore matches nothing and is reported as debris on every run.
+
+`.worktree.json`'s `database.protect` is the escape hatch, and its entries are **glob
+patterns**:
+
+```json
+"database": {
+  "engine": "postgresql",
+  "protect": ["myapp_test_tmpl_*"]
+}
+```
+
+They are patterns rather than literals because the databases worth protecting are almost
+never one fixed name. The case that set the shape: a test suite that copies each run's
+database from a pre-migrated template, `<project>_test_tmpl_<migration head>`, so a run
+costs ~45ms instead of ~1.5s. A template belongs to a *migration head*, not to a checkout,
+so it matches no worktree by construction and every sweep offers to drop it.
+
+Naming those exactly does not work, and it is worth being precise about why, because the
+attempt looks reasonable: the live heads are spread across branches — one on the integration
+branch, another on some unmerged feature branch — and no single checkout can see all of
+them. So a hand-pinned list cannot be verified from anywhere, and the day a migration lands
+it protects two dead templates while the live one goes back to being swept. That failure is
+silent and in the unhelpful direction. It also pushes per-branch state into a shared
+base-branch config file, which makes editing `.worktree.json` a step in landing a migration.
+`myapp_test_tmpl_*` has none of those properties.
+
+Two things follow from patterns:
+
+- **A literal entry still means exactly what it did.** A pattern with no metacharacters is
+  an exact match, so lists written before this are unaffected.
+- **Every match is reported**, with the pattern that caused it, under `Protected by
+  .database.protect`. A pattern is the one thing here that can suppress a *genuine* orphan,
+  and a too-broad one would otherwise do it invisibly — which is a worse failure than the
+  staleness patterns exist to remove.
+
+The two built-in protections — `<project>` and `<project>_test` — stay exact, and stay
+silent. Those names are minted by these scripts, so there is nothing to go stale and nothing
+to be surprised by.
+
+`.database.protect` is only consulted for databases under the `<project>_` prefix, because
+that prefix is the whole of what the sweep considers. An entry outside it is inert rather
+than wrong: nothing outside the prefix was ever going to be dropped.
+
 ### `check-db-isolation` — which database is this checkout actually pointed at?
 
 ```

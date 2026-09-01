@@ -15,7 +15,20 @@
     "",
     "base_port is 5690, not 5681: the main compose stack already publishes 5681",
     "for the app, and allocating from there hands the first worktree a port it",
-    "cannot bind. Start yours above every port your own compose file publishes."
+    "cannot bind. Start yours above every port your own compose file publishes.",
+    "",
+    "database.protect is a list of GLOB patterns naming databases prune-worktrees",
+    "must never call orphans. Use it for databases your project generates on some",
+    "axis other than the worktree -- per-migration-head test templates being the",
+    "usual one, which is why the value below is a wildcard rather than a name: a",
+    "hand-pinned head is stale the next time somebody lands a migration, and it is",
+    "stale silently. A literal entry still works, since a pattern with no",
+    "metacharacters matches exactly. See harness/README.md, `Databases the sweep",
+    "must not touch`.",
+    "",
+    "That one is ILLUSTRATIVE and not quarterback's: this repo mints no template",
+    "databases, so its real .worktree.json sets no protect list at all. The shape",
+    "is what to copy, not the string."
   ],
 
   "project": "quarterback",
@@ -35,7 +48,8 @@
     "url_env": "DATABASE_URL",
     "user_env": "POSTGRES_USER",
     "password_env": "POSTGRES_PASSWORD",
-    "name_env": "POSTGRES_DB"
+    "name_env": "POSTGRES_DB",
+    "protect": ["myapp_test_tmpl_*"]
   },
 
   "worker": {
