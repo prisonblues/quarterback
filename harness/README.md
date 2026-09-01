@@ -2502,7 +2502,15 @@ live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fl
 the only thing that ever said so and the narrow view is exactly the view that drops it.
 The SEAT ROWS of AGENTS are not scoped: `tmux_seats()` lists every seat pane on the whole
 tmux server, so another screen's seat is a pane you can still close, and narrowing it away
-would take the `✕` with it. Nor is the liveness a claim row is judged against — an agent the
+would take the `✕` with it. It returns `(seats, error)` rather than a bare list, because an
+empty list is a fact about the SCREEN and a failure is a fact about the MACHINE: a shim on
+PATH ahead of the real tmux once made every call exit 127, and the panel reported "no seat
+screen on this server" beside a screen with three seats in it while the `＋` declined to add
+one. A tmux that cannot be reached now rides the AGENTS title as `tmux: <what went wrong>`
+and the `＋` says the panel is blind rather than empty. Being **outside** tmux is not an
+error and deliberately reports none — the dashboard full-screen in a bare terminal is a
+first-class way to run it, and a complaint that fires whenever nothing is wrong is how the
+real failures get buried. Nor is the liveness a claim row is judged against — an agent the
 scope hid is still alive, and calling its claim `gone` because this pane is narrow would be
 stating a fact about somebody's work on the strength of a filter. A claim whose holder the
 scope hid keeps a row of its own, marked `elsewhere`, because it is in scope and its holder

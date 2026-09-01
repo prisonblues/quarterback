@@ -859,7 +859,7 @@ def test_no_tmux_means_no_seats_rather_than_an_exception(monkeypatch):
     traceback on every refresh — this is called on a four-second timer.
     """
     monkeypatch.delenv("TMUX", raising=False)
-    assert qd.tmux_seats() == []
+    assert qd.tmux_seats() == ([], None)
 
 
 def _tmux_returning(monkeypatch, rows):
@@ -885,7 +885,8 @@ def test_seats_come_back_in_seat_order_not_pane_order(monkeypatch):
         "%1\t2\ts\t0\tbash\t/repo\t",
         "%3\t\ts\t0\tqb-board\t/repo\t",   # the board pane: no @qb_seat
     ])
-    got = qd.tmux_seats()
+    got, err = qd.tmux_seats()
+    assert err is None
     assert [s["seat"] for s in got] == ["1", "2", "3"]
     assert [s["pane"] for s in got] == ["%0", "%1", "%2"]
     assert all(s["command"] for s in got), "the board pane leaked into the seats"
@@ -901,7 +902,7 @@ def test_two_screens_come_back_grouped_by_screen(monkeypatch):
         "%3\t2\tseats-nix-fleet\t0\tclaude\t/x/nix-fleet\tsess-n2",
         "%1\t2\tseats-lexray\t0\tclaude\t/x/lexray\tsess-l2",
     ])
-    got = qd.tmux_seats()
+    got, _ = qd.tmux_seats()
     assert [(s["session"], s["seat"]) for s in got] == [
         ("seats-lexray", "1"), ("seats-lexray", "2"),
         ("seats-nix-fleet", "1"), ("seats-nix-fleet", "2"),
@@ -918,7 +919,7 @@ def test_a_seat_carries_the_session_of_the_agent_in_it(monkeypatch):
     _tmux_returning(monkeypatch, [
         "%0\t1\ts\t0\tclaude\t/repo\t7f3c9a21-1111-4222-8333-444455556666",
     ])
-    assert qd.tmux_seats()[0]["agent"] == "7f3c9a21-1111-4222-8333-444455556666"
+    assert qd.tmux_seats()[0][0]["agent"] == "7f3c9a21-1111-4222-8333-444455556666"
 
 
 def test_a_pane_with_no_agent_in_it_is_still_a_seat(monkeypatch):
@@ -926,7 +927,7 @@ def test_a_pane_with_no_agent_in_it_is_still_a_seat(monkeypatch):
     the agent in, or a screen built with an empty initial command. It is a seat
     with no state, not a row to drop: those are the ones free to be given work."""
     _tmux_returning(monkeypatch, ["%0\t1\ts\t0\tbash\t/repo\t"])
-    got = qd.tmux_seats()
+    got, _ = qd.tmux_seats()
     assert [s["seat"] for s in got] == ["1"]
     assert got[0]["agent"] == ""
 
@@ -938,7 +939,71 @@ def test_a_tmux_that_fails_is_an_empty_screen_not_a_crash(monkeypatch):
         raise OSError("no tmux here")
 
     monkeypatch.setattr(qd.subprocess, "run", boom)
-    assert qd.tmux_seats() == []
+    seats, err = qd.tmux_seats()
+    assert seats == []
+    assert err, "a failure came back indistinguishable from an empty screen"
+
+
+# ---- the machine, told apart from the screen ---------------------------------
+#
+# Every one of these used to be `[]`, which is also what a screen with no seats
+# returns — so the dashboard said "no seat screen on this server" beside a screen
+# with three seats in it, and its ＋ declined to add one. The seats half is not
+# what these pin; the ERROR half is.
+
+
+def test_a_tmux_that_exits_nonzero_says_so_rather_than_reporting_no_seats(monkeypatch):
+    """The shape this was written for: a shim on PATH ahead of the real tmux,
+    exiting 127 on every call, on a box with a screen up."""
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+
+    class Done:
+        returncode = 127
+        stdout = ""
+        stderr = "/nix/store/gone/bin/tmux: No such file or directory"
+
+    monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+    seats, err = qd.tmux_seats()
+    assert seats == []
+    assert "No such file" in err, err
+
+
+def test_the_exit_code_is_the_fallback_and_not_the_answer(monkeypatch):
+    """stderr first, because it names WHICH tmux broke. An exit code alone is the
+    answer only when there was nothing else to say."""
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+
+    class Done:
+        returncode = 3
+        stdout = ""
+        stderr = "   \n"
+
+    monkeypatch.setattr(qd.subprocess, "run", lambda *a, **k: Done())
+    assert qd.tmux_seats()[1] == "tmux exited 3"
+
+
+def test_a_missing_tmux_binary_is_named_as_such(monkeypatch):
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+
+    def gone(*a, **k):
+        raise FileNotFoundError("tmux")
+
+    monkeypatch.setattr(qd.subprocess, "run", gone)
+    assert qd.tmux_seats()[1] == "tmux is not on PATH"
+
+
+def test_outside_tmux_is_not_reported_as_a_failure(monkeypatch):
+    """A deliberate departure from the first cut of this fix, which called this
+    one an error too.
+
+    The dashboard full-screen in a bare terminal is a first-class way to run it.
+    An error here would fire on every such run and bury the failures this change
+    exists to surface — a permanent complaint that means nothing is wrong.
+    """
+    monkeypatch.delenv("TMUX", raising=False)
+    seats, err = qd.tmux_seats()
+    assert seats == []
+    assert err is None, "a bare terminal was reported as a broken machine"
 
 
 # --- what an agent is doing, and when that answer goes off ---------------------

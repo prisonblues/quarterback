@@ -2506,7 +2506,7 @@ async def _drive_review_pane(seats: list[dict]) -> tuple[list[list[str]], list[s
     # that expects a real call, and the suite would go green on nothing.
     real_seats, real_run = app_module.qd.tmux_seats, app_module.subprocess.run
     async with app.run_test(size=(90, 44)):
-        app_module.qd.tmux_seats = lambda: seats
+        app_module.qd.tmux_seats = lambda: (seats, None)
         app_module.subprocess.run = lambda argv, **kw: (calls.append(argv), Done())[1]
         app_module.os.environ["TMUX"] = "/tmp/whatever,1,0"
         try:
@@ -3971,3 +3971,76 @@ def test_a_duration_that_would_overflow_is_answered_not_raised():
          "expiry": "99999999999999999999d", "repo": None}))
     assert human.set == []
     assert "not a duration" in said, said
+
+
+# ---- a panel that cannot see says so -----------------------------------------
+#
+# `tmux_seats()` used to answer `[]` whether the screen had no seats or tmux could
+# not be run at all, and the dashboard reported the first while the second was
+# true: "no seat screen on this server" beside a screen with three seats in it,
+# and a ＋ that declined to add one. These pin the two places the difference has
+# to reach a reader — the title of the panel whose rows are missing, and the verbs
+# that refuse.
+
+
+def test_a_tmux_we_cannot_reach_rides_the_agents_title(monkeypatch):
+    """On the AGENTS title, not a status line: the failure IS that this panel
+    looked complete when it was not, and a line that scrolls away does not fix a
+    panel that lies while you are reading it."""
+    app = _dash()
+    said: list[str] = []
+
+    class Table:
+        def clear(self, *a, **k): pass
+
+        def add_row(self, *cells, key=None, **k):
+            return SimpleNamespace(value=key)
+
+    app.query_one = lambda sel, *a, **k: (
+        Table() if sel == "#agents" else _Sink(said) if sel == "#t_agents"
+        else _Sink())
+    app.render_seats([], "tmux exited 127")
+    assert any("tmux: tmux exited 127" in s for s in said), said
+
+
+def test_a_screen_that_really_has_no_seats_says_nothing_about_tmux():
+    """The other half, and the one that decides whether the first is noise: no
+    error means the empty list is the truth, and a title that complained anyway
+    would fire on every dashboard run in a bare terminal."""
+    app = _dash()
+    said: list[str] = []
+
+    class Table:
+        def clear(self, *a, **k): pass
+
+        def add_row(self, *cells, key=None, **k):
+            return SimpleNamespace(value=key)
+
+    app.query_one = lambda sel, *a, **k: (
+        Table() if sel == "#agents" else _Sink(said) if sel == "#t_agents"
+        else _Sink())
+    app.render_seats([], None)
+    assert not any("tmux:" in s for s in said), said
+
+
+def test_the_plus_refuses_by_naming_the_machine_and_not_the_screen():
+    """It advised starting a screen you were already sitting in. The remedy for a
+    broken tmux is not `qb-seats`, and sending a reader there is the whole cost of
+    the two states having looked alike."""
+    app = _dash()
+    said: list[str] = []
+    app.say = said.append
+    app.seats_error = "tmux is not on PATH"
+    app.add_seat()
+    assert said and "blind, not empty" in said[0], said
+    assert "start one with qb-seats" not in said[0], said
+
+
+def test_expanding_refuses_the_same_way():
+    """`z` reads the same seat list, so it inherited the same wrong sentence."""
+    app = _dash()
+    said: list[str] = []
+    app.say = said.append
+    app.seats_error = "tmux could not be run (OSError)"
+    app.action_expand()
+    assert said and "blind, not empty" in said[0], said
