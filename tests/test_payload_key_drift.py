@@ -14,6 +14,13 @@ it and asked which of the twenty-five entries were dropped because somebody deci
 to and which were dropped because nobody had looked. Five of them were the second
 kind.
 
+There is no seventh. #112 adds four keys to the payload — the harness identity —
+and binds all four in the same commit, which is what this file was written to make
+the only available move: the drift assertion goes red on the commit that adds an
+unbound key, so the choice between "a field somebody meant to add" and "a key
+somebody meant to stop sending" gets made while the person adding it is still
+holding the question.
+
 This file is what fails.
 
 It reads the top-level keys of every payload ``harness/loops/panel.py`` builds and
@@ -321,3 +328,37 @@ def test_the_provenance_working_is_bound_and_no_longer_dropped(panel_source):
         assert key in accepted, f"ReviewIn does not bind {key}"
         assert key in columns, f"review_runs has no column for {key}"
         assert key not in DROPPED_BY_DESIGN, f"{key} is still exempted"
+
+
+#: The keys #112 added to the payload and bound in the same commit. Written out
+#: here for :data:`PROVENANCE_WORKING`'s reason and one more that is specific to
+#: this set: these four never appeared on :data:`DROPPED_BY_DESIGN` at all, so
+#: there is no removal for a reader to notice, and without this list a commit that
+#: deleted the columns would leave the drift test complaining about four
+#: *unexpected dropped keys* — true, and naming the repair backwards.
+HARNESS_IDENTITY = ("harness_rev", "harness_dirty", "harness_digest", "harness_path")
+
+
+def test_the_harness_identity_is_bound_and_no_longer_dropped(panel_source):
+    """#112: which harness produced the round, on the row with the round.
+
+    Four keys and not one, because the question has no single true answer from
+    inside a running panel: ``harness_rev`` names a commit and is null on every
+    installed harness, ``harness_digest`` is a content proxy that is always there
+    and can only say "same code or not", ``harness_path`` says whether the round
+    came from the deployed harness at all, and ``harness_dirty`` is what stops a
+    rev being read as more than it is. A single field would have to be one of
+    those, and each of them is silent in a case the others cover.
+
+    Four assertions each, for the reason the two tests above give: a field with no
+    column stores nothing, a column with no field is the ``converged`` shape
+    exactly, and an entry on the allow-list would swallow the key again if the
+    field were ever removed.
+    """
+    payload, accepted = panel_payload_keys(panel_source), review_in_accepts()
+    columns = {c.name for c in ReviewRun.__table__.columns}
+    for key in HARNESS_IDENTITY:
+        assert key in payload, f"the panel no longer sends {key}"
+        assert key in accepted, f"ReviewIn does not bind {key}"
+        assert key in columns, f"review_runs has no column for {key}"
+        assert key not in DROPPED_BY_DESIGN, f"{key} is exempted rather than stored"

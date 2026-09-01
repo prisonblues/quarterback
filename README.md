@@ -192,13 +192,16 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, rules_dropped]
                                                                     [, provenance_restored_dropped]
                                                                     [, since_sha_dropped]
+                                                                    [, harness_rev_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards,
                                                                   unread_files as a count,
                                                                   + scope/since_sha/fix_range_source,
-                                                                  what each round measured)
+                                                                  what each round measured,
+                                                                  + harness_rev/dirty/digest,
+                                                                  which harness read it)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance
@@ -206,7 +209,9 @@ GET   /review/{id}                                              (scorecards + fi
                                                                  + review_panel, the dials it ran under
                                                                  + rules, which layer set each of them
                                                                  + provenance_restored, what it did
-                                                                   not attribute)
+                                                                   not attribute
+                                                                 + harness_path, where that harness
+                                                                   ran from)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
@@ -1083,6 +1088,33 @@ the round actually reviewed, which is what makes the stored `diff_chars` compara
 The two objects are opaque JSONB on `GET /review/{id}`, refused whole rather than trimmed. The
 three scalars ride `GET /reviews` too, on `merge_base`'s rule: a recalibration reads a population
 and slices it on these, and detail-only would mean one fetch per run.
+
+**And which HARNESS produced the round (#112).** Everything above says how a round was configured
+and what its numbers were measured against; nothing said what RAN it. `.harness-rules` argues at
+length that an unpinned reviewer MODEL makes "codex found more than claude" unattributable and
+pins three of the four seats for it — while the harness itself was unpinned, unrecorded, and
+changes far more often than a vendor slug. On 2026-08-31 six merges changed `round_stop`,
+`converged`, the `fix_injection` accounting and `restored_lines` in a day, and the deployed panel
+on one host was rebuilt underneath a running session: two rounds of one cycle, read by different
+machinery, indistinguishable in the record that the r1 → r2 comparison is drawn from.
+
+Four fields, because from inside a running panel the question has no single true answer —
+`qb-doctor`'s `check_harness` says as much about the same problem, and settles for content as a
+PROXY because the truthful answer is in a flake pin no harness script can reach:
+
+| field | what it is | when it is null |
+|---|---|---|
+| `harness_rev` | the commit of the checkout it ran from. **Authoritative** | every installed harness — the nix store is not a checkout — and any copy the containing repo does not track |
+| `harness_dirty` | whether that checkout carried changes the rev does not | no rev, or nobody could ask |
+| `harness_digest` | `loops-sha256-1:<hex>` over the loop modules. **A proxy**: it cannot name a version, only answer "same code or not" | the directory could not be read |
+| `harness_path` | where it ran from. **A locator** — for a nix install also an exact build identity, and the only field that says a round did NOT come from the deployed harness | the panel did not say |
+
+Stored verbatim: this board has no checkout of the harness to resolve a rev against, does not
+recompute a digest and does not parse a store path. The first three ride `GET /reviews`, because
+what a recalibration groups a population by must not cost one fetch per run; the path is
+detail-only. There is deliberately no release NUMBER among them — `package.nix` ships no
+`pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
+a merge, so a running harness has none to report and a branch's harness never had one.
 
 ## Releases
 
@@ -2393,6 +2425,9 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
   test_review_provenance_working.py  what a stored count was measured against —
                    rules, provenance_restored, fix_range_source, scope,
                    since_sha — round-tripped and refused (#647)
+  test_review_harness_identity.py    which harness produced the round —
+                   rev/dirty/digest/path, what each says and what each cannot,
+                   and the NUL a text column refuses (#112)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)

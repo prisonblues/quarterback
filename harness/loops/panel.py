@@ -928,7 +928,14 @@ def _payload_defaults() -> dict:
     payload too: a consumer reading `payload['judged']` or `payload['run_key']`
     should not have to know which exit produced it. It used to be a hand-written
     literal of nine keys against this one's two dozen, so the skipped PR — the
-    case that payload exists FOR — was the one that raised KeyError."""
+    case that payload exists FOR — was the one that raised KeyError.
+
+    The harness identity (#112) is read from a value `panel_core` resolved AT
+    IMPORT, rather than measured at each of the four exits: a payload is written
+    after the review, so a harness rebuilt in between would otherwise be recorded
+    as the one that produced the round — which is the event the field exists to
+    make visible, not one it should be able to hide inside."""
+    harness = harness_identity()
     return {
         # Where this round's wall clock went (#192). None means the run never got
         # far enough to say — the same distinction every other key here draws, and
@@ -1116,6 +1123,22 @@ def _payload_defaults() -> dict:
         # repo have when it refused" is exactly the question a refusal raises. Null
         # only as the shape a caller building a payload by hand would leave.
         "rules": None,
+        # WHICH HARNESS produced this round (#112). On every payload including the
+        # ones that reviewed nothing, and for `rules`' reason turned up one level:
+        # a refusal was still produced by a version of this code, and #39 and #40
+        # are about reviewers reporting harness defects — from other repos, where
+        # the harness version is least knowable and most likely to be old.
+        #
+        # Four fields because not one of them is true in every case, and
+        # `panel_core.harness_identity` says which is authoritative (`rev`, when it
+        # is not null) and which are proxies (`digest`, `path`). The whole point of
+        # recording them is that a cycle's r1 -> r2 comparison — which every stop
+        # argument here rests on — currently ASSUMES both rounds were read by the
+        # same machinery, and nothing in the record could check it.
+        "harness_rev": harness["rev"],
+        "harness_dirty": harness["dirty"],
+        "harness_digest": harness["digest"],
+        "harness_path": harness["path"],
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
