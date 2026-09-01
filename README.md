@@ -192,6 +192,9 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, rules_dropped]
                                                                     [, provenance_restored_dropped]
                                                                     [, since_sha_dropped]
+                                                                    [, nul_replaced]
+                                                                    [, nul_paths_dropped]
+                                                                    [, nonfinite_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
@@ -1083,6 +1086,33 @@ the round actually reviewed, which is what makes the stored `diff_chars` compara
 The two objects are opaque JSONB on `GET /review/{id}`, refused whole rather than trimmed. The
 three scalars ride `GET /reviews` too, on `merge_base`'s rule: a recalibration reads a population
 and slices it on these, and detail-only would mean one fetch per run.
+
+**And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
+A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;
+`json.loads` accepts all four, so a round carrying one passed every validator and 500ed at the
+INSERT — which the panel records as "the board did not answer", indistinguishable from a board that
+was down. #643 and #647 fixed three fields each in its own validator; a probe found the same 500 in
+twenty-eight other places. It is now one pass over the whole body, and the answer differs by what
+the value is FOR:
+
+* a **path** — `unread_files`, `changed_files[].path`, a finding's `file`, the removed convention
+  files — is **dropped**, because each is matched by exact string and a marked path is not a
+  shorter path but a different file that matches nothing forever;
+* an **opaque policy record** (`review_panel`, `rules`, `provenance_restored`) keeps its
+  **whole-object refusal** and the pass does not reach inside it: half a dial set is not a smaller
+  policy but one no round ran under;
+* **everything else** — prose, names, identities, vocabulary words, mapping keys — keeps its value
+  with the NUL replaced by `␦`, the mark `_echo` has always used on the way out, because storing
+  nothing loses a reviewer's account and an unmarked strip is a silent edit of evidence;
+* a **non-finite number** becomes NULL, "nobody said";
+* and **nothing is a 422**, because refusing the request loses the findings, the scorecards and the
+  accounts along with the byte. `repo` is the exception and already was one: it is the row's
+  identity, and a marked spelling would be a second repository nothing ever asks about.
+
+All of it is reported by dotted position under `nul_replaced`, `nul_paths_dropped` and
+`nonfinite_dropped`. `POST /review/outcomes` has the same defect and the opposite remedy — the item
+is **refused** and the reason names the field — because its rule is that a fixer recording an
+outcome can simply be told, where the panel cannot be failed over the board being fussy.
 
 ## Releases
 
@@ -2393,6 +2423,10 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
   test_review_provenance_working.py  what a stored count was measured against —
                    rules, provenance_restored, fix_range_source, scope,
                    since_sha — round-tripped and refused (#647)
+  test_review_unstorable_values.py   a NUL or a NaN in every position a caller
+                   can put one, and which of drop / mark / refuse each gets (#646)
+  test_outcome_unstorable_values.py  the same class on POST /review/outcomes,
+                   where the item is refused and named instead (#646)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)
