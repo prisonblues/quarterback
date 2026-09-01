@@ -1365,6 +1365,7 @@ python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
     --escalated <the key the fixer's escalated ID maps to> \
     --escalated-from-board \
     --narrowed <the key each of the fixer's NARROWED IDs maps to> \
+    --declined <key>:<budget|premise|scope|refuted> \
     --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
     --json-file /tmp/tmp.AbC123/r<r>.json
 ```
@@ -1441,6 +1442,54 @@ fix, wearing the cycle instead of the brief. Three things about it that are NOT
   direction; what it does not do is announce itself, so a caller who believes it declared
   a narrowing watches the round it meant to end run anyway with nothing on screen saying
   why. The note is there. An ID or a title in place of a key is the usual cause.
+
+**`--declined` is the third register, and it is the one that stops the loop paying
+twice (#665).** A fix pass that identifies a correction and does not make it is
+already recording that in §4b — a `deferred` row under roads (1) or (2), or a
+`refuted` one. Until now that record went nowhere the loop could read: on a real
+cycle a pass declared two corrections it could not pay for under the growth
+ceiling, and the round after it spent its own budget rediscovering one of them and
+reported it as a fresh finding. Pass the same keys forward:
+
+```
+    --declined <key>:budget      # a ceiling the fix did not fit under
+    --declined <key>:premise     # an assumption the pass could not decide
+    --declined <key>:scope       # a repair that would open files this change never touched
+    --declined <key>:refuted     # the pass disagreeing with the finding on the merits
+```
+
+Same argument shape as `--escalated` — keys from §4b's `jq`, repeatable,
+deduplicated, refused outside a cycle — and it **is** inherited through
+`--baseline`, so pass a key on the round after the pass that declined it and let
+the register carry it from there. The reason word is not decoration: it is what
+the next round's reader is briefed off, and "priced out" and "I think this finding
+is wrong" call for opposite next moves. A word this loop does not recognise is
+recorded as `unstated` and named in `config_notes` — the declaration survives, the
+adjective does not.
+
+**It loosens NOTHING, which is the point of it.** The finding stays outstanding,
+stays counted at every one of `round_stop`'s four rules, stays a fix pass's work,
+and still buys another round exactly as it did — this is not a second
+`--escalated`. What it changes is what the round can CLAIM: a finding matching an
+inherited declaration is marked 🧾 and reported `new_this_round: false`, because an
+earlier round already raised it and calling it news overstates what this round
+found; and a cycle that ENDS with declarations on the record takes a veto line and
+cannot report `converged: true`. Landing with a known-unfixed defect is allowed;
+landing with one while calling the cycle clean is not.
+
+**The register does not retract, and a `refuted` declaration is an argument you
+should have.** There is no un-decline: a correction genuinely made in a later pass
+goes on costing the cycle its `converged` until the cycle ends, which is the
+conservative direction and #617's `--new-cycle` is the clean start for a PR that
+has actually had the work done. And a pass that declines everything buys itself
+nothing — every declaration is a veto against the cycle it is in, so the flag
+cannot be gamed in the direction the fixer would want.
+
+**A cycle that ends holding declarations reaches the board.** The round that ends
+it posts one `needs-human` `decision` naming the keys, their rounds and their
+reasons, so the PR lands with its known-unfixed defects named rather than with a
+`config_notes` line nobody reads. Its answers are a person's: raise the ceiling,
+widen the scope, argue with the fixer, or accept the defect.
 
 **A stop that is HOLDING an escalation is never convergence — and that is
 narrower than "the cycle can never converge with a question open".** When the

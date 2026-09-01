@@ -79,6 +79,14 @@ DROPPED_BY_DESIGN = frozenset({
     # rounds, and the board stores the round's OUTCOME rather than its working.
     "escalated",            # key -> the round an escalation was first declared in
     "acknowledged",         # key -> the round an unverifiable claim was accepted in
+    # #665. The register itself is the next ROUND's input, exactly as the two above
+    # are, and it is dropped here for their reason. What this board keeps of it is
+    # the verdict: `round_stop.declined_outstanding` rides the stored stop, and a
+    # cycle ending with declarations outstanding is already unable to store
+    # `converged: true`. The named defects reach the board separately, as a
+    # `needs-human` post (`panel.announce_declinations`), which is where a question
+    # for a person belongs rather than on a review row nobody queries by it.
+    "declined",             # key -> {round, reason} a fix pass could not make it
     "unresolved_claims",    # #547's ledger, per claim
     "new_finding_keys",     # the keys behind `new_findings`, which IS stored
     "prior_rounds",         # derivable from this board's own rows for the cycle

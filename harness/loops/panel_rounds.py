@@ -238,6 +238,75 @@ def _key_gist(value: object, limit: int = 24) -> str:
     return (flat[:limit] + "…" if len(flat) > limit else flat) or "(empty)"
 
 
+#: Why a fix pass did not make a correction it had already identified (#665).
+#:
+#: Four words, and they are the four ways a pass can END UP not writing a patch it
+#: knows is owed. `budget` is a ceiling — the growth cap, a line budget, a token
+#: cap — where the pass agrees the fix is right and cannot afford it. `premise` is
+#: #84/#491's case arriving one step earlier: the fix rests on an assumption the
+#: pass cannot decide. `scope` is a correction that would open files the change
+#: never touched, which #619 measures and #624 records. `refuted` is the pass
+#: disagreeing with the finding on the merits.
+#:
+#: A CLOSED vocabulary, and the reason is what the word is FOR. The register's
+#: whole job is that the next round does not pay to rediscover the fact, and the
+#: next round's reader is briefed off these words: "priced out" and "I think this
+#: finding is wrong" call for opposite next moves. An open vocabulary would let a
+#: fixer write a sentence, and a sentence is exactly the prose the loop already
+#: throws away.
+#:
+#: An unrecognised word is NOT a rejected declaration — see
+#: :func:`declination_or_none`. Losing the declaration to keep the vocabulary
+#: clean would be the bug this issue is about, committed in the name of the fix.
+DECLINE_REASONS: tuple[str, ...] = ("budget", "premise", "scope", "refuted")
+
+#: What a declaration carrying no usable reason word is recorded as. A real value
+#: in the register and not a null: the FACT is that a pass declined a correction,
+#: and that fact is worth inheriting whether or not the word beside it survived.
+DECLINE_UNSTATED = "unstated"
+
+
+def declination_or_none(value: object) -> tuple[str, str, str] | None:
+    """Read one ``KEY:REASON`` declaration — ``(key, reason, problem)``, or None.
+
+    ``None`` is returned for one failure and one only: the KEY half is not the
+    shape of a finding key. That is the one half the register cannot do without,
+    because a declaration nothing can be joined to is a row that matches no
+    finding for the rest of the cycle while its caller reads the silence as the
+    declaration having landed — the same failure ``--escalated`` and
+    ``--acknowledge`` are both checked at the door for.
+
+    The REASON half is different in kind and is treated differently on purpose.
+    A missing or unrecognised word is recorded as :data:`DECLINE_UNSTATED` and
+    NAMED in ``problem``, never dropped: this whole register exists because a
+    fact one actor established was thrown away, and throwing the same fact away
+    over its adjective would be that bug committed by the fix for it. What the
+    refusal protects is narrower — the word is briefed to the next round's fixer
+    and posted to the board, so a word nobody recognises must not travel as
+    though a fixer had said it.
+
+    ``:`` splits at the FIRST occurrence. A key is hex and cannot contain one, so
+    everything after it is the reason however many more it holds — and a caller
+    that pasted ``key:budget:whatever`` gets ``budget:whatever`` refused as a
+    word rather than silently read as ``budget``."""
+    raw = str(value)
+    key, _, reason = raw.partition(":")
+    if not _is_key(key):
+        return None
+    word = reason.strip().lower()
+    if word in DECLINE_REASONS:
+        return _key_norm(key), word, ""
+    return (_key_norm(key), DECLINE_UNSTATED,
+            (f"`{_key_gist(reason)}` is not one of {', '.join(DECLINE_REASONS)} — "
+             f"the declaration was recorded with no reason (`{DECLINE_UNSTATED}`), "
+             "so the next round inherits the defect but not what priced it out")
+            if reason.strip() else
+            (f"carries no reason — the declaration was recorded as "
+             f"`{DECLINE_UNSTATED}`, so the next round inherits the defect but not "
+             f"why it was left. Pass KEY:REASON, where REASON is one of "
+             f"{', '.join(DECLINE_REASONS)}"))
+
+
 def _defect_title(reports: list[Finding]) -> str:
     """The reporters' own words that identify the defect: the lexicographically
     first of their titles, so it does not move with report ordering, with which
@@ -1117,6 +1186,44 @@ def _same_words(a: str, b: str) -> bool:
 TREND_SEVERE = "P2"
 
 
+@dataclass(frozen=True)
+class Declination:
+    """A correction a fix pass identified and did not make (#665).
+
+    The third register that travels between rounds on the baseline payload, and
+    the only one of the three whose value is a PAIR rather than a round number.
+    ``escalated`` (#221) and ``acknowledged`` (#547) each record that an act
+    happened; this records that an act did NOT happen, and "why not" is the half
+    that stops the next round paying to rediscover it — a defect the pass could
+    not afford and a defect the pass thinks is not real want opposite next moves,
+    and a bare key cannot tell them apart.
+
+    Frozen, because it is inherited: a later round holding a reference to an
+    earlier round's declaration must not be able to re-word it in place."""
+
+    #: The round whose fix pass declared it. Earliest wins on a merge, for the
+    #: reason the cycle id does — a caller re-passing a key it inherited must not
+    #: re-date the declaration to now.
+    round: int
+    #: One of :data:`DECLINE_REASONS`, or :data:`DECLINE_UNSTATED` where the
+    #: declaration arrived without a word this loop recognises. Never null: see
+    #: :func:`declination_or_none` on why the fact outlives its adjective.
+    reason: str
+
+    def as_dict(self) -> dict:
+        """The payload shape — an OBJECT, where the two older registers serialise
+        a bare int.
+
+        A second parallel register keyed the same way (``declined`` plus
+        ``declined_reasons``) was the cheaper diff and was rejected: it is the
+        same answer written twice with two chances to disagree, and the two halves
+        would be merged by different code on every baseline read. Nesting keeps
+        one entry indivisible, and :func:`_inherit_declined` still reads a bare
+        int as "the round, reason unstated" so a hand-written baseline and a
+        payload from before the reason existed both load."""
+        return {"round": self.round, "reason": self.reason}
+
+
 @dataclass
 class RoundTrend:
     """One earlier round as the cross-round trend block reads it (#490).
@@ -1609,6 +1716,29 @@ class Baseline:
     #: question to the same person every round, which is the permanent HOLD this
     #: register exists to end, arriving one round later and wearing a discharge.
     acknowledged: dict[str, int] = field(default_factory=dict)
+    #: Corrections an earlier round's fix pass identified and did NOT make
+    #: (``--declined``, #665), mapped to the round and the reason each was first
+    #: declared under.
+    #:
+    #: Inherited for the reason its two siblings above are, and the reason is
+    #: different again. An escalation and an acknowledgement each record something
+    #: a HUMAN did outside the loop; this records something one of the loop's own
+    #: actors decided it could not do — and the loop then threw the decision away.
+    #: Observed live: a fix pass declared two corrections it could not pay for
+    #: under the growth ceiling, the declaration went nowhere, and the next round
+    #: spent its own budget rediscovering one of them (``classify()``'s now-wrong
+    #: KEEP reason) and reported it as a fresh finding. The information existed,
+    #: the fixer was honest about it, and the cycle paid twice.
+    #:
+    #: **It subtracts from nothing.** ``escalated`` is a filter in front of all four
+    #: stop rules; this is not a filter at all. A declined finding is still
+    #: outstanding, still counted at every rule, still handed to the next fix pass,
+    #: and still blocks a stop exactly as it did before — the register can only ever
+    #: ADD a veto line and take a cycle's claim of clean convergence away. That is
+    #: what makes it un-gameable by the one actor that writes it: there is no
+    #: declaration a fixer can make that buys it a smaller round, a bigger budget or
+    #: an easier stop.
+    declined: dict[str, Declination] = field(default_factory=dict)
     #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
     #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
@@ -1814,6 +1944,77 @@ def _inherit(into: dict[str, int], raw: object, was: int, path, problems: list[s
                 "declaration's")
         first = when if ok else was
         into[key] = min(first, into.get(key, first))
+
+
+#: What a cycle loses when a `declined` register cannot be read. Written out once
+#: rather than inline, because :func:`_inherit` takes it as a sentence and the
+#: reason has to be the same one in every branch that reports a failure.
+DECLINED_COST = ("a correction an earlier fix pass already declared it could not "
+                 "make is rediscovered from scratch, and reported as a fresh finding")
+
+
+def _inherit_declined(into: dict[str, Declination], raw: object, was: int, path,
+                      problems: list[str]) -> None:
+    """Read the `{key: {round, reason}}` register out of a baseline payload (#665).
+
+    **The key and the round half go through :func:`_inherit` and are not
+    re-implemented here**, which is that function's own rule applied to a third
+    caller: the half that matters is the failure handling — an unreadable
+    container, a key of the wrong shape, a round outside the cycle — and a third
+    copy of it is a third chance for one copy to silently stop matching the
+    others. Everything below the call is the half `_inherit` cannot have, because
+    it is the half no other register carries.
+
+    A value that is not an object is read as the ROUND alone, exactly as
+    `_inherit` reads a bare list: a hand-written baseline saying ``{"abc…": 2}``
+    means "round 2 declared this", and the reason is simply not known. It is
+    recorded :data:`DECLINE_UNSTATED` and not reported, because nothing went
+    wrong — the payload never claimed to carry a word.
+
+    A reason word this loop does not recognise IS reported, and the entry is still
+    inherited under :data:`DECLINE_UNSTATED`. Dropping it would lose a defect over
+    its adjective, which is the failure this whole register exists to stop; and
+    passing the word through would put a string no vocabulary contains into the
+    next round's brief and onto the board, wearing a fixer's authority.
+
+    Earliest round wins a collision across baselines, and the earliest round's
+    REASON travels with it. The two cannot be merged separately without inventing
+    a declaration nobody made: round 2 said `budget`, round 3 re-declared the same
+    key as `scope`, and a register holding round 2's date beside round 3's word
+    would be a sentence neither pass wrote."""
+    rounds: dict[str, int] = {}
+    reasons: dict[str, object] = {}
+    flat: object = raw
+    if isinstance(raw, dict):
+        split: dict[object, object] = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                split[k] = v.get("round")
+                if _is_key(k):
+                    reasons[_key_norm(k)] = v.get("reason")
+            else:
+                # A bare round, from a hand-written baseline. `_inherit` judges
+                # it; nothing is claimed about a reason nobody sent.
+                split[k] = v
+        flat = split
+    _inherit(rounds, flat, was, path, problems, "declined", "the declaration",
+             _is_key, _key_norm, "the shape of a finding key", DECLINED_COST)
+    for key, when in rounds.items():
+        word = reasons.get(key)
+        if word is None:
+            word = DECLINE_UNSTATED
+        elif str(word).strip().lower() in DECLINE_REASONS:
+            word = str(word).strip().lower()
+        else:
+            problems.append(
+                f"baseline {path} declines {key} for `{_key_gist(word)}`, which is "
+                f"not one of {', '.join(DECLINE_REASONS)} — the declaration was "
+                f"inherited as `{DECLINE_UNSTATED}`, so the defect carries forward "
+                "and what priced it out does not")
+            word = DECLINE_UNSTATED
+        held = into.get(key)
+        if held is None or when < held.round:
+            into[key] = Declination(when, word)
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -2129,6 +2330,16 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                  lambda k: k.strip().lower(), "the shape of an obligation key",
                  "an unverifiable claim a human already accepted goes back to costing "
                  "the round its confidence and is put to them again next round")
+        # #665's register, the third of the shape and the only one whose entries
+        # are objects. Read through its own reader for the reason stated there:
+        # the key and the round go through `_inherit` above, and only the reason
+        # word — which no other register has — is judged here.
+        #
+        # It rides the same tolerant-and-loud rule as the two above, and the cost
+        # of losing it is the sharpest of the three because it is measurable: the
+        # cycle pays a second time for a fact one of its own actors already
+        # established, and books the second payment as a discovery.
+        _inherit_declined(b.declined, payload.get("declined"), was, path, b.problems)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -4554,6 +4765,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                trigger_floor: str = NO_SEVERITY_FLOOR,
                cleared_floor: str = NO_SEVERITY_FLOOR,
                narrowed: Iterable[str] = (),
+               declined: Iterable[str] = (),
                premises: dict | None = None,
                injection: dict | None = None,
                revert: dict | None = None,
@@ -4631,6 +4843,35 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     however Sonar graded it. **Escalations are still subtracted before every rule**,
     and so are ``narrowed`` keys — the filters run once, in front of all four, and
     this changes neither.
+
+    **``declined`` IS NOT A FILTER AND IS NOT A RULE (#665).** It is the register of
+    corrections an earlier fix pass identified and could not make, and it is the one
+    input to this function that changes no rule's answer. Nothing is subtracted for
+    it, nothing is exempted by it, and no branch below can be reached BECAUSE of it
+    that could not be reached without it. What it does is take a stop's claim to
+    have converged: a cycle ending with declarations on the record has not run out
+    of defects, it has run out of corrections anybody was willing to make, and those
+    two ending in the same word is how a PR lands with known-unfixed defects and a
+    clean verdict.
+
+    So it costs a veto line and it costs ``converged``, and it costs them only on a
+    STOP — on a ``go again`` the round is not claiming anything. The direction is
+    the one this whole register is bound by: it can make a verdict less confident
+    and never more, which is what makes it safe to be written by the actor it
+    reports on.
+
+    **Every declaration in the register counts, not only the ones this round raised
+    again**, and that is the one place it parts company with ``escalated``'s
+    ``blocking``. Bounding it to what the round raised was written first and is
+    wrong here: under the default `increment` scope a later round never re-reads the
+    file the declined correction was owed in, so the bound would silence the
+    register in exactly the case that motivated it — the quiet round after the pass
+    that declined. The cost of the wider rule is stated rather than hidden: nothing
+    RETRACTS a declaration, so a correction genuinely made in a later pass goes on
+    costing the cycle its confidence until the cycle ends. That is the conservative
+    direction (a defect nobody recorded as fixed reads as unfixed), it never adds a
+    round, and #617's ``--new-cycle`` is the clean start for a PR that has actually
+    had the work done.
 
     The cap is what stops rule 3 running forever when two reviewers disagree
     about a P2 — the cycle ends either way, and a cap reached with work
@@ -5260,7 +5501,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # A `dict` is deliberately NOT rejected: it iterates its keys, which is correct
     # and is what the production call site passes (the register itself).
     for name, value in (("repeated", repeated), ("escalated", escalated),
-                        ("narrowed", narrowed)):
+                        ("narrowed", narrowed), ("declined", declined)):
         if isinstance(value, str):
             raise TypeError(
                 f"round_stop({name}=...) takes a COLLECTION of finding keys, not one "
@@ -5352,6 +5593,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #: property of the round, and a payload that reported the first would go on
     #: crediting a narrowing long after the code moved.
     narrowed_cleared = answered & ({*new_keys} | {c.key for c in outstanding})
+    #: #665's register, and the only collection here that is NOT narrowed to the
+    #: keys this round raised. The docstring argues that at length; the short of it
+    #: is that `blocking`'s bound exists because an escalation waits on a human who
+    #: may have answered it since, while a declined correction waits on a fix pass
+    #: this cycle can see the output of — and under `increment` scope the round that
+    #: would have seen it never re-reads the file. Sorted where it is published, for
+    #: `escalated_outstanding`'s reason: the artifact's bytes must not move with the
+    #: order of the flags.
+    #:
+    #: Subtracted from nothing. It appears in no filter, in `cleared_out`, in
+    #: `work`, or in any of the four rules — the greps that would show otherwise are
+    #: the review this feature is owed.
+    unfixed = frozenset(k for k in declined if k)
     # The work a fix round can actually clear, under names of their own. The
     # subtraction happens ONCE, before the rules, because every rule below asks
     # "is there work outstanding" and an escalated finding is precisely work the
@@ -5506,6 +5760,26 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             "form declined"
             + (f", {len(loud)} of them at or above the {trigger_floor} round trigger "
                "floor" if loud else ""))
+    elif unfixed:
+        # #665, and the branch the issue asks for in as many words: a cycle ending
+        # with declarations outstanding has not converged, and must not read as a
+        # dry round. This is the case the register was filed over — the pass
+        # declined two corrections, the round after it re-read only the fix commit,
+        # found nothing, and would have reported "dry" over a defect one of its own
+        # actors had already written down.
+        #
+        # LAST in the chain, under every branch that names open work, on the chain's
+        # own rule that the most specific TRUE thing wins. Each branch above says
+        # what THIS round observed; this one says what an EARLIER round declared, and
+        # a live observation says more. It is above the dry branch, which is the only
+        # one it must never fall through to — and every round it catches would
+        # otherwise have landed there, because a declared finding this round raises
+        # again is a repeat and one of the branches above has it.
+        stop, reason = True, (
+            "nothing raised that an earlier round had not — but this cycle carries "
+            f"{len(unfixed)} correction(s) an earlier fix pass declared it could not "
+            "make, so it did not converge: it ran out of corrections anybody was "
+            "willing to make, which is not the same as running out of defects")
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -5721,6 +5995,22 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
                        "outstanding and no round can close them — a human answers "
                        "these, not another fix pass"]
+    # #665, and on the same "only on a STOP" rule as the two above. This is the
+    # whole of what the register costs, and it is deliberately the least it could
+    # cost: no rule changed its answer, no finding was subtracted, and the round
+    # went exactly as far as it would have gone. What it loses is `confident`, and
+    # with it `converged` — a cycle that ends holding a correction its own fix pass
+    # said it could not make is not a clean finish, and until this line the payload
+    # had no way to say so.
+    #
+    # Says the reasons out loud, because the word is what a reader acts on: a
+    # correction priced out under a ceiling is a budget conversation, and a finding
+    # the fixer refuted is an argument with the panel. Both were "not fixed" before.
+    if unfixed and stop:
+        veto = [*veto, f"{len(unfixed)} correction(s) an earlier fix pass identified "
+                       "and declared it could not make are still on record for this "
+                       "cycle — this stop is the end of what the loop was willing to "
+                       "attempt, not the end of what it found (#665)"]
     # #505, and BEFORE #489's line for the reason the stop below it is applied first:
     # a reader coming down the veto list meets the count, then the attribution that
     # explains part of it. Unconditional for `injected`'s reason — `flat` is only ever
@@ -5960,6 +6250,17 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                f"{len(below_floor)} finding(s) are outstanding and every one is under "
                f"the {cleared_floor} cleared floor: the repo's own policy is that "
                "these are reported and not fixed here, so nothing is handed on (#165)")
+        # #665, appended rather than branching: the disposal is still `nobody` — a
+        # declined correction is by definition one no fix pass would take, so there
+        # is nobody in the loop to hand it to — but "nothing is outstanding" is not
+        # a true sentence to end on while the cycle holds one, and this branch's
+        # `why` is the sentence a relay repeats. The keys are in `outstanding.declined`
+        # beside it.
+        if unfixed:
+            why += (f". {len(unfixed)} correction(s) an earlier fix pass declared it "
+                    "could not make are still on record: nothing in the loop takes "
+                    "them, so they land with the PR unless a human decides otherwise "
+                    "(#665)")
     # Computed here rather than inline in the payload so that `converged` below is
     # built FROM it and cannot drift out of step with it: a capped or vetoed stop is
     # then unable to read as a clean finish by construction rather than by two
@@ -5975,6 +6276,11 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # question wants the second. Sorted, so a round that declares the same set
         # twice writes the same bytes and a diff means something changed.
         "escalated_outstanding": sorted(blocking),
+        # #665's register as this round was given it, sorted for
+        # `escalated_outstanding`'s reason. Not narrowed to the keys this round
+        # raised — the docstring argues why, and the field name says "the cycle's",
+        # which is what it is.
+        "declined_outstanding": sorted(unfixed),
         # What this ROUND cleared narrowly (#615), on `escalated_outstanding`'s terms:
         # the register it was given, narrowed to the keys this round raised. These are
         # the findings that did NOT count at any rule and are not in `outstanding`
@@ -6012,8 +6318,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # a cycle that ended with real findings unfixed by policy as a clean finish.
         # False here costs such a round nothing; a false TRUE would be the one reading
         # this field exists to make impossible.
+        # `unfixed` is already carried by `confident` through the veto line above,
+        # and it is named here as well for the reason `blocking` is: this flag is
+        # what the epic is judged on, and a reader checking it against the payload
+        # must be able to see every conjunct rather than reconstruct one from a veto
+        # string. The two cannot disagree — both read the same local.
         "converged": bool(confident and not fixable and not below_floor
-                          and not blocking),
+                          and not blocking and not unfixed),
         "veto": veto,
         "round": round_no,
         "max_rounds": max_rounds,
@@ -6191,6 +6502,13 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             # against this block would find them nowhere and read the gap as a
             # dropped finding rather than as a fixer's declared decision.
             "narrowed": sorted(narrowed_cleared),
+            # #665. In this block for the reason `escalated` and `narrowed` are: it
+            # is the whole answer to "who gets what is left", and a known-unfixed
+            # defect is left to whoever lands the PR. It is not a fourth disposal —
+            # a declined finding that is still outstanding is in `fixable` too, and
+            # that is not double counting: `fixable` says a fix pass COULD take it,
+            # this says a fix pass already looked at it and said it would not.
+            "declined": sorted(unfixed),
             # null on a `go again`, where no disposal is being made; otherwise
             # `fixer`, `human` or `nobody`. `why` is the sentence a relay repeats.
             "handed_to": handed_to,
@@ -6208,6 +6526,7 @@ __all__ = [
     "_fold_reports", "_NOT_WORD", "_norm_title", "_key_from_title",
     "_defect_title", "_defect_key", "_finding_id", "Canonical",
     "_KEY_RE", "_key_norm", "_is_key", "_key_gist",
+    "DECLINE_REASONS", "DECLINE_UNSTATED", "declination_or_none", "Declination",
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "MAX_RECURRENCE_FINDINGS", "RECURRENCE_TITLE_CHARS", "recurrence_brief",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
@@ -6215,7 +6534,7 @@ __all__ = [
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
     "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
     "_introduced", "_trend_row",
-    "_inherit", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
+    "_inherit", "DECLINED_COST", "_inherit_declined", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
     "CI_NOT_APPLICABLE", "round_stop",
     "CLAIM_KEY_PREFIX", "CLAIM_KEY_RE", "_claim_norm", "claim_key",
     "is_claim_key", "Obligation", "CoverageRuling", "_coverage_ruling",
