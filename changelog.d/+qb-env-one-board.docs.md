@@ -17,9 +17,25 @@ distinction is the thing worth leaving behind for whoever reads this next and re
 Two contract lines were stale in the same way. `QUARTERBACK_TOKEN_CMD` described the
 per-site sources by naming the hosts (`the token file on daedalus, an ssh fetch on
 sisyphus`) rather than the shapes; it now names the shapes, which is what a reader of a
-published harness can act on. And `QUARTERBACK_TOKEN_REFRESH_CMD` gains the case that
-now exists in the wild: a bearer a human copied onto a box has nothing behind it to
-re-mint from, so the refresh is deliberately left unset and a 401 stands until somebody
-acts.
+published harness can act on.
+
+`QUARTERBACK_TOKEN_REFRESH_CMD` gains the case that now exists in the wild — a bearer a
+human maintains as a file — and a first draft of this documented it wrongly, which is
+worth recording since the wrong version is the intuitive one. Leaving the refresh unset
+does NOT mean a 401 stands until somebody intervenes: the unset value defaults to
+`TOKEN_CMD`, so the 401 re-reads the file. Unchanged, and the refresh fails, correctly,
+because there is nothing new to present. Re-dropped since the session began, and the
+new bearer is picked up in place with no restart. The real limit is "cannot be re-minted
+without a human", not "cannot be refreshed", and the two are easy to conflate.
+
+One further correction, to a claim that predates this change. The header said
+"Environment beats the config file throughout". It does for `QUARTERBACK_TOKEN` and an
+explicit `QUARTERBACK_AGENT`, both resolved through functions that check first — and it
+does not for the plain assignments, because `qb_load_config` sources the file and a
+sourced `VAR=value` overwrites the caller's export. So a one-shot
+`QUARTERBACK_BASE_URL=... qb ...` is silently ignored on any host that has a config.
+Verified rather than reasoned about. The header now says which half is true; the fix is
+a behaviour change for every consumer (`: "${VAR:=...}"` in the rendered config flips
+who wins) and wants its own decision rather than riding along in a docs commit.
 
 Comments only — no behaviour change.

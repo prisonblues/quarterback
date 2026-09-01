@@ -39,10 +39,14 @@
 #                          rotation just returns the same stale bearer, so the refresh
 #                          has to go past the cache to the source of truth. Defaults
 #                          to TOKEN_CMD, which is right wherever that already reads
-#                          the authoritative copy. Leave it unset where nothing can
-#                          re-mint — a hand-dropped file has no source behind it — and
-#                          the refresh is a no-op, so a 401 stands until a human acts.
-#                          That is the honest outcome rather than a fake success.
+#                          the authoritative copy — including a site whose bearer is a
+#                          file a human maintains. There the 401 re-reads that file:
+#                          unchanged, and the refresh reports failure, which is
+#                          correct because there is nothing new to present; re-dropped
+#                          since the session started, and the new value is picked up in
+#                          place with no restart. So "cannot be re-minted without a
+#                          human" is the real limit, NOT "cannot be refreshed" — and
+#                          leaving this unset is how you ask for that behaviour.
 #   QUARTERBACK_REPO       checkout holding mcp/ (for qb-mcp's venv).
 #   QUARTERBACK_AGENT      this machine's name in the token file. Defaults to hostname.
 #   QUARTERBACK_HUMAN_URL  optional; the BROWSER vhost, where a person is authenticated at
@@ -64,8 +68,20 @@
 #                          value-or-command shape as QUARTERBACK_TOKEN, and resolved the
 #                          same way; unset means those two tools refuse and say so.
 #
-# Environment beats the config file throughout, so a single invocation can override
-# any of it without editing anything.
+# Environment beats the config file for the two things resolved through a function —
+# QUARTERBACK_TOKEN short-circuits qb_resolve_token, and an explicit QUARTERBACK_AGENT
+# is passed through untouched.
+#
+# IT DOES NOT for the plain assignments. qb_load_config sources the config file, and a
+# `VAR=value` line in a sourced file overwrites whatever the caller exported — so
+# `QUARTERBACK_BASE_URL=... qb ...` is silently ignored on any host that has a config,
+# which is every host that works at all. Measured, not inferred.
+#
+# Left as-is rather than fixed in a docs change, because the fix is a behaviour change
+# to every consumer and wants its own decision: the config would have to assign only
+# into unset variables (`: "${VAR:=...}"`), and that flips which side wins for anyone
+# currently relying on the file. Recorded here so the next person to try an
+# override knows it is the code that is wrong and not their shell.
 
 QB_CONFIG="${QUARTERBACK_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/quarterback/config}"
 
