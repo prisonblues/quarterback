@@ -1154,6 +1154,10 @@ def _payload_defaults() -> dict:
         # the round that inherits it never has to tell "this cycle declined nothing"
         # from "this payload predates the register".
         "declined": {},
+        # #674's, beside the register it cancels and for the same reason the three
+        # above are here: a round that inherits this must never have to tell "nothing
+        # was retracted" apart from "this payload predates the key".
+        "retracted": {},
         "sonar_gate": "skipped",
         "ci_status": "unknown",
         "ci_failing": [],
@@ -1572,7 +1576,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         #
         # Keeping new flags last and keyword-only is what makes the block safe to
         # extend past all five.
-        no_pr_claim: bool = False) -> int:
+        no_pr_claim: bool = False,
+        # #674's retractions. Last, for the reason the parameter above it is last and
+        # for the one #687 corrected: five of this signature's boundaries are already
+        # type-silent, so an insertion anywhere inside the positional block can be
+        # swallowed by the one caller that passes twenty of them by position. New
+        # flags go on the end and get named at the call site.
+        retract: list[str] | None = None) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -2039,6 +2049,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # answer here as there. Both halves are deterministic given an argv; neither
         # is independent of it.
         unmade.setdefault(key, why_not)
+
+    # `--retract` (#674), at the same door as the four above and taking a BARE key,
+    # because a retraction has nothing to say about why: the reason lives on the
+    # declination it cancels and the whole point is that the declination is no longer
+    # owed. Refused rather than noted on a bad key, on `--declined`'s rule — a
+    # retraction that matches nothing leaves the veto standing while its caller reads
+    # the silence as the PR having been unblocked, and that silence is expensive here
+    # because what it withholds is a landing.
+    pulled: set[str] = set()
+    for raw in retract or []:
+        text = str(raw).strip().lower()
+        if not _is_key(text):
+            notes.append(
+                f"--retract `{_key_gist(raw)}` is not the shape of a finding key "
+                "(8-64 hex characters) — it was ignored, so any declination it meant "
+                "to lift is still on record and still holds an earned stop")
+            continue
+        pulled.add(text)
 
     # Progress goes to stderr in --json mode, so stdout is the payload and only
     # the payload: it is a machine-readable artifact, and a consumer that has to
@@ -3856,9 +3884,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # re-passing an inherited key must not re-date it to now. Sorted, so the
     # payload's bytes do not move with the order of the flags or of the baseline
     # reads.
+    # #674's retractions, inherited first so a round that does not re-pass the flag
+    # still honours one an earlier round recorded. `prior` wins the collision on the
+    # same rule the registers themselves use: the earliest round that retracted owns
+    # the date, and re-passing a key must not re-date it to now.
+    retracted_held = dict(sorted({**{k: round_no for k in pulled},
+                                  **prior.retracted}.items()))
+    # SUBTRACTED HERE, once, before anything reads the register. Every consequence of
+    # a declination — `is_new` moving the key into `repeated`, `declined_outstanding`,
+    # the veto that costs the stop its `confident`, and through that a `preland
+    # --require-earned-stop` HOLD — hangs off `declined_held`, so lifting the key here
+    # lifts all of them together and none of those call sites needs to learn a second
+    # register exists. A retraction that names no declination changes nothing and is
+    # reported below rather than silently doing nothing.
     declined_held = dict(sorted({**{k: Declination(round_no, why_not)
                                     for k, why_not in unmade.items()},
                                  **prior.declined}.items()))
+    lifted = sorted(k for k in retracted_held if k in declined_held)
+    declined_held = {k: v for k, v in declined_held.items()
+                     if k not in retracted_held}
     seen_before: dict[str, bool] = {}
 
     def is_new(c: Canonical) -> bool:
@@ -4183,6 +4227,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "earlier round's payload carries — check the key, or the "
                      "baseline it should have come in on. The declaration is still "
                      "recorded and inherited, and it matches nothing")
+
+    # #674's two, and they are the pair `--declined`'s own notes are: one says the
+    # retraction did something, the other says it did not. The second matters more.
+    # A key typed at `--retract` that lifts nothing leaves the veto standing and the
+    # PR unlandable on an earned stop, and the caller who typed it has every reason to
+    # believe the opposite — which is the same silence `--declined`'s bad-key refusal
+    # exists to prevent, arriving one flag later.
+    for key in lifted:
+        notes.append(f"--retract {key} lifted a declination an earlier fix pass "
+                     "recorded — the correction it named is no longer counted as "
+                     "outstanding, and it no longer costs this cycle its earned stop")
+    for key in sorted(k for k in retracted_held if k not in lifted):
+        notes.append(f"--retract {key} names no declination this cycle carries — "
+                     "check the key against the payload's `declined` register. "
+                     "Nothing was lifted, so any veto that was standing is standing "
+                     "still")
     # Not a defect and so not a declaration either: the master ruled this finding
     # not real, so there is no correction anybody owes. Said rather than corrected,
     # for the reason the escalated equivalent above gives — the other reading, a
@@ -5569,6 +5629,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # as `escalated` is, and it is the reason the next round does not pay to
         # rediscover a defect one of its own actors already wrote down.
         "declined": {k: d.as_dict() for k, d in declined_held.items()},
+        # key -> the round it was first retracted in, inherited by the next round the
+        # way `acknowledged` is. Emitted even when empty, so a reader can tell "nobody
+        # retracted anything" from "this payload predates #674".
+        "retracted": retracted_held,
         # On the finding, not only in the register beside it: this is what a
         # fixer's brief is built from, and §5's rule is that an escalated finding
         # is never handed to another fixer. On EVERY bucket, not just `to_fix`:
@@ -6817,6 +6881,19 @@ def main() -> int:
                          "act instead of a permanent HOLD. Per claim on purpose — "
                          "there is no flag that accepts them all. Repeatable, and "
                          "inherited by later rounds through --baseline")
+    ap.add_argument("--retract", action="append", default=[], metavar="KEY",
+                    help="a finding key whose DECLINATION no longer stands (#674): a "
+                         "correction an earlier fix pass recorded it could not make, "
+                         "which has since been made or was never owed. Lifting it "
+                         "stops the finding being counted outstanding and stops it "
+                         "costing the cycle its earned stop — which is what otherwise "
+                         "holds the PR under `preland --require-earned-stop`, since "
+                         "nothing in the loop retracts a declaration by itself. A "
+                         "HUMAN act on purpose: a fix pass saying it fixed the thing "
+                         "is the actor attesting to its own work (#622), and an "
+                         "absent finding is not evidence of a repair when the round "
+                         "never re-read the file. Repeatable, and inherited by later "
+                         "rounds through --baseline")
     ap.add_argument("--new-cycle", action="store_true", dest="new_cycle",
                     help="start a NEW panel/fix cycle on a PR whose last cycle the "
                          "board says was already ended (#617). Without it such a run "
@@ -6921,6 +6998,7 @@ def main() -> int:
                                    ("--narrowed", bool(args.narrowed)),
                                    ("--acknowledge", bool(args.acknowledge)),
                                    ("--declined", bool(args.declined)),
+                                   ("--retract", bool(args.retract)),
                                    # Refused rather than ordered, because the two are
                                    # different questions about one premise and the
                                    # answer to "which ran?" must not be a reading of
@@ -6973,7 +7051,8 @@ def main() -> int:
                                    ("--new-cycle", args.new_cycle),
                                    ("--narrowed", bool(args.narrowed)),
                                    ("--acknowledge", bool(args.acknowledge)),
-                                   ("--declined", bool(args.declined))) if used]
+                                   ("--declined", bool(args.declined)),
+                                   ("--retract", bool(args.retract))) if used]
         if wrong:
             raise SystemExit(
                 f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
@@ -7116,7 +7195,8 @@ def main() -> int:
                args.max_rounds, args.scope, args.since, args.force,
                args.no_code_access, args.escalated, args.escalated_from_board,
                args.narrowed, args.acknowledge, args.declined, args.premise_file,
-               args.new_cycle, no_pr_claim=args.no_pr_claim)
+               args.new_cycle, no_pr_claim=args.no_pr_claim,
+               retract=args.retract)
 
 
 if __name__ == "__main__":

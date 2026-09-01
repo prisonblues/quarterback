@@ -87,6 +87,13 @@ DROPPED_BY_DESIGN = frozenset({
     # `needs-human` post (`panel.announce_declinations`), which is where a question
     # for a person belongs rather than on a review row nobody queries by it.
     "declined",             # key -> {round, reason} a fix pass could not make it
+    # #674, and dropped for the same reason as the three above it: it is the next
+    # ROUND's input rather than this round's outcome. What the board keeps is the
+    # consequence — a retracted declination stops riding `declined_outstanding` and
+    # stops costing the stop its `confident`, both of which ARE stored — so the row
+    # already says whether the hold is lifted without carrying the register that
+    # lifted it.
+    "retracted",            # key -> the round a human retracted a declination in
     "unresolved_claims",    # #547's ledger, per claim
     "new_finding_keys",     # the keys behind `new_findings`, which IS stored
     "prior_rounds",         # derivable from this board's own rows for the cycle
