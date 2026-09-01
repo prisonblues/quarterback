@@ -5,8 +5,11 @@ with the browser and tmux calls stubbed, because a test that opened Chrome and
 moved the cursor of a live seat screen would be its own bug.
 
 SKIPPED unless the machine can actually run the dashboard: textual and the board
-client come from mcp/'s environment, and the fetches want a configured board. In
-CI today that means this skips; it is written to run where the thing itself runs.
+client come from mcp/'s environment. CI DOES run this file — `tests.yml` gives the
+dashboard step the `tui` extra precisely so it executes, and asserts a non-zero
+pass count so a silently-skipping module fails the build. What skips there is the
+handful of tests that want a configured board and a `gh`, which CI deliberately
+does not have.
 Two defects came out of it that hand-testing had passed:
 
   * a single click did nothing. DataTable treats a click on any row but the
@@ -117,7 +120,7 @@ pytestmark = pytest.mark.skipif(_NO_TUI is not None, reason=_NO_TUI or "")
 #: repo, so their row indices are a function of what the fleet happens to be doing
 #: while the suite runs — and this repo runs several agents that post to that board
 #: and open PRs against that repo at once. Three of the four failures anyone has
-#: recorded for this file are among these four tests, out of 103 in it.
+#: recorded for this file are among these four tests, out of 107 in it.
 #:
 #: The value being protected is what a green local suite MEANS. CI already has it:
 #: `tests.yml` runs the dashboard suites serially and with no board configured, so
@@ -130,8 +133,14 @@ pytestmark = pytest.mark.skipif(_NO_TUI is not None, reason=_NO_TUI or "")
 #: finding, and stubbing the data is how you keep the clicking and lose the point —
 #: the claim is that the dashboard works on the board as it really is. Ask for them
 #: by name: `QB_DASH_LIVE=1 pytest harness/tests/test_qb_dash.py`.
+#: Read as a switch and not as a string, because `bool("0")` is True and this file
+#: documents `QB_DASH_LIVE=1` in four places — so a reader who tried `=0` to turn the
+#: live tests OFF would have turned them on. That is `low_severity_fix_lines`' own
+#: lesson one repo over: every non-empty string is truthy in Python, `"false"`
+#: included, and a setting whose job is to gate something stops doing it.
+_LIVE_ON = os.environ.get("QB_DASH_LIVE", "").strip().lower() in {"1", "true", "yes", "on"}
 _NO_LIVE = _NO_BOARD or (
-    None if os.environ.get("QB_DASH_LIVE") else
+    None if _LIVE_ON else
     "live board/repo data is opt-in (#644): set QB_DASH_LIVE=1 to run these")
 needs_live_data = pytest.mark.skipif(_NO_LIVE is not None, reason=_NO_LIVE or "")
 
@@ -298,8 +307,12 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
 #:
 #: A count of READS, and stated precisely because the imprecise version is
 #: misleading: every unsuccessful read still costs a `pilot.pause(0.05)`, so this is
-#: also a wall-clock floor of 12s that STRETCHES under contention rather than a
-#: quantity independent of time. The old 60 was a 3s floor by the same arithmetic.
+#: also a wall-clock floor of ~11.95s that STRETCHES under contention rather than a
+#: quantity independent of time — 239 pauses and not 240, because the read that
+#: succeeds does not pause after itself. The old 60 was ~2.95s by the same arithmetic.
+#: The exact figure does not matter and the off-by-one is written down anyway: a
+#: comment that rounds in its own favour is how the rest of this file's false claims
+#: started.
 #:
 #: The distinction that survives is about what is guaranteed. A real deadline
 #: (`while time.monotonic() < start + N`) expires while the app is descheduled, so a
