@@ -3912,13 +3912,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the date, and re-passing a key must not re-date it to now.
     retracted_held = dict(sorted({**{k: round_no for k in pulled},
                                   **prior.retracted}.items()))
-    # SUBTRACTED HERE, once, before anything reads the register. Every consequence of
-    # a declination — `is_new` moving the key into `repeated`, `declined_outstanding`,
-    # the veto that costs the stop its `confident`, and through that a `preland
-    # --require-earned-stop` HOLD — hangs off `declined_held`, so lifting the key here
-    # lifts all of them together and none of those call sites needs to learn a second
-    # register exists. A retraction that names no declination changes nothing and is
-    # reported below rather than silently doing nothing.
+    # TWO VALUES, and the split is the correction to how this was first written.
+    # `declined_held` is the RECORD — every declaration the cycle has ever carried,
+    # retracted ones included — and it is what the payload emits, because a round that
+    # inherited a retraction whose declination had been filtered out of the payload
+    # matched nothing and reported it as a typo on every subsequent round.
+    # `live_declined` below is the READING of that record: the declarations still
+    # standing after retractions are applied, and it is what the five behavioural
+    # consumers take — `is_new` moving a key into `repeated`, `round_stop`'s
+    # `declined` argument, the two per-finding payload flags, and the report mark.
+    # Between them they carry every consequence a declination has, including the veto
+    # that costs the stop its `confident` and through it a `preland
+    # --require-earned-stop` HOLD.
+    #
+    # So nothing is subtracted from the record in place. What lifting a key changes is
+    # which of the two a consumer should be reading, and the rule for choosing is
+    # simple enough to state once: behaviour reads `live_declined`, history reads
+    # `declined_held`, and a consumer wanting both wants the second.
     declined_held = dict(sorted({**{k: Declination(round_no, why_not)
                                     for k, why_not in unmade.items()},
                                  **prior.declined}.items()))
@@ -4269,18 +4279,24 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "recorded and inherited, and it matches nothing")
 
     # #674's two, and they are the pair `--declined`'s own notes are: one says the
-    # retraction did something, the other says it did not. The second matters more.
-    # A key typed at `--retract` that lifts nothing leaves the veto standing and the
-    # PR unlandable on an earned stop, and the caller who typed it has every reason to
-    # believe the opposite — which is the same silence `--declined`'s bad-key refusal
-    # exists to prevent, arriving one flag later.
+    # retraction did something, the other says it did not. The second matters more,
+    # because a caller who typed a key and got silence has every reason to believe the
+    # PR was unblocked — the same silence `--declined`'s bad-key refusal exists to
+    # prevent, arriving one flag later.
+    #
+    # Stated carefully, because the first version of this comment was not: a key that
+    # lifts nothing does NOT leave "the veto" standing, since a key naming no
+    # declination has no veto of its own to leave. What it leaves standing is whatever
+    # the cycle was already holding, unchanged — which is the same disappointment for
+    # the caller and a different sentence, and the emitted notes say the latter.
     for key in lifted:
         notes.append(f"--retract {key} lifted a declination an earlier fix pass "
                      "recorded — the correction it named is no longer counted as "
                      "outstanding, and it no longer costs this cycle its earned stop")
     # SPLIT IN TWO, because "lifted nothing" has two causes and they want opposite
-    # actions. A key naming no declination at all is probably a typo and the veto is
-    # standing. A key whose declination was made AFTER the retraction is not a typo —
+    # actions. A key naming no declination at all is probably a typo, and nothing the
+    # cycle holds has changed. A key whose declination was made AFTER the retraction
+    # is not a typo —
     # it is a defect that recurred and a fix pass declined it afresh, and the right
     # answer is to look at the new declaration rather than to re-type the flag.
     for key in sorted(k for k in retracted_held
