@@ -634,6 +634,19 @@ about it are about two different issues numbered 42. A blocker naming a ref nobo
 still attaches to nothing and stays in the queue, which is correct — there is no plan row
 for it to hold up.
 
+**It is answered on the board, not on the plan page (#677).** The paragraph above is right
+about the plan, and for a while it was also the only route to an answer box — the board's
+`⛔ N waiting` chip was a link to `/plan/view`, and the plan page offers the box as a chip on
+a plan ROW. Compose the two and a blocker whose subject nothing plans is counted on the
+board, sent to the plan page by its own tooltip, and not on it. Self-perpetuating, too: the
+subject reaching a terminal state is exactly what closes the plan item, so the question
+became unanswerable at the moment it was answered in real life. The first five resolutions
+this table ever recorded were five agents withdrawing their own questions and not one
+person's answer. The chip now expands into the queue itself, with a box per row posting
+straight to `POST /blockers/resolve` — the board already reads every row from
+`GET /blockers?open=true`, so no plan row is in the path. The plan page keeps its chip: a
+question that IS holding a row up should be answerable on the row it is holding up.
+
 ### A suggested order, and the ledger it writes to (#232)
 
 "Only a human reorders it" is a rule about who may **write** the sequence. It left the fleet
