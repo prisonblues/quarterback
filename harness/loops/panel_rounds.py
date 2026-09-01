@@ -1739,6 +1739,24 @@ class Baseline:
     #: declaration a fixer can make that buys it a smaller round, a bigger budget or
     #: an easier stop.
     declined: dict[str, Declination] = field(default_factory=dict)
+
+    #: Declination keys a human has RETRACTED (`--retract`, #674), mapped to the
+    #: round the retraction was first recorded in.
+    #:
+    #: The fourth register of this shape and the only one that CANCELS another. A
+    #: declination is what a fix pass could not do; a retraction is a person saying
+    #: the correction has since been made, or was never owed. Without it #665's
+    #: register is a one-way door: nothing in the loop retracts a declaration, so the
+    #: veto it raises stands for the rest of the cycle and — through `confident` and
+    #: `preland --require-earned-stop` — holds the landing with it.
+    #:
+    #: A HUMAN act, and inherited for the same reason `acknowledged` is: a later round
+    #: does not make it stop being true, and re-asking would rebuild the permanent HOLD
+    #: this removes. Deliberately NOT inferable from a round's own findings — an absent
+    #: finding is not evidence of a repair when the round's scope never re-read the
+    #: file — and never from a fix pass reporting its own success, which is the actor
+    #: attesting to its own work (#622).
+    retracted: dict[str, int] = field(default_factory=dict)
     #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
     #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
@@ -2340,6 +2358,19 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # cycle pays a second time for a fact one of its own actors already
         # established, and books the second payment as a discovery.
         _inherit_declined(b.declined, payload.get("declined"), was, path, b.problems)
+        # #674's register, the fourth of the shape and the mirror of the one above:
+        # `declined` records what a pass could not do, this records a person saying it
+        # no longer needs doing. Inherited on `acknowledged`'s exact terms — a human
+        # act performed outside the loop that no later round makes untrue — and read
+        # by the same function for the same reason, since a key and a round is all it
+        # is. The cost of losing one is stated as a HOLD rather than a cost in rounds
+        # because that is what it is: the declination comes back, the veto with it,
+        # and the PR stops being strictly landable until somebody types the flag again.
+        _inherit(b.retracted, payload.get("retracted"), was, path, b.problems,
+                 "retracted", "retraction", _is_key,
+                 lambda k: k.strip().lower(), "the shape of a finding key",
+                 "a declination a human already retracted comes back, and with it the "
+                 "veto that stops this PR landing on an earned stop")
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
