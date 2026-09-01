@@ -1418,6 +1418,213 @@ def rules_record(cfg: dict) -> dict:
     }
 
 
+#: How a ``harness_digest`` is computed, carried as a PREFIX on the value rather
+#: than left in this docstring (#112).
+#:
+#: The digest's whole job is to answer "were these two rounds read by the same
+#: machinery", and that answer only means anything between two values computed the
+#: same way. A bare hex digest would go on comparing equal to itself after somebody
+#: changed what goes INTO it — silently splitting one harness version into two
+#: groups, or merging two into one — which is this issue's own bug one layer down
+#: and in the direction nobody would notice. So the scheme rides on the value:
+#: `loops-sha256-1:<hex>`, a consumer groups on the whole string, and a change to
+#: what is digested bumps the trailing number instead of reusing it.
+HARNESS_DIGEST_SCHEME = "loops-sha256-1"
+
+#: Seconds for either `git` call behind `harness_rev`. Short on purpose: this is
+#: bookkeeping on a payload nothing gates on, and a `git` that has not answered in
+#: ten seconds leaves the rev null — which is the same answer an INSTALLED harness
+#: gives anyway, that being the common case rather than the exotic one.
+HARNESS_GIT_TIMEOUT_S = 10
+
+
+
+def _harness_git(loops: Path, *args: str) -> str | None:
+    """stdout of ``git -C <loops> <args>``, or None if it could not run or failed.
+
+    `panel_scope._git`'s contract and its reasons, for a caller that cannot import
+    it: `sh` raises on a non-zero exit, and every non-zero exit here is an ANSWER —
+    "this directory is not inside a git checkout" is what an installed harness says
+    and is the commonest outcome this function has. `sh` is also what the suites
+    replace with a `gh` double, so routing local git through it would put these
+    calls in front of a stub that knows only the forge.
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(loops), *args],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=HARNESS_GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _harness_digest(loops: Path) -> str | None:
+    """A content digest of the loop modules in ``loops``, or None if unreadable.
+
+    **The one field that is always available and never lies about SAMENESS.** A
+    rev is null on every installed harness and a path says only where the code sat;
+    this says whether two rounds ran the same code, which is the question every
+    r1 -> r2 comparison in this system silently assumes the answer to.
+
+    What goes in, and each exclusion is a claim:
+
+    * ``*.py`` in this directory and no deeper. `loops/tests/` ships with the
+      package and does not run a round, so a release that only changed tests must
+      not read as different machinery.
+    * The SHEBANG of each file is dropped. `package.nix`'s `postFixup` runs
+      `patchShebangs`, so every installed file differs from the checkout it was
+      built from by its first line — counting it would give every deployed harness
+      a digest that matches no checkout anywhere, which is `qb-doctor`'s
+      `_same_but_for_shebang` and the 24 files it once called drift.
+    * Names and lengths are hashed beside the bodies, so two files cannot be
+      renamed into each other's contents or shifted across a boundary without the
+      digest moving.
+
+    ``None`` where the directory could not be read, and where it does not hold this
+    very module: home-manager links some harness files in individually, and a
+    ``__file__`` resolved through a flat symlink would put ``parent`` at
+    ``/nix/store`` — where this would otherwise cheerfully digest a few thousand
+    unrelated packages and call it a harness. A digest of the wrong directory is
+    worse than no digest, because nothing downstream can tell it is wrong.
+    """
+    if not (loops / "panel_core.py").is_file():
+        return None
+    try:
+        files = sorted(p for p in loops.glob("*.py") if p.is_file())
+        if not files:
+            return None
+        h = hashlib.sha256()
+        for p in files:
+            body = p.read_bytes()
+            if body.startswith(b"#!"):
+                body = body.partition(b"\n")[2]
+            h.update(f"{p.name}\0{len(body)}\0".encode())
+            h.update(body)
+    except OSError:
+        return None
+    return f"{HARNESS_DIGEST_SCHEME}:{h.hexdigest()}"
+
+
+def _harness_checkout(loops: Path) -> tuple[str | None, bool | None]:
+    """``(rev, dirty)`` for the checkout this harness runs from, or ``(None, None)``.
+
+    The AUTHORITATIVE half of the identity when it answers, and it does not answer
+    often: an installed harness lives in the nix store, which is not a checkout, so
+    a null rev is the ordinary case rather than a failure.
+
+    **A rev is only reported when the containing repository actually tracks this
+    file.** Without that test the answer is worse than absent: `panel-review-pr.md`
+    tells you to run the panel from a scratchpad copy, and a copy dropped inside
+    some OTHER checkout would take that repository's HEAD and record it as the
+    harness's own — a plausible 40-hex commit id, in the right column, belonging to
+    the wrong repository. `ls-files --error-unmatch` is the cheapest question that
+    separates "the harness's own checkout" from "some checkout the harness happens
+    to be sitting in".
+
+    ``dirty`` is scoped to exactly what :func:`_harness_digest` reads and to
+    nothing else — ``:(glob)*.py``, which is the top level of this directory and
+    not ``tests/`` below it — and it counts untracked files, because an untracked
+    module here is in the digest and is running. The scopes agreeing is the whole
+    point: ``dirty`` then means precisely "the digest above is not what that rev
+    would produce", where a plain ``-- .`` would have said "somebody edited a test"
+    in the same words (found by Codex).
+    """
+    if _harness_git(loops, "ls-files", "--error-unmatch", "panel_core.py") is None:
+        return None, None
+    head = _harness_git(loops, "rev-parse", "HEAD")
+    if not head or not head.strip():
+        return None, None
+    status = _harness_git(loops, "status", "--porcelain", "--", ":(glob)*.py")
+    # `status` is None only where git answered the two calls above and failed this
+    # one, which leaves the rev true and its cleanliness unknown. Null, not False:
+    # "nobody checked" must not read as "checked and clean" — that is the whole of
+    # #112's complaint about a version field that is sometimes a lie.
+    return head.strip(), None if status is None else bool(status.strip())
+
+
+def harness_identity(loops: Path | None = None) -> dict:
+    """WHICH HARNESS PRODUCED THIS ROUND — #112, four fields and no single answer.
+
+    A payload described the electorate and the decision in detail and said nothing
+    about the code that ran the panel. So a leaderboard aggregated across runs whose
+    prompts, budget arithmetic and seat-loss behaviour differed, and — the sharp
+    end — an r1 -> r2 comparison, which every stop argument in this system rests on,
+    assumed both rounds were read by the same machinery with nothing in the record
+    able to check it. That is not hypothetical: on 2026-08-31 six PRs changed
+    `round_stop`, `converged`, the `fix_injection` accounting and `restored_lines`,
+    and the deployed harness was rebuilt underneath a running session.
+
+    **Four fields and not one, because no single one of them is true in every
+    case.** `qb-doctor`'s `check_harness` reached the same conclusion from the other
+    side and wrote it down: the truthful answer lives in the flake pin's rev, which
+    a running harness cannot reach, so content stands in as a PROXY. This records
+    both, and says which is which:
+
+    * ``rev`` — the commit of the checkout this code is in. AUTHORITATIVE where it
+      is not null: it names something you can `git show`. Null on every installed
+      harness, which is most of them.
+    * ``dirty`` — whether the digested directory has changes that rev does not
+      carry, untracked files included. `true` is what makes a rev honest rather
+      than merely present; null is "no rev, or nobody could ask".
+    * ``digest`` — :data:`HARNESS_DIGEST_SCHEME` over the loop modules. A PROXY:
+      it cannot name a version, and two digests being different does not say which
+      is newer. It is the only field that is always there and never wrong about the
+      one question that matters most — same code, or not.
+    * ``path`` — the directory it all ran from. A LOCATOR, and machine-scoped: for
+      a nix install it is also an exact identity of the build (the store path is a
+      hash of everything that went into it), and for a scratchpad copy it is the
+      only field that says the round did not come from the deployed harness at all.
+
+    A round carries all four or the honest absence of each. A round that carried one
+    field which is sometimes a lie would be worse than a round that carried nothing,
+    because a reader cannot see which of the two it has.
+
+    ``loops`` is for the tests. The real call takes no argument and returns
+    :data:`_HARNESS_IDENTITY`, which was resolved AT IMPORT — see there for why the
+    timing is part of the answer rather than an implementation detail.
+    """
+    if loops is None:
+        return _HARNESS_IDENTITY
+    loops = Path(loops)
+    rev, dirty = _harness_checkout(loops)
+    return {"rev": rev, "dirty": dirty, "digest": _harness_digest(loops),
+            # The directory the other three are ABOUT, so a reader never has to
+            # guess whether a digest describes the deployed harness or a copy.
+            "path": str(loops)}
+
+
+def _loops_dir() -> Path:
+    """This module's own directory, symlinks resolved, or unresolved if it cannot be.
+
+    Resolved because an installed harness is reached through ``~/.claude/loops``,
+    which home-manager points at a store path: the symlink is what gets re-pointed
+    by a rebuild, and the store path underneath it is the identity worth recording.
+    Never raises — a ``resolve()`` that fails on an exotic filesystem must cost the
+    identity's precision and not the round.
+    """
+    try:
+        return Path(__file__).resolve().parent
+    except OSError:
+        return Path(__file__).parent
+
+
+#: This process's answer, resolved AT IMPORT and never again.
+#:
+#: **The timing is the point, and it was wrong in the first cut** (found by Codex).
+#: Computing it lazily meant computing it when `_payload_defaults()` ran, which is
+#: when a round WRITES its payload — after the review. A harness rebuilt in between
+#: would then be recorded as the harness that produced the round, and the rebuild
+#: lands on the symlink `~/.claude/loops`, so even the resolution of `__file__`
+#: would have followed it to the new store path. That is #112's own scenario, and a
+#: field that reported the NEW harness for a round the OLD one produced would hide
+#: precisely the event it exists to expose.
+#:
+#: Import is as close to "the code this process loaded" as a running program can
+#: get, and it costs about 8 ms — two `git` calls and a hash of the directory —
+#: against a round measured in minutes.
+_HARNESS_IDENTITY: dict = harness_identity(_loops_dir())
+
+
 def board_dial_notes(cfg: dict) -> list[str]:
     """`config_notes` lines for a round that ran under a board dial, or none.
 
@@ -2907,6 +3114,9 @@ __all__ = [
     "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
+    "HARNESS_DIGEST_SCHEME", "HARNESS_GIT_TIMEOUT_S", "_harness_git",
+    "_harness_digest", "_harness_checkout", "harness_identity", "_loops_dir",
+    "_HARNESS_IDENTITY",
     "board_dial_notes",
     "RULES_FILENAME", "SAMPLE_FILENAME", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",

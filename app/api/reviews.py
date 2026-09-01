@@ -388,6 +388,35 @@ The remaining twenty are listed in that test with the reasoning for each
 tier. None of them shares a name with a ``review_runs`` column, which the test
 also asserts: that pairing — a column that wants a value, and a payload sending
 it into ``extra="ignore"`` — is exactly the shape ``converged`` had.
+
+**#112 — and which HARNESS produced the round.** Everything above says how a
+round was configured and what its numbers were measured against. Nothing said
+what RAN it. ``.harness-rules`` argues at length that an unpinned reviewer MODEL
+makes "codex found more than claude" unattributable, and pins three of the four
+seats for that reason; the harness itself was unpinned and unrecorded, and it
+changes far more often than a vendor slug. Four fields close that, and there are
+four because no ONE of them is true in every case:
+
+* ``harness_rev`` — the commit of the checkout the panel ran from. The only
+  AUTHORITATIVE one, and null on every installed harness, the nix store being no
+  checkout. The panel refuses to report a rev it cannot prove is the harness's
+  own, so a scratchpad copy inside some other repository sends null rather than
+  that repository's HEAD.
+* ``harness_dirty`` — whether that checkout carried changes the rev does not.
+  What makes a rev honest rather than merely present.
+* ``harness_digest`` — a scheme-tagged content hash of the loop modules. A
+  PROXY, in ``qb-doctor``'s own words about the same problem: the truthful answer
+  is the flake pin's rev and no running harness can reach it, so content stands
+  in. It cannot name a version; it is the only field always present and never
+  wrong about "same code, or not", which is the question an r1 -> r2 comparison
+  actually asks.
+* ``harness_path`` — where it ran from. A LOCATOR, machine-scoped, and the only
+  field that says a round did not come from the deployed harness at all.
+
+Stored verbatim and never interpreted: this board has no checkout of the harness
+to resolve a rev against, does not recompute a digest and does not parse a store
+path. The first three ride every view because a recalibration slices a
+population on them; the path is detail-only, on ``unread_files``' rule.
 """
 
 from __future__ import annotations
@@ -1517,6 +1546,17 @@ MAX_RESTORED_CHARS = 8192
 #: :func:`_word_or_none`, which refuses rather than truncating for the reason every
 #: other refusal in this module does.
 MAX_SCOPE_CHARS = 64
+#: How long a ``harness_digest`` may be (#112). The panel sends a scheme tag and a
+#: sha256 — 79 characters — and this leaves room for a longer scheme name without
+#: leaving room for a field whose whole contract is "one opaque token" to become a
+#: place to put prose.
+MAX_HARNESS_DIGEST_CHARS = 128
+#: How long a ``harness_path`` may be (#112). A nix store path is around 120
+#: characters and a checkout path around 60; Linux's own ``PATH_MAX`` is 4096, which
+#: is the bound a sender could actually reach and is four hundred times what an
+#: honest value needs. This sits between the two: generous against real paths,
+#: closed against a locator used as a text field.
+MAX_HARNESS_PATH_CHARS = 512
 
 
 def _has_nul(node: object) -> bool:
@@ -1670,8 +1710,8 @@ def _restored_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
                                       "denominator"))
 
 
-def _word_or_none(v: object) -> str | None:
-    """``scope`` or ``fix_range_source``: one word, verbatim, or nothing (#647).
+def _word_or_none(v: object, *, cap: int = MAX_SCOPE_CHARS) -> str | None:
+    """One word, verbatim, or nothing — ``scope`` and three others (#647, #112).
 
     **Stored against no vocabulary, and this is the coercer in this module that
     has to justify NOT having one.** :meth:`ReviewIn._state` coerces anything
@@ -1695,12 +1735,30 @@ def _word_or_none(v: object) -> str | None:
 
     Refused rather than truncated, on this module's standing rule: a truncated
     ``increment`` is ``incre``, which is not a shorter true answer but a different
-    false one.
+    false one. And a truncated store path names a directory that does not exist,
+    which is the same fault one field over.
+
+    ``cap`` is a parameter and not a constant because #112's two fields are the
+    same KIND of value at a different size — a digest and a filesystem path are one
+    opaque token each, refused for the same three reasons — and the alternative was
+    a second copy of this function differing in one integer. See
+    :data:`MAX_HARNESS_DIGEST_CHARS` and :data:`MAX_HARNESS_PATH_CHARS`.
+
+    **A NUL is refused here and not at INSERT** (#112). Postgres cannot store
+    ``\u0000`` in a ``text`` column any more than in a JSONB string, and Python's
+    ``str`` holds one happily — so ``scope: "pr\u0000"`` passed every check this
+    function made and became a 500 on a round that had done nothing else wrong.
+    That is the failure :func:`_has_nul` was written for on the JSONB side in #647,
+    arriving on the scalar side; it is fixed for ``scope`` and ``fix_range_source``
+    at the same time as it is prevented for the two fields #112 adds, because they
+    share this coercer and a bug fixed on one of them is fixed on all four.
     """
     if not isinstance(v, str):
         return None
     s = v.strip()
-    return s if s and len(s) <= MAX_SCOPE_CHARS else None
+    if not s or len(s) > cap or "\x00" in s:
+        return None
+    return s
 
 
 def _unread_paths(v: object) -> tuple[list[str] | None, int]:
@@ -1989,6 +2047,28 @@ class ReviewIn(BaseModel):
     #: normalised value against a raw one.
     scope: str | None = None
     since_sha: str | None = None
+    #: WHICH HARNESS produced this round (#112). Four fields because no one of them
+    #: is true in every case, and the model docstring on
+    #: :attr:`app.models.review.ReviewRun.harness_rev` says which is authoritative
+    #: and which are proxies. In short: ``harness_rev`` names a commit and is null
+    #: on every installed harness; ``harness_digest`` is a content hash that is
+    #: always there and can only answer "same code or not"; ``harness_path`` says
+    #: where it ran from; ``harness_dirty`` says whether the rev is the whole truth.
+    #:
+    #: Stored verbatim and never interpreted here — this board has no checkout of
+    #: the harness to resolve a rev against, does not recompute a digest and does
+    #: not parse a store path. What is refused is being STORABLE, which is
+    #: :func:`_word_or_none` for the two strings and :meth:`_harness_flag` for the
+    #: boolean.
+    #:
+    #: ``harness_rev`` goes through :meth:`_commit_id` with the other commit ids,
+    #: for the normalisation and NOT because it is an end of any range: it names a
+    #: commit in a DIFFERENT repository — the harness's own — and nothing may
+    #: assemble ``harness_rev...head_sha``.
+    harness_rev: str | None = None
+    harness_dirty: bool | None = None
+    harness_digest: str | None = None
+    harness_path: str | None = None
     #: Set by the validators, never by the caller: what was trimmed, what could
     #: not be read, and which bucket names this board did not recognise. All of it
     #: reported in the response, none of it storable by the sender.
@@ -2013,6 +2093,11 @@ class ReviewIn(BaseModel):
     #: ``since_sha`` is the one of the three whose loss silently changes what
     #: ``scope: increment`` means.
     since_sha_dropped: str | None = None
+    #: ...and the harness's own rev (#112), on that argument again and one more: a
+    #: refused ``harness_rev`` leaves the round with a digest and no name for it,
+    #: which is exactly the state this issue exists to end. Told to the sender,
+    #: because the sender is the only party that can look at what it sent.
+    harness_rev_dropped: str | None = None
     #: Why a ``review_panel`` that arrived was not stored, or ``""``. Its own
     #: signal rather than a line in ``unreadable_fields``: that list means "this
     #: value was not the SHAPE its field takes", and an object refused for its SIZE
@@ -2121,6 +2206,11 @@ class ReviewIn(BaseModel):
         rules, restored = v.get("rules"), v.get("provenance_restored")
         scope, range_source = v.get("scope"), v.get("fix_range_source")
         since = v.get("since_sha")
+        # #112's four. `harness_rev` is read here with the other commit ids because
+        # it goes through the same `_sha_or_none` and earns the same drop signal —
+        # not because it is an end of any range on this row.
+        h_rev, h_dirty = v.get("harness_rev"), v.get("harness_dirty")
+        h_digest, h_path = v.get("harness_digest"), v.get("harness_path")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -2144,6 +2234,12 @@ class ReviewIn(BaseModel):
                 # merged flag, for the reason directly above.
                 "since_sha_dropped": (_echo(since) if since is not None
                                       and _sha_or_none(since) is None else None),
+                # ...and the harness's own (#112). Fourth of four and still not a
+                # merged flag: a producer that sends a good head and a garbled
+                # harness rev has one bug, in a field a reader would otherwise read
+                # as "this round came from an installed harness".
+                "harness_rev_dropped": (_echo(h_rev) if h_rev is not None
+                                        and _sha_or_none(h_rev) is None else None),
                 # Keys this board has no column for. Named rather than dropped: a
                 # bucket the panel has started sending and the board silently
                 # ignores is #93 happening again, one release later.
@@ -2210,6 +2306,22 @@ class ReviewIn(BaseModel):
                         ("scope", scope, _word_or_none(scope) is not None),
                         ("fix_range_source", range_source,
                          _word_or_none(range_source) is not None),
+                        # ...and #112's three non-commit fields, on that same rule
+                        # and at their own bounds. A refused digest or path would
+                        # otherwise land on the NULL that means "recorded before
+                        # these columns", which is a claim about the payload's AGE
+                        # and not about this round's machinery.
+                        ("harness_digest", h_digest,
+                         _word_or_none(h_digest, cap=MAX_HARNESS_DIGEST_CHARS)
+                         is not None),
+                        ("harness_path", h_path,
+                         _word_or_none(h_path, cap=MAX_HARNESS_PATH_CHARS)
+                         is not None),
+                        # `harness_dirty: "yes"` is a producer sending the wrong
+                        # shape for a three-state flag, and the state it would
+                        # land on — NULL, "nobody could ask" — is the one this
+                        # field exists to keep apart from `false`.
+                        ("harness_dirty", h_dirty, isinstance(h_dirty, bool)),
                         # #67's two, on the same rule: `recurrence_counts:
                         # ["revisited"]` is a producer sending the wrong SHAPE, and
                         # it would otherwise land on NULL indistinguishable from a
@@ -2225,7 +2337,7 @@ class ReviewIn(BaseModel):
         return _stored_repo(v)
 
     @field_validator("head_sha", "merge_base", "base_sha", "since_sha",
-                     mode="before")
+                     "harness_rev", mode="before")
     @classmethod
     def _commit_id(cls, v: object) -> str | None:
         """Every commit id on this model, coerced by one rule.
@@ -2235,7 +2347,14 @@ class ReviewIn(BaseModel):
         from them at read time compares a normalised value against a raw one.
         ``since_sha`` (#647) joined them for exactly that reason — under increment
         scope the round's target is ``since_sha...head_sha``, so it is the other
-        end of a range whose head end is already normalised here."""
+        end of a range whose head end is already normalised here.
+
+        ``harness_rev`` (#112) joined for the normalisation and for NOTHING ELSE.
+        It names a commit in a different repository — the harness's own — so it is
+        not an end of any range on this row, and nothing may assemble
+        ``harness_rev...head_sha``. It is here because "what a commit id is" should
+        have one answer on this model, and a second copy of that answer is how two
+        spellings of the same 40 hex digits end up in one table."""
         return _sha_or_none(v)
 
     @field_validator("unread_files", mode="before")
@@ -2278,6 +2397,46 @@ class ReviewIn(BaseModel):
         ``scope: increment`` — and two coercions of "is this a word" would let one
         of the pair survive a payload the other did not."""
         return _word_or_none(v)
+
+    @field_validator("harness_digest", mode="before")
+    @classmethod
+    def _harness_digest(cls, v: object) -> str | None:
+        """One opaque token, verbatim, or None (#112).
+
+        Its own validator rather than joining ``scope``'s only because the bound
+        differs: a scheme-tagged sha256 is 79 characters and would not survive
+        :data:`MAX_SCOPE_CHARS`. The coercion is the same one and deliberately
+        knows nothing about the scheme — the tag is ON the value precisely so that
+        this board never has to learn one."""
+        return _word_or_none(v, cap=MAX_HARNESS_DIGEST_CHARS)
+
+    @field_validator("harness_path", mode="before")
+    @classmethod
+    def _harness_path(cls, v: object) -> str | None:
+        """Where the harness ran from, verbatim, or None (#112).
+
+        Not parsed. A nix store path carries a hash this board could read and must
+        not: doing so would make it a second implementation of "which build is
+        this", which is the drift #305 exists to end, and it would silently
+        classify a checkout path as unknown rather than as what it is."""
+        return _word_or_none(v, cap=MAX_HARNESS_PATH_CHARS)
+
+    @field_validator("harness_dirty", mode="before")
+    @classmethod
+    def _harness_flag(cls, v: object) -> bool | None:
+        """A three-state flag, or None — never a 422 (#112).
+
+        Tolerant on this module's standing rule, which the bare ``bool | None``
+        fields beside it predate: recording is best-effort, and a payload is never
+        refused over one field because refusing it loses the findings, the
+        scorecards and the accounts along with the bad value. Without this,
+        ``harness_dirty: "yes"`` is a 422 and a round's whole record is gone.
+
+        ``isinstance`` and not truthiness. JSON has real booleans, so a ``1`` here
+        is a producer sending the wrong shape and lands on NULL with
+        ``unreadable_fields`` saying so — rather than on ``true``, which would be
+        this board guessing about the one distinction the field carries."""
+        return v if isinstance(v, bool) else None
 
     @field_validator("provenance_counts", mode="before")
     @classmethod
@@ -2940,6 +3099,17 @@ async def record_review(
         # make every ordinary round indistinguishable from a pre-#647 one.
         scope=body.scope,
         since_sha=body.since_sha,
+        # #112: which harness produced the round, stored AS SENT and never
+        # interpreted. Four fields rather than one because the question has no
+        # single true answer from inside a running panel — `harness_rev` is
+        # authoritative and usually absent, `harness_digest` is a proxy and always
+        # present, `harness_path` says whether the round came from the deployed
+        # harness at all. A board that folded them into one would be choosing which
+        # of the three to be wrong about.
+        harness_rev=body.harness_rev,
+        harness_dirty=body.harness_dirty,
+        harness_digest=body.harness_digest,
+        harness_path=body.harness_path,
         recurrence_counts=body.recurrence_counts,
         premise_counts=body.premise_counts,
         changed_lines=body.changed_lines,
@@ -3215,6 +3385,12 @@ async def record_review(
     # whose `scope` says `increment` with no anchor to say increment of WHAT.
     if body.since_sha_dropped is not None:
         dropped["since_sha_dropped"] = body.since_sha_dropped
+    # ...and the fourth, #112's. A refused `harness_rev` leaves a round carrying a
+    # digest nobody can put a name to, which reads exactly like a round from an
+    # installed harness — the commonest case, and therefore the one a wrong value
+    # hides in best.
+    if body.harness_rev_dropped is not None:
+        dropped["harness_rev_dropped"] = body.harness_rev_dropped
     # Every provenance bucket this board did not recognise, from the findings and
     # from the run's own tally, named rather than swallowed.
     #
@@ -3979,6 +4155,24 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "scope": r.scope,
         "since_sha": r.since_sha,
         "fix_range_source": r.fix_range_source,
+        # #112's three identity fields, here for #647's reason exactly. A
+        # recalibration reads a POPULATION and the whole point of these is to slice
+        # it: "were these rounds read by the same machinery" is a question about
+        # thousands of rows, and detail-only would have meant one fetch per run to
+        # ask it. `harness_digest` is the field that answers it — `harness_rev` is
+        # null on every installed harness — and `harness_dirty` is what stops a rev
+        # being read as more than it is.
+        #
+        # `harness_path` does NOT ride here, and the cut is between a GROUPING key
+        # and a LOCATOR. The path changes exactly when the digest does on a nix
+        # install, so it buys a population nothing the digest has not already
+        # bought; what it is for is a reader who has picked one round and wants to
+        # go and look at the machinery, which is a one-run question. It is bounded
+        # at `MAX_HARNESS_PATH_CHARS` and `GET /reviews?limit=500` would carry five
+        # hundred of them for that.
+        "harness_rev": r.harness_rev,
+        "harness_dirty": r.harness_dirty,
+        "harness_digest": r.harness_digest,
         # The COUNT, not the paths — the same trade `changed_files_total` makes
         # two lines down, and for the same reason. The cost `changed_files` was
         # kept out of this view for is response SIZE: `unread_files` is bounded
@@ -7515,6 +7709,14 @@ async def get_review(
         # anchor — and neither is the same as an empty object.
         "rules": run.rules,
         "provenance_restored": run.provenance_restored,
+        # #112: where the harness that produced this round ran from. Detail-only,
+        # on the rule directly above and for the cut `_run_view` states: the three
+        # fields a population is GROUPED by ride every view, and the one a reader
+        # follows to go and look at a single round's machinery rides this one.
+        #
+        # Unmasked. NULL is "the panel did not say", which is every round recorded
+        # before the column — and never a claim that the round came from nowhere.
+        "harness_path": run.harness_path,
         # #113: what this round ASKED for, kept apart from the per-seat answer in
         # `reviewers[].code_blind`. A round with the setting on and every seat
         # blind is a configuration doing nothing, and only the difference shows it.
