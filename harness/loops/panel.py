@@ -3818,10 +3818,56 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # what it can do is stop the caller reading the cycle's silence as the
     # acknowledgement having landed.
     raised = {ob.key for ob in obligations}
-    for key in sorted(k for k in accepted if k not in raised):
+    dangling = sorted(k for k in accepted if k not in raised)
+    for key in dangling:
         notes.append(f"--acknowledge {key} names no unverifiable claim this round "
                      "raised — check the key against the report's Unverifiable claims "
                      "list, and expect a new one if the judge reworded the claim")
+    # The two halves of a re-worded claim, PAIRED (#663). Both halves were already
+    # emitted and were reported apart: the note above went into `config_notes` while
+    # the claim it was meant to discharge sat in the ledger under a key the caller
+    # has never seen, vetoing the round. Read separately they are two shrugs. Read
+    # together they are the signature `_claim_norm` describes — one key left as
+    # another arrived, in the same round — because rewording is very nearly the only
+    # way that happens to a key content-addressed over the claim's own words.
+    #
+    # A QUESTION, not a match, and that is the property being protected rather than
+    # a hedge. `_claim_norm` and `claim_key` (`panel_rounds.py:676-716`) state their
+    # limit rather than papering over it, and the reason they do is that this design
+    # refuses to match claim prose at all. Nothing here reads a claim's words either:
+    # it pairs two key sets the round has already computed and puts the pairing to
+    # the human who authored the acknowledgement, who can tell whether two sentences
+    # say the same thing where no matcher available here can. Confidence is not
+    # bought back and the obligation is not discharged — the caller re-acknowledges
+    # under the new key, or does not.
+    #
+    # Considered and rejected: pairing against `ack_held` rather than `accepted`, so
+    # that an acknowledgement INHERITED from an earlier round pairs too. That is the
+    # same defect and it would fire far more often, which is the problem — an
+    # inherited acknowledgement names no claim this round in the ordinary case where
+    # it WORKED, the claim having been settled and gone, so pairing it with whatever
+    # unrelated obligation this round happened to raise would put the question again
+    # every round for the rest of the cycle. That is the alert fatigue the vetoes
+    # above are careful not to become. Re-passing the key on the command line is a
+    # live act about THIS round, and it is the half worth pairing.
+    #
+    # The durable fix is not this: key the obligation on the capability limit that
+    # could not be checked rather than on the judge's sentence about it, so that a
+    # re-worded sentence keeps the id. The judge authors the sentence and does not
+    # author the limit, which is what makes one a stable id and the other an unstable
+    # one — and that belongs with #623's typed obligations, not ahead of them.
+    unacknowledged = sorted(ob.key for ob in obligations if ob.key not in ack_held)
+    if dangling and unacknowledged:
+        notes.append(
+            f"--acknowledge named {', '.join(dangling)}, which no claim this round "
+            f"carries, and this round raised {', '.join(unacknowledged)} that no "
+            "acknowledgement names — are these the same claim under new keys? A key "
+            "is content-addressed over the claim's own words, so a judge that says "
+            "the same thing differently mints a new one and the acknowledgement does "
+            "not carry. Nothing here compares the two claims' wording: read them in "
+            "the report's Unverifiable claims list and answer it. If they are the "
+            "same claim, re-acknowledge under the new key — otherwise this round "
+            "spends its confidence on a question you have already settled")
     # Declared this round, plus every key an earlier round declared. The earliest
     # round that said so owns the answer, so `prior` wins a collision — a caller
     # re-passing a key it inherited must not re-date the claim to now.

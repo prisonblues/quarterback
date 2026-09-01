@@ -748,7 +748,11 @@ yes is the cheap gate, and a gate that always passes is worse than one that alwa
 holds because it looks like assurance. If a claim comes back next round under a new
 key, the judge reworded it — the key is derived from the claim's text and absorbs
 spelling but not rewording — and the run says so in `config_notes` rather than
-silently ignoring the stale one.
+silently ignoring the stale one. Where that same round also raises a claim no
+acknowledgement names, it pairs the two by key and asks you outright whether they are
+the same claim. It does not compare the two wordings and never re-acknowledges for you:
+read both in the Unverifiable claims block, and if they are the same claim, pass the new
+key on the next round's `--acknowledge`.
 
 ## 5. Re-review the fix commit — the round that used to be skipped
 
