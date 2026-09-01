@@ -3,12 +3,22 @@
 #
 # WHY THIS EXISTS. The three wrappers used to bake one deployment into themselves:
 # `${QUARTERBACK_BASE_URL:-https://qb.fo.ls}` for the URL and a hardwired 1Password
-# read for the token. That is fine while there is one board, and actively dangerous
-# once there are two. The fleet now has a second, deliberately disjoint board on the
-# work island (daedalus), and `qb.fo.ls` is NOT unreachable from there — it resolves
-# on public DNS and answers over the internet. So an unset variable on an employer's
-# machine meant "quietly talk to the personal board", which is precisely the thing
-# hosts/sisyphus/default.nix forbids.
+# read for the token. The case that forced the change was a fleet running two
+# deliberately disjoint boards — a personal one and a second on an employer-owned
+# island — where `qb.fo.ls` was reachable from both, so an unset variable on the
+# employer's machine meant "quietly talk to the personal board".
+#
+# THAT FLEET NOW RUNS ONE BOARD AGAIN, and this file is unchanged by it, which is
+# the point worth recording. The rule was never "there are two boards"; it is that a
+# machine must be TOLD which board it belongs to. A default is a guess about
+# deployment topology, and it is equally wrong when it happens to guess right — it
+# just stops being visibly wrong. Anyone reading this after the second board went
+# away should not conclude the default can come back.
+#
+# What varies per site is no longer only the URL. It is the TOKEN SOURCE too, which
+# is why that is a command: one site reads a cache a boot-time hydrator wrote, and
+# another reads a file a human copied there and has nothing behind it to re-fetch
+# from. Both are served by the same contract below.
 #
 # The published MCP server already got this right; mcp/mcp_server/server.py says of
 # its own base URL: "No default: the board is self-hosted, so there is no sensible
@@ -19,9 +29,9 @@
 #
 #   QUARTERBACK_BASE_URL   the board this machine talks to. Required; no default.
 #   QUARTERBACK_TOKEN_CMD  a command printing this machine's bearer on stdout. This
-#                          is what makes the token source per-site: a cached file on
-#                          the personal fleet, the token file on daedalus, an ssh
-#                          fetch on sisyphus. Kept cheap — it runs on every call.
+#                          is what makes the token source per-site: a boot-hydrated
+#                          cache on a host with a vault sidecar, a plain file a human
+#                          dropped on one without. Kept cheap — it runs on every call.
 #   QUARTERBACK_TOKEN_REFRESH_CMD
 #                          optional; used INSTEAD of TOKEN_CMD after a confirmed 401.
 #                          It exists because the two are not always the same command:
@@ -29,7 +39,10 @@
 #                          rotation just returns the same stale bearer, so the refresh
 #                          has to go past the cache to the source of truth. Defaults
 #                          to TOKEN_CMD, which is right wherever that already reads
-#                          the authoritative copy.
+#                          the authoritative copy. Leave it unset where nothing can
+#                          re-mint — a hand-dropped file has no source behind it — and
+#                          the refresh is a no-op, so a 401 stands until a human acts.
+#                          That is the honest outcome rather than a fake success.
 #   QUARTERBACK_REPO       checkout holding mcp/ (for qb-mcp's venv).
 #   QUARTERBACK_AGENT      this machine's name in the token file. Defaults to hostname.
 #   QUARTERBACK_HUMAN_URL  optional; the BROWSER vhost, where a person is authenticated at
@@ -68,7 +81,7 @@ qb_load_config() {
   # simply ABSENT rather than failing. Then this expanded to empty, and an empty agent
   # name is not an error anywhere — it silently becomes `quarterback-` in every `op://`
   # reference built from it (#556). A nix check sandbox has no `hostname`; so, in
-  # principle, does the work island's thin PATH.
+  # principle, does a stripped-down host's thin PATH.
   #
   # `uname -n` is coreutils and `/etc/hostname` is a file, so between them there is
   # somewhere to read on any box this script can run on at all.
