@@ -6006,6 +6006,17 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # Says the reasons out loud, because the word is what a reader acts on: a
     # correction priced out under a ceiling is a budget conversation, and a finding
     # the fixer refuted is an argument with the panel. Both were "not fixed" before.
+    # AND THIS IS A LANDING HOLD, not only a withheld word — said here because the
+    # consequence is two files away and a reader of this line will not find it.
+    # `confident` below requires an empty veto, so this sets `stop_confident: false`,
+    # which `preland`'s `_round_stop_earned` turns into a FAILED check rather than a
+    # warning under `--require-earned-stop` — the mode `/panel-review-pr` §7 uses
+    # precisely when it is about to offer to land. So a cycle holding one declaration
+    # cannot land strictly until the declaration is gone, and nothing retracts one
+    # (#674): a fresh cycle is the only exit. That is the intended direction — a
+    # correction the loop admitted it could not make is not a clean landing — but it
+    # is a bigger cost than "the cycle does not report converged", and a key typed
+    # into `--declined` that names nothing is retained too, so a typo holds the PR.
     if unfixed and stop:
         veto = [*veto, f"{len(unfixed)} correction(s) an earlier fix pass identified "
                        "and declared it could not make are still on record for this "

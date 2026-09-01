@@ -2003,8 +2003,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             notes.append(f"--declined {key} {problem}")
         # First spelling wins, which is the same rule the three flags above use for a
         # repeated key. A pass that declines one finding twice for two reasons has
-        # said something this loop cannot resolve, and picking the last would make
-        # the register depend on flag order.
+        # said something this loop cannot resolve, and one of them has to be picked.
+        #
+        # NOT because first-wins escapes flag order — it does not, and an earlier
+        # draft of this comment claimed it did. `deadbeef:budget DEADBEEF:refuted`
+        # records `budget` and the reverse records `refuted`; last-wins would be
+        # order-dependent in exactly the same way and to the same degree. The reason
+        # to prefer first is that it matches the three flags above, so a reader who
+        # knows one knows all four, and a caller who repeats a key gets the same
+        # answer here as there. Both halves are deterministic given an argv; neither
+        # is independent of it.
         unmade.setdefault(key, why_not)
 
     # Progress goes to stderr in --json mode, so stdout is the payload and only
