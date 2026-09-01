@@ -537,6 +537,72 @@ def announce_escalations(payload: dict, cfg: dict) -> list[str]:
     return said
 
 
+def announce_declinations(payload: dict, cfg: dict) -> list[str]:
+    """Tell the board about the corrections this cycle is landing without (#665).
+
+    The third consequence the issue asks for, and the one that decides whether any
+    of the rest matters outside a single process: a declaration that lives only in
+    the payload is read by the next round and by nobody else, so a PR that lands
+    with known-unfixed defects lands with them unnamed exactly as it does today.
+
+    **Only on the round that ENDS the cycle.** A declaration on a `go again` round
+    is a fact about work still in flight — the next fix pass may well make the
+    correction — and announcing it would put a question on a person's queue that
+    the loop is still answering. `round_stop.stop` is what says the cycle is over,
+    and `declined_outstanding` is what it is over WITH.
+
+    Filed as `decision`, which is what it is: the answers are raise the ceiling,
+    widen the scope, argue with the fixer, or accept the defect, and every one of
+    them is a person's call rather than another pass's. One post for the lot,
+    because the question is about the cycle and not about each finding — a queue
+    row per declined correction would be #620's batch accumulation on the class of
+    finding a human is least likely to want listed separately.
+
+    Never raises and never fails a review, on :func:`announce_escalations`' rule:
+    a board that will not take a post does not undo a round that ran."""
+    stop = payload.get("round_stop")
+    if not isinstance(stop, dict) or not stop.get("stop"):
+        return []
+    keys = [str(k) for k in (stop.get("declined_outstanding") or []) if k]
+    if not keys:
+        return []
+    register = payload.get("declined")
+    register = register if isinstance(register, dict) else {}
+    repo = payload.get("github") or ""
+    pr = payload.get("pr")
+    head = str(payload.get("head_sha") or "")
+
+    def said(key: str) -> str:
+        row = register.get(key)
+        row = row if isinstance(row, dict) else {}
+        return (f"- {key[:12]} declared unfixable in round {row.get('round') or '?'} "
+                f"({row.get('reason') or DECLINE_UNSTATED})")
+
+    note = announce(
+        cls="decision",
+        reason=(f"{len(keys)} correction(s) a fix pass of this cycle identified and "
+                "declared it could not make. The cycle has ended, so no further pass "
+                "will attempt them: they land with the PR unless a human raises the "
+                "ceiling, widens the scope, or accepts the defect"),
+        summary=(f"PR #{pr} — panel cycle ended with {len(keys)} known-unfixed "
+                 "defect(s) a fix pass declined"),
+        repo=repo, cfg=cfg,
+        # The KEYS are in the dedupe key and not only the commit, on
+        # `announce_escalations`' reason: a later cycle on the same head that
+        # declines a different correction is a different question, and a key naming
+        # only the PR would swallow it behind the first.
+        key=f"panel:{repo}:{pr}:declined:{head}:" + nh_digest(*sorted(keys)),
+        detail="\n".join(
+            [f"Panel cycle on {payload.get('branch') or '?'} ended at {head[:12]} "
+             f"with {stop.get('reason') or ''}.", ""]
+            + [said(k) for k in sorted(keys)]
+            + ["", "These are not a fixer's: a pass already looked at each one and "
+               "said it would not make the correction. Re-declare them on the next "
+               "cycle with --declined if they are still true."]),
+        refs=[{"kind": "pr", "value": str(pr), "repo": repo}])
+    return [note] if note else []
+
+
 # ----------------------------------------------------------------------------- run
 
 
@@ -1084,6 +1150,10 @@ def _payload_defaults() -> dict:
         # be exactly the silence this issue exists to stop producing.
         "acknowledged": {},
         "unresolved_claims": [],
+        # #665's, on the same terms: present on every payload, empty by default, so
+        # the round that inherits it never has to tell "this cycle declined nothing"
+        # from "this payload predates the register".
+        "declined": {},
         "sonar_gate": "skipped",
         "ci_status": "unknown",
         "ci_failing": [],
@@ -1470,6 +1540,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         escalated_from_board: bool = False,
         narrowed: list[str] | None = None,
         acknowledge: list[str] | None = None,
+        declined: list[str] | None = None,
         premise_file: str = "",
         new_cycle: bool = False,
         # #550's control arm. Last and keyword-only in practice rather than beside
@@ -1921,6 +1992,54 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          "key (8-64 hex characters) — it was ignored, so the finding it "
                          "meant is still counted as work this cycle has to clear")
 
+    # `--declined` (#665), at the same door, and it takes a PAIR where the three
+    # flags above take a key: `KEY:REASON`. The reason is not decoration — it is the
+    # half that stops the next round paying to rediscover the fact, because "priced
+    # out under the ceiling" and "I think this finding is wrong" ask the round after
+    # for opposite things, and a bare key cannot tell them apart.
+    #
+    # Deduplicated on the spelling passed, exactly as the three above are, and for
+    # the same reason: `panel-review-pr.md` documents re-passing an inherited
+    # declaration as harmless, and a duplicate note would reach a public PR comment
+    # twice under `--post`.
+    #
+    # The two halves fail DIFFERENTLY on purpose (`declination_or_none` argues it):
+    # a bad key is refused, because a declaration nothing joins to matches no finding
+    # for the rest of the cycle while its caller reads the silence as success; a bad
+    # reason is recorded as `unstated` and named, because losing a declared defect
+    # over its adjective is the exact failure this register exists to end.
+    unmade: dict[str, str] = {}
+    seen_declined: set[str] = set()
+    for raw in declined or []:
+        if str(raw) in seen_declined:
+            continue
+        seen_declined.add(str(raw))
+        read = declination_or_none(raw)
+        if read is None:
+            notes.append(
+                f"--declined `{_key_gist(raw)}` does not start with a finding key "
+                "(8-64 hex characters, then `:` and one of "
+                f"{', '.join(DECLINE_REASONS)}) — it was ignored, so the correction "
+                "it named dies with this pass and the next round pays to rediscover "
+                "it")
+            continue
+        key, why_not, problem = read
+        if problem:
+            notes.append(f"--declined {key} {problem}")
+        # First spelling wins, which is the same rule the three flags above use for a
+        # repeated key. A pass that declines one finding twice for two reasons has
+        # said something this loop cannot resolve, and one of them has to be picked.
+        #
+        # NOT because first-wins escapes flag order — it does not, and an earlier
+        # draft of this comment claimed it did. `deadbeef:budget DEADBEEF:refuted`
+        # records `budget` and the reverse records `refuted`; last-wins would be
+        # order-dependent in exactly the same way and to the same degree. The reason
+        # to prefer first is that it matches the three flags above, so a reader who
+        # knows one knows all four, and a caller who repeats a key gets the same
+        # answer here as there. Both halves are deterministic given an argv; neither
+        # is independent of it.
+        unmade.setdefault(key, why_not)
+
     # Progress goes to stderr in --json mode, so stdout is the payload and only
     # the payload: it is a machine-readable artifact, and a consumer that has to
     # strip a two-line preamble before parsing is one preamble away from breaking.
@@ -1984,6 +2103,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 notes.append(f"--acknowledge {key} was passed to a round that reviewed "
                              "nothing, so it was NOT recorded — pass it again on the "
                              "next round that runs")
+            # #665, and the same answer for `--escalated`'s reason exactly: a round
+            # that reviewed nothing cannot date a declaration to itself, and the typo
+            # check that would catch a mistyped key needs findings this round does
+            # not have. Reported rather than recorded, and never silent — a lost
+            # declaration is the whole of what this register exists to prevent.
+            for key in sorted(k for k in unmade if k not in skip_prior.declined):
+                notes.append(f"--declined {key} was passed to a round that reviewed "
+                             "nothing, so it was NOT recorded — pass it again on the "
+                             "next round that runs")
             skipped_payload = {
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
@@ -2043,6 +2171,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # the person who accepted them has not un-accepted them because a
                 # title matched /^Merge /.
                 "acknowledged": dict(skip_prior.acknowledged),
+                # Carried forward and added to by nothing, for the reason the two
+                # above are: a correction an earlier pass could not make is not made
+                # by a title matching /^Merge /, and a register that emptied on the
+                # quietest round of the cycle would lose the fact on the round least
+                # likely to be read.
+                "declined": {k: d.as_dict()
+                             for k, d in sorted(skip_prior.declined.items())},
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -3709,6 +3844,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `notes`.
     prior_keys, prior_rounds = prior.keys, len(prior.rounds)
     notes.extend(prior.problems)
+    # #665's register, built HERE and not beside `escalated`/`acknowledged` at the
+    # stop, because the round diff below reads it and the round diff is the first
+    # consequence the issue asks for. The two typo checks that need this round's
+    # findings still live down there with their siblings; only the register itself
+    # is early, and it needs nothing this round produced — the declarations are the
+    # caller's `--declined` and the baselines', both of which exist already.
+    #
+    # `prior` wins a collision on the same rule as the other two registers: the
+    # earliest round that recorded the declaration owns its date and its reason, and
+    # re-passing an inherited key must not re-date it to now. Sorted, so the
+    # payload's bytes do not move with the order of the flags or of the baseline
+    # reads.
+    declined_held = dict(sorted({**{k: Declination(round_no, why_not)
+                                    for k, why_not in unmade.items()},
+                                 **prior.declined}.items()))
     seen_before: dict[str, bool] = {}
 
     def is_new(c: Canonical) -> bool:
@@ -3716,7 +3866,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         🆕 marker and the serialised `new_this_round`, so the payload cannot
         disagree with the report about which findings are fresh. Memoised: the
         reworded-title fallback is a sequence comparison against every title the
-        baseline holds."""
+        baseline holds.
+
+        **A finding in #665's declined register is not new, whatever the buckets
+        say.** An inherited declaration is an earlier round's own record that this
+        defect was raised, given to a fix pass, and left unmade — so "no earlier
+        round raised this" is false about it by construction, and a round reporting
+        it as a fresh discovery overstates what it found. That is the observation
+        the register was filed over: a pass declined a correction, the declaration
+        went nowhere, and the round after it booked the same defect as news.
+
+        It is a correction and not a relaxation, and the distinction is what makes
+        it safe. In the ordinary case the payload chain carries the finding RECORD
+        too and `raised_before` already answers False — nothing changes. It changes
+        an answer only where the chain is thin (one baseline passed, which the docs
+        allow; a premise re-worded under a new key), and there the old answer was
+        untrue. Nor does it buy the cycle an easier stop: `round_stop`'s rule 1 and
+        rule 3 are both bounded by the trigger floor, and `panel.py` derives
+        `repeated` from this same predicate — so a key that stops being new becomes
+        a repeat in the same breath, and the four rules reach the identical verdict.
+        """
+        if c.key in declined_held:
+            return False
         if c.key not in seen_before:
             seen_before[c.key] = prior.raised_before(c)
         return not seen_before[c.key]
@@ -3966,7 +4137,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # it. A key an earlier payload's register carries is by construction a key an
     # earlier round knew.
     seen = ({c.key for c in (*to_fix, *sonar, *dismissed)}
-            | prior.keys | set(prior.escalated))
+            | prior.keys | set(prior.escalated) | set(prior.declined))
     for key in sorted(k for k in held if k not in seen):
         notes.append(f"--escalated {key} names no finding this round raised and no "
                      "earlier round's payload carries — check the key, or the "
@@ -4000,6 +4171,30 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         notes.append(f"--narrowed {key} names no finding this round raised and no "
                      "earlier round's payload carries — check the key. It cleared "
                      "nothing, so whatever it meant is still outstanding")
+    # #665's typo check, against the same population and for the same reason, with
+    # one difference in what the silence would cost. A mistyped `--escalated` key
+    # leaves a finding counted as clearable; a mistyped `--declined` key leaves the
+    # DECLARATION nowhere — the register holds a row that joins to nothing, the next
+    # round inherits it, and the correction the pass was honest about is rediscovered
+    # anyway. That is the failure this whole register was filed against, arriving
+    # through the flag that was meant to close it.
+    for key in sorted(k for k in unmade if k not in seen):
+        notes.append(f"--declined {key} names no finding this round raised and no "
+                     "earlier round's payload carries — check the key, or the "
+                     "baseline it should have come in on. The declaration is still "
+                     "recorded and inherited, and it matches nothing")
+    # Not a defect and so not a declaration either: the master ruled this finding
+    # not real, so there is no correction anybody owes. Said rather than corrected,
+    # for the reason the escalated equivalent above gives — the other reading, a
+    # judge that dismissed this round what an earlier round confirmed, is legitimate
+    # and this cannot tell the two apart. The key stays in the register, and a later
+    # round that rules the same defect real inherits the declaration with it.
+    for key in sorted({c.key for c in dismissed} & set(unmade)):
+        notes.append(f"--declined {key} names a finding this round's master DISMISSED "
+                     "as not real, so there was no correction to decline — the key is "
+                     "still recorded and inherited, and it will cost this cycle its "
+                     "`converged` for as long as it runs. Withdraw it from the next "
+                     "round's --declined if that is not what you meant")
     # ---- MEASURED BEFORE THE STOP RULE, WHICH IS WHAT #489 CHANGED ABOUT IT.
     # This block used to sit below `round_stop`, and could, because nothing read it:
     # provenance was recorded, tallied and printed and stopped no run. It now feeds
@@ -4607,6 +4802,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # publishes what survived at `round_stop.narrowed`, so the rule
                       # has one home rather than one per caller.
                       narrowed=told,
+                      # #665, and it is the odd one of the three: `escalated` and
+                      # `narrowed` both change what the rules count, and this changes
+                      # nothing they count. It is passed so the verdict can say that
+                      # a cycle ending with declarations on the record did not
+                      # converge — the whole register's effect is one veto line and
+                      # one flag, both in the strict direction. The cycle's WHOLE
+                      # register, not this round's declarations: a correction
+                      # declined in round 2 is still unmade in round 4, and under
+                      # `increment` scope round 4 never re-reads the file to notice.
+                      declined=sorted(declined_held),
                       # #165. The trigger floor bounds which NEW findings buy a round;
                       # the fix floor bounds rules 2 and 3, because a finding no fix
                       # round was asked to clear is outstanding every round by
@@ -5359,6 +5564,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # inherits it through `--baseline`, so a cycle cannot lose an open premise
         # question by forgetting to re-pass a flag.
         "escalated": held,
+        # key -> `{round, reason}` of every correction a fix pass of this cycle
+        # identified and did not make (#665). Inherited through `--baseline` exactly
+        # as `escalated` is, and it is the reason the next round does not pay to
+        # rediscover a defect one of its own actors already wrote down.
+        "declined": {k: d.as_dict() for k, d in declined_held.items()},
         # On the finding, not only in the register beside it: this is what a
         # fixer's brief is built from, and §5's rule is that an escalated finding
         # is never handed to another fixer. On EVERY bucket, not just `to_fix`:
@@ -5412,6 +5622,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                     "recurrence": recurrence_at(c)[0],
                     "recurs_of": recurrence_at(c)[1],
                     "escalated": c.key in held,
+                    # #665. On the finding for `escalated`'s reason and one of its
+                    # own: this is the flag that says a row is a KNOWN-UNFIXED defect
+                    # rather than a fresh finding, and an orchestrator building the
+                    # next fixer's brief has to be able to see it without joining
+                    # against the register. `new_this_round` is False on every row
+                    # this is True on, by construction — `is_new` reads the same
+                    # register — so the two can never disagree.
+                    "declined": c.key in declined_held,
                     "below_fix_floor": below_floor(c),
                     "below_threshold": below_threshold(c),
                     "seats_required": dials.threshold_for(c.severity),
@@ -5421,6 +5639,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             "recurrence": recurrence_at(c)[0],
                             "recurs_of": recurrence_at(c)[1],
                             "escalated": c.key in held,
+                            "declined": c.key in declined_held,
                             "below_fix_floor": below_floor(c),
                             "below_threshold": False,
                             "seats_required": 1,
@@ -5430,6 +5649,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                        "recurrence": recurrence_at(c)[0],
                        "recurs_of": recurrence_at(c)[1],
                        "escalated": False,
+                       # False for `escalated`'s reason: the master ruled it not
+                       # real, so there was no correction for a pass to decline and
+                       # a True here would say the opposite about the same row. A
+                       # caller that does decline a dismissed key gets a
+                       # `config_notes` line rather than a record that contradicts
+                       # the report.
+                       "declined": False,
                        "below_fix_floor": False,
                        "below_threshold": False,
                        "seats_required": 1,
@@ -5536,6 +5762,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # (Codex).
     if record:
         notes.extend(announce_escalations(payload, cfg))
+        # #665, beside it and under the same `record` gate for the same reason: a
+        # preview or a dry read must not put a question on somebody's queue. Its own
+        # call rather than a branch inside `announce_escalations`, because the two
+        # answer different questions — that one is "no reviewer can settle this",
+        # this one is "a fixer looked at it and would not" — and only this one waits
+        # for the cycle to be over.
+        notes.extend(announce_declinations(payload, cfg))
 
     # So a caller can have BOTH the PR comment and the machine-readable run.
     # Without --json-file, --json suppresses the report and the only way to get
@@ -5613,6 +5846,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         presents as ordinary work."""
         return (f" ⛔ _escalated in round {held[c.key]} — awaiting a human, "
                 "not a fix pass_" if c.key in held else "")
+
+    def declination(c: Canonical) -> str:
+        """The 🧾 mark: this defect is KNOWN unfixed, not newly found (#665).
+
+        Beside the ⛔ and in the same lists, because the two say different things
+        to the same reader. An escalation says no fix pass may touch this; a
+        declaration says one already looked at it and would not, and names what
+        priced it out — a reader deciding whether to raise a ceiling, widen a scope
+        or argue with the fixer needs the word and cannot get it anywhere else.
+
+        Dismissed findings never carry it, for the reason they never carry the ⛔:
+        the master ruled the defect not real, so there was no correction to
+        decline."""
+        d = declined_held.get(c.key)
+        return (f" 🧾 _declared unfixable in round {d.round} ({d.reason}) — a "
+                "known-unfixed defect, not a fresh finding_" if d else "")
 
     def accounts(c: Canonical) -> list[str]:
         """What each reviewer actually said, under a MERGED finding.
@@ -6168,7 +6417,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             paid = "💸 " if budgeted(c) else ""
             lines.append(f"- {paid}**{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
                          f"{c.synthesis}"
-                         f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}")
+                         f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}"
+                         f"{declination(c)}")
             lines += accounts(c)
     else:
         lines.append("- none")
@@ -6220,7 +6470,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         for c in under_floor:
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             lines.append(f"- 🔽 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
-                         f"{c.synthesis}{conf(c)}{escalation(c)}")
+                         f"{c.synthesis}{conf(c)}{escalation(c)}{declination(c)}")
 
     # #78's half of the same idea, and a section of its own rather than a subheading
     # under the one above, for the reason that one is a section rather than a mark: the
@@ -6253,7 +6503,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             lines.append(f"- 👥 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
                          f"{c.synthesis}{conf(c)} — _{len(c.reviewers)} of "
                          f"{dials.threshold_for(c.severity)} seats_"
-                         f"{escalation(c)}")
+                         f"{escalation(c)}{declination(c)}")
 
     if sonar:
         lines.append(f"\n### SonarCloud issues ({len(sonar)}) — part of the gate")
@@ -6262,7 +6512,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # diff too, because the gate has to end up clear either way.
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             lines.append(f"- {c.severity}{fresh} `{loc(c)}` — {c.synthesis}"
-                         f"{escalation(c)}")
+                         f"{escalation(c)}{declination(c)}")
 
     if dismissed:
         lines.append(f"\n### Dismissed by master ({len(dismissed)})")
@@ -6415,6 +6665,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         for label, keys in (("to fix", handoff.get("fixable") or []),
                             ("escalated, for a human only",
                              handoff.get("escalated") or []),
+                            ("declared unfixable by an earlier fix pass — known "
+                             "unfixed", handoff.get("declined") or []),
                             (f"under the {stop['cleared_floor']} fix floor — reported, "
                              "not fixed here", handoff.get("below_floor") or [])):
             if keys:
@@ -6537,6 +6789,24 @@ def main() -> int:
                          "(--round/--max-rounds/--baseline) to mean anything, and is "
                          "NOT inherited by later rounds — a narrowing is discharged the "
                          "moment it is honoured, so there is nothing to carry")
+    ap.add_argument("--declined", action="append", default=[], metavar="KEY:REASON",
+                    help="a correction this fix pass IDENTIFIED and did not make "
+                         "(#665): the finding key, a colon, and one of "
+                         f"{'/'.join(DECLINE_REASONS)}. `budget` is a ceiling the fix "
+                         "did not fit under, `premise` an assumption the pass could "
+                         "not decide, `scope` a repair that would open files the "
+                         "change never touched, `refuted` the pass disagreeing with "
+                         "the finding. Today such a declaration is made in prose and "
+                         "thrown away, and the next round spends its own budget "
+                         "rediscovering the same defect as a fresh finding. Recorded, "
+                         "inherited by later rounds through --baseline, marked on the "
+                         "finding as a known-unfixed defect rather than news, and "
+                         "carried to the board so a PR that lands with one lands with "
+                         "it named. It LOOSENS NOTHING — the finding stays "
+                         "outstanding, stays counted at every stop rule and stays a "
+                         "fix pass's work; all a declaration can do is cost the cycle "
+                         "its `converged`. Repeatable; needs a cycle "
+                         "(--round/--max-rounds/--baseline) to mean anything")
     ap.add_argument("--acknowledge", action="append", default=[], metavar="KEY",
                     help=f"an obligation key ({CLAIM_KEY_PREFIX} and 12 hex characters, "
                          "as the report's Unverifiable claims list prints it) whose "
@@ -6650,6 +6920,7 @@ def main() -> int:
                                    ("--new-cycle", args.new_cycle),
                                    ("--narrowed", bool(args.narrowed)),
                                    ("--acknowledge", bool(args.acknowledge)),
+                                   ("--declined", bool(args.declined)),
                                    # Refused rather than ordered, because the two are
                                    # different questions about one premise and the
                                    # answer to "which ran?" must not be a reading of
@@ -6701,7 +6972,8 @@ def main() -> int:
                                     args.escalated_from_board),
                                    ("--new-cycle", args.new_cycle),
                                    ("--narrowed", bool(args.narrowed)),
-                                   ("--acknowledge", bool(args.acknowledge))) if used]
+                                   ("--acknowledge", bool(args.acknowledge)),
+                                   ("--declined", bool(args.declined))) if used]
         if wrong:
             raise SystemExit(
                 f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
@@ -6798,6 +7070,19 @@ def main() -> int:
                          "It names work a LATER round must not count, and a single-pass "
                          "review — which `--round 1` on its own still is — has no later "
                          "round")
+    # `--declined` takes the same door for `--narrowed`'s reason exactly: it names a
+    # correction a FIX PASS decided not to make, and a fix pass by construction
+    # followed a review round. Outside a cycle there is no later round to inherit the
+    # declaration, which is the only thing the register is for — recording one there
+    # would write a fact into a payload nothing will ever read.
+    if args.declined and not (
+            round_no > 1 or args.max_rounds is not None or args.baseline):
+        raise SystemExit("--declined needs a cycle to mean anything: pass --round (2 or "
+                         "more) and --max-rounds, plus the earlier rounds' --baseline. "
+                         "It records a correction a fix pass could not make so the NEXT "
+                         "round inherits it instead of rediscovering it, and a "
+                         "single-pass review — which `--round 1` on its own still is — "
+                         "has no next round")
     # #617's flag says the run is a NEW cycle, and the report's banner says its round
     # counter and its baseline start from scratch. NOTHING IN THE FLAG DID THAT. It is
     # read in exactly three places — the pre-flight gate and the banner — and it
@@ -6830,8 +7115,8 @@ def main() -> int:
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
                args.no_code_access, args.escalated, args.escalated_from_board,
-               args.narrowed, args.acknowledge, args.premise_file, args.new_cycle,
-               no_pr_claim=args.no_pr_claim)
+               args.narrowed, args.acknowledge, args.declined, args.premise_file,
+               args.new_cycle, no_pr_claim=args.no_pr_claim)
 
 
 if __name__ == "__main__":

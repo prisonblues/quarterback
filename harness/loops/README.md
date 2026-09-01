@@ -1681,6 +1681,51 @@ what the flag touches outside that function:
   clear" on its own. (`preland.py` HOLDs on that gate independently; this is the
   panel saying it in its own verdict.)
 
+### A correction the fixer could not make (`--declined`) (#665)
+
+`--declined <key>:<budget|premise|scope|refuted>` (repeatable) records a correction
+a fix pass IDENTIFIED and did not make, so the next round inherits it instead of
+paying to rediscover it. It is the third register of the shape `escalated` and
+`acknowledged` have, and it is the only one that carries a reason as well as a key.
+
+It exists because that fact was being thrown away. On a real cycle a fix pass
+declared two corrections it could not afford under the growth ceiling; the
+declaration lived in prose nothing read, and the next round spent its own budget
+rediscovering one of them and reported it as a fresh finding.
+
+**It loosens nothing, and that is the design rather than a side effect.** The
+finding stays outstanding, stays counted at every one of `round_stop`'s four rules,
+stays a fix pass's work, and buys another round exactly as it did — it is subtracted
+from no filter and appears in no rule. What it can do is take a claim away:
+
+- **A finding matching an inherited declaration is not news.** It is reported
+  `new_this_round: false` and `declined: true` on every bucket, and marked 🧾 in the
+  report with the round and the word — an earlier round raised it, and calling it a
+  fresh discovery overstates what this round found. `panel.py`'s `is_new` reads the
+  register directly, so this holds even where the finding RECORD did not travel
+  (the register is inherited transitively and the buckets are not).
+- **A cycle ending with declarations outstanding has not converged.** The stop takes
+  a veto line, `confident` and `converged` are false, and where the round would
+  otherwise have been dry the `reason` says the cycle ran out of corrections anybody
+  was willing to make rather than out of defects.
+- **It reaches the board.** The round that ENDS the cycle posts one `needs-human`
+  `decision` naming the keys, their rounds and their reasons, so a PR that lands with
+  known-unfixed defects lands with them named.
+
+Unlike `escalated`'s `escalated_outstanding`, the published
+`round_stop.declined_outstanding` is the cycle's WHOLE register and is not narrowed
+to the keys this round raised: under the default `increment` scope a later round
+never re-reads the file the declined correction was owed in, and the bound would
+silence the register in exactly the case that motivated it. The cost is stated
+rather than hidden — nothing retracts a declaration, so a correction genuinely made
+later goes on costing the cycle its `converged` until the cycle ends, and #617's
+`--new-cycle` is the clean start.
+
+An unrecognised reason word is recorded as `unstated` and named in `config_notes`:
+losing a declared defect over its adjective would be this issue's own bug committed
+by its fix. A value with no finding key in it is refused outright, for
+`--escalated`'s reason.
+
 ### What the cycle leaves behind — `round_stop.outstanding` (#42)
 
 `stop` answers **one** question: *should another panel run?* It is a question about
@@ -1703,6 +1748,7 @@ So the payload states both questions. `round_stop.outstanding` carries:
 | `fixable` | The keys a fix pass is asked to clear — everything still outstanding at or above `fix_severity_floor`, gate issues included (they are exempt from both floors). Built from **one universe**: `outstanding` ∪ `new_keys` ∪ `repeated`, minus the escalated. A key reaching only one of those parameters would otherwise be counted for the STOP and dropped from the disposal, which is this bug one level down. |
 | `below_floor` | Outstanding and under the fix floor. Handed to nobody **deliberately** — #165's policy stop, and the repo's own decision. Listed rather than dropped, because silence about them is what lets such a stop read as a dry one. |
 | `escalated` | `escalated_outstanding` under a second name, off the same local so the two cannot disagree. Never a fixer's, at any stop (#221). |
+| `declined` | The cycle's `declined` register (#665) — corrections a fix pass identified and did not make. Not a fourth disposal: a declined finding that is still outstanding is in `fixable` too, and that is not double counting — `fixable` says a fix pass COULD take it, this says one already looked and would not. |
 | `handed_to` | `fixer`, `human`, `nobody` — or **null on a `go again`**, where no disposal is being made and §5's ordinary path takes the findings to the next fix pass. |
 | `why` | The one sentence the relay repeats. |
 
