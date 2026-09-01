@@ -191,7 +191,7 @@ because it is model output from other PRs quoted into a prompt that instructs a 
 fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
 whichever is crossed first binds, because a pure multiple hands its rope out in proportion to
 the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
-stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+stops a 113-line one at 226 (#492), while `min_fix_growth_chars` (**2,000**) is the floor under the multiple and the one term here that loosens — diff framing is ~430 fixed chars a hunk and the multiple's allowance is not, so below ~413 chars a 3.0x ceiling cannot afford one honest one-file fix, and on the PR that was measured on it priced a real correction out into a regression the next round then found (#664); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
 not have; `max_rounds` (**6** as of 2026-08-30, from 2 — #621) surfaces the existing cap, which is
 a backstop against a cycle running forever and not a convergence mechanism: what ends a cycle is

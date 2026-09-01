@@ -4749,28 +4749,66 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # starting size: at 3.0x a 113-line PR may grow ~226 lines while a 2,000-line one
     # may grow 4,000 — the loosest allowance handed to the case most in need of a
     # ceiling. So `max_fix_growth_chars` states the same limit absolutely and the
-    # cycle stops on whichever is crossed first. Both are ceilings, so the pair can
-    # only ever TIGHTEN: nothing this arrangement lets through would have been caught
-    # by the multiple alone. Either half is `null`-able on its own and both null is
-    # the pre-#165 behaviour of no check at all, which is why the block below runs
+    # cycle stops on whichever is crossed first. Both of those are ceilings, so THE
+    # PAIR can only ever tighten: nothing that arrangement lets through would have been
+    # caught by the multiple alone. Either half is `null`-able on its own and both null
+    # is the pre-#165 behaviour of no check at all, which is why the block below runs
     # whenever EITHER is set rather than only when the multiple is.
+    #
+    # **AND A FLOOR UNDER THE MULTIPLE (#664), WHICH LOOSENS.** The sentence above used
+    # to be written of the whole mechanism, and since this floor exists it is true only
+    # of the pair of ceilings: `min_fix_growth_chars` lets through cycles the multiple
+    # alone WOULD have stopped, deliberately, and it is the first term here that does.
+    # Proportionality bites at both ends and #492 only answered the top. Diff framing
+    # is fixed per file-hunk — `diff --git`, `index`, `---`/`+++`, `@@` and a hunk's
+    # context lines are ~430 chars before any repair — while the multiple's allowance
+    # shrinks with the PR, so below ~413 chars a 3.0x ceiling cannot afford ONE honest
+    # one-file fix. On the 439-char PR #664 measured, the allowance was 878 chars, the
+    # smallest truthful single-hunk fix cost 827, the fixer named two corrections it
+    # could not pay for, and the round after found one of them. That is a ceiling
+    # writing the regression it then charges for.
+    #
+    # So the ratio half asks TWO questions and the absolute half still asks one: a
+    # small PR is no longer stopped for multiplying a number that was never big enough
+    # to divide, and a PR of any size that grows past `max_fix_growth_chars` stops
+    # exactly as it did. `null` on the floor is the pre-#664 behaviour precisely, which
+    # is what makes the SHAPE — floor on the ratio, versus measuring both ends net of
+    # framing — reversible while it is still a decision (#664 is `needs-human`).
     #
     # `grown` is the difference of the same two sizes the ratio divides — deliberately,
     # because two halves of one ceiling read off two different measurements is #298's
     # defect one level up, and there is exactly one pair of numbers in this payload
-    # that both halves may be computed from.
+    # that both halves may be computed from. The floor is read off that same `grown`
+    # for the same reason: a floor measured against anything else would be a third
+    # string in a comparison that already has exactly two.
     growth = None
     limit, limit_chars = dials.max_fix_growth, dials.max_fix_growth_chars
+    floor_chars = dials.min_fix_growth_chars
     if (limit is not None or limit_chars is not None) and prior.first_reviewed:
         first_round, first_chars, first_scope = prior.first_reviewed
         pr_chars = len(review.diff)
         ratio = pr_chars / first_chars
         grown = pr_chars - first_chars
-        over_ratio = limit is not None and ratio > limit
+        # The floor guards the RATIO ONLY. Applied to `over` as a whole it would put a
+        # 2,000-char hole in the absolute ceiling as well, which is a ceiling already
+        # stated in the units the floor is written in and needs no help from it.
+        # Named at length because `under_floor` in this function is the SEVERITY floor's
+        # list of findings, and this one is chars.
+        below_growth_floor = floor_chars is not None and grown <= floor_chars
+        over_ratio = limit is not None and ratio > limit and not below_growth_floor
         over_chars = limit_chars is not None and grown > limit_chars
         over = over_ratio or over_chars
         growth = {"limit": limit, "limit_chars": limit_chars,
+                  "floor_chars": floor_chars,
                   "ratio": round(ratio, 3), "grown": grown,
+                  # Recorded rather than derivable, because the interesting case leaves
+                  # no other trace: a PR at 4.2x that did not stop looks identical in
+                  # this record to one at 4.2x under a null floor unless the payload
+                  # says the floor is what held it. `config_notes` never reaches the
+                  # board and there is no veto line on a round that did not stop, so
+                  # this flag is the only place the suppression is written down.
+                  "floor_held": bool(below_growth_floor and limit is not None
+                                     and ratio > limit),
                   "over": over, "over_ratio": over_ratio, "over_chars": over_chars,
                   "chars": pr_chars, "scope": "pr",
                   "review_scope": review.scope,

@@ -1063,6 +1063,11 @@ DEFAULTS: dict = {
         # and `null` on both is no growth check at all, as it was before either
         # existed.
         #
+        # The claim is about THIS KEY and not about the mechanism, and since #664 the
+        # difference is load-bearing: `min_fix_growth_chars` below is a floor under the
+        # MULTIPLE, and a floor is a term that loosens. So "the growth check can only
+        # ever tighten" is false of the block as a whole and stays true of this key.
+        #
         # **A second key rather than a two-part `max_fix_growth` value**, which is the
         # open question #492 left. A pair would avoid a fifth growth-adjacent name in a
         # block already near 25 keys, and it would cost more than that saves:
@@ -1073,6 +1078,93 @@ DEFAULTS: dict = {
         # nulls, two independent answers, and either one settable from the board on its
         # own.
         "max_fix_growth_chars": 30_000,
+        # The FLOOR under the multiple (#664), and THE ONE TERM IN THIS BLOCK THAT
+        # LOOSENS. The ratio half fires only where the PR has ALSO grown by more than
+        # this many chars. The absolute half is untouched by it.
+        #
+        # **Proportionality has two ends and #492 only fixed the top.** "A pure multiple
+        # hands its rope out in proportion to the starting size" is the argument written
+        # one key up, and read downward it says something worse about the small PR: the
+        # allowance shrinks with the change while the cost of the smallest possible fix
+        # does not. Diff framing is fixed per file-hunk — `diff --git`, the `index`
+        # line, `---`/`+++`, an `@@` header and the context lines a hunk must carry come
+        # to ~430 chars before one character of the actual repair.
+        #
+        # **The measurement.** On a 439-char PR at 3.0x the whole growth allowance is
+        # 878 chars. The smallest honest single-hunk fix measured on that PR cost 827,
+        # of which ~430 was framing — 49% of the entire allowance spent on the shape of
+        # a diff — so one hunk in one file WAS the budget, and a second finding whose
+        # fix was ~200 chars could not be paid for whatever else was true about it. The
+        # breakevens follow: the allowance equals one hunk's framing at a PR of 215
+        # chars and equals that measured minimum honest hunk at 413.5. Below ~413 chars
+        # a 3.0x ceiling cannot afford a single truthful one-file fix, and the dial
+        # stops meaning "a fix pass that MULTIPLIES the diff has written a second
+        # change" and starts meaning "this PR is too small to be fixed at all".
+        #
+        # **It did not merely refuse a fix; it wrote one.** On that cycle the fixer
+        # declared two corrections it could not pay for and the NEXT round found one of
+        # them — a `classify()` KEEP reason the change had made wrong. The ceiling
+        # produced a regression and then bought a round to rediscover it, which is
+        # anti-convergence by construction and the reverse of what every key here is
+        # for.
+        #
+        # **2,000, and what it is calibrated against.** About a two-file fix: ~860 of
+        # framing plus ~1,140 of content, which is ~17 churned lines at PR #188's own
+        # measured 66 chars a line. That is the smallest change that is honestly two
+        # hunks rather than one, and a fix pass under it has not written a second
+        # change under any reading. It sits far below `max_fix_growth_chars`' 30,000 on
+        # purpose: the floor guards the RATIO only, so a floor near the absolute ceiling
+        # would leave a small PR running all the way to the absolute stop with the
+        # multiple unable to fire first, and crossed-first would have inverted. A repo
+        # that writes a floor at or above the absolute half is told so in `config_notes`
+        # rather than left to discover it from a cycle that did not stop.
+        #
+        # **No floor under the absolute half, and that is a decision rather than an
+        # omission.** 30,000 chars is already ~70 hunks of framing, so a floor there
+        # could only ever be inert — and an inert key still reads as configured, which
+        # is #169's failure.
+        #
+        # **NOT the framing-net measurement, which is the better answer this cannot
+        # have.** Subtracting `diff --git`/`index`/`---`/`+++`/`@@` from both ends
+        # before dividing would measure the thing this dial claims to measure instead of
+        # approximating it, and it needs no key at all. It is recorded here and
+        # rejected: `pr_chars` on every baseline already in flight is a RAW char count,
+        # so a framing-net numerator would decline to run on every cycle in flight and
+        # every payload behind it. That is #169's ships-unwired failure, and it is the
+        # same objection #492 used to reject a `_lines` dial — which is also why the
+        # unit here is chars for the third time rather than a fourth measurement a
+        # reader of this block has to hold.
+        #
+        # **A third key rather than a two-part value, on #492's own reasoning.** That
+        # question was answered one key up and the answer holds with one part added:
+        # `BOARD_DIALS` types each of these as a scalar `number` and the board's column
+        # stores one JSON value per dial, so a tuple needs a new shape at both ends; and
+        # `null` is already the documented off switch for `max_fix_growth`, so a
+        # multi-part value would have to say which part a bare `null` switches off —
+        # now three parts rather than two, and the third one means the opposite
+        # direction from the other two. Three keys, three nulls, three independent
+        # answers, each settable from the board on its own. `null` here is the floor off
+        # and the exact pre-#664 behaviour, which is what makes the shape cheap to
+        # reverse if the shape turns out to be wrong.
+        #
+        # **Against #621's "not a 29th dial", because this IS a new key.** That epic's
+        # rule is that an item makes an existing decision durable, moves a rule from
+        # prose into code, or measures what nobody measures — and that where a remedy
+        # needs a new judgement it asks for one rather than picking a number. This is a
+        # bound on the KNOWN SHAPE DEFECT of an existing dial rather than a new question
+        # asked of a round: #492 repaired that defect at the top of the range and left
+        # nothing watching the bottom, where the same proportionality bites the other
+        # way. The number is measured rather than invented, the alternative needing no
+        # key is rejected above for a reason that is not taste, and the SHAPE is the
+        # part genuinely left to a human — #664 is `needs-human/decision` and says so.
+        #
+        # #551 is this same sizing question from the other end (`low_severity_fix_lines`
+        # is an absolute with no proportional companion) and this key does NOT settle
+        # it. What that dial wants is a CEILING — `min(lines, pct x the first round)` —
+        # because the accumulation it measures is dangerous on the SMALL PR, which is
+        # exactly the end this floor loosens. Same question, opposite operator; a floor
+        # written there on the strength of this one would reintroduce #188.
+        "min_fix_growth_chars": 2_000,
         # The GUARD half of that same ceiling, and the one dial here measured PER FIX
         # PASS rather than per PR (#618). Test and prose lines ONE pass may churn.
         #
@@ -2909,7 +3001,8 @@ class Dial(NamedTuple):
     write `{"max_rounds": "lots"}` into a run is a channel that can break one, and
     the sample's values are checked by whoever consumes them rather than here.
     `nullable` is per dial rather than global: `null` is the documented OFF SWITCH
-    for `max_fix_growth`, `max_fix_growth_chars`, `distant_merge_lines`,
+    for `max_fix_growth`, `max_fix_growth_chars`, `min_fix_growth_chars`,
+    `distant_merge_lines`,
     `escalate_on.premise_repeated`, `escalate_on.fix_injection`,
     `escalate_on.new_findings_not_falling`, `escalate_on.premise_undecidable`,
     `escalate_on.unrefereed_fix`, `escalate_on.guard_lines`,
@@ -3070,6 +3163,12 @@ BOARD_DIALS: dict[str, Dial] = {
     # one above.
     "review_panel.max_fix_growth_chars": Dial("number", True, "either",
         'how many chars past its round-1 size it may grow; whichever ceiling binds first'),
+    # #664's floor under the multiple, and the one dial in this block that LOOSENS: the
+    # ratio half fires only where the growth also clears this. Settable and nullable on
+    # its own for the same reason as the key above, and `null` is the exact pre-#664
+    # behaviour — which is what makes a shape decision reversible from the board.
+    "review_panel.min_fix_growth_chars": Dial("number", True, "either",
+        'how much a PR must have grown before the MULTIPLE may stop the cycle at all'),
     # #618's per-pass guard ceiling. `nullable` because `null` is its off switch and
     # is also its shipped value: the count is uncalibrated, so a board that could
     # only move the number and never clear it would be a channel that can arm an
