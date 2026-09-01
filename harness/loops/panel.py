@@ -1484,11 +1484,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         #
         # One caller is enough for the rule to earn its place, and the count is the
         # argument: twenty unnamed arguments in source order is a block where an
-        # insertion between any two of them is silent, type-compatible for most
-        # pairs, and shifts every argument after it by one. `escalated`,
-        # `narrowed` and `acknowledge` are all `list[str] | None` and adjacent, so
-        # three of those shifts would not even raise. Keeping new flags last and
-        # keyword-only is what makes that block safe to extend.
+        # insertion shifts every argument after it by one, silently.
+        #
+        # Most of those shifts WOULD raise or misbehave loudly, because the types
+        # alternate — `escalated` is separated from `narrowed` by
+        # `escalated_from_board: bool`, so a shift across it hands a bool where a
+        # list is wanted. The dangerous case is narrower and is the one worth
+        # naming: `narrowed` and `acknowledge` are adjacent AND both
+        # `list[str] | None`, so an insertion between them passes every type check
+        # and silently swaps two registers whose confusion no test would catch.
+        #
+        # One silent pair is the whole argument. Keeping new flags last and
+        # keyword-only is what makes the block safe to extend.
         no_pr_claim: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of

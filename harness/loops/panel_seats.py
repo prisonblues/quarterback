@@ -2005,16 +2005,20 @@ def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
 
     **The empty string is null too**, said here because the paragraph below reads as
     though `null` were the only off spelling and a reviewer took it that way (#686).
-    It is not a quirk of this key: sixteen resolvers in this module read `""` as null,
-    so it is the module's convention rather than this dial's behaviour, and refusing
-    it here alone would make this the one dial that answers a cleared value
-    differently from the other fifteen.
+    It is not a quirk of this key: SEVENTEEN resolvers in this module read `""` as
+    null, so it is the module's convention rather than this dial's behaviour, and
+    refusing it here alone would make this the one dial that answers a cleared value
+    differently from the other sixteen.
 
     WHY the convention exists is not recorded anywhere and is deliberately not guessed
-    at here. It is NOT the board's clear path — `POST /dials/clear` stamps `cleared_at`
-    on the row and the dial then resolves as absent, so nothing on that route ever
-    hands this function a `""`. What does reach it is a hand-written `.harness-rules`,
-    where a key emptied rather than deleted is an ordinary thing to leave behind.
+    at here. Two routes DO deliver one, so it is not unreachable: a hand-written
+    `.harness-rules` with a key emptied rather than deleted, and `POST /dials`, which
+    `json.dumps`es whatever `value` it is given and stores it — the API validates the
+    dial NAME and the payload size but not the value's type, on the stated rule that
+    "the client owns the vocabulary". `POST /dials/clear` is the one route that cannot:
+    it stamps `cleared_at` and the dial then resolves as ABSENT, which is a different
+    answer from `null` here (absent inherits the default; `null` switches the floor
+    off).
 
     That is not in tension with `0` below. `0` is a number a repo can mean and whose
     meaning would be wrong; `""` is the absence of a value, which is what `null` is.
