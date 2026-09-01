@@ -14,7 +14,9 @@ set -uo pipefail
 #                ->  port  .worktree-ports line "<port>:<create-name>"
 #
 # Safe by default: DRY-RUN unless --prune is given. The main DB (<project>) and
-# <project>_test are always protected, plus anything in `.database.protect`. A
+# <project>_test are always protected, plus anything matching a pattern in
+# `.database.protect` -- a list of GLOBS, so a family of generated databases
+# (`<project>_test_tmpl_*`) can be named without pinning names that go stale. A
 # directory another live agent is working in is reported separately and never
 # removed, however de-registered it looks (see `worktree-holder`).
 #
@@ -74,10 +76,12 @@ cfg() {
     echo "$default"
 }
 
+# >>> cfg-array
 cfg_array() {
     local key="$1"
     [[ -n "$CONFIG_JSON" ]] && echo "$CONFIG_JSON" | jq -r "$key[]? // empty" 2>/dev/null
 }
+# <<< cfg-array
 
 detect_project_name() {
     local root="$1"
@@ -102,6 +106,7 @@ detect_project_name() {
 # and the sweep reported "Orphan databases: none" while 103 orphans sat in the
 # real container. Silent, and it flipped run to run as containers came and went.
 # The caller picks the first candidate that actually answers as $PG_USER.
+# >>> pg-container
 postgres_container_candidates() {
     local names
     names=$(docker ps --format '{{.Names}}' 2>/dev/null || true)
@@ -114,6 +119,7 @@ postgres_container_candidates() {
 postgres_container_answers() {
     docker exec "$1" psql -U "$PG_USER" -d postgres -tAc 'SELECT 1' >/dev/null 2>&1
 }
+# <<< pg-container
 
 # Drop a database robustly. Try WITH (FORCE) (Postgres 13+) to evict any stray
 # connections; fall back to terminating backends then a plain drop.
@@ -323,6 +329,7 @@ shopt -u nullglob
 # 1. ORPHAN DATABASES
 # ============================================
 ORPHAN_DBS=()
+PROTECTED_DBS=()
 if [[ "$DB_ENGINE" = "postgresql" ]]; then
     PG_USER=""
     if [[ -f "$MAIN_REPO/.env" ]]; then
@@ -333,11 +340,44 @@ if [[ "$DB_ENGINE" = "postgresql" ]]; then
         fi
     fi
 
-    # Protected: main DB, test DB, and any configured names.
+# >>> db-scan
+    # Protected: main DB and test DB always, plus anything the project
+    # configured. The two built-ins are exact because we mint those names
+    # ourselves; the configured entries are GLOB PATTERNS, because the databases
+    # a project wants to protect are usually a *family* whose members this file
+    # cannot name -- minted by the project's own tooling, carrying something the
+    # config was written too early to know.
+    #
+    # The case that forced it: a test suite that copies each run's database from
+    # a pre-migrated template, `<project>_test_tmpl_<migration head>`. That name
+    # maps to no worktree by construction, so every sweep offers to drop it.
+    # Naming them exactly means pinning live migration heads into shared
+    # base-branch config -- heads that live on branches no single checkout can
+    # see, so the list silently protects dead templates while the live one goes
+    # back to being swept. `<project>_test_tmpl_*` cannot go stale, and keeps
+    # the tool ignorant of the project's migration tool.
+    #
+    # A literal entry still works: a pattern with no metacharacters is an exact
+    # match, so this is backward compatible with every list already written.
     declare -A PROTECT=()
     PROTECT["$PROJECT"]=1
     PROTECT["${PROJECT}_test"]=1
-    while IFS= read -r p; do [[ -n "$p" ]] && PROTECT["$p"]=1; done < <(cfg_array '.database.protect')
+    PROTECT_GLOBS=()
+    while IFS= read -r p; do [[ -n "$p" ]] && PROTECT_GLOBS+=("$p"); done < <(cfg_array '.database.protect')
+
+    # Echoes the pattern that protects $1, or fails. Reporting *which* pattern
+    # matched is the point: a too-broad one would otherwise suppress genuine
+    # orphans invisibly, which is a worse failure than the staleness this fixes.
+    protecting_glob() {
+        local db="$1" g
+        for g in ${PROTECT_GLOBS[@]+"${PROTECT_GLOBS[@]}"}; do
+            # UNQUOTED on the right. Quoting $g degrades `==` to a literal
+            # string comparison -- exactly the bug being fixed here, and it
+            # would look like it worked for every pattern that has no wildcard.
+            [[ "$db" == $g ]] && { printf '%s' "$g"; return 0; }
+        done
+        return 1
+    }
 
     # Resolve the container only once PG_USER is known, so "does it answer as
     # this user?" is available as the tie-breaker.
@@ -361,10 +401,15 @@ if [[ "$DB_ENGINE" = "postgresql" ]]; then
             [[ "$db" == "${PROJECT}_"* ]] || continue
             [[ -n "${LIVE_DB[$db]:-}" ]] && continue
             [[ -n "${PROTECT[$db]:-}" ]] && continue
+            if pattern=$(protecting_glob "$db"); then
+                PROTECTED_DBS+=("$db  (.database.protect: $pattern)")
+                continue
+            fi
             ORPHAN_DBS+=("$db")
         done < <(docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
                     "SELECT datname FROM pg_database ORDER BY 1" 2>/dev/null)
     fi
+# <<< db-scan
 else
     echo -e "${YELLOW}! No Postgres engine configured — skipping DB scan${NC}"
 fi
@@ -533,6 +578,10 @@ report "Leftover directories" "${#LEFTOVER_DIRS[@]}"     "${LEFTOVER_DIRS[@]:-}"
 report "Orphan containers"    "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]:-}"
 report "Orphan nginx blocks"  "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
 report "Orphan board claims"  "${#ORPHAN_CLAIMS[@]}"     "${ORPHAN_CLAIMS[@]:-}"
+if [[ ${#PROTECTED_DBS[@]} -gt 0 ]]; then
+    echo -e "${YELLOW}Protected by .database.protect — not counted as orphans (${#PROTECTED_DBS[@]}):${NC}"
+    printf '    %s\n' "${PROTECTED_DBS[@]}"
+fi
 if [[ ${#SKIPPED_DIRS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}  (ignored ${#SKIPPED_DIRS[@]} ${PROJECT}-* dir(s) with no worktree markers — not touched)${NC}"
 fi
