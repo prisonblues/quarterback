@@ -2003,6 +2003,22 @@ def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
     reading the two keys beside it already have. ``null`` here is the exact pre-#664
     behaviour, which is what makes a shape decision reversible without a release.
 
+    **The empty string is null too**, said here because the paragraph below reads as
+    though `null` were the only off spelling and a reviewer took it that way (#686).
+    It is not a quirk of this key: sixteen resolvers in this module read `""` as null,
+    so it is the module's convention rather than this dial's behaviour, and refusing
+    it here alone would make this the one dial that answers a cleared value
+    differently from the other fifteen.
+
+    WHY the convention exists is not recorded anywhere and is deliberately not guessed
+    at here. It is NOT the board's clear path — `POST /dials/clear` stamps `cleared_at`
+    on the row and the dial then resolves as absent, so nothing on that route ever
+    hands this function a `""`. What does reach it is a hand-written `.harness-rules`,
+    where a key emptied rather than deleted is an ordinary thing to leave behind.
+
+    That is not in tension with `0` below. `0` is a number a repo can mean and whose
+    meaning would be wrong; `""` is the absence of a value, which is what `null` is.
+
     ``0`` is refused rather than read as "no floor". A floor of zero is one every
     growth clears the moment a fix pass writes a character, so it is the OFF position
     written in a spelling that does not say so, and `null` is already that spelling —

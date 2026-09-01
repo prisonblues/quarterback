@@ -1473,9 +1473,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         premise_file: str = "",
         new_cycle: bool = False,
         # #550's control arm. Last and keyword-only in practice rather than beside
-        # `no_code_access` where it reads best: every caller here passes the first
-        # fourteen positionally, and a parameter inserted mid-list silently shifts
-        # `escalated` into it.
+        # `no_code_access` where it reads best.
+        #
+        # The reason, stated accurately because the first version of this comment was
+        # not (#687): it is NOT that "every caller passes the first fourteen
+        # positionally". The suites call this with two positional arguments and the
+        # rest by keyword, so a mid-list insertion would not touch them. There is
+        # exactly ONE long positional caller — `main()` at the bottom of this file —
+        # and it passes TWENTY positionally before naming this one by keyword.
+        #
+        # One caller is enough for the rule to earn its place, and the count is the
+        # argument: twenty unnamed arguments in source order is a block where an
+        # insertion between any two of them is silent, type-compatible for most
+        # pairs, and shifts every argument after it by one. `escalated`,
+        # `narrowed` and `acknowledge` are all `list[str] | None` and adjacent, so
+        # three of those shifts would not even raise. Keeping new flags last and
+        # keyword-only is what makes that block safe to extend.
         no_pr_claim: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
