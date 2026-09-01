@@ -2749,6 +2749,14 @@ class _Sink:
 
     def clear(self, *a, **k): pass
 
+    #: The chip bar rebuilds its columns rather than updating them — the columns
+    #: ARE the chips — and hides itself when there is nothing to choose between.
+    #: A stub missing either is a stub that turns a repo filter into an
+    #: AttributeError inside render_agents, which every seat test goes through.
+    def set_class(self, *a, **k): pass
+
+    def add_columns(self, *a, **k): return []
+
     def add_row(self, *a, key=None, **k):
         """Hands back a key like the real one does.
 
@@ -4044,3 +4052,147 @@ def test_expanding_refuses_the_same_way():
     app.seats_error = "tmux could not be run (OSError)"
     app.action_expand()
     assert said and "blind, not empty" in said[0], said
+
+
+# ---- the chip bar ------------------------------------------------------------
+#
+# Sixteen agents across three repos is a list you read rather than one you scan,
+# and the dashboard had no way to narrow it: `s` is binary — this screen's repos
+# or every repo — and `--repo` is a command-line flag you cannot reach from a
+# running dashboard.
+
+
+def _bar(app, board, seats=None):
+    """Drive `render_agents` and read back the bar, the title and whether it hid.
+
+    The chips are read off the stub's `add_row` rather than off a widget, for the
+    reason `_seat_labels` reads labels that way: which repos it offers and which
+    one is lit are decisions, and driving a pilot to find them out would test
+    Textual's layout instead.
+    """
+    chips: list[list[str]] = []
+    hidden: list[bool] = []
+    said: list[str] = []
+
+    class Bar:
+        def set_class(self, on, *names): hidden.append(bool(on))
+        def clear(self, **k): pass
+        def add_columns(self, *a): return []
+
+        def add_row(self, *cells, key=None, **k):
+            chips.append([str(getattr(c, "plain", c)).strip() for c in cells])
+            return SimpleNamespace(value=key)
+
+    class Rows(Bar):
+        def add_row(self, *cells, key=None, **k):
+            return SimpleNamespace(value=key)
+
+    app.board = board
+    app.seats = seats or []
+    app.query_one = lambda sel, *a, **k: (
+        Bar() if sel == "#chips" else Rows() if sel == "#agents"
+        else _Sink(said) if sel == "#t_agents" else _Sink())
+    app.render_agents()
+    return (chips[0] if chips else []), (hidden[0] if hidden else False), said
+
+
+def _wide(app):
+    """Fleet-wide scope, and `say` sent nowhere.
+
+    `Scope.on` is TRUE when the scope is NARROWED to this screen's repos — the
+    reading that cost the first cut of these tests an hour — so the fleet-wide
+    one is the toggle of a scope that is on. Several repos is the only state a
+    chip bar has anything to do in, and the narrow scope is what hides them.
+
+    `say` writes to the running app's screen, and there is no screen here.
+    """
+    if app.scope.on:
+        app.scope = app.scope.toggled()
+    app.say = lambda *a, **k: None
+    return app
+
+
+def _fleet(*repos):
+    """A board answer with one live agent per named repo."""
+    return {"agents": [{"holder": f"zeus/a{i}", "session": f"s{i}", "state": "working",
+                        "repo": r, "reported": None}
+                       for i, r in enumerate(repos)], "claims": []}
+
+
+def test_the_bar_offers_a_chip_for_each_repo_the_fleet_is_in():
+    app = _wide(_dash())
+    chips, hid, _ = _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    assert not hid
+    assert chips == ["lexray", "quarterback"]
+
+
+def test_one_repo_is_not_a_choice_so_the_bar_hides():
+    """A line of a 78-column pane is worth more than a control that cannot change
+    what you are looking at."""
+    app = _wide(_dash())
+    _, hid, _ = _bar(app, _fleet("quarterback", "quarterback"))
+    assert hid, "the bar drew a single chip"
+
+
+def test_a_chip_filters_and_the_title_keeps_the_unfiltered_count():
+    """`3 of 16 · lexray` is a fact about what you are looking at. `3 live` alone,
+    on a screen whose bar has scrolled out of a short pane, is a fact about the
+    fleet — and a wrong one."""
+    app = _wide(_dash())
+    _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    app.filter_repo("lexray")
+    _, _, said = _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    assert any("1 of 3" in s and "lexray" in s for s in said), said
+
+
+def test_the_same_chip_is_the_on_and_the_off_switch():
+    """A separate `clear` chip is one more thing to find, and in a pane narrow
+    enough to clip the bar it is the one that gets clipped."""
+    app = _wide(_dash())
+    app.render_agents = lambda: None
+    app.filter_repo("lexray")
+    assert app.repo_filter == "lexray"
+    app.filter_repo("lexray")
+    assert app.repo_filter is None
+
+
+def test_the_bar_keeps_every_chip_while_one_of_them_is_filtered_to():
+    """Built from the rows left AFTER a filter, it would lose every chip but the
+    active one the moment you used it — a filter you cannot leave."""
+    app = _wide(_dash())
+    app.repo_filter = "lexray"
+    chips, hid, _ = _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    assert not hid
+    assert chips == ["lexray", "quarterback"], chips
+
+
+def test_a_filter_whose_repo_goes_quiet_is_dropped_rather_than_stranding_you():
+    """The last agent in `lexray` exits, so its chip stops being drawn — and a
+    filter that survived that is an empty table with no visible control to clear
+    it."""
+    app = _wide(_dash())
+    app.repo_filter = "lexray"
+    _bar(app, _fleet("quarterback", "selfhost"))
+    assert app.repo_filter is None
+
+
+def test_a_click_on_the_bar_reaches_the_chip_under_the_pointer():
+    """The bar is one row, so the COLUMN is the whole of which chip was hit — and
+    a chip has no record in `self.rows`, which everything below this reaches for."""
+    app = _wide(_dash())
+    app.chips = ["lexray", "quarterback"]
+    app.render_agents = lambda: None
+    app.dispatch_row("chips", 1)
+    assert app.repo_filter == "quarterback"
+    app.dispatch_row("chips", 0)
+    assert app.repo_filter == "lexray"
+
+
+def test_a_click_past_the_last_chip_does_nothing():
+    """A stale column index — the bar rebuilt between the render and the click —
+    must not index into the list it no longer matches."""
+    app = _wide(_dash())
+    app.chips = ["lexray"]
+    app.render_agents = lambda: None
+    app.dispatch_row("chips", 7)
+    assert app.repo_filter is None

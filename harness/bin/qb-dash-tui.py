@@ -912,6 +912,11 @@ class Dash(App):
     #limits { height: 1; padding: 0 1; background: $panel; color: $text;
               display: none; }
     #head { height: 1; padding: 0 1; background: $panel; color: $text; }
+    /* `display: none` until there is a choice to make — see render_chips. One
+       repo is not a filter, and a bar that draws a single chip spends a line of
+       a 78-column pane on a control that cannot change anything. */
+    #chips { height: 1; background: $surface; }
+    #chips.empty { display: none; }
     #detail { height: auto; min-height: 1; padding: 0 1; background: $panel;
               color: $text-muted; }
     .title { height: 1; padding: 0 1; background: $boost; color: $accent; }
@@ -1072,6 +1077,11 @@ class Dash(App):
         # ...and why that list is empty, when the reason is the machine rather
         # than the screen. None means the list is the truth.
         self.seats_error: str | None = None
+        # The chip bar's filter, and the repos it is offering. The list is what
+        # turns a click's COLUMN into a repo — ClickTable reports which cell was
+        # hit, and on a one-row table that index is the whole of the answer.
+        self.repo_filter: str | None = None
+        self.chips: list[str] = []
         # session id -> the board's live agent, which is the id the pane carries
         # as `@qb_session`. One key and no narrowing: it was (machine, scope, seat
         # number) while a pane could only be identified through the agent's name,
@@ -1196,6 +1206,11 @@ class Dash(App):
         # towards is the one number none of the tables can show.
         yield Static("", id="limits")
         yield Static("quarterback — connecting…", id="head")
+        # A ClickTable of one row, rather than a Static carrying click markup:
+        # every other clickable thing here is a table cell, and ClickTable already
+        # reports the column that was hit. A second click mechanism would be a
+        # second place for "what did they click" to be got wrong.
+        yield ClickTable(id="chips", cursor_type="none", show_header=False)
         # A PANEL PER TABLE, and the pairing is structural rather than visual: a
         # grid places cells, so a title loose in the container is a cell of its
         # own and lands in a different column from the table it names. Wrapping
@@ -1217,7 +1232,8 @@ class Dash(App):
             with Vertical(classes="panel", id="p_work"):
                 yield Static("WORK", classes="title", id="t_work")
                 yield ClickTable(id="work", cursor_type="row")
-        yield Static("click: seat→pane, ✕→close it, ＋→add one, agent→where it "
+        yield Static("click: chip→filter to that repo (again to clear), "
+                     "seat→pane, ✕→close it, ＋→add one, agent→where it "
                      "is, claim→its note, work row→why it is where it is, "
                      "⚖→panel review, ⚒→fix issue, ✎→set or clear a dial"
                      # NO SQUARE BRACKETS IN THIS STRING. `#detail` is a Static
@@ -1810,6 +1826,13 @@ class Dash(App):
         """
         rows, hidden = qd.agent_rows(self.board, self.scope,
                                      qd.plan_items(self.plan), self.seats)
+        # THE CHIPS COME OFF THE UNFILTERED ROWS, always. Built from what is left
+        # after a filter, the bar would lose every chip but the active one the
+        # moment you used it — a filter you cannot leave, and the one thing the
+        # toggle below exists to prevent.
+        self.render_chips(rows)
+        everyone = len(rows)
+        rows = qd.only_repo(rows, self.repo_filter)
         table = self.query_one("#agents", DataTable)
         table.clear()
         for row in rows:
@@ -1862,8 +1885,60 @@ class Dash(App):
         # missing because of it, not in a status line that scrolls away: the whole
         # failure is that this panel looked complete when it was not.
         blind = f" · tmux: {qd.clip(self.seats_error, 40)}" if self.seats_error else ""
+        # THE UNFILTERED COUNT STAYS ON THE TITLE, so a filter reads as a filter
+        # rather than as the fleet having shrunk. "3 of 16 · lexray" is a fact
+        # about what you are looking at; "3 live" alone, on a screen whose chip
+        # bar has scrolled out of a short pane, is a fact about the fleet and a
+        # wrong one.
+        narrowed = (f" · {len(rows)} of {everyone} · {self.repo_filter}"
+                    if self.repo_filter else "")
         self.query_one("#t_agents", Static).update(
-            f"AGENTS · {qd.agent_tally(rows)}{qd.elsewhere(hidden)}{blind}")
+            f"AGENTS · {qd.agent_tally(rows)}{narrowed}{qd.elsewhere(hidden)}{blind}")
+
+    def render_chips(self, rows: list[dict]) -> None:
+        """One clickable chip per repo the live fleet is in.
+
+        The bar hides itself below two repos: one chip is not a choice, and a line
+        of a 78-column pane is worth more than a control that cannot change what
+        you are looking at. It reappears the moment a second repo does.
+
+        A FILTER FOR A REPO THAT HAS GONE QUIET IS DROPPED, not kept as a chip
+        with nothing behind it. The alternative strands you: the last agent in
+        `lexray` exits, its chip stops being drawn, and the filter it set is still
+        on — an empty table with no visible control to clear it.
+        """
+        chips = qd.chip_repos(rows)
+        if self.repo_filter and self.repo_filter not in chips:
+            self.repo_filter = None
+        self.chips = chips
+        table = self.query_one("#chips", ClickTable)
+        table.set_class(len(chips) < 2, "empty")
+        if len(chips) < 2:
+            self.chips = []
+            return
+        # Rebuilt rather than updated: the columns ARE the chips, and a DataTable
+        # has no way to drop one. Two repos becoming three is a new bar.
+        table.clear(columns=True)
+        table.add_columns(*[str(i) for i in range(len(chips))])
+        table.add_row(*[
+            Text(f" {name} ",
+                 style="bold black on cyan" if name == self.repo_filter
+                 else qd.repo_colour(name))
+            for name in chips], key="chips")
+
+    def filter_repo(self, repo: str | None) -> None:
+        """Set the filter, or clear it when it is already what was clicked.
+
+        THE SAME CHIP IS BOTH THE ON AND THE OFF SWITCH. A separate `clear` chip
+        is one more thing to find, and in a pane narrow enough to clip the bar it
+        is the one that gets clipped — leaving a filter set and no way to unset
+        it. Clicking the chip you are filtered to is the way out, and it is the
+        chip already under your pointer.
+        """
+        self.repo_filter = None if repo == self.repo_filter else repo
+        self.say(f"filtered to {self.repo_filter}" if self.repo_filter
+                 else "showing every repo")
+        self.render_agents()
 
     def work_action(self, row: dict) -> tuple[str, str | None]:
         """``('⚖', 'panel')`` — the icon this row's verb column wears, and what a
@@ -2142,6 +2217,13 @@ class Dash(App):
         self.dispatch_row(key)
 
     def dispatch_row(self, key: str, column: int | None = None) -> None:
+        # The chip bar is one row, so the COLUMN is the whole of which chip. It is
+        # answered before anything below reaches for `self.rows`: a chip has no
+        # record there, and every other row does.
+        if key == "chips":
+            if column is not None and 0 <= column < len(self.chips):
+                self.filter_repo(self.chips[column])
+            return
         """What a click does, by what the row IS rather than by which table it is in.
 
         There were six branches keyed on a table name and four constants all equal

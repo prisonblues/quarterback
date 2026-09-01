@@ -2548,6 +2548,16 @@ outside a checkout, a fleet-wide plan item, a `plan:<uuid>` claim this process h
 resolved — is kept, because no repo is not evidence of another repo and hiding it drops a
 live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fleet`) was
 the only thing that ever said so and the narrow view is exactly the view that drops it.
+**The chip bar narrows the fleet to one repo.** One line of clickable chips above the
+tables, a chip per repo the live fleet is actually in — not per repo the board knows, because
+a chip with nobody behind it filters to an empty table. The same chip sets and clears, so a
+bar clipped by a narrow pane cannot strand you with a filter and no way out; the unfiltered
+count stays on the title (`AGENTS · 3 of 16 · lexray`) so a filter reads as a filter rather
+than as the fleet having shrunk; and the bar hides itself below two repos, which makes it
+mostly a fleet-wide-scope control — the scope that needed it. It does **not** narrow WORK:
+`gh` is only ever asked about the watched repos, so filtering those rows would show all of
+them or none.
+
 The SEAT ROWS of AGENTS are not scoped: `tmux_seats()` lists every seat pane on the whole
 tmux server, so another screen's seat is a pane you can still close, and narrowing it away
 would take the `✕` with it. It returns `(seats, error)` rather than a bare list, because an
