@@ -2140,6 +2140,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 notes.append(f"--declined {key} was passed to a round that reviewed "
                              "nothing, so it was NOT recorded — pass it again on the "
                              "next round that runs")
+            # #674's, and it does NOT get the same answer. A declaration is dated to
+            # the round that made it, so a round which reviewed nothing cannot record
+            # one; a RETRACTION is a human act about a declaration that already
+            # exists, and losing it resurrects a veto that holds the PR out of a
+            # strict landing. So retractions ARE carried through a skipped round —
+            # the payload below persists the register — and only a key that lifts
+            # nothing is worth reporting here.
+            for key in sorted(k for k in pulled if k not in skip_prior.declined):
+                notes.append(f"--retract {key} names no declination this cycle "
+                             "carries, and this round reviewed nothing that could "
+                             "have raised one — check the key against the payload's "
+                             "`declined` register")
             skipped_payload = {
                 **_payload_defaults(),
                 "repo": repo_name, "github": gh_repo, "pr": pr_number,
@@ -2206,6 +2218,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # likely to be read.
                 "declined": {k: d.as_dict()
                              for k, d in sorted(skip_prior.declined.items())},
+                # #674, and it is CARRIED rather than dropped, unlike the declaration
+                # above it. A skipped round cannot date a new declaration to itself,
+                # so `--declined` is reported and not recorded — but a retraction that
+                # vanished here would resurrect the veto it lifted, and the next round
+                # would hold the PR out of a strict landing on a declination a human
+                # had already answered. Retractions passed to THIS round are added,
+                # because unlike a declaration a retraction needs no findings to be
+                # true: it is an act about a key that already exists in the register.
+                "retracted": dict(sorted({**{k: round_no for k in pulled},
+                                          **skip_prior.retracted}.items())),
                 "round": round_no,
                 "cycle": skip_prior.cycle,
                 "prior_rounds": len(skip_prior.rounds),
@@ -3900,9 +3922,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     declined_held = dict(sorted({**{k: Declination(round_no, why_not)
                                     for k, why_not in unmade.items()},
                                  **prior.declined}.items()))
-    lifted = sorted(k for k in retracted_held if k in declined_held)
-    declined_held = {k: v for k, v in declined_held.items()
-                     if k not in retracted_held}
+    #
+    # A RE-DECLINATION OUTLIVES THE RETRACTION THAT CAME BEFORE IT. A key retracted
+    # in round 2 and declined again in round 5 is not the round-2 declaration coming
+    # back — it is a new assertion about a defect that recurred, and recurrence is
+    # real enough on this fleet to have its own issue (#508). Subtracting it anyway
+    # would discard a fix pass's fresh, honest statement because a human answered a
+    # different one three rounds earlier, so the comparison is on ROUNDS and not on
+    # membership: a retraction lifts the declarations it could have been answering,
+    # which are the ones recorded no later than itself.
+    #
+    # `prior` normally wins a collision so a re-passed key is not re-dated, but a key
+    # declared THIS round that a previous round retracted is the one case where the
+    # newer date is the true one — otherwise the re-declination inherits the old
+    # round number and the comparison below lifts it immediately.
+    for key, why_not in unmade.items():
+        was = retracted_held.get(key)
+        if was is not None and was < round_no:
+            declined_held[key] = Declination(round_no, why_not)
+    lifted = sorted(k for k, d in declined_held.items()
+                    if k in retracted_held and retracted_held[k] >= d.round)
+    live_declined = {k: v for k, v in declined_held.items() if k not in lifted}
     seen_before: dict[str, bool] = {}
 
     def is_new(c: Canonical) -> bool:
@@ -3930,7 +3970,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         `repeated` from this same predicate — so a key that stops being new becomes
         a repeat in the same breath, and the four rules reach the identical verdict.
         """
-        if c.key in declined_held:
+        if c.key in live_declined:
             return False
         if c.key not in seen_before:
             seen_before[c.key] = prior.raised_before(c)
@@ -4238,7 +4278,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         notes.append(f"--retract {key} lifted a declination an earlier fix pass "
                      "recorded — the correction it named is no longer counted as "
                      "outstanding, and it no longer costs this cycle its earned stop")
-    for key in sorted(k for k in retracted_held if k not in lifted):
+    # SPLIT IN TWO, because "lifted nothing" has two causes and they want opposite
+    # actions. A key naming no declination at all is probably a typo and the veto is
+    # standing. A key whose declination was made AFTER the retraction is not a typo —
+    # it is a defect that recurred and a fix pass declined it afresh, and the right
+    # answer is to look at the new declaration rather than to re-type the flag.
+    for key in sorted(k for k in retracted_held
+                      if k not in lifted and k in declined_held):
+        notes.append(f"--retract {key} was recorded in round {retracted_held[key]}, "
+                     f"but the declination it names was made in round "
+                     f"{declined_held[key].round} — later, so it is a fresh "
+                     "declaration and not the one that was retracted. It stands, and "
+                     "it still costs this cycle its earned stop")
+    for key in sorted(k for k in retracted_held if k not in declined_held):
         notes.append(f"--retract {key} names no declination this cycle carries — "
                      "check the key against the payload's `declined` register. "
                      "Nothing was lifted, so any veto that was standing is standing "
@@ -4871,7 +4923,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # register, not this round's declarations: a correction
                       # declined in round 2 is still unmade in round 4, and under
                       # `increment` scope round 4 never re-reads the file to notice.
-                      declined=sorted(declined_held),
+                      declined=sorted(live_declined),
                       # #165. The trigger floor bounds which NEW findings buy a round;
                       # the fix floor bounds rules 2 and 3, because a finding no fix
                       # round was asked to clear is outstanding every round by
@@ -5628,6 +5680,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # identified and did not make (#665). Inherited through `--baseline` exactly
         # as `escalated` is, and it is the reason the next round does not pay to
         # rediscover a defect one of its own actors already wrote down.
+        # THE FULL RECORD, retracted entries included, and that is the fix for a
+        # defect this register had on its first draft: emitting the filtered set made
+        # the next round inherit a retraction whose declination was gone, so nothing
+        # matched, and the "names no declination this cycle carries" note below fired
+        # falsely on every round after the first. History belongs in the payload; the
+        # subtraction is a reading of it, and `retracted` beside it is what lets any
+        # reader — this loop or a person — perform the same reading.
         "declined": {k: d.as_dict() for k, d in declined_held.items()},
         # key -> the round it was first retracted in, inherited by the next round the
         # way `acknowledged` is. Emitted even when empty, so a reader can tell "nobody
@@ -5693,7 +5752,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                     # against the register. `new_this_round` is False on every row
                     # this is True on, by construction — `is_new` reads the same
                     # register — so the two can never disagree.
-                    "declined": c.key in declined_held,
+                    "declined": c.key in live_declined,
                     "below_fix_floor": below_floor(c),
                     "below_threshold": below_threshold(c),
                     "seats_required": dials.threshold_for(c.severity),
@@ -5703,7 +5762,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             "recurrence": recurrence_at(c)[0],
                             "recurs_of": recurrence_at(c)[1],
                             "escalated": c.key in held,
-                            "declined": c.key in declined_held,
+                            "declined": c.key in live_declined,
                             "below_fix_floor": below_floor(c),
                             "below_threshold": False,
                             "seats_required": 1,
@@ -5923,7 +5982,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         Dismissed findings never carry it, for the reason they never carry the ⛔:
         the master ruled the defect not real, so there was no correction to
         decline."""
-        d = declined_held.get(c.key)
+        d = live_declined.get(c.key)
         return (f" 🧾 _declared unfixable in round {d.round} ({d.reason}) — a "
                 "known-unfixed defect, not a fresh finding_" if d else "")
 
