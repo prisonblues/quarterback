@@ -928,7 +928,14 @@ def _payload_defaults() -> dict:
     payload too: a consumer reading `payload['judged']` or `payload['run_key']`
     should not have to know which exit produced it. It used to be a hand-written
     literal of nine keys against this one's two dozen, so the skipped PR — the
-    case that payload exists FOR — was the one that raised KeyError."""
+    case that payload exists FOR — was the one that raised KeyError.
+
+    The harness identity (#112) is read from a value `panel_core` resolved AT
+    IMPORT, rather than measured at each of the four exits: a payload is written
+    after the review, so a harness rebuilt in between would otherwise be recorded
+    as the one that produced the round — which is the event the field exists to
+    make visible, not one it should be able to hide inside."""
+    harness = harness_identity()
     return {
         # Where this round's wall clock went (#192). None means the run never got
         # far enough to say — the same distinction every other key here draws, and
@@ -1116,6 +1123,22 @@ def _payload_defaults() -> dict:
         # repo have when it refused" is exactly the question a refusal raises. Null
         # only as the shape a caller building a payload by hand would leave.
         "rules": None,
+        # WHICH HARNESS produced this round (#112). On every payload including the
+        # ones that reviewed nothing, and for `rules`' reason turned up one level:
+        # a refusal was still produced by a version of this code, and #39 and #40
+        # are about reviewers reporting harness defects — from other repos, where
+        # the harness version is least knowable and most likely to be old.
+        #
+        # Four fields because not one of them is true in every case, and
+        # `panel_core.harness_identity` says which is authoritative (`rev`, when it
+        # is not null) and which are proxies (`digest`, `path`). The whole point of
+        # recording them is that a cycle's r1 -> r2 comparison — which every stop
+        # argument here rests on — currently ASSUMES both rounds were read by the
+        # same machinery, and nothing in the record could check it.
+        "harness_rev": harness["rev"],
+        "harness_dirty": harness["dirty"],
+        "harness_digest": harness["digest"],
+        "harness_path": harness["path"],
         "reviewers_selected": [],
         "reviewers_override": None,
         "to_fix": [],
@@ -3534,17 +3557,69 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     def below_floor(c: Canonical) -> bool:
         return not severity_at_least(c.severity, dials.fix_floor)
 
+    # #78's corroboration threshold: how many DISTINCT members raised this defect,
+    # against how many its band requires. `c.reviewers` and not the LLM seats — a
+    # canonical finding's reporters can legitimately include sonarqube's soft
+    # findings, which are judged alongside them, and the report's `⋆consensus`
+    # notation has counted them the same way since #62. The whole safety argument
+    # lives on `Dials.corroboration_applies`: a band the threshold may act on is one
+    # `round_stop`'s rules 1, 2 and 3 all ignore, so nothing this stands down can hold
+    # the cycle open and no blocker can be suppressed for want of a second opinion.
+    def below_threshold(c: Canonical) -> bool:
+        return dials.uncorroborated(c.severity, len(c.reviewers))
+
     # The other half of #297: findings the fix floor admits but the trigger floor does
     # not, which the round pays for out of a shared line budget rather than
     # unconditionally. They stay in the fixer's LIST — a genuinely cheap fix is worth
     # taking while the pass is open, which is the argument `fix_severity_floor` is set
     # a tier low for — and are marked so the budget travels with them into any brief
     # built by pasting that list.
+    #
+    # AND NOT STOOD DOWN, which is the one place #78 has to reach into a flag it did
+    # not add. `budgeted_fix` means "this round's work while the line budget lasts",
+    # so it is false of everything that is not this round's work at all — that is
+    # already true of a below-floor finding by construction, because `Dials.budgeted`
+    # requires the fix floor, and it is NOT true of a below-threshold one, which sits
+    # squarely inside the budgeted band. Left alone, the payload would offer a fixer a
+    # finding to spend budget on that the report has taken out of its list.
     def budgeted(c: Canonical) -> bool:
-        return dials.budgeted(c.severity)
+        return dials.budgeted(c.severity) and not below_threshold(c)
 
-    for_fix = [c for c in to_fix if not below_floor(c)]
+    # The fixer's list, minus BOTH ways a confirmed finding is deliberately not this
+    # round's work. The two are independent questions — one about the band, one about
+    # who raised it — and a finding can be under either or both.
+    for_fix = [c for c in to_fix if not below_floor(c) and not below_threshold(c)]
     under_floor = [c for c in to_fix if below_floor(c)]
+    # Reported under its own heading, exactly as `under_floor` is and for the reason
+    # #165 gives: the two lists are read by different readers, and an orchestrator
+    # pasting "the To fix list" into a brief must not sweep these up with it. A
+    # finding that is below the floor AS WELL is listed once, in `under_floor`, which
+    # already says it is not this round's work — the payload flags both independently,
+    # so nothing is lost and the report does not print the same defect twice.
+    under_threshold = [c for c in to_fix if below_threshold(c) and not below_floor(c)]
+    # A threshold no answer can reach, said where the numbers are known. Every seat
+    # that filed anything this round agreeing on one defect is the most corroboration
+    # this round could ever have produced, so a threshold above that count stands down
+    # its whole band — which is a config nobody meant to write, and is invisible in a
+    # report that only ever shows what the round did stand down.
+    threshold_filers = len(ran_llm) + (1 if sonar_filed else 0)
+    # `> 1` first, and it is load-bearing rather than a tidy-up: a round where no
+    # member filed at all has `threshold_filers == 0`, and every band's threshold is
+    # at least 1, so a bare comparison against the count would put this note on every
+    # round of every repo that has never written the key — a warning about a policy
+    # nobody set, which is the alert fatigue `coverage_veto` is careful about one file
+    # over.
+    unreachable_bands = sorted({f"`{b}` ({dials.threshold_for(b)} seats)"
+                                for b in SEVERITIES
+                                if 1 < dials.threshold_for(b) > threshold_filers})
+    if unreachable_bands:
+        notes.append(
+            f"`threshold_by_severity` asks for more seats than filed a finding this "
+            f"round: {', '.join(unreachable_bands)} against {threshold_filers} — no "
+            "finding in those bands can reach the threshold, so the whole band is "
+            "reported "
+            "rather than fixed. That is a policy this round applied, not a fault; "
+            "lower the number or enable another seat if it was not the intent")
     dismissed = [c for c in findings if c.verdict == "dismissed"]
     # Sonar's hard-gate issues never reach the judge, so each is a canonical
     # record of its own single account — numbered after the judged ones, since
@@ -5095,12 +5170,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # False on a SONAR issue, where the other two flags are computed: neither
         # floor applies to a hard-gate issue at any rule, so a budget that could
         # decline to fix one would say the panel may leave a red quality gate red.
+        # `below_threshold` is the fourth and is #78's: the finding is at or above
+        # every floor and is still not this round's work, because fewer members raised
+        # it than its band requires. It rides here rather than being left to a consumer
+        # to derive, on `below_fix_floor`'s own reason — an orchestrator building a
+        # fixer's brief has to be able to SEE that a finding was stood down, and a
+        # threshold that a reader can only reconstruct by joining `reviewers` against
+        # `review_panel.threshold_by_severity` is a suppression that reads as an
+        # omission. `seats_required` is beside it because the flag alone does not say
+        # what the bar was, and the bar moves per band; it is `1` wherever no threshold
+        # applies, which is what every band has always required.
+        #
+        # ALWAYS FALSE ON A SONAR ISSUE, for `budgeted_fix`'s reason and one of its
+        # own: a hard-gate issue is a red quality gate rather than a judged opinion, it
+        # is filed by a scanner and never by a panel of seats, so "not enough seats
+        # agreed" is not a sentence that can be true of it.
         "to_fix": [{**c.as_dict(), "new_this_round": is_new(c),
                     "provenance": provenance_of(c),
                     "recurrence": recurrence_at(c)[0],
                     "recurs_of": recurrence_at(c)[1],
                     "escalated": c.key in held,
                     "below_fix_floor": below_floor(c),
+                    "below_threshold": below_threshold(c),
+                    "seats_required": dials.threshold_for(c.severity),
                     "budgeted_fix": budgeted(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
                             "provenance": provenance_of(c),
@@ -5108,6 +5200,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             "recurs_of": recurrence_at(c)[1],
                             "escalated": c.key in held,
                             "below_fix_floor": below_floor(c),
+                            "below_threshold": False,
+                            "seats_required": 1,
                             "budgeted_fix": False} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
                        "provenance": provenance_of(c),
@@ -5115,6 +5209,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                        "recurs_of": recurrence_at(c)[1],
                        "escalated": False,
                        "below_fix_floor": False,
+                       "below_threshold": False,
+                       "seats_required": 1,
                        "budgeted_fix": False} for c in dismissed],
         # The eight #165/#297 dials AS APPLIED, not as written: a repo whose
         # `fix_severity_floor` was rejected reads the floor that actually ran here
@@ -5755,7 +5851,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 else "increment" if target_scope == "increment" else "diff")
         lines.append(f"\n_{what} is {len(review.target):,} chars — truncated for {cut}_")
 
-    lines.append(f"\n### To fix ({len(for_fix)}) — master-confirmed, any reviewer count"
+    # "any reviewer count" stops being true the moment a threshold is in force, and
+    # this header is the line an orchestrator reads to know what the list IS. So the
+    # clause is conditional on the policy rather than fixed: a repo at the shipped `{}`
+    # sees exactly the sentence it saw before #78.
+    counted = ("master-confirmed, corroborated to `threshold_by_severity`"
+               if under_threshold or dials.thresholds_applied()
+               else "master-confirmed, any reviewer count")
+    lines.append(f"\n### To fix ({len(for_fix)}) — {counted}"
                  + (f", {dials.fix_floor} and above"
                     if under_floor else ""))
     # #297's budget, stated where the list it bounds is, not only on the dials line.
@@ -5859,6 +5962,39 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
             lines.append(f"- 🔽 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
                          f"{c.synthesis}{conf(c)}{escalation(c)}")
+
+    # #78's half of the same idea, and a section of its own rather than a subheading
+    # under the one above, for the reason that one is a section rather than a mark: the
+    # two lists are not this round's work for DIFFERENT reasons, and the remedy differs
+    # too. A below-floor finding is under a severity cut the repo set and stays under
+    # it however many seats raise it; a below-threshold finding is above every cut and
+    # is one corroborating seat away from being ordinary work, which is a fact the next
+    # round can change and a reader has to be able to act on.
+    if under_threshold:
+        lines.append(f"\n### Reported, not this round's work ({len(under_threshold)}) "
+                     "— under the corroboration threshold")
+        lines.append(
+            "_Master-confirmed, recorded, and deliberately NOT for the fixer: fewer "
+            "members raised each of these than `review_panel.threshold_by_severity` "
+            "requires at its band (#78). Do not build a fix brief from this list. They "
+            "stay in the payload (`below_threshold`, with `seats_required` beside it) "
+            "and on the board, and they are **not suppressed**: a threshold may only "
+            f"stand down a severity below the `{dials.round_trigger_floor}` round "
+            f"trigger floor that is also not "
+            f"{' or '.join(BLOCKING_SEVERITIES)}, so nothing here blocks a merge and "
+            "nothing here is a finding another round could not raise again with a "
+            "second seat behind it. **No GitHub issue**, deliberately, and unlike a "
+            "below-floor deferral: `review_panel.file_deferral_issues` gates a "
+            "decision about a finding the repo has said is not worth fixing, and one "
+            "seat away from work is not that — a tracker row per solo P3 is the batch "
+            "accumulation #620 measured, opened for the class of finding least likely "
+            "to be real._")
+        for c in under_threshold:
+            fresh = " 🆕" if prior_rounds and is_new(c) else ""
+            lines.append(f"- 👥 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+                         f"{c.synthesis}{conf(c)} — _{len(c.reviewers)} of "
+                         f"{dials.threshold_for(c.severity)} seats_"
+                         f"{escalation(c)}")
 
     if sonar:
         lines.append(f"\n### SonarCloud issues ({len(sonar)}) — part of the gate")

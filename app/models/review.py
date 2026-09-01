@@ -282,6 +282,60 @@ class ReviewRun(Base):
     #: only prior round IS the anchor. Not the same as a round that looked for
     #: restored lines and found none, which sends a ``count`` of 0.
     provenance_restored: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: WHICH HARNESS PRODUCED THIS ROUND (#112) — four fields, because no one of
+    #: them is true in every case and a field that is sometimes a lie is worse than
+    #: three that are each honest about their scope.
+    #:
+    #: Everything above says what the round was CONFIGURED with. Nothing said what
+    #: RAN it. So a leaderboard aggregated confirmed/dismissed rates over runs whose
+    #: prompts, budget arithmetic and seat-loss behaviour differed, and the r1 -> r2
+    #: comparison every stop argument rests on assumed both rounds were read by the
+    #: same machinery — an assumption nothing on this row could check. On
+    #: 2026-08-31 six merges changed ``round_stop``, ``converged``, the
+    #: ``fix_injection`` accounting and ``restored_lines`` in one day, and the panel
+    #: on one host was rebuilt underneath a running session.
+    #:
+    #: :attr:`harness_rev` is the commit of the checkout the panel ran from, and is
+    #: the only AUTHORITATIVE field here: it names something a reader can go and
+    #: ``git show``. It is NULL on every installed harness, which is most of them —
+    #: the nix store is not a checkout — and the panel refuses to report a rev it
+    #: cannot prove is the harness's own, so a scratchpad copy sitting inside some
+    #: other repository records NULL rather than that repository's HEAD.
+    #:
+    #: :attr:`harness_dirty` is whether the digested directory carried changes that
+    #: rev does not, untracked files included. It is what makes a rev honest rather
+    #: than merely present: a developing panel is edited in place, and #112 was found
+    #: from exactly such a copy. NULL is "no rev, or nobody could ask" — never a
+    #: silent ``false``.
+    #:
+    #: :attr:`harness_digest` is a content hash of the loop modules, scheme-tagged
+    #: (``loops-sha256-1:<hex>``). A **PROXY**, and ``qb-doctor``'s ``check_harness``
+    #: says why in the same words: the truthful answer is the flake pin's rev and a
+    #: running harness cannot reach it, so content stands in. It cannot name a
+    #: version and it cannot say which of two is newer. It is the only field that is
+    #: always present and never wrong about the one question that matters most —
+    #: same code, or not — which is precisely the question an r1 -> r2 comparison
+    #: needs. Compare digests only within a scheme; the tag is on the value so that
+    #: a change to what is hashed cannot masquerade as a change to the harness.
+    #:
+    #: :attr:`harness_path` is where it all ran from. A **LOCATOR**, machine-scoped:
+    #: for a nix install it doubles as an exact identity of the build, and for a
+    #: scratchpad copy it is the only field that says the round did not come from
+    #: the deployed harness at all. Detail-only — see ``reviews._run_view``.
+    #:
+    #: Stored verbatim, all four. This board does not parse a store path, does not
+    #: recompute a digest and does not resolve a rev against any repository; it has
+    #: no checkout of the harness to resolve one against, and a second implementation
+    #: of "which harness is this" is the drift #305 exists to end.
+    #:
+    #: NULL = the panel did not say, on all four. That is every run recorded before
+    #: these columns, and it stays a permanent answer for ``rev``/``dirty`` on every
+    #: installed harness. No backfill: attributing today's harness to a round that
+    #: ran under another is the exact error this column exists to make impossible.
+    harness_rev: Mapped[str | None] = mapped_column(Text)
+    harness_dirty: Mapped[bool | None] = mapped_column(Boolean)
+    harness_digest: Mapped[str | None] = mapped_column(Text)
+    harness_path: Mapped[str | None] = mapped_column(Text)
     changed_lines: Mapped[int | None] = mapped_column(Integer)
     #: GitHub's own count of the PR's changed files (v2.23), stored beside the
     #: rows in :class:`ReviewRunFile` rather than derived from them. When the two

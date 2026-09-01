@@ -1606,6 +1606,96 @@ def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
     return n
 
 
+def threshold_by_severity(panel: dict, notes: list[str]) -> dict[str, int]:
+    """`threshold_by_severity` — how many DISTINCT seats must independently raise a
+    finding at each severity before it is this round's work (#78).
+
+    A mapping of severity band to a whole number >= 1: ``{"P3": 2}`` reads "a P3 one
+    seat raised is reported, not fixed". A band the mapping does not name needs one
+    seat, which is what every band has always needed, so ``{}`` is the whole off
+    switch and is the shipped default.
+
+    **`1` is legal and means no threshold at that band.** It is not a second spelling
+    of anything — the identity, written out — and a repo that wants to say "P3 is
+    deliberately left at one seat" beside a `P4: 2` can. `0` is refused: no finding
+    can be raised by fewer than one seat, so a threshold of nothing is a value with no
+    behaviour, and a hand that wrote it meant either the off switch (leave the band
+    out) or `1`, and nothing here can tell which.
+
+    An explicit `null` inherits the default like any other absent value. There is no
+    nullable switch to want: `{}` already spells "no threshold anywhere" and a second
+    spelling for it would be one written value with two meanings, which is the
+    collapse :func:`unrefereed_line_weight` refuses one function up.
+
+    A bool is rejected before the integer read, for :func:`low_severity_budget`'s
+    reason — ``isinstance(True, int)`` is True, so ``{"P3": true}`` would otherwise
+    become a threshold of one, which is not off and is not anything else either. An
+    integral float counts and a fractional one does not: a finding is raised by a
+    whole number of seats, and `1.5` is not a count anything can be short of.
+
+    **The keys are severities and nothing else.** A band this panel does not have —
+    `P0`, `BLOCKER`, a typo — is refused rather than dropped, because a dropped key is
+    a policy the operator wrote and the round did not run, and the whole of this dial
+    is per-band. Normalised on the way in (stripped, upper-cased) exactly as every
+    other severity entering the panel is, so `" p3 "` out of a hand-edited rules file
+    resolves to the same band a board dial spelling `P3` does.
+
+    **What this function does NOT decide is which bands the threshold may act on.**
+    That is :meth:`Dials.corroboration_applies`, and it is deliberately downstream: a
+    repo may legally write `{"P2": 2}` and the round will refuse to apply it and say
+    so, rather than the file failing to load. The difference matters because
+    `round_trigger_floor` is a separate dial that a board layer can move underneath a
+    written mapping — so whether a band is actionable is a property of the resolved
+    round, not of the value.
+    """
+    raw = panel.get("threshold_by_severity", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        return dict(DEFAULT_THRESHOLD_BY_SEVERITY)
+
+    def refuse(what: str) -> dict[str, int]:
+        _refuse_value("threshold_by_severity", raw,
+                      f"{what} — a mapping of severity band "
+                      f"({', '.join(SEVERITIES)}) to the whole number of seats, 1 or "
+                      "more, that must independently raise a finding at that band "
+                      "before it is fixed, or {} for no threshold anywhere")
+        return {}                  # unreachable; `_refuse_value` always raises
+
+    if not isinstance(raw, dict):
+        return refuse("a mapping")
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        band = str(key).strip().upper()
+        if band not in SEVERITIES:
+            return refuse(f"keyed by severity band ({key!r} is not one)")
+        if band in out:
+            # Two spellings of one band, refused rather than resolved. Normalising on
+            # the way in is what makes `" p3 "` and `"P3"` the same band, and it is
+            # also what lets them BOTH be written — after which one of the two numbers
+            # silently wins on dict insertion order, and a repo reading its own rules
+            # file cannot tell which. Refused for `low_severity_fix_lines`' reason: a
+            # hand that wrote two meant one of them, and nothing here can tell which.
+            return refuse(f"one entry per severity band ({band} is written twice)")
+        n = None
+        if isinstance(value, bool):
+            n = None
+        elif isinstance(value, int):
+            n = value
+        elif isinstance(value, float):
+            n = int(value) if value.is_integer() else None
+        elif isinstance(value, str):
+            try:
+                n = int(value.strip())
+            except ValueError:
+                n = None
+        if n is None:
+            return refuse(f"a whole number of seats at every band ({band} is "
+                          f"{value!r})")
+        if n < 1:
+            return refuse(f"1 or more at every band ({band} is {value!r})")
+        out[band] = n
+    return out
+
+
 def next_door_days(panel: dict, notes: list[str]) -> int:
     """`next_door_days` — whole days >= 0, how far back #508's hints may reach.
 
@@ -2131,7 +2221,7 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The thirteen #165/#297/#492/#482/#554/#508/#618 settings as this round
+    """The fourteen #165/#297/#492/#482/#554/#508/#618/#78 settings as this round
     applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
@@ -2157,6 +2247,12 @@ class Dials:
     next_door_days: int = DEFAULT_NEXT_DOOR_DAYS
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
     max_rounds: int = DEFAULT_MAX_ROUNDS
+    #: #78's corroboration threshold, band by band. Carried here for its siblings'
+    #: reason — the report, the payload and the fixer's list have to be reading ONE
+    #: mapping — and as a plain dict rather than a frozen mapping because nothing
+    #: hashes a `Dials` and pretending otherwise would cost a type nobody reads.
+    threshold_by_severity: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_THRESHOLD_BY_SEVERITY))
 
     def as_dict(self) -> dict:
         """For the payload. Every key present on every round, so a consumer never has
@@ -2173,7 +2269,13 @@ class Dials:
                 "reviewer_scope": self.reviewer_scope,
                 "next_door_days": self.next_door_days,
                 "require_failing_test": self.require_failing_test,
-                "max_rounds": self.max_rounds}
+                "max_rounds": self.max_rounds,
+                # A COPY, not the object this round is applying. `as_dict` is the
+                # payload's view and a payload is serialised, posted and stored; the
+                # other twelve are immutable scalars and cannot be edited through it,
+                # and a mapping handed out by reference could be — which would make
+                # the recorded policy and the applied policy the same mutable thing.
+                "threshold_by_severity": dict(self.threshold_by_severity)}
 
     @property
     def budgeted_band(self) -> bool:
@@ -2226,6 +2328,89 @@ class Dials:
         `round_trigger_floor` already makes on the same tier, one round earlier."""
         return (self.round_trigger_floor if self.budgeted_band
                 else self.fix_severity_floor)
+
+    def corroboration_applies(self, severity: str) -> bool:
+        """May a corroboration threshold stand a finding at this severity down AT ALL?
+
+        **This is the safety property of #78 and it is a property of the MECHANISM,
+        not of the shipped default.** A threshold suppresses work on the strength of a
+        head count, which points the opposite way from every other brake in this
+        system: the rest of them decline to spend, and this one declines to look. A
+        single seat finding a genuine P1 nobody else spotted is the case the panel
+        exists for — #78's own table has one, `32-F01`, solo and real — so the answer
+        cannot be left to whoever writes the mapping.
+
+        Two conditions, and both are about ``round_stop`` rather than about taste:
+
+        * **Below ``round_trigger_floor``.** #621's decided rule is that a repeated
+          finding keeps a cycle going only if it would have bought a round in the
+          first place. A finding at or above the trigger floor buys rounds — under
+          rule 1 when it is new and rule 3 when it repeats — so standing it down would
+          leave a finding no fix pass may touch and every rule still demanding, which
+          is the jam ``escalated`` was added to break. Below the floor there is
+          nothing to jam: rules 1 and 3 already ignore it.
+        * **Not one of :data:`panel_core.BLOCKING_SEVERITIES`.** Rule 2 blocks on
+          ``P1``/``P2`` whatever the floors say, so the first condition alone is not
+          enough: at ``round_trigger_floor: P1`` a ``P2`` is below the floor and rule 2
+          still demands it every round, for ever, on a finding the threshold has taken
+          out of the fixer's list. The tuple is read from where rule 2 reads it, so the
+          two cannot drift.
+
+        The two together make the guarantee mechanical: **anything a threshold stands
+        down is a finding rules 1, 2 and 3 all ignore already**, so the cycle cannot be
+        held open by one, ``round_stop`` needs no new parameter, and no round can end
+        with a blocker suppressed for want of a second opinion.
+        """
+        return (not severity_at_least(severity, self.round_trigger_floor)
+                and severity not in BLOCKING_SEVERITIES)
+
+    def threshold_for(self, severity: str) -> int:
+        """Seats a finding at this severity needs before it is this round's work.
+
+        `1` — one seat, which is every band's requirement before #78 and every band's
+        requirement at the shipped `{}` — for a band the mapping does not name AND for
+        a band :meth:`corroboration_applies` refuses. The refusal is expressed as a
+        threshold of one rather than as a separate flag so that every reader asks one
+        question and gets one number; a repo that wrote `{"P1": 3}` gets a round that
+        applies 1 and a `config_notes` line saying the key was ignored, never a round
+        that quietly honours it.
+        """
+        if not self.corroboration_applies(severity):
+            return 1
+        return max(1, self.threshold_by_severity.get(severity, 1))
+
+    def uncorroborated(self, severity: str, seats: int) -> bool:
+        """Was this finding raised by fewer seats than its band requires?
+
+        `seats` is the number of DISTINCT members that filed it — `Canonical.reviewers`
+        — which is the same count the report's `⋆consensus` notation has always shown.
+        False at every band under the shipped default, so a round of a repo that has
+        not written this key behaves exactly as it did.
+        """
+        return seats < self.threshold_for(severity)
+
+    def thresholds_applied(self) -> bool:
+        """Is a corroboration threshold in force at any band this round?
+
+        Asked of :meth:`threshold_for` rather than of the written mapping, so a repo
+        whose every written band was refused by :meth:`corroboration_applies` reads as
+        what it is — no threshold applied — and the report does not announce a policy
+        the round declined to run.
+        """
+        return any(self.threshold_for(b) > 1 for b in SEVERITIES)
+
+    def thresholds_ignored(self) -> list[str]:
+        """The bands this repo wrote a threshold for that the round will not apply.
+
+        Reported rather than silently dropped, on the rule every resolver in this
+        module follows: a policy the operator wrote and the round did not run is worse
+        than a refused value, because nothing says it did not run. Empty at the shipped
+        default and for any mapping that only names actionable bands, so the note fires
+        on a real mistake and never on a working config.
+        """
+        return [b for b in SEVERITIES
+                if self.threshold_by_severity.get(b, 1) > 1
+                and not self.corroboration_applies(b)]
 
     def budgeted(self, severity: str) -> bool:
         """Is a finding at this severity one the budget pays for — in the band, and
@@ -2382,12 +2567,22 @@ class Dials:
                 # out of this report, so "does this deferral get an issue" has to be
                 # readable from the artifact rather than from whoever remembers the
                 # repo's config (#482).
-                f"{self.deferral_gist()}")
+                f"{self.deferral_gist()}"
+                # #78's threshold, appended on `max_fix_guard_lines`' rule and for
+                # its reason: said only when SET, because the shipped value is `{}`
+                # and a clause reading "corroboration 1 seat everywhere" on every
+                # repo that never wrote the key reports an absence rather than a
+                # policy. What a reader has instead is the `⋆consensus` notation,
+                # which names the seats behind every finding at every setting.
+                + (" · corroboration " + ", ".join(
+                    f"{b} {self.threshold_for(b)} seats" for b in SEVERITIES
+                    if self.threshold_for(b) > 1)
+                   if any(self.threshold_for(b) > 1 for b in SEVERITIES) else ""))
 
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all thirteen at once.
+    """Read, validate and report all fourteen at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2418,7 +2613,25 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         require_failing_test=panel_flag(panel, "require_failing_test",
                                         DEFAULT_REQUIRE_FAILING_TEST, notes),
         max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes, round_ceiling),
+        threshold_by_severity=threshold_by_severity(panel, notes),
     )
+    # #78's one migration-shaped hazard, said out loud rather than special-cased, and
+    # it is not really a migration: `round_trigger_floor` is a SEPARATE dial that a
+    # board layer can move underneath a mapping somebody wrote months ago. A repo that
+    # wrote `{"P3": 2}` under the shipped `P2` trigger floor and later moved that floor
+    # to `P3` has a key that stopped doing anything, and nothing else in the round
+    # would say so. See `Dials.corroboration_applies` for why the bands are refused
+    # rather than honoured.
+    ignored = dials.thresholds_ignored()
+    if ignored:
+        notes.append(
+            f"`threshold_by_severity` names {', '.join(ignored)}, which this round "
+            f"will NOT apply — a corroboration threshold may only stand down a "
+            f"severity below the `{dials.round_trigger_floor}` round trigger floor "
+            f"that is also not {' or '.join(BLOCKING_SEVERITIES)}. Those findings buy "
+            "another round however few seats raised them, so suppressing them would "
+            "leave a finding no fix pass may touch and every stop rule still "
+            "demanding. Each named band is applied at 1 seat, as it was before the key")
     # The one migration hazard #492 creates, said out loud rather than special-cased.
     # A repo that wrote `max_fix_growth: null` meant "no growth check" — that key WAS
     # the whole check — and after #492 it switches off the multiple only, leaving an

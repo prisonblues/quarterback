@@ -144,7 +144,7 @@ async def test_a_nul_in_an_unread_path_records_the_round(client):
     path instead of truncating it.
     """
     posted = await post(client, 2, ("unread_files",), ["app/a\x00b.py"])
-    assert posted["nul_paths_dropped"] == ["unread_files[0]"]
+    assert posted["nul_dropped"] == ["unread_files[0]"]
     # The arithmetic still closes: one entry arrived and one was unusable.
     assert posted["unread_files_dropped"] == {"over_cap": 0, "unusable": 1}
     assert (await detail(client, posted["id"]))["unread_files"] is None
@@ -203,13 +203,18 @@ MARKED_ENTRIES = [
     (("reviewers", "claude", "could_not_assess"), "reviewers.claude.could_not_assess[0]"),
 ]
 
-#: Paths. Dropped rather than marked — see :data:`app.api.reviews._PATH_KEYS`.
-PATH_POSITIONS = [
+#: Tokens matched by exact string. Dropped rather than marked — see
+#: :data:`app.api.reviews._MATCHED_KEYS`.
+MATCHED_POSITIONS = [
     (("unread_files",), [NUL], "unread_files[0]"),
     (("code_access", "convention_files_removed"), [NUL],
      "code_access.convention_files_removed[0]"),
     (("changed_files", 0, "path"), NUL, "changed_files[0].path"),
     (("to_fix", 0, "file"), NUL, "to_fix[0].file"),
+    # #112's two. `harness_digest` is held against the previous round's to answer
+    # "same code, or not"; `harness_path` is a locator a reader follows.
+    (("harness_digest",), f"loops-sha256-1:{NUL}", "harness_digest"),
+    (("harness_path",), f"/nix/store/{NUL}", "harness_path"),
 ]
 
 
@@ -242,21 +247,24 @@ async def test_a_nul_in_a_list_entry_is_marked_and_its_index_named(
     assert named in posted["nul_replaced"]
 
 
-@pytest.mark.parametrize("path,value,named", PATH_POSITIONS,
-                         ids=[n for _, _, n in PATH_POSITIONS])
-async def test_a_nul_in_a_path_drops_that_path_and_says_so(
+@pytest.mark.parametrize("path,value,named", MATCHED_POSITIONS,
+                         ids=[n for _, _, n in MATCHED_POSITIONS])
+async def test_a_nul_in_a_matched_token_drops_it_and_says_so(
         client, path, value, named):
     """The one class that is dropped rather than marked, and why it is separate.
 
-    ``app/a␦b.py`` is not ``app/ab.py`` and it is not the file the sender meant.
-    Every one of these four is matched by exact string somewhere — the unread
-    list against the next round's diff, ``changed_files`` against another PR's in
-    ``GET /review/collisions``, a finding's ``file`` in ``_derive_key`` — so a
-    marked path is a value that looks like data and matches nothing forever.
+    The test is not "is this a path", it is "is this compared with ``==`` somewhere
+    that will not report the miss". The unread list is matched against the next
+    round's diff, ``changed_files`` against another PR's in
+    ``GET /review/collisions``, a finding's ``file`` inside ``_derive_key``, and
+    ``harness_digest`` against the previous round's to answer the one question #112
+    says that field is never wrong about. A marked token is not a shorter one, it is
+    a DIFFERENT one, and it answers that comparison wrongly and silently forever —
+    where NULL answers *unknown*, which is honest.
     """
-    posted = await post(client, 300 + [n for _, _, n in PATH_POSITIONS].index(named),
+    posted = await post(client, 300 + [n for _, _, n in MATCHED_POSITIONS].index(named),
                         path, value)
-    assert named in posted["nul_paths_dropped"]
+    assert named in posted["nul_dropped"]
     assert named not in posted.get("nul_replaced", [])
 
 
@@ -316,7 +324,7 @@ async def test_an_ordinary_payload_reports_nothing(client):
     assert r.status_code == 201, r.text
     body = r.json()
     assert not any(k in body for k in
-                   ("nul_replaced", "nul_paths_dropped", "nonfinite_dropped"))
+                   ("nul_replaced", "nul_dropped", "nonfinite_dropped"))
 
 
 async def test_a_sender_cannot_write_its_own_account_of_what_was_marked(client):
@@ -328,10 +336,10 @@ async def test_a_sender_cannot_write_its_own_account_of_what_was_marked(client):
     """
     posted = await post(client, 503, ("pr_title",), NUL,
                         nul_replaced=["nothing happened"],
-                        nul_paths_dropped=["nor here"],
+                        nul_dropped=["nor here"],
                         nonfinite_dropped=["nor here either"])
     assert posted["nul_replaced"] == ["pr_title"]
-    assert "nul_paths_dropped" not in posted
+    assert "nul_dropped" not in posted
     assert "nonfinite_dropped" not in posted
 
 
@@ -492,3 +500,127 @@ async def test_two_keys_that_marking_makes_one_leave_the_last(client):
     run = await detail(client, posted["id"])
     seat = next(c for c in run["reviewers"] if c["name"] == f"cla{MARK}ude")
     assert seat["model"] == "second"
+
+
+# ---------------------------------------------------------------------------
+# The fields #112 and #78 added while this was in review, each classified on
+# purpose rather than by whichever branch happened to land last.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["scope", "fix_range_source"])
+async def test_a_word_read_against_no_vocabulary_is_marked_and_kept(client, field):
+    """#112 refused these; this keeps them, and the reason is `_word_or_none`'s own.
+
+    #112 found the real 500 here — `scope: "pr\\x00"` reached a `text` column — and
+    fixed it with a NUL test inside `_word_or_none`. The whole-body pass now runs
+    before that function is ever called, so the test was dead and is gone.
+
+    What replaced it is a different answer, not the same one. These two are read
+    against **no vocabulary on purpose**, and that docstring's argument is that a
+    value outside the set reclassifies nothing because a consumer grouping a
+    population by it gets an extra group it can SEE. NULL would fold it into "the
+    panel did not say", which is a claim about the payload's AGE. So the word is
+    marked, stored, and named — one signal, and `unreadable_fields` is not it,
+    because the value IS the shape this field takes.
+    """
+    posted = await post(client, 1000 + ["scope", "fix_range_source"].index(field),
+                        (field,), f"incre{NUL}ment")
+    assert posted["nul_replaced"] == [field]
+    assert field not in posted.get("unreadable_fields", [])
+    r = await client.get("/reviews", params={"repo": REPO}, headers=AGENT)
+    assert r.status_code == 200, r.text
+    run = next(x for x in r.json() if x["id"] == posted["id"])
+    assert run[field] == f"incre{MARKED}ment"
+
+
+async def test_a_marked_harness_rev_is_refused_by_its_own_coercer(client):
+    """A marked value IS still disbelieved wherever a coercer follows it.
+
+    `harness_rev` names a commit in the harness's own repository and goes through
+    `_sha_or_none` with the other commit ids. Marking it does not smuggle it past
+    that: `a␦b` is not forty hex characters, so it lands on NULL and #112's
+    `harness_rev_dropped` names what arrived. Two keys, and they are complementary
+    rather than competing — one says a byte was marked, the other says the marked
+    result was not a commit id and quotes it.
+    """
+    posted = await post(client, 1010, ("harness_rev",), NUL)
+    assert posted["nul_replaced"] == ["harness_rev"]
+    assert posted["harness_rev_dropped"] == MARKED
+    r = await client.get("/reviews", params={"repo": REPO}, headers=AGENT)
+    run = next(x for x in r.json() if x["id"] == posted["id"])
+    assert run["harness_rev"] is None
+
+
+@pytest.mark.parametrize("field,view", [("harness_digest", "list"),
+                                        ("harness_path", "detail")])
+async def test_a_dropped_harness_token_is_named_once_and_not_twice(client, field, view):
+    """One signal, which is the thing a merge of two fixes most easily breaks.
+
+    #112 names both of these in `unreadable_fields` when `_word_or_none` refuses
+    them. The whole-body pass drops them to `None` first, and a `None` is a field
+    the sender did not send — so that check does not fire and `nul_dropped` is the
+    only thing that speaks. A sender is told once, in the bucket that says why.
+    """
+    posted = await post(client, 1020 + ["harness_digest", "harness_path"].index(field),
+                        (field,), f"loops-sha256-1:{NUL}")
+    assert posted["nul_dropped"] == [field]
+    assert field not in posted.get("unreadable_fields", [])
+    if view == "detail":
+        assert (await detail(client, posted["id"]))[field] is None
+    else:
+        r = await client.get("/reviews", params={"repo": REPO}, headers=AGENT)
+        assert next(x for x in r.json() if x["id"] == posted["id"])[field] is None
+
+
+async def test_a_non_finite_harness_flag_is_named_as_the_number_it_was(client):
+    """`harness_dirty` is a three-state flag, and `NaN` is not one of the three.
+
+    #112 lands a non-bool on NULL and names it in `unreadable_fields`. A non-finite
+    number is dropped one step earlier and named in `nonfinite_dropped` instead —
+    still exactly one signal, and the more specific of the two, because "your
+    number was not a number" points at the producer's arithmetic while "wrong
+    shape" points at its schema.
+    """
+    raw = (f'{{"repo": "{REPO}", "pr": 1030, "reviewed": true, '
+           f'"harness_dirty": NaN}}')
+    r = await client.post("/review", content=raw.encode(),
+                          headers={**AGENT, "content-type": "application/json"})
+    assert r.status_code == 201, r.text
+    assert r.json()["nonfinite_dropped"] == ["harness_dirty"]
+    assert "harness_dirty" not in r.json().get("unreadable_fields", [])
+
+
+async def test_a_nul_inside_a_threshold_map_refuses_the_whole_dial_set(client):
+    """#78's dial nests a mapping inside `review_panel`, and the pass still stops.
+
+    `threshold_by_severity` arrived after this pass was written, which is the case
+    `_OPAQUE_FIELDS` exists for: nothing here had to learn the new key, because the
+    rule is about the BLOCK and not about its contents. `_opaque_or_none` walks it
+    with `_has_nul` and refuses the dial set whole — half a policy record being one
+    no round ran under — rather than the pass editing a threshold inside it.
+    """
+    posted = await post(client, 1040, ("review_panel",),
+                        {"max_rounds": 5, "threshold_by_severity": {f"P{NUL}3": 2}})
+    assert "NUL" in posted["review_panel_dropped"]
+    assert not posted.get("nul_replaced")
+    assert (await detail(client, posted["id"]))["review_panel"] is None
+
+
+async def test_a_finding_key_this_board_ignores_cannot_500_the_round(client):
+    """#78's per-finding pair, which `FindingIn`'s `extra="ignore"` discards.
+
+    `below_threshold` and `seats_required` reach no column, so neither could have
+    500ed — but the pass walks them anyway, because it classifies by POSITION and
+    not by what the model happens to bind, and a key that is ignored today is a
+    column tomorrow. A non-finite `seats_required` is named rather than silently
+    handed to pydantic, which is what turned a 422 into a 500 elsewhere on this row.
+    """
+    raw = (f'{{"repo": "{REPO}", "pr": 1050, "reviewed": true, "judged": true, '
+           f'"to_fix": [{{"title": "t", "severity": "P3", '
+           f'"below_threshold": true, "seats_required": NaN}}]}}')
+    r = await client.post("/review", content=raw.encode(),
+                          headers={**AGENT, "content-type": "application/json"})
+    assert r.status_code == 201, r.text
+    assert r.json()["nonfinite_dropped"] == ["to_fix[0].seats_required"]
+    assert r.json()["findings"] == 1

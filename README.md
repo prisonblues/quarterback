@@ -192,8 +192,9 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, rules_dropped]
                                                                     [, provenance_restored_dropped]
                                                                     [, since_sha_dropped]
+                                                                    [, harness_rev_dropped]
                                                                     [, nul_replaced]
-                                                                    [, nul_paths_dropped]
+                                                                    [, nul_dropped]
                                                                     [, nonfinite_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
@@ -201,7 +202,9 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards,
                                                                   unread_files as a count,
                                                                   + scope/since_sha/fix_range_source,
-                                                                  what each round measured)
+                                                                  what each round measured,
+                                                                  + harness_rev/dirty/digest,
+                                                                  which harness read it)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance
@@ -209,7 +212,9 @@ GET   /review/{id}                                              (scorecards + fi
                                                                  + review_panel, the dials it ran under
                                                                  + rules, which layer set each of them
                                                                  + provenance_restored, what it did
-                                                                   not attribute)
+                                                                   not attribute
+                                                                 + harness_path, where that harness
+                                                                   ran from)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
@@ -1087,20 +1092,50 @@ The two objects are opaque JSONB on `GET /review/{id}`, refused whole rather tha
 three scalars ride `GET /reviews` too, on `merge_base`'s rule: a recalibration reads a population
 and slices it on these, and detail-only would mean one fetch per run.
 
+**And which HARNESS produced the round (#112).** Everything above says how a round was configured
+and what its numbers were measured against; nothing said what RAN it. `.harness-rules` argues at
+length that an unpinned reviewer MODEL makes "codex found more than claude" unattributable and
+pins three of the four seats for it — while the harness itself was unpinned, unrecorded, and
+changes far more often than a vendor slug. On 2026-08-31 six merges changed `round_stop`,
+`converged`, the `fix_injection` accounting and `restored_lines` in a day, and the deployed panel
+on one host was rebuilt underneath a running session: two rounds of one cycle, read by different
+machinery, indistinguishable in the record that the r1 → r2 comparison is drawn from.
+
+Four fields, because from inside a running panel the question has no single true answer —
+`qb-doctor`'s `check_harness` says as much about the same problem, and settles for content as a
+PROXY because the truthful answer is in a flake pin no harness script can reach:
+
+| field | what it is | when it is null |
+|---|---|---|
+| `harness_rev` | the commit of the checkout it ran from. **Authoritative** | every installed harness — the nix store is not a checkout — and any copy the containing repo does not track |
+| `harness_dirty` | whether that checkout carried changes the rev does not | no rev, or nobody could ask |
+| `harness_digest` | `loops-sha256-1:<hex>` over the loop modules. **A proxy**: it cannot name a version, only answer "same code or not" | the directory could not be read |
+| `harness_path` | where it ran from. **A locator** — for a nix install also an exact build identity, and the only field that says a round did NOT come from the deployed harness | the panel did not say |
+
+Stored verbatim: this board has no checkout of the harness to resolve a rev against, does not
+recompute a digest and does not parse a store path. The first three ride `GET /reviews`, because
+what a recalibration groups a population by must not cost one fetch per run; the path is
+detail-only. There is deliberately no release NUMBER among them — `package.nix` ships no
+`pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
+a merge, so a running harness has none to report and a branch's harness never had one.
+
 **And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
 A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;
 `json.loads` accepts all four, so a round carrying one passed every validator and 500ed at the
 INSERT — which the panel records as "the board did not answer", indistinguishable from a board that
-was down. #643 and #647 fixed three fields each in its own validator; a probe found the same 500 in
-twenty-eight other places. It is now one pass over the whole body, and the answer differs by what
-the value is FOR:
+was down. #643, #647 and #112 fixed four fields between them, each in its own validator; a probe
+found the same 500 in twenty-eight further places. It is now one pass over the whole body, before
+any coercer runs, and the per-field checks that predate it are gone rather than left beside it — a
+chokepoint with exceptions is not one. The answer differs by what the value is FOR:
 
-* a **path** — `unread_files`, `changed_files[].path`, a finding's `file`, the removed convention
-  files — is **dropped**, because each is matched by exact string and a marked path is not a
-  shorter path but a different file that matches nothing forever;
+* a token **matched by exact string** — `unread_files`, `changed_files[].path`, a finding's `file`,
+  the removed convention files, `harness_path` and `harness_digest` — is **dropped**, because a
+  marked token is not a shorter one but a *different* one, and it answers its comparison wrongly and
+  silently forever, where NULL answers *unknown*;
 * an **opaque policy record** (`review_panel`, `rules`, `provenance_restored`) keeps its
   **whole-object refusal** and the pass does not reach inside it: half a dial set is not a smaller
-  policy but one no round ran under;
+  policy but one no round ran under — so #78's `threshold_by_severity` is refused with the dial set
+  rather than edited inside it;
 * **everything else** — prose, names, identities, vocabulary words, mapping keys — keeps its value
   with the NUL replaced by `␦`, the mark `_echo` has always used on the way out, because storing
   nothing loses a reviewer's account and an unmarked strip is a silent edit of evidence;
@@ -1109,10 +1144,16 @@ the value is FOR:
   accounts along with the byte. `repo` is the exception and already was one: it is the row's
   identity, and a marked spelling would be a second repository nothing ever asks about.
 
-All of it is reported by dotted position under `nul_replaced`, `nul_paths_dropped` and
-`nonfinite_dropped`. `POST /review/outcomes` has the same defect and the opposite remedy — the item
-is **refused** and the reason names the field — because its rule is that a fixer recording an
-outcome can simply be told, where the panel cannot be failed over the board being fussy.
+A marked value is not thereby believed where a coercer follows it: `head_sha`, `harness_rev`,
+`provenance` and `pr_state` meet theirs immediately after and are refused under the drop signal they
+already had. Where none follows, the marked value is stored — `scope` and `fix_range_source` are the
+deliberate case, because they are read against no vocabulary on purpose and a marked one is an extra
+group a consumer can SEE rather than a value folded into "the panel did not say".
+
+All of it is reported by dotted position under `nul_replaced`, `nul_dropped` and `nonfinite_dropped`.
+`POST /review/outcomes` has the same defect and the opposite remedy — the item is **refused** and the
+reason names the field — because its rule is that a fixer recording an outcome can simply be told,
+where the panel cannot be failed over the board being fussy.
 
 ## Releases
 
@@ -2423,8 +2464,11 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
   test_review_provenance_working.py  what a stored count was measured against —
                    rules, provenance_restored, fix_range_source, scope,
                    since_sha — round-tripped and refused (#647)
+  test_review_harness_identity.py    which harness produced the round —
+                   rev/dirty/digest/path, what each says and what each cannot,
+                   and the NUL a text column refuses (#112)
   test_review_unstorable_values.py   a NUL or a NaN in every position a caller
-                   can put one, and which of drop / mark / refuse each gets (#646)
+                   can put one, and which of mark / drop / refuse each gets (#646)
   test_outcome_unstorable_values.py  the same class on POST /review/outcomes,
                    where the item is refused and named instead (#646)
 harness/      step 2 of the install — the workflow the board coordinates
