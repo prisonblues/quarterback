@@ -2131,3 +2131,60 @@ def test_an_optimistic_reorder_drops_next_rather_than_guessing_it():
     # does not change which items are open.
     assert out["counts"] == {"open": 5}
     assert out["truncated"] is False
+
+
+# ---- what the chip bar offers, and what a chip does --------------------------
+#
+# Sixteen agents across three repos is a list you read rather than one you scan.
+# These are the two decisions behind narrowing it, kept out of the renderer so
+# that finding out which repos a chip bar would show does not require a Textual
+# app to ask.
+
+
+def test_the_chips_are_the_repos_the_rows_are_actually_in():
+    """Not the repos the board knows, and not the ones this checkout watches. A
+    chip with nobody behind it filters to an empty table — a control that can only
+    disappoint."""
+    rows = [{"repo": "quarterback"}, {"repo": "quarterback"}, {"repo": "lexray"}]
+    assert qd.chip_repos(rows) == ["lexray", "quarterback"]
+
+
+def test_one_repo_spelled_three_ways_is_one_chip():
+    """A lease reports a bare `quarterback`; the plan and `gh` report
+    `prisonblues/quarterback`. Two chips for one repo would be two filters that
+    each hide half of it."""
+    rows = [{"repo": "prisonblues/quarterback"}, {"repo": "quarterback"},
+            {"repo": "Quarterback"}]
+    assert qd.chip_repos(rows) == ["quarterback"]
+
+
+def test_a_row_with_no_repo_offers_no_chip():
+    assert qd.chip_repos([{"repo": None}, {"repo": ""}, {}]) == []
+
+
+def test_the_chips_are_alphabetical_and_not_by_size():
+    """The bar is a place your eye goes back to. An order that reshuffles whenever
+    an agent starts or stops is one you have to re-read every tick."""
+    rows = [{"repo": "zulu"}] * 5 + [{"repo": "alpha"}]
+    assert qd.chip_repos(rows) == ["alpha", "zulu"]
+
+
+def test_filtering_to_a_repo_keeps_its_rows_however_they_spell_it():
+    rows = [{"repo": "prisonblues/quarterback", "n": 1}, {"repo": "quarterback", "n": 2},
+            {"repo": "lexray", "n": 3}]
+    assert [r["n"] for r in qd.only_repo(rows, "quarterback")] == [1, 2]
+
+
+def test_no_filter_is_every_row_and_not_an_empty_one():
+    rows = [{"repo": "quarterback"}, {"repo": "lexray"}]
+    assert qd.only_repo(rows, None) == rows
+    assert qd.only_repo(rows, "") == rows
+
+
+def test_a_row_with_no_repo_is_dropped_by_a_filter_rather_than_kept():
+    """It reads the other way round at first — an unknown repo is not a known
+    mismatch. But a row that survives every filter is one the chip bar cannot
+    explain, and the `N of M` beside the chip would count rows the chip does not
+    describe."""
+    rows = [{"repo": "quarterback"}, {"repo": None}]
+    assert qd.only_repo(rows, "quarterback") == [{"repo": "quarterback"}]
