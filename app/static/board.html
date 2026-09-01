@@ -207,8 +207,10 @@
 </header>
 <!-- The list the chip expands (#677). It sits directly under the sticky header
      rather than in `main` because it is not a third view of the stream: it is the
-     chip saying what it is counting, and it stays put while the feed scrolls
-     behind it. -->
+     chip saying what it is counting, so it opens against the chip and pushes the
+     feed down rather than replacing it. It scrolls away with the page — see
+     `.bpanel` for why a second sticky element under a header that wraps to two
+     lines on a phone would have to guess a height that changes. -->
 <section id="blockedPanel" class="bpanel" hidden aria-label="questions waiting on a person">
   <div class="bp-head">
     <span class="bp-title">&#9940; waiting on a person</span>
@@ -490,6 +492,13 @@ let blockedRows = [];
 let blockedOpen = false;
 // Reads are numbered so a slower earlier one cannot paint over a later one.
 let blockedSeq = 0;
+// `GET /blockers` defaults to 200 and caps at 1000, and it applies the limit before
+// it counts — so an unlimited-looking read was quietly the oldest 200, and both the
+// chip's number and this list would have been a truncation presented as a total.
+// Asked for explicitly, at the endpoint's maximum, and said out loud when it binds:
+// the inbox does the same a few hundred lines down, for the same reason.
+const BLOCKED_LIMIT = 1000;
+let blockedCapped = false;
 
 async function loadBlocked(){
   // The endpoint decides who may answer and its refusal is the authority; the page
@@ -499,29 +508,40 @@ async function loadBlocked(){
   const seq = ++blockedSeq;
   let out;
   try {
-    const r = await fetch("/blockers?open=true", {headers:{Accept:"application/json"}});
+    const r = await fetch(`/blockers?open=true&limit=${BLOCKED_LIMIT}`,
+                          {headers:{Accept:"application/json"}});
     if(!r.ok) return;                       // a board that will not answer says nothing
     out = await r.json();
   } catch(e){ return; }
   // Answer two rows in quick succession and each starts a read of its own. If the
   // first response lands second, the list reverts to the state that still held the
   // row just resolved — an open answer box on a question the server has already
-  // closed, and clicking it earns a 409. The panel does not poll while it is open,
-  // by design, so nothing would come along and correct it either. Last read wins.
+  // closed, and clicking it earns a 409. Last read wins.
   if(seq !== blockedSeq) return;
   const all = out.blockers || [];
   blockedRows = all;
+  blockedCapped = all.length >= BLOCKED_LIMIT;
+  renderBlockedChip();
+  renderBlocked();
+}
+
+// The chip is painted from `blockedRows` rather than from a response, so the one
+// caller that changes those rows without a read — answering one — can repaint
+// without waiting for the server to agree. See the answer handler for why that
+// matters when the re-read is the thing that fails.
+function renderBlockedChip(){
+  const all = blockedRows;
   // Hidden at zero, EXCEPT while the panel is open. The chip is then the panel's
   // own toggle, and taking it away from somebody who has just answered the last
   // question leaves an open panel with no control that opened it. This zero is
   // also not the one #244 forbids: that rule is about a read that FAILED rendering
-  // "0 waiting" as if it knew, and the two `return`s above are how that is kept.
+  // "0 waiting" as if it knew, and `loadBlocked`'s two early returns are how that
+  // is kept — a failed read never reaches this function at all.
   blockedChip.hidden = !all.length && !blockedOpen;
   if(!all.length){
     blockedChip.classList.remove("mine");
     blockedChip.textContent = "⛔ none waiting";
     blockedChip.title = "nothing is waiting on a person";
-    renderBlocked();
     return;
   }
   const mine = all.filter(b => b.owner && me && b.owner === me.agent).length;
@@ -542,7 +562,6 @@ async function loadBlocked(){
       + `"${oldest.question}" (${oldest.kind}, ${oldest.raised_by}). Open the list to answer.`
     : `${all.length} open question(s), none addressed to you. Oldest: `
       + `"${oldest.question}" (${oldest.kind}, ${oldest.raised_by}). Open the list to answer.`;
-  renderBlocked();
 }
 
 // ---- the list the chip expands (#677) -------------------------------------
@@ -623,7 +642,14 @@ function renderBlocked(){
   // re-sorting would cost the list the property it is ordered for.
   blockedSub.textContent = `${blockedRows.length} open · oldest first`
     + (mine ? ` · ${mine} addressed to you` : "");
-  blockedList.innerHTML = blockedRows.map(blockedRow).join("");
+  // Oldest first, so the cap drops the NEWEST — and says it did, rather than
+  // presenting a truncated queue as the whole of it. Same shape as the inbox's,
+  // and #244's rule underneath both: a page must not imply a completeness it has
+  // not got.
+  const capped = blockedCapped
+    ? `<div class="empty" style="padding:14px">showing the oldest ${BLOCKED_LIMIT}
+       &mdash; there are more open questions than this list can hold</div>` : "";
+  blockedList.innerHTML = blockedRows.map(blockedRow).join("") + capped;
   for(const [id, v] of typed){
     const box = document.getElementById("bans-" + id);
     if(box) box.value = v;
@@ -692,11 +718,19 @@ blockedPanel.addEventListener("click", async (e)=>{
   }
   btn.disabled = false;
   if(!ok) return;
-  // Re-read rather than splice the row out locally: the answer is now a stored
-  // record and what the list shows next should be the server's account of it.
   blockedNote.textContent = "answered \u2713 — the resolution is on the row, and it is "
     + "what the next agent reads.";
   blockedNote.hidden = false;
+  // Taken out LOCALLY first, and then reconciled by the read. The obvious order is
+  // the other way round — the answer is a stored record now, so let the server say
+  // what the list holds — but `loadBlocked` returns silently on a failed read, by
+  // design, and the two states then compose into a lie: "answered ✓" printed over a
+  // still-open box for the question just answered, whose button earns a 409 when
+  // somebody believes the box and not the note. A stale list is a smaller wrong
+  // answer than a contradictory one, and the poll or the next open corrects it.
+  blockedRows = blockedRows.filter(b => b.id !== id);
+  renderBlockedChip();
+  renderBlocked();
   await loadBlocked();
 });
 
@@ -927,13 +961,27 @@ loadMe();
 loadSessions();
 loadBacklog().then(connect);
 setInterval(loadSessions, 15000);
-// The chip is re-read on the same beat rather than only at page load: a blocker is
-// a thing that is still true, and a board left open on a desk all afternoon was
-// otherwise showing the count it had when the tab was opened — a question raised at
-// 16:21 reached nobody until somebody happened to reload. NOT while the list is
-// open: the panel re-reads on every answer, and a poll landing mid-sentence is a
-// re-render nobody asked for.
-setInterval(() => { if(!blockedOpen) loadBlocked(); }, 15000);
+// Re-read on the same beat rather than only at page load: a blocker is a thing that
+// is still true, and a board left open on a desk all afternoon was otherwise showing
+// the count it had when the tab was opened — a question raised at 16:21 reached
+// nobody until somebody happened to reload. The open LIST is refreshed by the same
+// beat, and has to be: somebody sitting with the queue open is the reader most
+// entitled to see a question arrive, and the one this whole issue is about.
+//
+// What the poll must not do is interrupt an answer. `renderBlocked` carries typed
+// text across a re-render but it cannot carry the caret — the input element itself
+// is replaced — so a refresh landing mid-sentence takes the cursor out from under a
+// person's hands. It is skipped while an answer is in progress, and an answer's own
+// re-read covers that window anyway.
+function answerInProgress(){
+  const active = document.activeElement;
+  if(active && active.id && active.id.indexOf("bans-") === 0) return true;
+  return blockedRows.some(b => {
+    const box = document.getElementById("bans-" + b.id);
+    return !!(box && box.value.trim());
+  });
+}
+setInterval(() => { if(!blockedOpen || !answerInProgress()) loadBlocked(); }, 15000);
 </script>
 </body>
 </html>

@@ -643,9 +643,12 @@ subject reaching a terminal state is exactly what closes the plan item, so the q
 became unanswerable at the moment it was answered in real life. The first five resolutions
 this table ever recorded were five agents withdrawing their own questions and not one
 person's answer. The chip now expands into the queue itself, with a box per row posting
-straight to `POST /blockers/resolve` — the board already reads every row from
+straight to `POST /blockers/resolve` — the board already reads the queue from
 `GET /blockers?open=true`, so no plan row is in the path. The plan page keeps its chip: a
-question that IS holding a row up should be answerable on the row it is holding up.
+question that IS holding a row up should be answerable on the row it is holding up. The read
+asks for the endpoint's maximum of 1000 and says so when it binds — `GET /blockers` applies
+its limit before it counts, so an unlimited-looking read is a truncation reported as a
+total.
 
 ### A suggested order, and the ledger it writes to (#232)
 
