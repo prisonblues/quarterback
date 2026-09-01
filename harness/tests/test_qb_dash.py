@@ -5,8 +5,11 @@ with the browser and tmux calls stubbed, because a test that opened Chrome and
 moved the cursor of a live seat screen would be its own bug.
 
 SKIPPED unless the machine can actually run the dashboard: textual and the board
-client come from mcp/'s environment, and the fetches want a configured board. In
-CI today that means this skips; it is written to run where the thing itself runs.
+client come from mcp/'s environment. CI DOES run this file — `tests.yml` gives the
+dashboard step the `tui` extra precisely so it executes, and asserts a non-zero
+pass count so a silently-skipping module fails the build. What skips there is the
+handful of tests that want a configured board and a `gh`, which CI deliberately
+does not have.
 Two defects came out of it that hand-testing had passed:
 
   * a single click did nothing. DataTable treats a click on any row but the
@@ -23,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import sys
 import time
@@ -111,7 +115,34 @@ pytestmark = pytest.mark.skipif(_NO_TUI is not None, reason=_NO_TUI or "")
 #: For the tests that click whatever the repo and the board actually have open
 #: today. They are still the ones that found the defects worth finding, so they
 #: are not weakened — they are just no longer the reason the rest cannot run.
-needs_live_data = pytest.mark.skipif(_NO_BOARD is not None, reason=_NO_BOARD or "")
+#:
+#: OPT-IN, and #644 is the reason. These four read the live board and the live
+#: repo, so their row indices are a function of what the fleet happens to be doing
+#: while the suite runs — and this repo runs several agents that post to that board
+#: and open PRs against that repo at once. Three of the four failures anyone has
+#: recorded for this file are among these four tests, out of 107 in it.
+#:
+#: The value being protected is what a green local suite MEANS. CI already has it:
+#: `tests.yml` runs the dashboard suites serially and with no board configured, so
+#: these skip there and are meant to. A developer or an agent running
+#: `pytest harness/tests` on a box that HAS a board was getting a different suite
+#: from the one CI gates on, and finding out by way of a failure attributed to
+#: whatever they had just changed. Now both mean the same thing.
+#:
+#: Not deleted, and not stubbed. They are the tests that found the defects worth
+#: finding, and stubbing the data is how you keep the clicking and lose the point —
+#: the claim is that the dashboard works on the board as it really is. Ask for them
+#: by name: `QB_DASH_LIVE=1 pytest harness/tests/test_qb_dash.py`.
+#: Read as a switch and not as a string, because `bool("0")` is True and this file
+#: documents `QB_DASH_LIVE=1` in four places — so a reader who tried `=0` to turn the
+#: live tests OFF would have turned them on. That is `low_severity_fix_lines`' own
+#: lesson one repo over: every non-empty string is truthy in Python, `"false"`
+#: included, and a setting whose job is to gate something stops doing it.
+_LIVE_ON = os.environ.get("QB_DASH_LIVE", "").strip().lower() in {"1", "true", "yes", "on"}
+_NO_LIVE = _NO_BOARD or (
+    None if _LIVE_ON else
+    "live board/repo data is opt-in (#644): set QB_DASH_LIVE=1 to run these")
+needs_live_data = pytest.mark.skipif(_NO_LIVE is not None, reason=_NO_LIVE or "")
 
 
 def _numbered_cell(row) -> str:
@@ -269,6 +300,29 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
         f"(region {table.region}, {table.row_count} rows)")
 
 
+#: How many 0.05s reads `_click_row` spends waiting for a pane to stop moving.
+#: The loop leaves the moment two consecutive reads agree, so on a healthy run this
+#: costs 0.1s whatever it is set to and the ceiling is paid only when something is
+#: genuinely wrong.
+#:
+#: A count of READS, and stated precisely because the imprecise version is
+#: misleading: every unsuccessful read still costs a `pilot.pause(0.05)`, so this is
+#: also a wall-clock floor of ~11.95s that STRETCHES under contention rather than a
+#: quantity independent of time — 239 pauses and not 240, because the read that
+#: succeeds does not pause after itself. The old 60 was ~2.95s by the same arithmetic.
+#: The exact figure does not matter and the off-by-one is written down anyway: a
+#: comment that rounds in its own favour is how the rest of this file's false claims
+#: started.
+#:
+#: The distinction that survives is about what is guaranteed. A real deadline
+#: (`while time.monotonic() < start + N`) expires while the app is descheduled, so a
+#: loaded box buys the pane FEWER chances to settle exactly when it needs more. A
+#: read count guarantees 240 observations however long the scheduler takes to
+#: deliver them. That is why the shape is a count and not a deadline; the 4x is what
+#: makes the count large enough to survive a box under load.
+_SETTLE_READS = int(os.environ.get("QB_DASH_SETTLE_READS", "240"))
+
+
 async def _click_row(pilot, table, offset, row: int | None = None) -> None:
     """Click `table` at `offset`, once the pane has stopped moving under it.
 
@@ -292,9 +346,18 @@ async def _click_row(pilot, table, offset, row: int | None = None) -> None:
     So: the same coordinate `Pilot.click` will compute, held still across two
     consecutive reads with a real row under it. Two rather than one because a
     single read cannot tell a settled pane from one between passes. Bounded at
-    3s and it clicks anyway when that runs out — a table that genuinely never
-    drew should fail on the assertion that names it, not time out in here — and
-    it costs 0.1s when nothing is moving, which is the normal case.
+    `_SETTLE_READS` reads and it RAISES when that runs out, and it costs 0.1s when
+    nothing is moving, which is the normal case.
+
+    It used to click anyway, on the argument that a table which never drew should
+    fail on the assertion that names it rather than time out in here. That argument
+    is wrong in the one direction that matters, and #644 is what it cost: the
+    assertion that names it is downstream and is about something else, so a pane
+    that never settled reported itself as a hammer that did not start a fix. Four
+    failures were investigated across two agents and two worktrees before anyone
+    read the `never settled` line in the captured output. A helper that cannot do
+    its job must say so in its own words — which is what `_click_row_index` twenty
+    lines up already does when the row it wants is off screen.
     """
     # A MOUSE MOVE FIRST, because the very first Click into a freshly mounted pane
     # is swallowed: no dispatch fires for it, and the same click a moment later
@@ -306,7 +369,7 @@ async def _click_row(pilot, table, offset, row: int | None = None) -> None:
     # whatever the hover left behind.
     await pilot.hover(table, offset=offset)
     previous, still = None, 0
-    for _ in range(60):
+    for _ in range(_SETTLE_READS):
         region = table.region
         x, y = region.offset.x + offset[0], region.offset.y + offset[1]
         under = table.screen.get_style_at(x, y).meta.get("row", -1)
@@ -323,13 +386,31 @@ async def _click_row(pilot, table, offset, row: int | None = None) -> None:
         previous = region
         await pilot.pause(0.05)
     else:
-        # It clicks anyway — but a click that never found a settled row is not the
-        # same event as one that did, and silence makes them the same in the log.
-        # Reachable on an ordinary day: a fixed y=2 offset addresses no row on a
-        # repo with one open PR, and the driver then reports whatever the empty
-        # click did or did not do, under the name of the thing it meant to test.
-        print(f"_click_row: {table.id} never settled with a row at {offset} "
-              f"— clicking anyway, region {table.region}")
+        # RAISES, naming what actually happened. The old branch printed this and
+        # clicked regardless, which made a pane that never settled indistinguishable
+        # from one that did — the click landed on the header, `ClickTable.on_click`
+        # refused it as `row: -1`, and the failure surfaced hundreds of lines later
+        # as whatever verb the test was checking. That is #644.
+        #
+        # The case the old branch was protecting is real and has not gone away: a
+        # fixed `y=2` offset addresses no row on a repo with one open PR, so the
+        # driver would find nothing under the pointer through no fault of the
+        # dashboard. But that case belongs to the four `@needs_live_data` tests,
+        # whose data is whatever the fleet has open this minute, and those are now
+        # opt-in for the same issue. What is left here runs on literals, so a pane
+        # that will not settle is a defect or a wedged event loop, and both want a
+        # name rather than a click.
+        under = table.screen.get_style_at(
+            table.region.offset.x + offset[0],
+            table.region.offset.y + offset[1]).meta.get("row", -1)
+        raise AssertionError(
+            f"{table.id} never settled with a row at {offset} after "
+            f"{_SETTLE_READS} reads — the pane was still moving, or nothing is "
+            f"drawn there. Row under the pointer: {under} (wanted "
+            f"{'any' if row is None else row}); region {table.region}, "
+            f"{table.row_count} rows. This is not a failure of whatever the test "
+            f"went on to assert. If the box is heavily loaded, raise "
+            f"QB_DASH_SETTLE_READS")
     await pilot.click(table, offset=offset)
 
 
