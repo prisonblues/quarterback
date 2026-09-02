@@ -26,10 +26,12 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import math
 import os
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -453,6 +455,147 @@ def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
     assert asyncio.run(_drive_issues()) == []
 
 
+#: How long `_let_the_workers_finish` will wait for the in-flight fetches to drain.
+#:
+#: A DEADLINE and not a read count, unlike `_SETTLE_READS` above, because what is
+#: being waited for is different in kind: that one waits for a pane to settle, which
+#: takes as many chances as a loaded box needs to give it, and this one waits for
+#: network calls whose own timeouts are the thing that bounds them. `fetch_prs`
+#: shells out to `gh` and the board calls go over http; 90s is several times the
+#: worst honest answer and short enough that a wedged worker fails a test rather
+#: than hanging a CI job with no signal at all — which is the one outcome worse than
+#: a red build.
+_WORKER_DRAIN_DEFAULT = 90.0
+
+
+def _worker_drain() -> float:
+    """`QB_DASH_WORKER_DRAIN` as a number of seconds that can actually expire.
+
+    **`nan` IS THE REASON THIS FUNCTION EXISTS.** `float("nan")` is a perfectly good
+    float, and `time.monotonic() >= start + nan` is False forever — so a deadline
+    built from it never expires, and the bound this knob was added to guarantee is
+    gone. Typing a three-letter word into an environment variable restored the
+    unbounded wait it replaced. `inf` does the same thing by a shorter route, and 0
+    or a negative expires before the first poll, which is not a bound either but at
+    least fails loudly.
+
+    That is the `QB_DASH_LIVE=0` lesson one constant up, in a different costume: a
+    knob that silently means something other than what it says. So an unusable value
+    is refused rather than honoured, and the refusal is `warnings.warn` rather than
+    `print` — pytest captures stdout and shows it only on failure, which is exactly
+    the run where this would not surface, while it lists warnings on a green one.
+
+    A value that is not a number at all is a typo and gets an error instead of a
+    default: silently running a suite for 90s when somebody asked for `9O` teaches
+    them nothing. Raised HERE and not at import, so it arrives as a readable failure
+    in the test that wanted it rather than as a collection error over the file.
+
+    Read at call time and not once at import, so `monkeypatch.setenv` in a test
+    reaches it — a module-level read is fixed before any test can set anything.
+    """
+    raw = os.environ.get("QB_DASH_WORKER_DRAIN", "").strip()
+    if not raw:
+        return _WORKER_DRAIN_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise AssertionError(
+            f"QB_DASH_WORKER_DRAIN={raw!r} is not a number of seconds") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        warnings.warn(
+            f"QB_DASH_WORKER_DRAIN={raw!r} is not a positive, finite number of "
+            f"seconds — a deadline built from it would never expire, which is the "
+            f"unbounded wait this setting exists to prevent. Using "
+            f"{_WORKER_DRAIN_DEFAULT}s.", stacklevel=2)
+        return _WORKER_DRAIN_DEFAULT
+    return seconds
+
+
+async def _let_the_workers_finish(app) -> None:
+    """Freezing the refreshers is half of it — this is the other half (#678).
+
+    Stubbing `app.refresh_board` does nothing to the worker that is already
+    running it, and three of the four make a SECOND call after the one these
+    drivers wait for: `refresh_board` fetches the claims and then the questions a
+    person owes, `refresh_plan` the plan and then the dials, `refresh_prs` the PR
+    list and then the queue. So the wait each driver does above ends one board
+    round trip before the pane stops changing, and the late arrival lands wherever
+    it lands — after `_settle_table` has pronounced the table still, or after
+    `_click_row_index` has read the screen position of the row it wants.
+
+    `_settle_table` cannot cover it. It watches row KEYS, and a question arriving
+    on a row this table already draws rewrites that row's state, its verb and its
+    last cell without changing a single key; the table is cleared and rebuilt
+    either way, and a `clear()` used to take the scroll with it.
+
+    MEASURED, not reasoned about — and the measurement is of a board on a day, not
+    of this code, so nobody re-running it later will reproduce the numbers. On
+    2026-09-01, against `prisonblues/quarterback` as the fleet had it that evening,
+    unmodified main failed two of thirty runs of the four live drivers, reading
+    `work never settled with a row at (3, 22)`; before #679 the same race clicked
+    anyway and reported `the icon did not raise the confirmation`, which is what
+    #678 was filed about. With the blockers call closed and the PR list still in
+    flight it came back in a new costume: a ⚒ click that raised the PANEL
+    confirmation, for a PR that had appeared on the board a moment earlier. What
+    generalises is the shape — a rebuild between reading a row's position and
+    clicking it — not the rate.
+
+    BOUNDED, because `WorkerManager.wait_for_complete` is not: it gathers every
+    worker's `wait()` and has no deadline of its own, so one wedged fetch would hang
+    all four of these drivers for as long as the runner allows — and a job killed at
+    its own timeout reports nothing at all about what it was doing, which is the one
+    outcome worse than a red build. The refusal names the workers still running,
+    because that is the only fact that makes a drain which did not finish
+    actionable.
+
+    POLLED RATHER THAN `asyncio.wait_for(app.workers.wait_for_complete(), …)`, and
+    the reason is in textual 8.2.8's `Worker.wait`: it awaits the worker's task
+    inside `except asyncio.CancelledError`, and that handler sets
+    `self.state = WorkerState.CANCELLED` on the WORKER. So cancelling the waiter —
+    which is all `wait_for` does on timeout — marks a worker that is still happily
+    running as cancelled, and then raises `WorkerCancelled` out of the gather before
+    `wait_for` can raise `TimeoutError`. Tried first, and it fails with
+    `textual.worker.WorkerCancelled` rather than with the message above. Waiting
+    without cancelling anything cannot corrupt the state it is reading.
+    """
+    # IMPORTED HERE, not at module scope, for the reason `_click_row_index` imports
+    # `Coordinate` here: this module must SKIP without textual rather than fail to
+    # collect, and the CI job that proves the rest of the harness needs no dashboard
+    # extras is the one a top-level import turns red.
+    from textual.worker import WorkerState
+
+    unfinished = (WorkerState.PENDING, WorkerState.RUNNING)
+    drain = _worker_drain()
+    deadline = time.monotonic() + drain
+    while True:
+        still = [w for w in app.workers if w.state in unfinished]
+        if not still:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"the dashboard's fetches did not drain within {drain}s — "
+                f"still going: "
+                + ", ".join(sorted(f"{w.group or w.name}={w.state.name}"
+                                   for w in still))
+                + ". Nothing below this line has been clicked, so this is not a "
+                  "failure of whatever the test went on to assert. Raise "
+                  "QB_DASH_WORKER_DRAIN if the board is genuinely that slow today")
+        await asyncio.sleep(0.05)
+
+
+def _no_confirm(app, what: str) -> str:
+    """Say there was no confirmation, and say the only thing that explains why.
+
+    Every refusal on this path — a machine that has not opted in, an issue the
+    board says is claimed, a repo this dashboard only watches, a click that landed
+    on a row whose icon is grey — ends in `say`, and `say` is the pane's one
+    visible answer to "did that click do anything". The bare sentence is the same
+    for all of them, and it was the whole of what #678 had to go on.
+    """
+    return (f"{what} did not raise the confirmation — the pane says "
+            f"{app.detail_text!r}, screen {type(app.screen).__name__}")
+
+
 async def _drive() -> list[str]:
     app_module = _load_app()
     app = app_module.Dash(interval=3600, gh_interval=3600)   # no refresh mid-test
@@ -510,6 +653,7 @@ async def _drive() -> list[str]:
         for name in ("refresh_board", "refresh_plan", "refresh_prs",
                      "refresh_issues"):
             setattr(app, name, lambda: None)
+        await _let_the_workers_finish(app)
         work = app.query_one("#work")
         agents = app.query_one("#agents")
         await _settle_table(pilot, work)
@@ -587,6 +731,7 @@ async def _drive_issues() -> list[str]:
         for name in ("refresh_board", "refresh_plan", "refresh_prs",
                      "refresh_issues"):
             setattr(app, name, lambda: None)
+        await _let_the_workers_finish(app)
         issues = app.query_one("#work")
         await _settle_table(pilot, issues)
         # AN ISSUE ROW, found by kind rather than taken from the top: WORK draws
@@ -594,12 +739,25 @@ async def _drive_issues() -> list[str]:
         # has in flight today (#589). The plan's own rows are mostly issue-backed
         # too, but the ⚒ on one goes through `fix_plan_item`; this driver is about
         # the issue row's own verb.
-        # NOT A BLOCKED ONE. The ⚒ is grey on a row a person owes an answer about
-        # (#328/#522), which is the behaviour its own test asserts — this driver is
-        # about the verb working where it is offered.
+        # AND ONE WHOSE ⚒ IS ACTUALLY LIVE, which is asked of `work_action` rather
+        # than rebuilt here (#678). This driver had the weakest guard of the four —
+        # it excluded only rows a person owes an answer about (#328/#522), and the
+        # ⚒ is grey on two further kinds of issue row this board draws every day:
+        # one already CLAIMED by an agent, and one belonging to a repo this
+        # dashboard only watches. Clicking either is correct behaviour producing no
+        # confirmation, which is indistinguishable in the failure list from the
+        # dashboard being broken. Its three siblings each skip when the board holds
+        # nothing they can act on; this now does the same.
+        #
+        # `work_action` and not a second opinion about what makes a ⚒ live: it is
+        # the call the renderer makes when it decides whether to draw the icon in
+        # cyan and the call `dispatch_row` makes when it decides what a click does,
+        # so a third answer here is the one that can drift from both.
         wanted = [str(rk.value) for rk in issues.rows
                   if str(rk.value).startswith("issue:")
-                  and not app.rows.get(str(rk.value), {}).get("blocked")]
+                  and (record := app.rows.get(str(rk.value)))
+                  and not record.get("blocked")
+                  and app.work_action(record)[1] == "fix"]
         # #433 GAVE AN EMPTY TABLE A THIRD MEANING and `_need_rows` knows two:
         # nothing open, or `gh` refusing. "The board has not answered, so nothing
         # has been painted yet" is neither, and it reaches `_need_rows` as an
@@ -618,7 +776,8 @@ async def _drive_issues() -> list[str]:
         # between the issue number and the icons, and a hardcoded index made this
         # fail with `int('quarterback')` rather than saying what moved.
         if not wanted:
-            pytest.skip("every open issue is on the plan today — no backlog row")
+            pytest.skip("no issue row offers a live ⚒ on the board today — every "
+                        "open issue is on the plan, claimed, or in a watched repo")
 
         # The ⚒ column asks first, the same as the ⚖ does. `top` comes off the row
         # the click actually landed on rather than off the index read above: a
@@ -627,16 +786,26 @@ async def _drive_issues() -> list[str]:
         key = await _click_row_index(pilot, issues, wanted[0], scroll=True,
                                      column=app_module.Dash.VERB_COLUMN)
         top = app.rows[key]["issue"]["number"]
+        # THE STATE THIS DRIVE CLAIMS TO BE IN, asked again after the click and not
+        # only before it. The guard above reads the table to choose a row; if that
+        # row went grey in between — an agent claimed the issue, a question was
+        # raised on it — then "no confirmation" is the dashboard being right, and a
+        # failure list that cannot tell that from a broken ⚒ is what left #678
+        # undiagnosed.
+        if app.work_action(app.rows[key])[1] != "fix":
+            pytest.skip(f"{key} stopped offering a live ⚒ between the read and the "
+                        f"click — the board moved under the test, not the dashboard")
         await pilot.pause(0.3)
         if started:
             failures.append("the icon started a fix with no confirmation")
         if not isinstance(app.screen, app_module.Confirm):
-            failures.append("the icon did not raise the confirmation")
+            failures.append(_no_confirm(app, "the icon"))
         else:
             await pilot.press("enter")
             await pilot.pause(0.3)
             if not started:
-                failures.append("confirming did not start the fix")
+                failures.append(f"confirming did not start the fix — the pane "
+                                f"says {app.detail_text!r}")
             elif ["/fix-issue", str(top)] != list(started[0][1][1:3]):
                 failures.append(f"wrong command launched: {started[0][1]}")
             elif started[0][0] != f"fix-issue-{top}":
@@ -657,7 +826,7 @@ async def _drive_issues() -> list[str]:
         await pilot.press("f")
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
-            failures.append("'f' did not raise the confirmation")
+            failures.append(_no_confirm(app, "'f'"))
         else:
             await pilot.press("escape")
             await pilot.pause(0.2)
@@ -701,6 +870,7 @@ async def _drive_plan() -> list[str]:
         for name in ("refresh_board", "refresh_plan", "refresh_prs",
                      "refresh_issues"):
             setattr(app, name, lambda: None)
+        await _let_the_workers_finish(app)
         await _settle_table(pilot, plan)
         _need_rows(plan, "plan items", app.plan_err)
 
@@ -741,12 +911,13 @@ async def _drive_plan() -> list[str]:
         if started:
             failures.append("the icon started a fix with no confirmation")
         elif not isinstance(app.screen, app_module.Confirm):
-            failures.append("the icon did not raise the confirmation")
+            failures.append(_no_confirm(app, "the icon"))
         else:
             await pilot.press("enter")
             await pilot.pause(0.3)
             if not started:
-                failures.append("confirming did not start the fix")
+                failures.append(f"confirming did not start the fix — the pane "
+                                f"says {app.detail_text!r}")
             elif ["/fix-issue", str(issue["number"])] != list(started[0][1][1:3]):
                 failures.append(f"wrong command launched: {started[0][1]}")
 
@@ -802,6 +973,7 @@ async def _drive_panel() -> list[str]:
         for name in ("refresh_board", "refresh_plan", "refresh_prs",
                      "refresh_issues"):
             setattr(app, name, lambda: None)
+        await _let_the_workers_finish(app)
         prs = app.query_one("#work")
         await _settle_table(pilot, prs)
         _need_rows(prs, "work", app.pr_err)
@@ -828,12 +1000,13 @@ async def _drive_panel() -> list[str]:
         if started:
             failures.append("the icon started a review with no confirmation")
         if not isinstance(app.screen, app_module.Confirm):
-            failures.append("the icon did not raise the confirmation")
+            failures.append(_no_confirm(app, "the icon"))
         else:
             await pilot.press("enter")               # …and confirming starts it
             await pilot.pause(0.3)
             if not started:
-                failures.append("confirming did not start the review")
+                failures.append(f"confirming did not start the review — the pane "
+                                f"says {app.detail_text!r}")
             elif "/panel-review-pr" not in started[0][1]:
                 failures.append(f"wrong command launched: {started[0][1]}")
             if windowed:
@@ -879,7 +1052,7 @@ async def _drive_panel() -> list[str]:
         await pilot.press("p")
         await pilot.pause(0.3)
         if not isinstance(app.screen, app_module.Confirm):
-            failures.append("'p' did not raise the confirmation")
+            failures.append(_no_confirm(app, "'p'"))
         else:
             await pilot.press("escape")
             await pilot.pause(0.2)
@@ -1776,6 +1949,274 @@ def test_w_shows_only_what_is_waiting_on_a_person():
     assert title.startswith("WAITING · "), title
     # The plan's own counts describe a list the reader has just filtered away.
     assert "open" not in title and "next" not in title, title
+
+
+async def _drive_scroll_across_a_rebuild() -> tuple:
+    """Scroll WORK down, then let a poll land that changes a row it already draws.
+
+    The rebuild is the point and it has to be a REAL one: `render_work` returns
+    early when its signature has not moved, so a driver whose second render
+    changed nothing would leave the scroll alone for the wrong reason and pass
+    against the defect. A question arriving on an issue already on screen changes
+    that issue's state glyph and its verb without adding or removing a row, which
+    is the smallest rebuild there is — and the returned glyphs are asserted on so
+    that "the table was rebuilt" is a fact this test checks rather than assumes.
+    """
+    app_module, app = _quiet_dash()
+    async with app.run_test(size=(100, 20)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.repo_slug = app_module.qd.REPO
+        # Enough rows to overflow a 20-line screen several times over, so there is
+        # somewhere to scroll TO.
+        app.render_issues(_issues_for(*range(460, 400, -1)), None)
+        app.render_board({"agents": [], "claims": []})
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+        table.move_cursor(row=table.row_count - 1, animate=False)
+        table._scroll_cursor_into_view(animate=False)
+        await pilot.pause(0.2)
+        before = table.scroll_y
+        top_before = (str(list(table.rows)[int(before)].value)
+                      if before >= 1 else None)
+        glyphs_before = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+        # ONE question, on a subject this table is already drawing. The repo-subject
+        # blockers in BLOCKERS would each take a row of their own at the TOP, which
+        # is a different claim (rows inserted above) and not the one being made here.
+        app.render_blockers({"blockers": [dict(BLOCKERS[0],
+                                               subject={"kind": "issue",
+                                                        "value": "430"})],
+                             "counts": {}, "error": None})
+        await pilot.pause(0.4)
+        after = table.scroll_y
+        top_after = (str(list(table.rows)[int(after)].value)
+                     if after >= 1 else None)
+        glyphs_after = [str(table.get_row_at(i)[0]) for i in range(table.row_count)]
+        return before, after, top_before, top_after, glyphs_before, glyphs_after
+
+
+def test_a_poll_that_lands_keeps_the_reader_where_they_had_scrolled_to():
+    """A background rebuild must not throw the reader back to the top.
+
+    `DataTable.clear()` resets `scroll_y`, so every poll that changed anything at
+    all took a reader thirty rows up a seventy-row table and took the row they
+    were reaching for with it. `work_sig` (#433) already limits this to the polls
+    that changed something — a reader picks a row by looking at it — and this is
+    what the polls that DID change something were still costing.
+
+    It is also half of what made the live `_drive_issues` fail as "the icon did not
+    raise the confirmation" — two runs in thirty on unmodified main, measured on one
+    board on 2026-09-01 and not a rate anybody will reproduce.
+    `refresh_board` fetches the claims and THEN the questions a person owes, the
+    driver freezes the workers as soon as the claims land, and the second call
+    arrives from the worker already in flight: after the driver has scrolled its
+    row into view and read the screen position of its ⚒. The rebuild sent the table
+    back to the top, and the click went to whatever row the top put under that
+    position — usually one whose ⚒ is grey by design. `_let_the_workers_finish` is
+    the other half.
+    """
+    (before, after, top_before, top_after,
+     glyphs_before, glyphs_after) = asyncio.run(_drive_scroll_across_a_rebuild())
+    # THE STATE THIS TEST CLAIMS TO BE IN, checked rather than assumed: it has to
+    # have scrolled, and the poll has to have rebuilt the table.
+    assert before >= 1, f"the table never scrolled, so nothing was at stake: {before}"
+    assert glyphs_after != glyphs_before, \
+        "the poll changed nothing, so no rebuild happened and this test proves nothing"
+    assert after == before, \
+        f"a poll threw the reader from row {before} back to row {after}"
+    assert top_after == top_before, \
+        f"the row at the top of the view changed: {top_before} -> {top_after}"
+
+
+async def _drive_scroll_when_the_anchor_goes() -> tuple:
+    """Two rebuilds from the same scrolled position: one that keeps the row the
+    reader is anchored on, and one that does not.
+
+    The pair is the test. "Back at the top when the anchor is gone" is also what an
+    unpatched renderer does with every rebuild, so on its own it would pass against
+    the defect — the half that cannot is the rebuild which KEEPS the row, and the
+    two only mean something read together.
+    """
+    app_module, app = _quiet_dash()
+    numbers = list(range(460, 400, -1))
+    async with app.run_test(size=(100, 20)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.repo_slug = app_module.qd.REPO
+        app.render_issues(_issues_for(*numbers), None)
+        app.render_board({"agents": [], "claims": []})
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+        table.move_cursor(row=table.row_count - 1, animate=False)
+        table._scroll_cursor_into_view(animate=False)
+        await pilot.pause(0.2)
+        before = table.scroll_y
+        anchor = str(list(table.rows)[int(before)].value)
+
+        # A rebuild that keeps the anchor row — a question landing on a row this
+        # table already draws, which changes its state and its verb and no keys.
+        app.render_blockers({"blockers": [dict(BLOCKERS[0],
+                                               subject={"kind": "issue",
+                                                        "value": "430"})],
+                             "counts": {}, "error": None})
+        await pilot.pause(0.4)
+        kept = table.scroll_y
+        top_kept = (str(list(table.rows)[int(kept)].value) if kept >= 1 else None)
+
+        # And one that loses it: the issue the reader was anchored on is closed
+        # between polls, which is the ordinary way a row leaves this table.
+        gone = int(anchor.rsplit("#", 1)[1])
+        app.render_issues(_issues_for(*[n for n in numbers if n != gone]), None)
+        await pilot.pause(0.4)
+        lost = table.scroll_y
+        return (before, kept, top_kept, anchor, lost,
+                [str(rk.value) for rk in table.rows])
+
+
+def test_a_rebuild_that_loses_the_readers_row_goes_back_to_the_top():
+    """The one case where keeping the reader's place has no right answer.
+
+    An anchor that has been merged, closed or filtered away is not somewhere the
+    table can be put back to, and a position computed from a row that no longer
+    exists would be a guess wearing the shape of the reader's place. So the view
+    stays where `clear()` left it, at the top — deliberately, and now checked,
+    because a deliberate behaviour nothing tests is one revision away from being an
+    accidental one.
+    """
+    before, kept, top_kept, anchor, lost, keys = asyncio.run(
+        _drive_scroll_when_the_anchor_goes())
+    # THE HALF THAT CANNOT PASS AGAINST THE DEFECT, and the state the other half
+    # depends on: the table really did scroll, and a rebuild really did keep it.
+    assert before >= 1, f"the table never scrolled, so nothing was at stake: {before}"
+    assert kept == before, \
+        f"a poll that kept the anchor row still moved the view: {before} -> {kept}"
+    assert top_kept == anchor, f"the row at the top changed: {anchor} -> {top_kept}"
+    # And the row really is gone, so "back to the top" is about a missing anchor
+    # rather than about a rebuild that quietly did nothing.
+    assert anchor not in keys, f"{anchor} is still in the table"
+    assert lost == 0, \
+        f"the view was put somewhere computed from a row that no longer exists: {lost}"
+
+
+async def _drive_restore_guards() -> tuple:
+    """Call `restore_work_scroll` four ways: live, superseded, and twice against a
+    reader who has scrolled since — once away from the top, and once BACK to it.
+
+    Called directly rather than raced into existence. Both guards are about the gap
+    that deferring the restore opens — a second rebuild, or a hand on the wheel —
+    and a test that tried to land either inside that gap would be timing-dependent
+    about the very thing it is asserting.
+
+    The fourth case is the one a position check cannot see. A reader who scrolled
+    away and came deliberately back to the top leaves `scroll_y` at 0, which is
+    exactly what `clear()` leaves it at, so only a flag set by their own wheel or
+    key can tell the two apart.
+    """
+    app_module, app = _quiet_dash()
+    async with app.run_test(size=(100, 20)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.render_issues(_issues_for(*range(460, 400, -1)), None)
+        app.render_board({"agents": [], "claims": []})
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+
+        async def restore(generation, from_row, touched=False):
+            table.scroll_to(y=from_row, animate=False)
+            await pilot.pause(0.2)
+            # AFTER the scroll above, which is this test moving the view and not the
+            # reader — `scroll_to` sets no flag, so the two cannot be conflated.
+            table.reader_scrolled = touched
+            app.restore_work_scroll(generation, 20)
+            await pilot.pause(0.2)
+            return table.scroll_y
+
+        # THE CONTROL FIRST: with nothing in the way it moves the view, so the three
+        # refusals below are this method declining rather than this method being
+        # unable to do anything at all.
+        live = await restore(app.work_scroll, 0)
+        stale = await restore(app.work_scroll - 1, 0)
+        readers = await restore(app.work_scroll, 5)
+        back_at_top = await restore(app.work_scroll, 0, touched=True)
+        return live, stale, readers, back_at_top
+
+
+def test_a_superseded_scroll_restore_and_a_readers_own_scroll_both_win():
+    """The restore is deferred a refresh, and both guards are about that gap.
+
+    A NEWER REBUILD WINS, and the reason is the row index rather than the ordering.
+    Callbacks run in the order they were queued, so an older one runs FIRST — which
+    would be harmless if a newer one were behind it to correct the view. The case
+    that is not harmless is the older one running alone: its index belongs to the
+    row list of the rebuild that queued it, and a second rebuild renumbers every row
+    while capturing no anchor of its own (it reads `scroll_y` as 0, because the
+    first restore has not run yet) and so queues no correction. The generation is
+    what stops the stale index landing unopposed.
+
+    AND THE READER WINS, asked of a flag their own wheel or key sets rather than of
+    where the view happens to be. `clear()` leaves `scroll_y` at 0, so a reader who
+    scrolled away and came deliberately back to the top is indistinguishable by
+    position from one who never touched it — and the restore would then override a
+    real choice, which is this change's own defect arriving from the other side.
+    """
+    live, stale, readers, back_at_top = asyncio.run(_drive_restore_guards())
+    assert live == 20, f"the restore did not move the view at all: {live}"
+    assert stale == 0, f"a superseded restore scrolled anyway: {stale}"
+    assert readers == 5, f"the restore overwrote the reader's own scroll: {readers}"
+    assert back_at_top == 0, \
+        (f"a reader who scrolled back to the top was treated as one who never "
+         f"scrolled, and the restore moved them to {back_at_top}")
+
+
+@pytest.mark.parametrize("value", ["nan", "NaN", "inf", "-inf", "0", "-5"])
+def test_a_drain_that_can_never_expire_is_refused_and_says_so(monkeypatch, value):
+    """`nan` in this variable is the unbounded wait, back, spelled as three letters.
+
+    The bound exists because a wedged worker that hangs the drivers forever gets a
+    CI job killed with no signal at all. `float("nan")` is a valid float and
+    `time.monotonic() >= start + nan` is False FOREVER, so a deadline built from it
+    never expires and the guarantee is gone — reachable by typing a word into an
+    environment variable. `inf` gets there by a shorter route, and 0 or a negative
+    is not a bound either, it is a deadline in the past.
+
+    The property asserted is the one that matters and not the specific number: what
+    comes back is finite and positive, so a deadline built on it can expire.
+    """
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", value)
+    with pytest.warns(UserWarning, match="QB_DASH_WORKER_DRAIN"):
+        drain = _worker_drain()
+    assert math.isfinite(drain) and drain > 0, \
+        f"{value!r} produced a deadline that cannot expire: {drain}"
+    assert drain == _WORKER_DRAIN_DEFAULT, drain
+    # The thing being prevented, stated as the arithmetic rather than trusted: this
+    # is what the loop's own test does with the deadline it is given.
+    assert not (time.monotonic() >= time.monotonic() + float("nan")), \
+        "a nan deadline is expected to be one that never expires"
+
+
+def test_a_drain_that_is_not_a_number_says_which_setting_and_what_was_in_it(monkeypatch):
+    """A typo gets an error, not the default.
+
+    Silently waiting 90s for somebody who asked for `9O` teaches them nothing, and
+    the failure it eventually produces is attributed to whatever the test went on to
+    do. Raised where it is read rather than at import, so it lands as a readable
+    failure inside the test that wanted it instead of as a collection error over the
+    whole file.
+    """
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", "9O")
+    with pytest.raises(AssertionError, match="QB_DASH_WORKER_DRAIN='9O'"):
+        _worker_drain()
+
+
+def test_a_drain_that_is_a_usable_number_of_seconds_is_taken_as_given(monkeypatch):
+    """The knob still works, which is what makes the three refusals above refusals
+    rather than the setting being ignored."""
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", "12.5")
+    assert _worker_drain() == 12.5
+    monkeypatch.delenv("QB_DASH_WORKER_DRAIN")
+    assert _worker_drain() == _WORKER_DRAIN_DEFAULT
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", "   ")
+    assert _worker_drain() == _WORKER_DRAIN_DEFAULT
 
 
 #: A plan with three open items in one scope, one in another and one fleet-wide —
@@ -2820,6 +3261,11 @@ class _Sink:
     bare `_Sink()` it was."""
 
     row_count = 0
+    #: A table that was never laid out is at the top of itself, and `render_work`
+    #: reads this to decide whether the reader had scrolled anywhere worth putting
+    #: them back (#678). Zero is both the honest answer and the one that leaves the
+    #: rest of that method on the path these tests are about.
+    scroll_y = 0
     #: The title Statics are measured for the room their tally has left, so a
     #: stand-in for one has to have a size. Zero is the honest answer for a widget
     #: that was never laid out, and the renderer treats anything under 20 as "no
