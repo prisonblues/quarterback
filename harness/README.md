@@ -173,7 +173,7 @@ between the two floors, counted rather than estimated and spent cheapest-first �
 second measurement on 2026-08-21, where PR #188's 185-line feature came out of two fix passes
 at 721 lines, 74% of the PR being review-response code, off a round-2 fix list that was 89%
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
-individually reasonable small fixes;
+individually reasonable small fixes, and since #551 `low_severity_fix_pct` (**22.4**) is the proportional half of that same budget — the round spends whichever of the two is smaller, so a fixed 40 lines can no longer be a bigger share of the change than the change, which is the danger #297 measured read down the size range rather than up it (**22.4** is 40 / 179, the allowance the absolute already grants on the one PR this dial has been watched on, so the pair is a no-op at and above that size and tightens only below it); a **ceiling** and not the floor #664 put under `max_fix_growth`, because the two dials' dangerous ends are opposite and a `max` written here would reintroduce #188;
 `unrefereed_line_weight` (**2**) is what one churned line of test or prose costs that budget
 against a production line's 1, because a production fix has an external referee in red/green,
 the suite and CI while a test fix has none — nothing tests a test — so a budget that prices

@@ -241,6 +241,17 @@ DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: all (the pre-#297 behaviour); `0` fixes none of them. `harness_rules` carries the
 #: measurement.
 DEFAULT_LOW_SEVERITY_FIX_LINES = 40
+#: The PROPORTIONAL half of that budget (#551): the most of the cycle's FIRST round
+#: the whole band may spend, as a percentage, with the round taking whichever of this
+#: and the absolute above is SMALLER. Both are ceilings, so the pair can only ever
+#: tighten — the mirror image of #664's floor one block down, and the opposite
+#: operator, because the accumulation `low_severity_fix_lines` measures is dangerous on
+#: the SMALL PR: 40 lines is ~22% of a 179-line change and larger than a 30-line one.
+#: 22.4 is 40 / 179 — the allowance the absolute already grants at the size #551
+#: measured it at — so the pair is a no-op at and above that size and tightens only
+#: below it. None switches the proportional half off and restores the pre-#551
+#: behaviour exactly; `harness_rules` carries the calibration.
+DEFAULT_LOW_SEVERITY_FIX_PCT = 22.4
 #: How much of the low-severity budget one UNREFEREED churned line costs, against a
 #: production line's 1 (#554). The budget's unit becomes exposure rather than length:
 #: a line written where nothing can check it spends more of the round than a line
@@ -3096,6 +3107,7 @@ __all__ = [
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
     "BLOCKING_SEVERITIES", "DEFAULT_THRESHOLD_BY_SEVERITY",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
+    "DEFAULT_LOW_SEVERITY_FIX_PCT",
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "DEFAULT_MIN_FIX_GROWTH_CHARS",

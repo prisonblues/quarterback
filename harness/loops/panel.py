@@ -4363,8 +4363,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # after each fix and stop when the budget is gone, and until now nothing checked.
     # One expression here rather than a second resolution of the dials, so the number
     # the brief states and the number the payload measures against cannot drift.
-    budgeting = fix_budget_state(refereeing, dials.low_severity_fix_lines,
-                                 dials.unrefereed_line_weight, dials.budgeted_band)
+    #
+    # BELOW the trend block since #551, which is a move rather than an accident: the
+    # budget is no longer a dial value read straight off `dials`, it is
+    # `min(low_severity_fix_lines, low_severity_fix_pct x the cycle's first round)`, and
+    # the denominator that needs is the one the block below already computes once for
+    # itself and for the payload. Deriving a second `first_chars` here is the
+    # duplicated-measurement failure this file keeps writing down, and it would show up
+    # as a report whose budget disagreed with its own growth ratio about how big round 1
+    # was.
 
     # ---- #490: this round's own row of the cross-round trend block, and the earlier
     # rounds' rows beside it.
@@ -4416,6 +4423,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # three rounds.
     trend_first_chars = (prior.first_reviewed[1] if prior.first_reviewed
                          else len(review.diff) if round_no == 1 else None)
+
+    # #551's budget, off THAT denominator and no other: the churned lines this round
+    # may actually spend on the 💸 band, `min(low_severity_fix_lines,
+    # low_severity_fix_pct x the first round)`. One expression for the number the
+    # fixer's brief states and the number #622's reader prices the pass against — they
+    # were one dial field until the budget stopped being a constant, and two
+    # computations of it is how a report and a payload come to disagree about the policy
+    # a round ran under. `None` where nothing is bounded, and the WRITTEN value wherever
+    # the proportion cannot apply — a null percentage, a repo with no budget, a
+    # first-round size this run could not read — so a round that cannot see round 1 is
+    # briefed exactly as it was before this key existed. `Dials.budget_for` carries
+    # which of those is which.
+    budget_lines = dials.budget_for(trend_first_chars)
+    budgeting = fix_budget_state(refereeing, budget_lines,
+                                 dials.unrefereed_line_weight, dials.budgeted_band)
     trend_rows = [*prior.trend,
                   RoundTrend(round=round_no, reviewed=True,
                              findings=len(outstanding),
@@ -6093,10 +6115,27 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # sweep these up, so the budget has to come with them, which means the header.
     on_budget = [c for c in for_fix if budgeted(c)]
     if on_budget:
+        # #551's proportional half, said HERE and not only on the dials line, because
+        # this sentence is the one an orchestrator sweeps into the fixer's brief: a
+        # brief stating 40 where the round is spending 6 is the pre-#551 behaviour
+        # relayed under a policy that is no longer in force. Said only where the
+        # proportion actually BOUND — the number is already correct either way, and a
+        # clause explaining a percentage that did not decide anything is one more thing
+        # for a fixer to weigh. The dials line carries the policy at every setting.
+        #
+        # AFTER "for the WHOLE round" and not inside it, so that sentence stays one
+        # string: it is the phrase the suites and an orchestrator both look for, and a
+        # clause spliced through the middle of it makes the budget unfindable at exactly
+        # the settings where knowing the number matters most.
+        cut_to = ("" if budget_lines == dials.low_severity_fix_lines else
+                  f" — cut from {dials.low_severity_fix_lines} lines by "
+                  f"`low_severity_fix_pct` at {dials.low_severity_fix_pct:g}% of the "
+                  "cycle's first round, because a fixed budget is a bigger share of a "
+                  "smaller change (#551)")
         lines.append(
             f"_💸 marks the {len(on_budget)} finding(s) below the "
             f"`{dials.round_trigger_floor}` cut. They share a "
-            f"{dials.low_severity_fix_lines}-line budget for the WHOLE round: measure "
+            f"{budget_lines}-line budget for the WHOLE round{cut_to}: measure "
             "each fix's churned lines (`git diff --numstat`) rather than estimating "
             "them, spend cheapest first, and stop when the budget is spent. "
             # #554, and it belongs HERE rather than only on the dials line: this note

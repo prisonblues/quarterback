@@ -65,7 +65,7 @@ PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
              "reviewers": {"claude": {"enabled": True, "model": "sonnet"}},
              "review_panel": {}}
 
-#: The fifteen, and where each one's default is written twice. `skip_title_patterns`
+#: The sixteen, and where each one's default is written twice. `skip_title_patterns`
 #: and the rest of the block are not dials and are not listed.
 DIALS = {
     "fixer_may_defer": "DEFAULT_FIXER_MAY_DEFER",
@@ -73,6 +73,7 @@ DIALS = {
     "fix_severity_floor": "DEFAULT_FIX_SEVERITY_FLOOR",
     "round_trigger_floor": "DEFAULT_ROUND_TRIGGER_FLOOR",
     "low_severity_fix_lines": "DEFAULT_LOW_SEVERITY_FIX_LINES",
+    "low_severity_fix_pct": "DEFAULT_LOW_SEVERITY_FIX_PCT",
     "unrefereed_line_weight": "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "max_fix_growth": "DEFAULT_MAX_FIX_GROWTH",
     "max_fix_growth_chars": "DEFAULT_MAX_FIX_GROWTH_CHARS",
@@ -247,6 +248,7 @@ BAD_VALUES = [
     ("fix_severity_floor", "p-4", "P1, P2, P3, P4"),
     ("round_trigger_floor", "blocker", "P1, P2, P3, P4"),
     ("low_severity_fix_lines", "a few", "a whole number"),
+    ("low_severity_fix_pct", "a fifth", "a number"),
     ("max_fix_growth", "lots", "is not a number"),
     ("max_fix_growth_chars", "a lot", "a whole number"),
     ("min_fix_growth_chars", "a bit", "a whole number"),
@@ -298,7 +300,8 @@ def test_unset_is_still_the_silent_not_configured_reading(key, unset):
     ceiling are nulled independently, which is most of why it is a second key."""
     dials = panel_seats.resolve_dials({key: unset}, None, [])
     expected = (None if key in ("max_fix_growth", "max_fix_growth_chars",
-                                "min_fix_growth_chars", "low_severity_fix_lines")
+                                "min_fix_growth_chars", "low_severity_fix_lines",
+                                "low_severity_fix_pct")
                 else harness_rules.DEFAULTS["review_panel"][key])
     assert getattr(dials, key) == expected
 
@@ -1688,7 +1691,13 @@ def test_the_budget_note_states_the_number_the_order_and_the_measurement(
     budget buy the most fixes; counting is what keeps the rule mechanical, and #297 is
     explicit that "does this risk ballooning?" asked of the fixer is a judgement by the
     actor whose judgement the 85% impugns."""
-    report, _, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")])
+    # #551's proportional half is nulled here on purpose. This test is about what the
+    # note SAYS — the order, the counting, the measurement — and the stub PR is 30 chars,
+    # on which 22.4% of round 1 legitimately cuts the budget to its clamp of 1. Left in,
+    # every assertion below would be about the number instead. Section 8b pins the cut
+    # itself, on both sides of the crossover.
+    report, _, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                            dials={"low_severity_fix_pct": None})
     assert "share a 40-line budget for the WHOLE round" in report
     assert "spend cheapest first" in report
     assert "git diff --numstat" in report
@@ -1948,6 +1957,253 @@ def test_the_orchestrator_relays_the_marks_with_the_list():
     # And the unpaid remainder joins the row the below-floor findings already use.
     assert "budget ran out before it, which is the same row for the same reason" \
         in panel_md
+
+
+# ------------------------------------- 8b. low_severity_fix_pct (#551)
+#
+# The proportional half of that same budget, and the OPPOSITE OPERATOR to #664's floor
+# four sections up. Both dials answer one sizing question and their dangerous ends are
+# opposite: `max_fix_growth`'s allowance shrinks with the PR while diff framing does
+# not, so a tiny PR cannot afford one honest fix — a floor. What this budget measures is
+# accumulation RELATIVE TO THE CHANGE (#188: 185 churned lines became 721, 74% of the PR
+# review-response code), so a fixed 40 lines is dangerous on the SMALL PR, where it can
+# exceed the diff it is polishing. Anyone implementing #551 from "40 lines is noise on a
+# big PR" writes a `max`, and that is the version that reintroduces #188. So: `min`,
+# both halves ceilings, and the pair can only ever tighten.
+
+#: A PR small enough that a fixed 40 lines is most of it. 535 chars is ~9 churned lines
+#: at `CHARS_PER_CHURNED_LINE`, so 22.4% of it is 2 — and 40 lines of P3 polish on a
+#: nine-line change is the shape #551 was filed about.
+TIGHT = "diff --git a/a.py b/a.py\n" + LINE * 30
+#: And one over the crossover (178.6 churned lines), where the absolute binds and this
+#: key is a no-op. Both fixtures assert their own properties below, or the tests that
+#: use them pin nothing.
+ROOMY = "diff --git a/a.py b/a.py\n" + LINE * 700
+
+
+def test_the_proportion_cuts_the_budget_on_a_pr_a_fixed_40_lines_would_swamp(
+        monkeypatch, capsys, tmp_path):
+    """The number that reaches the fixer, on the PR shape #551 measured.
+
+    The note under **To fix** is the only place the budget reaches a fixer at all, so a
+    proportion that moved the budget and not that sentence would be a dial applied by
+    nobody — `unrefereed_line_weight`'s own near-miss (#554), one dial over."""
+    # Properties of the fixture, or this asserts nothing: the PR is under the crossover,
+    # so the proportion is the smaller half and 40 is NOT what this round may spend.
+    assert len(TIGHT) / panel_seats.CHARS_PER_CHURNED_LINE < 178
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  diff=TIGHT)
+    assert "share a 2-line budget for the WHOLE round" in report
+    # And it says WHY, naming the key: an orchestrator reading "2" with no explanation
+    # has a number it cannot check and a dial it cannot find.
+    assert "cut from 40 lines by `low_severity_fix_pct` at 22.4%" in report
+    assert "a fixed budget is a bigger share of a smaller change (#551)" in report
+    # The payload measures the pass against the SAME number the brief stated. They were
+    # one dial field until the budget stopped being a constant; two derivations of it is
+    # how a report and a payload come to disagree about the policy a round ran under.
+    assert payload["round_stop"]["fix_budget"]["limit"] == 2
+    assert payload["review_panel"]["low_severity_fix_pct"] == 22.4
+    # The finding is still the fixer's work and still marked — this key moves the SIZE
+    # of the budget and never which findings are on it, nor the order they are spent in.
+    assert "💸 **P3**" in report
+    assert payload["to_fix"][0]["budgeted_fix"] is True
+
+
+def test_the_absolute_still_binds_above_the_crossover_and_this_key_is_a_no_op(
+        monkeypatch, capsys, tmp_path):
+    """22.4 is 40 / 179 — the allowance the absolute ALREADY grants on the one run this
+    dial has been watched on (a 179-line PR that spent 31 of its 40 lines and dropped a
+    17-line fix against 9 remaining, which is the dial working rather than failing). So
+    the crossover is 178.6 churned lines, at or above which nothing changes at all: no
+    cut, no clause, and the same 40 the round was briefed before this key existed."""
+    # Over the crossover, so the ABSOLUTE is the smaller half. Asserted rather than
+    # assumed, because a fixture that drifted under it would make this test pass by
+    # measuring the wrong half.
+    assert len(ROOMY) / panel_seats.CHARS_PER_CHURNED_LINE > 178.6
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  diff=ROOMY)
+    assert "share a 40-line budget for the WHOLE round" in report
+    assert "low_severity_fix_pct" not in report.split("### To fix")[1]
+    assert payload["round_stop"]["fix_budget"]["limit"] == 40
+
+
+def test_nulling_the_proportion_is_the_pre_551_behaviour_exactly(
+        monkeypatch, capsys, tmp_path):
+    """What makes the SHAPE reversible while it is still a decision (#551 is
+    `needs-human/decision`, and #664 landed on the same property): one `null` and the
+    absolute binds on its own again, on the same PR, with no other key touched."""
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  diff=TIGHT, dials={"low_severity_fix_pct": None})
+    assert payload["review_panel"]["low_severity_fix_pct"] is None
+    assert "share a 40-line budget for the WHOLE round" in report
+    assert "cut from 40 lines" not in report
+    assert payload["round_stop"]["fix_budget"]["limit"] == 40
+
+
+def test_the_denominator_is_the_first_round_and_never_the_round_in_hand(
+        monkeypatch, capsys, tmp_path):
+    """`max_fix_growth`'s own rule, and for its reason: a budget that grows as the PR
+    grows pays for the growth it is supposed to bound. Round 1 reads a 535-char PR and
+    round 2 a 11,925-char one — over the crossover on its own size — and the budget the
+    second round is briefed with is still round 1's."""
+    _, _, r1 = band_run(monkeypatch, capsys, tmp_path, [finding("P3")], round_no=1,
+                        max_rounds=3, diff=TIGHT)
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  round_no=2, baseline=[r1], max_rounds=3, diff=ROOMY,
+                                  scope="pr")
+    assert "share a 2-line budget for the WHOLE round" in report
+    assert payload["round_stop"]["fix_budget"]["limit"] == 2
+
+
+def test_a_first_round_size_this_run_cannot_read_leaves_the_written_budget_alone(
+        monkeypatch, capsys, tmp_path):
+    """Round 2 with no readable baseline: the denominator is genuinely unknown,
+    `max_fix_growth` declines to run on the same absence, and a guessed one is worse
+    than none. So the round is briefed exactly as it was before this key existed."""
+    report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                                  round_no=2, max_rounds=3, diff=TIGHT)
+    # The key IS in force — this is the branch where it declines, not a round that never
+    # had it — and saying both is what stops this reading as "nothing happened".
+    assert payload["review_panel"]["low_severity_fix_pct"] == 22.4
+    assert "share a 40-line budget for the WHOLE round" in report
+    assert "cut from 40 lines" not in report
+    assert payload["round_stop"]["fix_budget"]["limit"] == 40
+
+
+def test_the_proportion_takes_the_MIN_and_a_max_would_reintroduce_188():
+    """The single assertion this whole dial turns on, in both directions.
+
+    #664 put a FLOOR under `max_fix_growth` and the tempting symmetry says this wants
+    one too. It wants the opposite: a `max` here would hand a bigger budget to a bigger
+    PR, which is #188's runaway (185 churned lines to 721) with a dial's blessing. Both
+    halves are ceilings and the round spends the smaller, so no value of the percentage
+    lets through a round the absolute alone would have stopped."""
+    dials = panel_seats.resolve_dials({}, None, [])
+    # Under the crossover the PROPORTION is smaller and binds...
+    assert dials.budget_for(30 * panel_seats.CHARS_PER_CHURNED_LINE) == 6
+    assert dials.budget_for(100 * panel_seats.CHARS_PER_CHURNED_LINE) == 22
+    # ...and over it the ABSOLUTE is smaller and binds, rather than the proportion
+    # raising the budget to 112, which is what a `max` would do.
+    assert dials.budget_for(500 * panel_seats.CHARS_PER_CHURNED_LINE) == 40
+    assert dials.budget_for(5000 * panel_seats.CHARS_PER_CHURNED_LINE) == 40
+
+
+def test_a_derived_budget_is_clamped_at_one_and_never_floors_to_zero():
+    """`0` is a WRITTEN value with its own consequence — `low_severity_fix_lines: 0`
+    raises the applied floor to the trigger cut and takes the band out of the fixer's
+    list entirely — so a proportion that floored to nothing on a very small PR would
+    take that decision on an operator's behalf, as a side effect of the PR's size. 1 is
+    the smallest budget that is still a budget."""
+    dials = panel_seats.resolve_dials({}, None, [])
+    assert 22.4 / 100 * (60 / panel_seats.CHARS_PER_CHURNED_LINE) < 1
+    assert dials.budget_for(60) == 1
+    assert dials.budget_for(1) == 1
+    # And the floor does not move with it: the band is still fixable work, still marked,
+    # which is exactly what a written `0` would have changed.
+    assert dials.fix_floor == dials.fix_severity_floor
+
+
+def test_a_written_zero_budget_is_left_exactly_where_it_is():
+    """The other half of the same rule. This key may LOWER a budget; it may never raise
+    one, and it may never turn "fix none of the band" into "fix one line of it"."""
+    dials = panel_seats.resolve_dials({"low_severity_fix_lines": 0}, None, [])
+    assert dials.budget_for(len(ROOMY)) == 0
+    assert dials.budget_for(60) == 0
+
+
+def test_a_percentage_beside_no_budget_bounds_nothing_and_the_round_says_so(
+        monkeypatch, capsys, tmp_path):
+    """#551's one configuration hazard, and it is the mirror of #664's. The two are
+    halves of one ceiling and the round spends the smaller, so with no absolute there is
+    no smaller to take. Letting the percentage BECOME a budget is the obvious
+    alternative and is worse: a repo that wrote `null` meant "no budget, every finding
+    above the fix floor is unconditional work", and handing it one back from a key it
+    may never have touched would make a written value mean the opposite of what it
+    names. So it goes inert and the round says so, rather than reading as configured and
+    bounding nothing (#169)."""
+    off = panel_seats.resolve_dials({"low_severity_fix_lines": None}, None, [])
+    assert off.budget_for(60) is None
+    _, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
+                             diff=TIGHT, dials={"low_severity_fix_lines": None})
+    note, = notes_about(payload, "low_severity_fix_pct")
+    assert "bounds nothing this round" in note
+    assert "whichever half is smaller" in note
+    # Not at the shipped defaults, where nobody wrote anything to be surprised about.
+    _, plain, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")], name="plain",
+                           diff=TIGHT)
+    assert not notes_about(plain, "low_severity_fix_pct")
+
+
+@pytest.mark.parametrize("raw,want", [
+    ({}, 22.4),                                    # absent inherits the default
+    ({"low_severity_fix_pct": 50}, 50.0),
+    ({"low_severity_fix_pct": 22.35}, 22.35),      # fractional, unlike the counts
+    ({"low_severity_fix_pct": " 10 "}, 10.0),      # a hand's string
+    ({"low_severity_fix_pct": 100}, 100.0),        # the whole change, and legal
+    ({"low_severity_fix_pct": None}, None),        # a written null is off
+    ({"low_severity_fix_pct": ""}, None),          # the module's reading of empty
+])
+def test_the_proportion_reads_the_three_answers_its_siblings_read(raw, want):
+    """Absent is the default, a written `null` is off, and `""` is read as `null` —
+    which is the convention EVERY dial resolver in this module keeps, not a courtesy
+    this one adds. Fractional values count here and nowhere else in the block: the
+    quantity is a percentage rather than a count of anything, and 22.35 — 40 / 179, the
+    measurement behind the default — is not expressible otherwise."""
+    assert panel_seats.low_severity_budget_pct(raw, []) == want
+
+
+@pytest.mark.parametrize("bad,why", [
+    (False, "a number"),
+    ("a fifth", "a number"),
+    (float("inf"), "a finite number"),
+    (float("nan"), "a finite number"),
+    (0, "above zero"),
+    (-22.4, "above zero"),
+    (101, "at most 100"),
+])
+def test_a_bad_proportion_is_refused_and_never_read_as_a_budget(bad, why):
+    """`0` is refused rather than read as "no proportion": a budget of nothing is
+    something `low_severity_fix_lines: 0` already says, and says with a consequence this
+    key must not reach. Above 100 is refused because a proportion over 100 permits a
+    round to spend more lines on the band than the change contains — the exact shape
+    #551 was filed about, arrived at through the key that exists to prevent it. `false`
+    is refused before the numeric read (`isinstance(True, int)`), and `inf`/`nan` on
+    `max_fix_growth`'s rule: one is the check off behind something that reads like a
+    number and the other compares false against everything."""
+    notes: list[str] = []
+    with pytest.raises(SystemExit) as refusal:
+        panel_seats.low_severity_budget_pct({"low_severity_fix_pct": bad}, notes)
+    assert why in str(refusal.value)
+    assert "null to let `low_severity_fix_lines` bind on its own" in str(refusal.value)
+    assert notes == []
+
+
+def test_the_proportion_is_settable_from_the_board_and_nullable_there():
+    """A shape decision that can only be reversed by a release is not reversible in the
+    sense #551 needs — the property that made #664's floor defensible to land while its
+    own shape was still a decision. `null` is the exact pre-#551 behaviour, so the board
+    layer has to be able to write it."""
+    assert not harness_rules.unknown_keys(
+        {"review_panel": {"low_severity_fix_pct": 22.4}})
+    assert "review_panel.low_severity_fix_pct" in harness_rules.BOARD_DIALS
+    assert harness_rules.BOARD_DIALS["review_panel.low_severity_fix_pct"].nullable
+
+
+def test_the_dials_line_names_both_halves_of_the_budget(monkeypatch, capsys, tmp_path):
+    """The policy, on the line the orchestrator builds the brief from, at every setting
+    — the applied number is the **To fix** header's job, and this line has no PR size in
+    front of it. A line naming only the absolute would make a round briefed at 2 read as
+    an arithmetic bug, which is `max_fix_growth_chars`' own argument for sharing a
+    clause."""
+    report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
+    assert ("below-P2 fix budget 40 lines or 22.4% of round 1, whichever is smaller, "
+            "unrefereed x2") in report
+    # Suppressed where there is no absolute for it to be the smaller of: a percentage
+    # under a null budget bounds nothing, and `config_notes` carries that case rather
+    # than a policy line that misdescribes it.
+    off, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")], name="off",
+                    config=cfg(low_severity_fix_lines=None))
+    assert "below-P2 fix budget off ·" in off
 
 
 # ------------------------------------------- 9. file_deferral_issues (#482)
@@ -2311,7 +2567,8 @@ def test_the_report_states_the_dials_on_every_round(monkeypatch, capsys, tmp_pat
     weighing a quiet round needs to know whether the quiet was measured or configured."""
     report, _, _ = run(monkeypatch, capsys, tmp_path, [finding("P2")])
     assert ("**Panel dials** (`review_panel`): fix at/above P4 · below-P2 fix budget "
-            "40 lines, unrefereed x2 · another round at/above P2 · reviewer scope diff "
+            "40 lines or 22.4% of round 1, whichever is smaller, unrefereed x2 · "
+            "another round at/above P2 · reviewer scope diff "
             "· fix growth "
             "cap 3x over +2,000 or +30,000 chars · fixer may defer yes · failing test "
             "required no · a deferral naming a category or one substantive item gets "

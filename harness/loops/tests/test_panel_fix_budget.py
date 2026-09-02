@@ -268,7 +268,14 @@ def _round(monkeypatch, capsys, tmp_path, *, round_no=1, baseline=(), added=1,
     measurement is taken under. The head moves per round because an unchanged head is
     "no commit landed between rounds" — a range that does not exist rather than one
     that spent nothing."""
-    cfg = {**CFG, "review_panel": dict(panel_block or {})}
+    # #551's proportional half off unless a caller says otherwise. This file is about
+    # #622's READER — the arithmetic and the one-sidedness of its verdict — and the
+    # fixture PR is ~120 chars, on which 22.4% of round 1 legitimately cuts the budget
+    # to its clamp of 1. Left on, every assertion here would be about the budget's SIZE
+    # rather than about who counted the pass. The cut itself is pinned in
+    # `test_panel_dials` section 8b, including its arrival in this same payload block.
+    cfg = {**CFG,
+           "review_panel": {"low_severity_fix_pct": None, **(panel_block or {})}}
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: cfg)
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "fix: a real bug", "additions": 3, "deletions": 1,

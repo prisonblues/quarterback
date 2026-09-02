@@ -1600,6 +1600,98 @@ def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+#: Chars of unified diff per churned line, for the one conversion #551's proportional
+#: budget cannot avoid: `low_severity_fix_lines` is spent in LINES and the only size a
+#: baseline records for the cycle's first round is `pr_chars`.
+#:
+#: **58, and it is re-measured rather than inherited.** PR #188's merged diff is 34,635
+#: chars over 597 churned lines. That is NOT the 34,717-over-521 (66 a line) that
+#: `max_fix_growth_chars` calibrates against in `harness_rules`: the char count
+#: reproduces on today's PR and the line count does not, and neither does the 721 in
+#: #297's own measurement of the same PR, so both line counts look to be from a
+#: pre-rebase state nothing can now read. The older number is left where it is rather
+#: than corrected on a guess, and this one is the number that can be reproduced.
+#:
+#: Cross-checked against this repo's last 25 non-merge commits, which run 60-95 chars a
+#: churned line with a median of 81 (three outliers above, to 741). **58 sits at the
+#: bottom of that deliberately.** Under-stating chars-per-line over-states the PR's line
+#: count, which makes the derived budget bigger and this ceiling LOOSER — and #664 has
+#: just measured what a fix budget that binds too early costs: a correction priced out
+#: into a regression the next round pays to rediscover. A ceiling errs loose.
+#:
+#: A constant and NOT a dial, which is the same line `unrefereed_line_weight` draws
+#: from the other side: the percentage beside it is a policy an operator may argue
+#: with, and this is a fact about diffs that nobody should be tuning. Folding the two
+#: into one lines-per-char dial would be one number rather than two and would hide
+#: which half is the judgement.
+CHARS_PER_CHURNED_LINE = 58
+
+
+def low_severity_budget_pct(panel: dict, notes: list[str]) -> float | None:
+    """`low_severity_fix_pct` — a percentage above 0 and at most 100, or ``None`` for
+    "the absolute binds on its own".
+
+    #551's proportional half of the low-severity budget, and the MIRROR IMAGE of
+    :func:`fix_growth_floor_chars`: the same sizing question from the other end, with
+    the opposite operator. There the defect is that a multiple's allowance shrinks with
+    the PR while diff framing does not, so a tiny PR cannot afford one honest fix — a
+    floor. Here the measurement is accumulation RELATIVE TO THE CHANGE (#297: PR #188's
+    185-line feature became 721 churned lines, 74% of it review-response code), so the
+    dangerous end is the SMALL PR, where a fixed 40 lines can exceed the diff it is
+    polishing. A `max` written here on the strength of the floor next door would
+    reintroduce #188; both halves are ceilings and the round spends the smaller.
+
+    **Absent inherits the default and a written ``null`` switches it off**, the reading
+    :func:`low_severity_budget` and the three growth keys already have. ``null`` is the
+    exact pre-#551 behaviour, which is what makes the shape reversible from the board
+    rather than by a release.
+
+    ``0`` is refused rather than read as "no proportion". A budget of nothing is
+    something `low_severity_fix_lines: 0` already says, and says with a consequence
+    this key must not reach: it raises the applied floor to the trigger cut
+    (:attr:`Dials.fix_floor`). A proportion of zero would express that decision without
+    an operator having made it, and `null` is the spelling already available for what
+    someone writing `0` here meant.
+
+    **Above 100 is refused**, which is the one bound here that is not a sibling's rule.
+    This is a proportion OF THE CHANGE, and a proportion over 100 permits a round to
+    spend more lines on the P3/P4 band than the change contains — the exact shape #551
+    was filed about, arrived at through the key that exists to prevent it. Fractional
+    values count, unlike every other number in this block: the quantity is a percentage
+    rather than a count of anything, `max_fix_growth` beside it is already a float, and
+    22.35 (40 / 179, the measurement behind the default) is not expressible otherwise.
+    A bool is refused before the numeric read for :func:`resolve_max_rounds`' reason
+    (``isinstance(True, int)``), and a non-finite value for :func:`fix_growth_limit`'s:
+    ``inf`` is the check off behind something that reads like a number, and ``nan``
+    compares false against everything."""
+    raw = panel.get("low_severity_fix_pct", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_LOW_SEVERITY_FIX_PCT
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> float | None:
+        _refuse_value("low_severity_fix_pct", raw,
+                      f"{what} — the most of the cycle's first round the low-severity "
+                      "budget may spend, as a percentage, or null to let "
+                      "`low_severity_fix_lines` bind on its own")
+        return None            # unreachable; `_refuse_value` always raises
+
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        return refuse("a number")
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return refuse("a number")
+    if n != n or n in (float("inf"), float("-inf")):
+        return refuse("a finite number")
+    if n <= 0:
+        return refuse("above zero")
+    if n > 100:
+        return refuse("at most 100")
+    return n
+
+
 def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
     """`unrefereed_line_weight` — a whole number >= 1, what one unrefereed churned
     line costs the low-severity budget against a production line's 1 (#554).
@@ -2330,8 +2422,8 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The fifteen #165/#297/#492/#482/#554/#508/#618/#78/#664 settings as this round
-    applied them.
+    """The sixteen #165/#297/#492/#482/#554/#508/#618/#78/#664/#551 settings as this
+    round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -2344,6 +2436,13 @@ class Dials:
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
     low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
+    #: #551's proportional half of that budget, and the mirror of `min_fix_growth_chars`
+    #: below — the same sizing question, the opposite operator, because a fixed line
+    #: budget is dangerous on the SMALL PR and a fixed growth allowance on the tiny one.
+    #: Both halves here are ceilings and :meth:`budget_for` spends the smaller, so this
+    #: can only ever tighten. Carried on this object for its siblings' reason: the
+    #: fixer's brief, the report and the payload's measurement have to read ONE number.
+    low_severity_fix_pct: float | None = DEFAULT_LOW_SEVERITY_FIX_PCT
     unrefereed_line_weight: int = DEFAULT_UNREFEREED_LINE_WEIGHT
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
@@ -2376,6 +2475,7 @@ class Dials:
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
                 "low_severity_fix_lines": self.low_severity_fix_lines,
+                "low_severity_fix_pct": self.low_severity_fix_pct,
                 "unrefereed_line_weight": self.unrefereed_line_weight,
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
@@ -2405,6 +2505,60 @@ class Dials:
         return (self.low_severity_fix_lines is not None
                 and not severity_at_least(self.fix_severity_floor,
                                           self.round_trigger_floor))
+
+    def budget_for(self, first_chars: int | None) -> int | None:
+        """The churned lines this round may actually spend on the 💸 band — #297's
+        absolute and #551's proportion, whichever is SMALLER.
+
+        The one number the fixer's brief states and the payload measures against, so it
+        is computed here rather than at either site: two derivations of one budget is
+        how a report and a payload come to disagree about the policy a round ran under.
+
+        ``first_chars`` is the size the cycle's FIRST round read the PR at — the same
+        denominator `max_fix_growth` divides by (`Baseline.first_reviewed`), and on
+        round 1 the round's own size, because round 1 IS the first round. It is
+        measured there and not against the current diff for `max_fix_growth`'s reason: a
+        budget that grows as the PR grows pays for the growth it is supposed to bound.
+
+        **Both terms are ceilings and this takes the min, which is what makes the pair
+        safe.** #664's floor one dial over is a `max` and loosens; writing a `max` here
+        on the strength of that symmetry is the version that reintroduces #188, because
+        the two dials' dangerous ends are opposite. See `harness_rules` for the
+        argument in full; the shape of it is that a proportional term can only ever
+        tighten this budget, so no setting of the percentage lets through a round the
+        absolute alone would have stopped.
+
+        **Three cases hand back the written value untouched**, and each is a case where
+        a proportion would be inventing something:
+
+        * ``low_severity_fix_pct: null`` — the half is off, and off is the exact
+          pre-#551 behaviour.
+        * **no budget at all** (`low_severity_fix_lines: null`) — there is no ceiling
+          for a proportion to be the smaller of, and a percentage must not BECOME a
+          budget on a repo that wrote it off. `resolve_dials` says so in `config_notes`.
+        * **an unknown first-round size** — round 2 with an unreadable baseline, or one
+          written before `pr_chars`. `max_fix_growth` declines to run there too; a
+          guessed denominator is worse than none.
+
+        A written ``0`` also comes back as ``0``: that is an operator saying "fix none
+        of the band", it already moves :attr:`fix_floor` to the trigger cut, and this
+        key may lower a budget and may never raise one.
+
+        **The derived value is clamped at 1 and never floors to 0**, which is the same
+        argument read the other way. On a PR small enough, 22.4% of it rounds to
+        nothing — and a budget of nothing is a written value with a consequence
+        (:attr:`fix_floor` again) that no size of PR should be able to trigger on an
+        operator's behalf. 1 is the smallest budget that is still a budget.
+
+        Chars to lines at :data:`CHARS_PER_CHURNED_LINE`, because a baseline records
+        only `pr_chars` and this budget is spent in lines; that constant carries its own
+        measurement and the reason it sits at the bottom of the measured range."""
+        written = self.low_severity_fix_lines
+        if (written is None or written == 0 or self.low_severity_fix_pct is None
+                or first_chars is None or first_chars <= 0):
+            return written
+        first_lines = first_chars / CHARS_PER_CHURNED_LINE
+        return max(1, min(written, int(self.low_severity_fix_pct / 100 * first_lines)))
 
     @property
     def fix_floor(self) -> str:
@@ -2678,8 +2832,21 @@ class Dials:
         # a dial that vanishes from the report at some settings is one a reader
         # cannot tell from a dial that was never applied. Suppressed only where the
         # budget is off, where there is nothing for it to be a unit of.
+        # #551's proportional half rides INSIDE the budget's clause rather than getting
+        # one of its own, on the floor's rule three keys down and for its reason: it is
+        # not a second thing this round bounds, it is the other half of one ceiling, and
+        # a reader who saw "40 lines" alone would take a round briefed at 6 for an
+        # arithmetic bug. This line states the POLICY and not the applied number — it
+        # has no PR size in front of it — so it says which two terms bind and leaves
+        # the arithmetic to the **To fix** header, which states what the round spent it
+        # on. Printed only where there IS an absolute for it to be the smaller of: a
+        # percentage under a null budget bounds nothing, and `config_notes` carries that
+        # case rather than a policy line that misdescribes it.
+        proportion = (f" or {self.low_severity_fix_pct:g}% of round 1, whichever is "
+                      "smaller" if self.low_severity_fix_lines is not None
+                      and self.low_severity_fix_pct is not None else "")
         budget = ("off" if self.low_severity_fix_lines is None
-                  else f"{self.low_severity_fix_lines} lines, unrefereed "
+                  else f"{self.low_severity_fix_lines} lines{proportion}, unrefereed "
                        f"x{self.unrefereed_line_weight}")
         return (f"fix at/above {self.fix_severity_floor} · below-"
                 f"{self.round_trigger_floor} fix budget {budget} · another round "
@@ -2708,7 +2875,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all fourteen at once.
+    """Read, validate and report all sixteen at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2730,6 +2897,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
         low_severity_fix_lines=low_severity_budget(panel, notes),
+        low_severity_fix_pct=low_severity_budget_pct(panel, notes),
         unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
@@ -2759,6 +2927,25 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
             "another round however few seats raised them, so suppressing them would "
             "leave a finding no fix pass may touch and every stop rule still "
             "demanding. Each named band is applied at 1 seat, as it was before the key")
+    # #551's one configuration hazard, said rather than refused, and it is the mirror of
+    # #664's below. A percentage with no absolute beside it bounds NOTHING: the two are
+    # halves of one ceiling and the round spends the smaller, so with
+    # `low_severity_fix_lines: null` there is no smaller to take. The obvious
+    # alternative — let the percentage become a budget on its own — is worse and is
+    # refused rather than argued for: a repo that wrote `null` meant "no budget, every
+    # finding above the fix floor is unconditional work", and handing it one back from a
+    # key it may never have touched would make a written value mean the opposite of what
+    # it names. So the percentage goes inert and the round SAYS so, naming the key that
+    # would put it back in force (#169: a dial that reads as configured and bounds
+    # nothing is the failure worth a line). Silent on the shipped defaults, where
+    # nobody wrote anything to be surprised about.
+    if dials.low_severity_fix_lines is None and dials.low_severity_fix_pct is not None:
+        notes.append(
+            f"`low_severity_fix_pct` is written at {dials.low_severity_fix_pct:g}% and "
+            "bounds nothing this round — it is the PROPORTIONAL half of the "
+            "low-severity budget and the round spends whichever half is smaller, so "
+            "with `low_severity_fix_lines: null` there is no budget for it to be the "
+            "smaller of. Write a line budget beside it, or null this too and mean it")
     # The one migration hazard #492 creates, said out loud rather than special-cased.
     # A repo that wrote `max_fix_growth: null` meant "no growth check" — that key WAS
     # the whole check — and after #492 it switches off the multiple only, leaving an
