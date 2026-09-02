@@ -380,7 +380,11 @@ class ReviewRun(Base):
     #: The integer summary of :attr:`fix_pass`, lifted out of the record's own
     #: ``counts`` block so that it can ride the run LIST (#624).
     #:
-    #: Eleven keys at most and every value a count or NULL, which is why this one is
+    #: Eleven keys at most and every value a count — a count the board cannot believe
+    #: drops WITH ITS KEY rather than being stored as a JSON null, which is
+    #: ``_tally_or_none``'s standing rule and matters here because zero is a claim
+    #: about a fix pass. So a reader asks this block whether it HAS a key, and a
+    #: record whose churn was not measurable has ten. That is why this one is
     #: not deferred and its parent is — the same cut :attr:`provenance_counts` and
     #: ``unread_files_count`` already make on this row, and #112's grouping-key /
     #: locator cut one field over. A population question about fix passes ("how big

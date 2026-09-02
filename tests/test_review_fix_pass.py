@@ -51,6 +51,10 @@ REPO = "acme/fixpass624"
 AGENT = {**LAPTOP, "X-Agent-Instance": "d624d1"}
 
 APP = Path(reviews.__file__).resolve().parent.parent
+#: The producer's own copy of the count vocabulary, read as source rather than
+#: imported — see `_panel_fix_pass_counts`.
+PANEL_ROUNDS = (Path(__file__).resolve().parent.parent
+                / "harness" / "loops" / "panel_rounds.py")
 
 #: One record, spelled the way `panel_rounds.fix_pass_record` spells it. Written out
 #: rather than imported: `harness/loops` is installed without `app/` beside it, so
@@ -313,15 +317,56 @@ async def test_a_record_with_no_readable_counts_lifts_NOTHING(client, counts):
     assert (await detail(client, got["id"]))["fix_pass"] is not None
 
 
-async def test_the_lifted_vocabulary_matches_the_records_own_eleven_keys(client):
+def _panel_fix_pass_counts() -> tuple[str, ...]:
+    """``panel_rounds.FIX_PASS_COUNTS`` read out of the harness SOURCE by `ast`.
+
+    Read rather than imported for `tests/test_payload_key_drift.py`'s reason:
+    `harness/loops` is installed without `app/` beside it, so an import here would be
+    a test that only runs in a checkout — and a test that SKIPS when an import fails
+    is a test that never runs anywhere, which is that file's own lesson and how the
+    drift it exists to catch got in.
+    """
+    tree = ast.parse(PANEL_ROUNDS.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "FIX_PASS_COUNTS"
+                   for t in node.targets):
+            continue
+        return tuple(e.value for e in ast.walk(node.value)
+                     if isinstance(e, ast.Constant) and isinstance(e.value, str))
+    return ()
+
+
+def test_the_lifted_vocabulary_matches_THE_PANELS_OWN():
     """The drift check, and this suite is where it belongs: `harness/loops` is
     installed without `app/` beside it, so these two halves are readable at once
     nowhere else — the position `tests/test_payload_key_drift.py` and
     `tests/test_needs_human_drift.py` are both in.
 
     A key the panel adds and this vocabulary does not name is stored in the record and
-    dropped from the tally, in silence, which is the shape `converged` had."""
-    assert set(RECORD["counts"]) == set(reviews.FIX_PASS_COUNTS)
+    dropped from the tally, in silence, which is the shape `converged` had.
+
+    **Against the PRODUCER's constant and not against this file's fixture**, which is
+    the whole difference between a drift check and a restatement: `RECORD` below is
+    hand-written here, so comparing it to :data:`reviews.FIX_PASS_COUNTS` compares two
+    things that move together when somebody edits this file and says nothing about the
+    panel. A second opinion on #705 caught exactly that — the panel could grow a
+    twelfth count and this stayed green while `_fix_pass_counts_or_none` silently
+    dropped it out of `GET /reviews`.
+    """
+    panel_vocab = _panel_fix_pass_counts()
+    # The scan's own failure mode first, on `test_payload_key_drift.py`'s rule: a
+    # rename that matched nothing would compare two empty tuples and pass. A floor and
+    # a spot-check rather than an exact count — the count is the thing that
+    # legitimately moves, and pinning it here would duplicate the assertion below
+    # while failing for a reason that names nothing.
+    assert len(panel_vocab) >= 8, f"read {panel_vocab!r} out of the panel — scan broke?"
+    assert {"briefed", "churn", "introduced"} <= set(panel_vocab), panel_vocab
+    assert panel_vocab == reviews.FIX_PASS_COUNTS
+    # …and the fixture below is the panel's shape, so the rest of this suite is
+    # exercising the record the panel actually sends.
+    assert set(RECORD["counts"]) == set(panel_vocab)
 
 
 # --------------------------------------------------------- and it is NOT a leaderboard
@@ -364,12 +409,52 @@ def test_nothing_in_the_api_aggregates_or_orders_by_either_column():
     the two read paths name them — but that no `func.sum`/`avg`/`count`/`min`/`max`,
     no `order_by` and no `group_by` has one of them anywhere inside it. That is the
     shape a ranking takes in this codebase, and it is what `GET /review/stats` is built
-    out of one endpoint over."""
-    aggregates = {"sum", "avg", "count", "min", "max", "percentile_cont", "stddev"}
+    out of one endpoint over.
+
+    **And the shape it takes when it is not written in SQL.** A second opinion on #705
+    pointed out that the SQL vocabulary alone left the whole Python half open:
+    `total += (run.fix_pass_counts or {}).get("introduced", 0)` and
+    `sorted(rows, key=lambda r: r.fix_pass_counts["introduced"])` are a sum and an
+    order by this column, and neither is a `func.` call. So `sorted`/`sort`/`Counter`
+    are read as aggregates too, and an augmented assignment naming either column is an
+    offender on its own."""
+    aggregates = {"sum", "avg", "count", "min", "max", "percentile_cont", "stddev",
+                  # The Python half. `sorted`/`.sort` is the ordering, `Counter` and
+                  # `most_common` are the grouping, `mean`/`median` the ratio.
+                  "sorted", "sort", "Counter", "most_common", "mean", "median",
+                  "nlargest", "nsmallest"}
+    named_columns = {"fix_pass", "fix_pass_counts"}
+    sql_shaped = {"order_by", "group_by", "percentile_cont", "stddev", "avg",
+                  "func", "sum", "count", "min", "max"}
+
+    def reads_the_column(node: ast.AST) -> bool:
+        """The column reached AS A COLUMN — `run.fix_pass_counts`, `ReviewRun.fix_pass`.
+
+        Attributes only, deliberately. Ingest legitimately names both fields as bare
+        locals and as string literals inside a `sorted(...)` over field NAMES
+        (``record_review``'s `unreadable_fields`), and flagging those would be
+        flagging the drop signal rather than a ranking."""
+        return bool(named_columns & {n.attr for n in ast.walk(node)
+                                     if isinstance(n, ast.Attribute)})
+
+    def mentions(node: ast.AST) -> bool:
+        """Any reference at all, for the SQL half — a query may name a column with a
+        string, and nothing in `app/` builds one over these two by any spelling."""
+        return reads_the_column(node) or bool(named_columns & (
+            {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+            | {c.value for c in ast.walk(node)
+               if isinstance(c, ast.Constant) and isinstance(c.value, str)}))
+
     offenders: list[str] = []
+    scanned = 0
     for path in sorted(APP.rglob("*.py")):
         tree = ast.parse(path.read_text())
+        scanned += 1
         for node in ast.walk(tree):
+            # `total += run.fix_pass_counts[...]` — a running sum with no call in it.
+            if isinstance(node, ast.AugAssign) and reads_the_column(node):
+                offenders.append(f"{path.name}:{node.lineno} +=")
+                continue
             if not isinstance(node, ast.Call):
                 continue
             fn = node.func
@@ -377,14 +462,15 @@ def test_nothing_in_the_api_aggregates_or_orders_by_either_column():
                      fn.id if isinstance(fn, ast.Name) else "")
             if named not in aggregates | {"order_by", "group_by"}:
                 continue
-            inside = {n.attr for n in ast.walk(node)
-                      if isinstance(n, ast.Attribute)} | {
-                n.id for n in ast.walk(node) if isinstance(n, ast.Name)} | {
-                c.value for c in ast.walk(node)
-                if isinstance(c, ast.Constant) and isinstance(c.value, str)}
-            if inside & {"fix_pass", "fix_pass_counts"}:
+            hit = mentions(node) if named in sql_shaped else reads_the_column(node)
+            if hit:
                 offenders.append(f"{path.name}:{node.lineno} {named}")
     assert not offenders, offenders
+    # The walk's own failure mode, on `tests/test_payload_key_drift.py`'s rule: a
+    # move that made `APP` name the wrong directory would scan nothing, find nothing
+    # and pass. A floor and a spot-check, not an exact count.
+    assert scanned >= 10, f"only {scanned} modules under {APP} — did the scan break?"
+    assert (APP / "api" / "reviews.py").exists(), APP
 
 
 def test_the_leaderboard_endpoint_does_not_read_it():

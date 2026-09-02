@@ -107,15 +107,40 @@ def _leaves(node, path=""):
 
     Written out rather than done with a JSON round trip because two of the four
     guarantees are about KEY NAMES as well as values, and both walks want the path
-    that reached a leaf so a failure names the field rather than the fact."""
-    if isinstance(node, dict):
+    that reached a leaf so a failure names the field rather than the fact.
+
+    An EMPTY dict or list yields itself rather than nothing, so its own key is still
+    on a path somebody can walk: a second opinion on #705 pointed out that
+    `{"ratio": {}}` reached neither guarantee, because a container with nothing
+    inside it produced no leaf at all and so produced no path."""
+    if isinstance(node, dict) and node:
         for k, v in node.items():
             yield from _leaves(v, f"{path}.{k}" if path else str(k))
-    elif isinstance(node, list):
+    elif isinstance(node, list) and node:
         for i, v in enumerate(node):
             yield from _leaves(v, f"{path}[{i}]")
     else:
         yield path, node
+
+
+def _key_names(record):
+    """Every key name on every path through the record, at every depth.
+
+    :func:`_leaves` hands back a dotted path and the two vocabulary walks below used
+    to test only its LAST segment, which is the leaf's own key — so an intermediate
+    key was never checked against either vocabulary at all. A second opinion on #705
+    broke both guarantees on that: `{"score": {"value": 1}}` yields `score.value`,
+    whose last segment is `value`, and `{"agent": {"name": "x"}}` yields `agent.name`,
+    whose last segment is `name`. Neither vocabulary names either of those, so a
+    record carrying a `score` block or an `agent` block would have passed the two
+    tests written to make it impossible.
+
+    Yields `(path, segment)` so a failure still names the whole field and not just
+    the offending word. List indices are stripped: `gaps[0]` is the key `gaps`.
+    """
+    for path, _value in _leaves(record):
+        for segment in path.split("."):
+            yield path, segment.split("[")[0]
 
 
 # ------------------------------------------------------------------ what it carries
@@ -376,9 +401,11 @@ def test_there_is_no_RATIO_anywhere_in_the_record():
     with which of the four gameable ones it is."""
     forbidden = ("share", "ratio", "rate", "per_", "score", "rank", "index",
                  "average", "mean", "percent", "efficiency", "density")
-    for path, value in _leaves(_record()):
-        leaf = path.split(".")[-1].split("[")[0]
-        assert not any(word in leaf for word in forbidden), path
+    got = _record()
+    # EVERY segment, not just the leaf's own key — `_key_names` says what that missed.
+    for path, name in _key_names(got):
+        assert not any(word in name for word in forbidden), path
+    for path, value in _leaves(got):
         assert not isinstance(value, float), f"{path} is a float: {value!r}"
 
 
@@ -393,10 +420,11 @@ def test_the_record_carries_no_ACTOR_and_that_is_the_strongest_guarantee_here():
     having to notice."""
     actorish = ("author", "agent", "model", "session", "fixer", "who", "by",
                 "actor", "machine", "instance", "user", "effort")
-    for path, _value in _leaves(_record()):
-        leaf = path.split(".")[-1].split("[")[0]
-        assert leaf not in actorish, path
-        assert not any(leaf.endswith(f"_{w}") or leaf.startswith(f"{w}_")
+    # EVERY segment, not just the leaf's own key: an `agent` BLOCK is the shape this
+    # guarantee most needs to catch, and its leaves are named `name` and `version`.
+    for path, name in _key_names(_record()):
+        assert name not in actorish, path
+        assert not any(name.endswith(f"_{w}") or name.startswith(f"{w}_")
                        for w in actorish), path
 
 
@@ -577,6 +605,46 @@ def test_the_key_rides_the_payload_at_the_TOP_LEVEL(monkeypatch, capsys, tmp_pat
     assert payload["fix_pass"] is not None
     assert "fix_pass" not in (payload["round_stop"] or {})
     assert "fix_pass" not in json.dumps(first["round_stop"] or {})
+
+
+def test_round_stop_is_not_HANDED_the_record_by_the_round_that_builds_it(
+        monkeypatch, capsys, tmp_path):
+    """The no-gate guarantee at the CALL SITE, which is the half an `ast` walk over
+    `round_stop` cannot make.
+
+    A second opinion on #705 named the hole exactly: the walk up in
+    `test_round_stop_is_not_passed_the_record_and_does_not_mention_it` bans a parameter
+    or a name containing `fix_pass`, so a future `round_stop(..., diagnostics=None)`
+    reading `diagnostics["counts"]["new_files"]` — with `panel.run` passing
+    `diagnostics=fix_pass` — would keep that test green while gating on the record. The
+    walk is about the callee's vocabulary; this is about what the one production caller
+    actually hands it (`panel.py:5028` is the only one outside a test).
+
+    Asserted by IDENTITY as well as by value: the record is a plain dict of counts, so
+    an equality test alone could be satisfied by an unrelated mapping, and it is the
+    object itself that must not travel."""
+    _r1, _first, r1 = _run(monkeypatch, capsys, tmp_path)
+    seen: list = []
+    real = panel.round_stop
+
+    def spy(*args, **kwargs):
+        seen.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(panel, "round_stop", spy)
+    _r2, payload, _ = _run(monkeypatch, capsys, tmp_path, round_no=2, baseline=[r1],
+                           fix=("app/sync.py", "nginx/site.conf"))
+    record = payload["fix_pass"]
+    # The round really did build one, or this test would be asserting about nothing.
+    assert record is not None and seen, (record, seen)
+    for args, kwargs in seen:
+        passed = [*args, *kwargs.values()]
+        assert not any(v is record for v in passed), sorted(kwargs)
+        assert not any(v == record for v in passed), sorted(kwargs)
+        # …and not smuggled one level in, as a member of a mapping it was given.
+        for v in passed:
+            if isinstance(v, dict):
+                assert not any(m is record or m == record for m in v.values())
 
 
 def test_a_real_round_records_the_pass_and_the_report_names_it(
