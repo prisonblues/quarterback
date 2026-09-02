@@ -241,6 +241,23 @@ DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: all (the pre-#297 behaviour); `0` fixes none of them. `harness_rules` carries the
 #: measurement.
 DEFAULT_LOW_SEVERITY_FIX_LINES = 40
+#: The PROPORTIONAL half of that budget (#551), and it is a SIZE rather than a rate:
+#: the first round's `pr_chars` at or above which the whole `low_severity_fix_lines`
+#: budget applies. Below it the budget is pro rata — `lines x first_chars / this` — so
+#: the round spends whichever of the two ceilings is smaller and the pair can only ever
+#: tighten. The opposite operator to #664's floor one block down, because the
+#: accumulation `low_severity_fix_lines` measures is dangerous on the SMALL PR, where a
+#: fixed 40 lines can exceed the diff it is polishing.
+#:
+#: **Denominated in chars because `pr_chars` is what a baseline records**, so the
+#: RUNTIME arithmetic converts nothing: a ratio of two char counts multiplying a line
+#: count. 14,325 is the median `pr_chars` of this repo's merged PRs scaled to the ~182
+#: churned lines at which 40 lines is the ~22% allowance #551 calls sane (n=21, range
+#: 9,538-18,604) — so the CALIBRATION is still anchored to a line count, and what it is
+#: free of is the disputed 66-versus-58 rate, not #692 as a whole. `harness_rules` says
+#: exactly how far that goes. None switches the proportional half off and restores the
+#: pre-#551 behaviour exactly.
+DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS = 14_325
 #: How much of the low-severity budget one UNREFEREED churned line costs, against a
 #: production line's 1 (#554). The budget's unit becomes exposure rather than length:
 #: a line written where nothing can check it spends more of the round than a line
@@ -3096,6 +3113,7 @@ __all__ = [
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
     "BLOCKING_SEVERITIES", "DEFAULT_THRESHOLD_BY_SEVERITY",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
+    "DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS",
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "DEFAULT_MIN_FIX_GROWTH_CHARS",
