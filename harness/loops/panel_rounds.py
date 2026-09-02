@@ -1632,6 +1632,64 @@ class Baseline:
     #: different consumers at different grains: the mechanical test wants a file
     #: index, and the judge wants sentences it can recognise the fix in.
     fixed_findings: list[tuple[str, str, str, int | None, str]] = field(default_factory=list)
+    #: The SEVERITY of every finding in the anchor round's brief, in payload order —
+    #: #622's strict half, and the one field here that has to count the findings
+    #: ``fixed_findings`` deliberately drops.
+    #:
+    #: The question it answers is not "what was the fixer working on" but "was ALL of
+    #: it budgeted", and that is a claim about the WHOLE list: one mandatory finding in
+    #: it and the pass had unbudgeted work to do, so the priced spend stops being
+    #: attributable to the band. ``fixed_findings`` drops any record it cannot place —
+    #: no file, or no key — which is right for recurrence (a finding nothing can place
+    #: is no evidence the fixer was working anywhere) and would be exactly wrong here:
+    #: dropping an unplaceable P1 turns a mixed list into an all-budgeted one and
+    #: manufactures the premise for an accusation. So every record is counted, and one
+    #: whose severity is unreadable is recorded ``"?"`` — a band no floor admits, which
+    #: declines the strict verdict rather than guessing at it.
+    #:
+    #: Empty for a round with no anchor payload, which reads as "no brief to test" and
+    #: not as "a brief with nothing in it": :func:`budgeted_brief` refuses both, and
+    #: says which.
+    fixed_severities: list[str] = field(default_factory=list)
+    #: The dials the ANCHOR round ran under — its payload's ``review_panel`` block,
+    #: whole and unedited (`Dials.as_dict`), or ``{}`` for a payload that carries none.
+    #:
+    #: The band a finding sits in is a function of the floors it was BANDED under, and
+    #: those are the anchor round's rather than this one's: the fixer was briefed under
+    #: that policy, spent under it, and is only fairly measured against it. An operator
+    #: who moved `fix_severity_floor` between rounds must not thereby reclassify what
+    #: the last pass was paying for.
+    #:
+    #: Carried whole rather than picked apart here for `first_reviewed`'s reason —
+    #: whatever reads it has to be able to say which values it applied — and read by
+    #: exactly one consumer (:func:`budgeted_brief`), which validates every key it
+    #: touches rather than trusting a payload that may have been written by an older
+    #: version, by hand, or under a `review_panel` block this release has never seen.
+    fixed_dials: dict = field(default_factory=dict)
+    #: What the ANCHOR round's budget block RECORDED — its payload's
+    #: ``round_stop.fix_budget``, or ``{}`` for a payload carrying none.
+    #:
+    #: Kept apart from ``fixed_dials`` beside it because since #551 the two answer
+    #: different questions and can hold different numbers. ``fixed_dials`` carries the
+    #: WRITTEN `low_severity_fix_lines`, which is what decides whether a finding is in
+    #: the 💸 band at all (`Dials.budgeted_band` reads the written value and #551 did
+    #: not change that). This carries the APPLIED budget — `Dials.budget_for`'s
+    #: pro-rata share of the cycle's first round, clamped — which is the number that
+    #: round's fixer was actually given in its brief and the only number a breach may
+    #: be claimed against.
+    #:
+    #: The two diverge without anybody touching a dial: round 1 takes its denominator
+    #: from ``len(review.diff)`` and round 2 takes round 1's recorded ``pr_chars``, and
+    #: those are two readings of one size that need not agree. Read back off the
+    #: payload rather than recomputed here, because recomputing needs a denominator
+    #: this round does not have — the anchor's own first-round reading — and a second
+    #: derivation of a budget is how a report and a payload come to disagree about the
+    #: policy a round ran under.
+    #:
+    #: ``{}`` for any payload written before #622, which declines the strict verdict:
+    #: a round whose applied budget was never recorded cannot be shown to have been
+    #: given the one this round would price against.
+    fixed_budget: dict = field(default_factory=dict)
     #: When the LATEST prior round that recorded one FINISHED, as epoch seconds
     #: (#192). The left-hand end of the fix phase: this round's own start is the
     #: right-hand end, and the span between them is the fixer, the verification
@@ -2454,6 +2512,16 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                 for f in anchor_payload.get(bucket) or []:
                     if not isinstance(f, dict):
                         continue
+                    # #622's strict half, and it is recorded BEFORE the placement
+                    # guard below rather than after it. The question this list
+                    # answers is whether the WHOLE brief was budgeted, so a record
+                    # that cannot be placed still counts as a finding the fixer was
+                    # sent to: dropped, an unplaceable P1 would turn a mixed list
+                    # into an all-budgeted one and manufacture the premise for an
+                    # accusation. A non-dict entry is skipped above and is the one
+                    # case that cannot be counted, since there is nothing in it to
+                    # read a severity off.
+                    b.fixed_severities.append(str(f.get("severity") or "?"))
                     file = str(f.get("file") or "")
                     key = str(f.get("key") or "") or _key_from_title(file, _baseline_title(f))
                     if not file or not key:
@@ -2468,6 +2536,25 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                         (key, str(f.get("severity") or "?"), file,
                          line if isinstance(line, int) and not isinstance(line, bool) else None,
                          str(f.get("synthesis") or _baseline_title(f) or "")))
+            # The policy that brief was banded under, off the SAME payload and no
+            # other (#622). A finding's band is a function of the two floors, and the
+            # floors that matter are the ones the FIXER was briefed under — an
+            # operator who moved `fix_severity_floor` between rounds must not thereby
+            # reclassify what the last pass was paying for. Taken whole rather than
+            # picked apart here: :func:`budgeted_brief` is the single consumer and it
+            # validates each key it reads, because this mapping can have been written
+            # by an older release, by hand, or by a `review_panel` block this one has
+            # never seen.
+            block = anchor_payload.get("review_panel")
+            b.fixed_dials = dict(block) if isinstance(block, dict) else {}
+            # And what that round APPLIED, which since #551 is not the same number
+            # (`fixed_budget`). Off the same payload as everything else in this block,
+            # on the rule the whole function follows: the brief, the floors it was
+            # banded under and the budget it was spent against are one round's policy,
+            # and assembling them from different payloads is how a premise gets paired
+            # with the wrong round's rules.
+            spent = (anchor_payload.get("round_stop") or {}).get("fix_budget")
+            b.fixed_budget = dict(spent) if isinstance(spent, dict) else {}
         # The fix phase's earlier end (#192), on its own pass rather than folded
         # into the loop above: a round can record a head and no finish (a payload
         # from before the field) or a finish and no head (a round whose PR read
@@ -4148,8 +4235,202 @@ def guard_churn_state(referee: dict | None, limit: int | None, armed: bool) -> d
             "over": bool(limit is not None and lines is not None and lines > limit)}
 
 
+#: What :func:`budgeted_brief` publishes when there was no prior brief to test, and
+#: the shape every one of its answers takes. Present on every round for
+#: :func:`referee_state`'s reason — a payload with no key and a round with no brief
+#: to read are different claims — with ``None`` rather than ``0`` in the counts,
+#: because "the prior round asked for nothing" and "there was no prior round" are two
+#: more.
+#:
+#: ``why`` is a SENTENCE and not a code, because its only two readers are a human
+#: looking at a report and a human looking at a payload, and the question it answers —
+#: "why is there no strict verdict here" — has six different answers, one per condition
+#: :func:`budgeted_brief` can decline on, that a consumer would otherwise have to
+#: reconstruct from three nulls.
+NO_PRIOR_BRIEF = {"round": None, "findings": None, "budgeted": None,
+                  "all_budgeted": False,
+                  "why": "no earlier round's To fix list reached this round"}
+
+
+def budgeted_brief(prior: "Baseline | None", round_no: int, limit: int | None,
+                   weight: int) -> dict:
+    """Was the WHOLE of the prior round's To fix list budgeted? — #622's strict half,
+    and the only premise under which a priced overspend is a breach rather than an
+    unproven one.
+
+    :func:`fix_budget_state` prices a fix pass and cannot say which finding each line
+    paid for, so ``spend > limit`` is normally no accusation: a round clearing two P1s
+    may spend three hundred production lines the budget never applied to. **There is
+    one shape where the attribution is not needed.** Where every finding the fixer was
+    sent to answer sits in the 💸 band — at or above `fix_severity_floor`, below
+    `round_trigger_floor`, with a budget to draw on — the pass had no mandatory work in
+    front of it, every line it wrote answers a budgeted finding or answers nothing in
+    the brief at all, and the priced total stops being an upper bound on the budgeted
+    spend and becomes the budgeted spend. That was recorded as considered-and-deferred
+    when the measurement landed (PR #668), on the ground that it needs the prior
+    round's list and the dials it was banded under out of a baseline payload. Since
+    #665/#674 that is routine — `escalated`, `acknowledged`, `declined` and `retracted`
+    all travel between rounds on exactly that payload — so this reads the two things it
+    needs off the anchor payload the same way, and the deferral is spent.
+
+    **The verdict is a PREMISE and not a measurement.** Nothing here counts a line.
+    ``all_budgeted`` says only whether the strict reading is available; the arithmetic
+    stays where it was, in one place, priced once.
+
+    **Six conditions, and every one of them declines rather than guesses.** The failure
+    this guards against is not a missed breach — that is where the loop already is —
+    it is a breach announced against a round that did not commit one, which is a
+    machine calling a fix pass dishonest on the strength of a payload it misread:
+
+    * **an anchor brief exists** (``prior.fixed_severities``). Round 1 has none, and
+      neither does a round whose baseline could not be read;
+    * **the brief is NOT EMPTY.** An anchor round that asked for nothing makes
+      ``all()`` vacuously true, and a pass that churned lines against an empty brief
+      spent them on something the brief never named — which is real and is #619's
+      question about surface, not this one's about budget. Vacuous truth is the
+      cheapest way to manufacture an accusation and it is refused by name;
+    * **the anchor round is the round immediately before this one.** The pass being
+      priced runs from the anchor's head to this round's, and where a round in between
+      recorded no head that range covers more than one fix phase — answering lists this
+      run does not hold. `revert_state` already keeps that case apart as ``spans``; here
+      it is simply refused;
+    * **the anchor payload names its band dials readably.** Both floors must be real
+      severities, and `low_severity_fix_lines` a number. That is checked rather than
+      left to :func:`severity_at_least`'s fallbacks, and the reason is that they are
+      not symmetric: an unreadable TRIGGER floor reads as no floor and budgets nothing
+      (harmless), while an unreadable FIX floor also reads as no floor and admits
+      EVERYTHING to the band — the loosening direction on exactly the test this
+      function exists to make strict;
+    * **the budget that round APPLIED, and its weight, are the ones in force here.**
+      The published ``spend`` is priced with this round's weight and compared against
+      this round's limit, and a breach claimed against a number the fixer was never
+      given is an accusation about a policy nobody applied. Where the two rounds
+      differ there are two honest numbers and this function will not pick one.
+
+      **The APPLIED budget and not the written dial, which is #551's whole
+      interaction with this feature.** Since that landed, the number in the fixer's
+      brief is `min(low_severity_fix_lines, its pro-rata share of the cycle's first
+      round)`, clamped — and the two rounds can apply different budgets with nobody
+      touching a dial, because round 1 takes that denominator from ``len(review.diff)``
+      and round 2 takes round 1's recorded ``pr_chars``. Checked on the dial instead,
+      this would wave through a pair of rounds that spent against 13 and 15 lines
+      because both wrote 40, and price the pass against a bound it was never given —
+      a false breach, and #551's own note puts the divergence on small PRs, which is
+      exactly where the priced total is closest to the limit. It is read off
+      :attr:`Baseline.fixed_budget`, the anchor's own recorded block, because
+      recomputing it needs that round's reading of round 1's size and this round does
+      not hold it. The WRITTEN dial is still read, for the one thing it still decides:
+      which findings were in the band at all;
+    * **every finding in the brief is budgeted**, under the ANCHOR round's floors and
+      not this round's. The fixer was briefed under that policy and spent under it, so
+      it is the policy it is fairly measured against — and an operator who dropped the
+      fix floor between rounds must not thereby reclassify what the last pass was
+      paying for.
+
+    An unreadable severity (``"?"``, which is what :class:`Baseline` records for a
+    finding whose band nothing could parse) declines the whole brief, and it does so
+    through :meth:`panel_seats.Dials.budgeted` rather than through a special case
+    here: :func:`severity_at_least` reads an unparseable severity as P1, P1 is at or
+    above every trigger floor, and a finding at or above the trigger floor is not
+    budgeted. The safe direction falls out of the predicate the rest of the round
+    already uses, which is better than a second one written to agree with it.
+
+    ``prior`` is the :class:`Baseline` and nothing else, on
+    :func:`guard_churn_state`'s rule: the anchor's list, its dials and its round number
+    are three readings of ONE payload, and a caller assembling them separately could
+    pair a brief with the wrong round's policy.
+    """
+    if prior is None or not prior.fixed_severities:
+        # Round 1, a baseline that could not be read, and an anchor payload whose two
+        # brief buckets were empty — three states, and the sentence covers all three
+        # because what a consumer does about them is the same: there is nothing to
+        # test the pass against. An anchor round that genuinely asked for NOTHING is
+        # in here on purpose. `all()` over an empty list is vacuously true, so a
+        # brief with no findings in it would otherwise be the cheapest way there is to
+        # manufacture the premise for an accusation — and a pass that churned lines
+        # against an empty brief spent them on something the brief never named, which
+        # is #619's question about surface rather than this one's about budget.
+        #
+        # The two are told apart in `why` and NOT in `findings`, which stays null for
+        # both: "the prior round asked for nothing" and "there was no prior round" are
+        # different claims about the cycle, and a `0` published for either would be the
+        # second wearing the first's clothes — `spend`'s own rule one function down.
+        at = None if prior is None else prior.head_round
+        return {**NO_PRIOR_BRIEF, "round": at,
+                "why": NO_PRIOR_BRIEF["why"] if at is None else
+                f"round {at} asked its fixer to fix nothing, so there is no brief for "
+                "this pass to have spent against"}
+    listed = list(prior.fixed_severities)
+    at = prior.head_round
+    got = {**NO_PRIOR_BRIEF, "round": at, "findings": len(listed)}
+    # The anchor round has to be the one whose fix pass this is. `head_round` is the
+    # latest EARLIER round that recorded a head, which `load_baseline` may have taken
+    # from round 1 on a run whose round 2 payload named none — and then the range
+    # being priced spans two fix phases while this brief describes one. `revert_state`
+    # keeps the same case apart as `spans` and prints a caveat; here there is no
+    # caveat that would make an accusation safe, so it is simply refused.
+    if at != round_no - 1:
+        return {**got, "why": f"round {at} is the last earlier round that recorded a "
+                              f"commit, so the pass priced here spans more than round "
+                              f"{round_no - 1}'s To fix list"}
+    dials, spent = prior.fixed_dials or {}, prior.fixed_budget or {}
+    floors = [dials.get("fix_severity_floor"), dials.get("round_trigger_floor")]
+    if any(not isinstance(f, str) or f.strip().upper() not in SEVERITIES
+           for f in floors):
+        return {**got, "why": f"round {at}'s payload does not name both band floors as "
+                              "severities, so which findings it banded cannot be read "
+                              "back out of it"}
+    # The WRITTEN dial, which is what decides band membership below and nothing else.
+    # `bool` is an `int` subclass, so a hand-edited `true` would otherwise reach
+    # `Dials.budgeted` as a truthy 1 and put findings in a band the round did not have;
+    # a string would be truthy there too, which is the loosening direction.
+    written = dials.get("low_severity_fix_lines")
+    if written is not None and not (isinstance(written, int)
+                                    and not isinstance(written, bool)):
+        return {**got, "why": f"round {at}'s payload does not name "
+                              "`low_severity_fix_lines` as a number, so which of its "
+                              "findings were in the band cannot be read back out of it"}
+    # And the budget that round APPLIED, which since #551 is a different number from
+    # the dial and is the only one a breach may be claimed against: `budget_lines` is
+    # `min(written, its pro-rata share of the cycle's first round)`, clamped, and it is
+    # what the anchor round's fixer was told in its brief.
+    #
+    # Read off the anchor's own recorded block rather than recomputed. Recomputing
+    # needs the denominator THAT round divided by — its reading of round 1's size —
+    # which this round does not hold; and round 1 takes that denominator from
+    # `len(review.diff)` while round 2 takes round 1's recorded `pr_chars`, so the two
+    # can differ with no dial touched. Both values off ONE recorded object, on the rule
+    # the rest of this function follows: a limit from the dials block and a weight from
+    # the stop block would be two halves of a policy nothing guarantees were applied
+    # together.
+    was_limit, was_weight = (spent.get("limit"), spent.get("weight"))
+    ints = [v for v in (was_limit, was_weight)
+            if isinstance(v, int) and not isinstance(v, bool)]
+    if len(ints) != 2 or was_limit != limit or was_weight != weight:
+        return {**got, "why": f"round {at} spent against an applied budget of "
+                              f"{was_limit!r} at x{was_weight!r} and this round prices "
+                              f"against {limit!r} at x{weight!r} — a breach claimed "
+                              "against a number the fixer was never given would be "
+                              "about a policy nobody applied"}
+    # One predicate, and it is the round's own: `Dials.budgeted` is what marks a
+    # finding 💸 in the fixer's list and what the report reads, so a second spelling
+    # here could let a finding be listed as budgeted and measured as mandatory in the
+    # same cycle. Built with the anchor's three band dials and nothing else — every
+    # other field on `Dials` is irrelevant to this question and defaulting them keeps
+    # the payload's other keys out of a verdict that must not depend on them.
+    was = Dials(fix_severity_floor=str(floors[0]).strip().upper(),
+                round_trigger_floor=str(floors[1]).strip().upper(),
+                low_severity_fix_lines=written)
+    budgeted = sum(1 for sev in listed if was.budgeted(sev))
+    return {**got, "budgeted": budgeted, "all_budgeted": budgeted == len(listed),
+            "why": None if budgeted == len(listed) else
+            (f"{len(listed) - budgeted} of round {at}'s {len(listed)} finding(s) were "
+             "mandatory work, which this spend may have gone on and a diff cannot say "
+             "it did not")}
+
+
 def fix_budget_state(referee: dict | None, limit: int | None, weight: int,
-                     band: bool) -> dict:
+                     band: bool, brief: dict | None = None) -> dict:
     """#622's measurement as this round read it, for `round_stop` and the payload —
     what the last fix pass SPENT, priced the way `low_severity_fix_lines` is spent,
     counted by something that is not the fixer.
@@ -4197,22 +4478,50 @@ def fix_budget_state(referee: dict | None, limit: int | None, weight: int,
       repo with no budget written, or a repo whose `fix_severity_floor` meets the
       trigger cut so there is no band to pay for (``band``).
 
-    **The sharper measurement that was considered and left out.** Where a round's
-    entire To fix list is budgeted — no mandatory finding in it at all — every line of
-    the pass answering it IS budget spend, and ``spend > limit`` is then a breach
-    outright rather than an unproven one. That needs the PRIOR round's list and the
-    dials it was banded under, read back out of a baseline payload, and it would put
-    this block's verdict at the mercy of a payload written under different dials by a
-    different version. #622 asks for the cheap half first and says so; the upper bound
-    needs nothing but the split already in hand, and the strict form can be added over
-    it later without either number changing meaning.
+    **``breach`` IS THE SIDE ``within`` DOES NOT HAVE, and it is the whole of what this
+    function gained.** ``within: False`` was never a violation and there was therefore
+    no input at all for which this reported one — a pass whose entire To fix list was
+    budgeted P3/P4 findings, priced at 41 production lines against `limit: 40`, ran a
+    round identical to a four-line pass. That was the honest shape while the
+    attribution was missing; it is not the honest shape now that it is not.
+    :func:`budgeted_brief` supplies the ONE premise that removes the need for
+    per-line attribution: where every finding the fixer was sent to answer sits in the
+    💸 band, the pass had no mandatory work in front of it, so the priced total is not
+    an upper bound on the budgeted spend — it IS the budgeted spend, and ``spend >
+    limit`` is a fact about the pass rather than the absence of one.
 
-    **Reported, never gated, on #67's rule** — and unlike `max_fix_guard_lines` there
-    is not even a flag to arm, because arming one would be the 29th dial #621 forbids.
-    Nothing in :func:`round_stop` reads this to move ``stop``. What it does is put the
-    count somewhere a human and an orchestrator can both read it, in the same register
-    `unrefereed_fix` and `fix_surface` already occupy: a pass that overspent is
-    evidence about the pass.
+    * ``breach: True`` — the whole brief was budgeted and the pass priced over the
+      budget. Provable from the diff, the prior round's list and the dials both rounds
+      ran under, with nothing taken on the fixer's word.
+    * ``breach: False`` — the premise held and the pass was inside its budget. Stronger
+      than ``within: True`` and not the same claim: this one says the budget was kept
+      by a pass that had no mandatory work to hide behind.
+    * ``breach: None`` — no strict verdict was available, which is the ordinary case
+      and stays ordinary. The brief carried mandatory work, or there was no brief, or
+      the dials moved between rounds. ``brief`` carries which. **A ``None`` here is
+      never evidence of anything** — it is the reading `within` has always had, and a
+      consumer that treats it as a pass or as a failure is wrong about most rounds.
+
+    ``brief`` is :func:`budgeted_brief`'s own output and nothing else, on ``referee``'s
+    rule: the premise is decided in one place, against one payload, and this function
+    reads the verdict rather than re-deriving it from a list and a dials block it would
+    have to re-validate.
+
+    **Why the strict half needs no flag to arm, where `max_fix_guard_lines` does.**
+    That ceiling is a number nobody has calibrated, so a repo may reasonably set one to
+    WATCH it, and `escalate_on.guard_lines` is what turns watching into stopping. There
+    is no equivalent judgement left here. The budget is a number this repo already
+    wrote, the band it applies to is a band this repo already configured, and the
+    premise is a proof rather than a threshold — so an `escalate_on` key would not be
+    offering a choice, it would be offering to ignore an arithmetic breach of the
+    repo's own policy. That is also the reason it is not the 29th dial #621 forbids:
+    no number here is new, and the only new thing is that the count now has a reader
+    other than the actor it constrains, which is #622's title.
+
+    **The upper bound half is still REPORTED AND NEVER GATED**, on #67's rule and
+    unchanged by any of the above: nothing reads ``within`` to move ``stop``, in either
+    direction, and a loud round whose brief carried a P1 ends exactly where it ended
+    before. What :func:`round_stop` reads is ``breach``, and only where it is ``True``.
 
     Every field is present on every round, its three siblings' rule. ``spend`` is
     ``None`` and never ``0`` where nobody read the pass, on
@@ -4232,10 +4541,19 @@ def fix_budget_state(referee: dict | None, limit: int | None, weight: int,
     # "there is no budget in force on this round" — and `band` is beside it for the
     # one who needs to know which.
     in_force = limit if band else None
+    within = None if in_force is None or spend is None else spend <= in_force
+    # The strict half, and it hangs off `within` rather than recomputing the
+    # comparison: one arithmetic, one place. `within is None` already covers every way
+    # there is nothing to compare — no budget in force, no band, no pass read — so the
+    # only thing left for the premise to add is whether the comparison MEANS anything
+    # about the budget, which is exactly what `all_budgeted` answers.
+    said = dict(brief) if isinstance(brief, dict) else {**NO_PRIOR_BRIEF}
     return {"limit": in_force, "weight": int(weight), "band": bool(band),
             "production": production, "unrefereed": unrefereed, "spend": spend,
-            "within": (None if in_force is None or spend is None
-                       else spend <= in_force)}
+            "within": within,
+            "brief": said,
+            "breach": (not within if within is not None
+                       and said.get("all_budgeted") else None)}
 
 
 def fix_surface_state(surface: object) -> dict | None:
@@ -5464,17 +5782,33 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     ``guard_churn`` read — production at 1, test and prose at `unrefereed_line_weight`
     — and puts the number beside the limit.
 
-    **Its verdict is one-sided and the payload says which side.** The budget bounds the
-    💸 band and not the pass, and a diff cannot attribute a line to the finding it paid
-    for, so ``within: True`` is a fact (the whole pass priced under the budget, so the
-    budgeted part is too) and ``within: False`` is the absence of one, never an
-    accusation. :func:`fix_budget_state` has the argument and the stricter form that
-    was left for later.
+    **It carries TWO verdicts about one number, and only the second one gates.**
+    ``within`` is the upper bound: the budget bounds the 💸 band and not the pass, and a
+    diff cannot attribute a line to the finding it paid for, so ``within: True`` is a
+    fact (the whole pass priced under the budget, so the budgeted part is too) and
+    ``within: False`` is the absence of one, never an accusation. Nothing here reads
+    it, in either direction, exactly as before.
 
-    **Reported, never gated, and with no flag to arm** — #67's rule for the first half
-    of that and #621 for the second: an `escalate_on` key here would be the new dial
-    that epic is explicit about not adding. It moves ``stop`` in neither direction and
-    files no veto line.
+    ``breach`` is the strict verdict, and it is the rung. :func:`budgeted_brief`
+    establishes the one premise that removes the need for per-line attribution — every
+    finding the LAST round sent the fixer to answer was in the 💸 band, so the pass had
+    no mandatory work in front of it and the priced total IS the budgeted spend. On
+    that premise, and on no other, ``spend > limit`` is a fact about the pass rather
+    than an unproven crossing, and the round ends on it with a veto line and
+    ``confident`` false.
+
+    **The same two bounds as its four siblings**, taken through ``going_again``: it may
+    only turn a ``go again`` into a STOP, and only the round rule 1 was buying, so it
+    can never cancel the repair round for a P1 an earlier round raised or for a finding
+    that came back.
+
+    **And still no flag to arm**, which is #621's "not a 29th dial" and is a stronger
+    claim here than it is one rung up. `max_fix_guard_lines` needs `escalate_on` because
+    its ceiling is uncalibrated and a repo may set one to WATCH it; there is no
+    equivalent judgement left in this one. The limit is a number the repo wrote, the
+    band is one its own floors carve out, and the premise is proved rather than assumed
+    — an `escalate_on` key would offer the option of ignoring an arithmetic breach of
+    the repo's own policy, which is not a dial anybody asked for.
 
     ``surface`` is #619, and it is the second argument to this function that decides
     nothing — reported, never gated. It is the set of files the last fix pass touched
@@ -6016,6 +6350,54 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"test and prose, past the `max_fix_guard_lines` ceiling of "
             f"{guarding['limit']} — that is guard work this round would be reviewing "
             "instead of the change, and a human decides what of it was wanted")
+    # #622's rung, applied BETWEEN #618's and #554's on the chain's ordering rule that
+    # the more specific truth wins the `reason`. Both of the rungs above it are volume
+    # claims — `flat` says the work is not shrinking, `overguarded` says how much of one
+    # bucket the pass wrote against a ceiling — and this is the volume claim that comes
+    # with an attribution PROOF: the whole of the last round's To fix list was budgeted,
+    # so every line of the pass answering it was budget spend and the pass went past a
+    # number this repo wrote. `unchecked` still takes the reason from it, because what
+    # KIND of work a pass did says more than how much of it there was, and `injected`
+    # takes it from both by naming the pass as the author of this round's findings.
+    #
+    # **`breach` and NOT `within`, and the difference is the whole of the rule.**
+    # `within: False` means the round could not SHOW the budget was kept; it is true of
+    # any round that cleared two P1s with three hundred production lines, and ending a
+    # cycle on it would be a machine calling an honest fix pass a spendthrift. `breach`
+    # is `False` inverted under a premise that makes the inversion sound
+    # (:func:`budgeted_brief`), and it is `None` — never `False` — wherever that premise
+    # could not be established, so this rung fires on a proof and on nothing else.
+    #
+    # **No arming flag, and that is not the same omission `fix_surface` makes.** #67's
+    # instrument-before-gate rule applies to a measurement whose threshold nobody has
+    # calibrated; there is no threshold here that anybody chose for this feature. The
+    # limit is `low_severity_fix_lines`, which the repo wrote; the band is the one its
+    # two floors already carve out; and the premise is proved rather than assumed. An
+    # `escalate_on` key would be the 29th dial #621 refuses, and what it would buy is
+    # the option of ignoring an arithmetic breach of the repo's own policy.
+    #
+    # `going_again` carries the same two bounds every rung on this chain takes: `not
+    # stop` is the guarantee that it can only turn a `go again` into a STOP, and the
+    # rest keeps the rule inside its own justification — the argument is about rule 1's
+    # input, so it may not cancel the repair round for a P1 an earlier round raised and
+    # this pass did not clear. A round it stops is a round that was going again only for
+    # findings the budget itself says are not worth one.
+    budgeting = (fix_budget_state(None, None, 1, False) if fix_budget is None
+                 else fix_budget)
+    # `.get` on the one key, and index on the rest: a `fix_budget` block written before
+    # this field existed carries no `breach`, and reading it with `[]` would turn a
+    # replayed older payload into a KeyError inside the stop rule. Once `breach` is
+    # true the block came from `fix_budget_state` and every other key is there by
+    # construction, which is why the reason and the veto below index freely.
+    overspent = bool(budgeting.get("breach") and going_again)
+    if overspent:
+        stop, reason = True, (
+            f"the fix pass before this round priced {budgeting['spend']} line(s) "
+            f"against the {budgeting['limit']}-line `low_severity_fix_lines` budget, "
+            f"and every one of the {budgeting['brief']['findings']} finding(s) it was "
+            "sent to answer was budgeted — so that spend WAS the budgeted spend and "
+            "the budget was broken, not merely unproven. A human decides what of it "
+            "was wanted, not another fix pass")
     # #554, applied BETWEEN #505's rung and #489's so that the ordering matches what
     # each one knows. `flat` says only that the work is not shrinking; this says what
     # KIND of work the last pass did; `injected` names that pass as the author of this
@@ -6156,6 +6538,30 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "ceiling is a number this repo wrote and not one anybody has "
                        "calibrated (#67): the shipped value is null, and this stop is "
                        "that count against that number, not convergence (#618)"]
+    # #622, and in the same place in this list as its rung is in the chain above, for
+    # the reason given there. Unconditional for `overguarded`'s reason — `overspent` is
+    # only ever true on a round this rule itself stopped.
+    #
+    # It says out loud that this one is a BREACH and not an unproven crossing, because
+    # that is the distinction the whole feature turns on and it is the one a reader
+    # skimming a veto list will otherwise supply from the other budget sentence they
+    # have seen — the report's line under `within: false`, which says the opposite in
+    # almost the same words. The premise is spelled out rather than cited: what makes
+    # the number binding here is that the fixer had no mandatory work to spend on, and
+    # a reader who cannot see that has been handed an accusation to take on trust.
+    if overspent:
+        veto = [*veto, f"the fix pass before this round priced "
+                       f"{budgeting['spend']} line(s) — {budgeting['production']} "
+                       f"production + {budgeting['unrefereed']} unrefereed at "
+                       f"x{budgeting['weight']} — against the {budgeting['limit']}-line "
+                       "`low_severity_fix_lines` budget it was given. Every one of the "
+                       f"{budgeting['brief']['findings']} finding(s) in round "
+                       f"{budgeting['brief']['round']}'s To fix list was in the 💸 band, "
+                       "so there was no mandatory work for that spend to belong to and "
+                       "the priced total IS the budgeted spend. That is a BREACH of a "
+                       "number this repo wrote, not the ordinary `within: false` that "
+                       "only means the budget could not be shown to have been kept: "
+                       "this stop is that breach, not convergence (#622)"]
     # #554, and BEFORE #489's line for the reason its stop is applied first: a reader
     # coming down the veto list meets what the pass WAS, then the attribution saying
     # what it cost. Unconditional for `injected`'s reason — `unchecked` is only ever
@@ -6312,7 +6718,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # disposal a fixer's is that no rule said otherwise, not that one particular rule
     # fired, so a stop added later inherits the safe answer by saying so in this list
     # rather than by being remembered here.
-    futile = bool(flat or unchecked or injected or circling or unobservable)
+    #
+    # `overspent` (#622) is in the list because its own `reason` ends "a human decides
+    # what of it was wanted, not another fix pass", and that sentence and this variable
+    # have to agree or the payload contradicts itself in the same round. `overguarded`
+    # is NOT here and this change deliberately leaves it where it was: that is #618's
+    # question, its wording is not identical, and quietly widening a second rung's
+    # disposal under a #622 branch is the kind of drive-by this file's own rule about
+    # surgical diffs exists to refuse.
+    futile = bool(flat or unchecked or injected or circling or unobservable
+                  or overspent)
     if not stop:
         # The cycle is going again, so there is no disposal to make: §5's ordinary
         # path hands this round's findings to the next fix pass and the round after
@@ -6555,15 +6970,29 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # kept apart on `referee_state`'s terms; `fired` is the verdict, kept apart from
         # both on `fix_injection`'s.
         "guard_churn": {**guarding, "fired": overguarded},
-        # #622's measurement, ALWAYS present for the reason its siblings are, and with
-        # no `fired` field for `fix_surface`'s: there is no verdict to have, because
-        # nothing above reads this to move `stop`. `within` is the field a consumer
-        # wants and it is THREE-STATE on purpose — true is "the pass priced under the
-        # budget", false is "that could not be shown", null is "nothing was measured or
-        # no budget was in force" — so a reader that treats false as a breach is wrong
-        # about a round that cleared two P1s. `fix_budget_state` has the argument.
-        "fix_budget": (fix_budget_state(None, None, 1, False)
-                       if fix_budget is None else fix_budget),
+        # #622's measurement, ALWAYS present for the reason its siblings are, and it
+        # carries TWO verdicts about one number because they are two different claims.
+        #
+        # `within` is the upper bound and it is THREE-STATE on purpose — true is "the
+        # pass priced under the budget", false is "that could NOT BE SHOWN", null is
+        # "nothing was measured or no budget was in force". A reader that treats false
+        # as a breach is wrong about a round that cleared two P1s, and nothing above
+        # reads it to move `stop` in either direction.
+        #
+        # `breach` is the strict verdict and it is the one this block gained: true only
+        # where the whole of the prior round's To fix list was budgeted, so the priced
+        # total IS the budgeted spend and going past the limit is a fact rather than an
+        # unproven crossing. `brief` beside it carries the premise — which round, how
+        # many findings, how many of them budgeted — so a reader can check the claim
+        # instead of taking it. Null is the ordinary case and means no strict verdict
+        # was available, never a pass and never a failure.
+        #
+        # `fired` is the property of the VERDICT, kept apart from `breach` on
+        # `fix_injection`'s terms: `breach: true` is true of every round that committed
+        # one, including the rounds this rung is deliberately bounded out of — one that
+        # had already stopped for something else, or one going again for a P1 an
+        # earlier round raised and this pass did not clear.
+        "fix_budget": {**budgeting, "fired": overspent},
         # #619's measurement, and the ONE block here whose key can be null: the files
         # the last fix pass touched that no earlier round had read. Reported and not
         # gated — #67's instrument-before-gate rule, and the gate has not been decided
@@ -6653,6 +7082,7 @@ __all__ = [
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
     "unrefereed_fix_brake", "referee_state", "fix_surface_state", "fix_budget_state",
+    "NO_PRIOR_BRIEF", "budgeted_brief",
     "guard_lines_brake", "guard_churn_state", "_pass_churn", "churn_cells",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",

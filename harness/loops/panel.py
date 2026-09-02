@@ -4785,8 +4785,32 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # briefed exactly as it was before this key existed. `Dials.budget_for` carries
     # which of those is which.
     budget_lines = dials.budget_for(trend_first_chars)
+    # #622's strict half, and the premise is decided BEFORE the pricing so that both
+    # arrive at `fix_budget_state` as one call: whether the last round's whole To fix
+    # list was budgeted is a question about the anchor payload alone, and
+    # `budgeted_brief` reads it off `prior` — the same `Baseline` `fixed_here` and
+    # #506's revert proposal already read, so the brief, the fix range and the round
+    # number it is attributed to cannot come from three different payloads. `round_no`
+    # goes with it because the premise requires the anchor to be the round IMMEDIATELY
+    # before this one; a wider range covers fix passes answering lists this run does
+    # not hold.
+    #
+    # **`budget_lines` AND NOT `dials.low_severity_fix_lines`, which is the whole of
+    # this feature's interaction with #551.** The number handed here is the one this
+    # round would price a breach against, and `budgeted_brief`'s job is to refuse
+    # unless the anchor round APPLIED the same one — because a breach claimed against a
+    # bound the fixer was never given is an accusation about a policy nobody ran. Since
+    # #551 the applied budget is not the dial: it is the dial's pro-rata share of the
+    # cycle's FIRST round, and round 1 takes that denominator from `len(review.diff)`
+    # while round 2 takes round 1's recorded `pr_chars` — two readings that need not
+    # agree even with no dial touched. Passing the dial here would compare two rounds
+    # on a number neither of them spent against, and on a small PR (#551's own note:
+    # a ~120-char PR is cut to the clamp) that is a false breach at exactly the sizes
+    # where this rung fires.
     budgeting = fix_budget_state(refereeing, budget_lines,
-                                 dials.unrefereed_line_weight, dials.budgeted_band)
+                                 dials.unrefereed_line_weight, dials.budgeted_band,
+                                 budgeted_brief(prior, round_no, budget_lines,
+                                                dials.unrefereed_line_weight))
     trend_rows = [*prior.trend,
                   RoundTrend(round=round_no, reviewed=True,
                              findings=len(outstanding),
@@ -6249,26 +6273,55 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # on every round of every such repo is the loud-and-wrong a reader learns to skip.
     # The number is in `round_stop.fix_budget` either way.
     #
-    # The two readings get DIFFERENT sentences, because the one-sidedness is the whole
-    # point and a single template would flatten it: under the budget is a fact about
-    # the pass, over it is the absence of that fact and not an accusation. A reader who
-    # takes the second for a breach will go and scold a round that cleared two P1s.
+    # The readings get DIFFERENT sentences, because the one-sidedness is the whole point
+    # and a single template would flatten it: under the budget is a fact about the pass,
+    # over it is the absence of that fact and not an accusation. A reader who takes the
+    # unproven crossing for a breach will go and scold a round that cleared two P1s —
+    # and a reader who takes a PROVEN one for the unproven case will wave through the
+    # round this feature exists to catch, which is why the third sentence exists and why
+    # it says which of the two it is in its first clause rather than in a tail nobody
+    # reaches.
     fb = (payload.get("round_stop") or {}).get("fix_budget") or {}
     if fb.get("within") is not None:
         priced = (f"{fb['production']} production + {fb['unrefereed']} unrefereed "
                   f"at x{fb['weight']}")
-        said = (f"priced at {fb['spend']} line(s) ({priced}) against the "
-                f"{fb['limit']}-line `low_severity_fix_lines` budget — "
-                + ("the WHOLE pass fits inside it, so the 💸 band did too, whatever "
-                   "the fixer counted"
-                   if fb["within"] else
-                   "which the whole pass does NOT fit inside. That is not a breach: "
-                   "the budget bounds only the 💸 band and a diff cannot say which "
-                   "lines paid for which finding, so this round simply cannot show "
-                   "the budget was kept"))
+        was = fb.get("brief") or {}
+        if fb.get("breach"):
+            # The premise is spelled out here, not cited. What makes the number binding
+            # is that the fixer had no mandatory work to spend on, and a reader who
+            # cannot see that has been handed an accusation to take on trust — the one
+            # thing this whole feature is against.
+            ended = (" — that is what ended this cycle" if fb.get("fired") else
+                     ". This round did not end on it: the rung may only turn a `go "
+                     "again` into a stop, and only the round rule 1 was buying")
+            said = (f"BROKE it — priced at {fb['spend']} line(s) ({priced}) against "
+                    f"the {fb['limit']}-line `low_severity_fix_lines` budget, and "
+                    f"every one of the {was.get('findings')} finding(s) in round "
+                    f"{was.get('round')}'s To fix list was in the 💸 band. There was "
+                    "no mandatory work for that spend to belong to, so the priced "
+                    f"total IS the budgeted spend{ended}")
+        elif fb["within"]:
+            said = (f"priced at {fb['spend']} line(s) ({priced}) against the "
+                    f"{fb['limit']}-line `low_severity_fix_lines` budget — the WHOLE "
+                    "pass fits inside it, so the 💸 band did too, whatever the fixer "
+                    "counted")
+        else:
+            said = (f"priced at {fb['spend']} line(s) ({priced}) against the "
+                    f"{fb['limit']}-line `low_severity_fix_lines` budget, which the "
+                    "whole pass does NOT fit inside. That is not a breach: the budget "
+                    "bounds only the 💸 band and a diff cannot say which lines paid "
+                    "for which finding, so this round cannot show the budget was kept "
+                    "— and it cannot show it was broken either. It would be a breach "
+                    "if the last round's whole To fix list had been budgeted; "
+                    f"{was.get('why')}")
+        # The #67 tail belongs to the two REPORTED readings and not to the third. Left
+        # on a breach it would say "nothing stops on this" one clause after the
+        # sentence that just said what stopped, which is the kind of stale boilerplate
+        # a reader learns to believe over the specific claim beside it.
+        tail = ("" if fb.get("breach") else
+                " Reported, not a threshold — an unproven crossing stops nothing (#67).")
         lines.append(f"**Budget spend of the last fix pass:** {said}. Counted here "
-                     "rather than by the fixer (#622). Reported, not a threshold — "
-                     "nothing stops on this (#67).")
+                     f"rather than by the fixer (#622).{tail}")
     # ---- new surface (#619), in the same register as the two above it: reported,
     # gating nothing. Printed from the round's own `surface` rather than back out of
     # `payload["round_stop"]`, because that block is null on a review-only run and
@@ -6606,7 +6659,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "The next round prices this pass itself — production at 1 and test or "
             "prose at the weight above, over `git diff --numstat` churn — and "
             "publishes it at `round_stop.fix_budget`, so the count does not rest on "
-            "your arithmetic (#622). What the "
+            # The strict half, said to the fixer for the same reason the pricing is:
+            # this is the one reading that ends a cycle, and a fixer told about the
+            # measurement but not about the consequence has been told half of it.
+            # Said with its precondition attached, because "every finding in your list
+            # is budgeted" is a fact about THIS brief that the fixer can check against
+            # the list directly beneath this note.
+            "your arithmetic (#622). Where every finding in the list below is 💸 — no "
+            "unconditional work in it at all — that price IS the budgeted spend, and "
+            "going past the budget ends the cycle for a human to look at rather than "
+            "being recorded and passed over. What the "
             "budget does not reach is reported and recorded exactly like a below-floor "
             "finding: not dropped, and not this round's work (#297). Everything "
             "unmarked is unconditional._")

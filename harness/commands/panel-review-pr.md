@@ -360,8 +360,23 @@ From its output collect:
   round clearing two P1s can spend three hundred production lines the budget never
   applied to. **Do not treat `false` as a breach and do not brief the next fixer as
   though it were.** `null` means there was nothing to measure: round 1, an unreadable fix
-  range, or no budget in force. REPORTED and gates nothing (#67), and there is no flag to
-  arm one — the epic this came from is explicit that it adds no dial.
+  range, or no budget in force. The upper bound is REPORTED and gates nothing (#67).
+
+  **`breach` is the side `within` does not have, and it is the one that gates.** It is
+  `true` only where every finding the LAST round sent the fixer to answer sat in the 💸
+  band — no mandatory work in front of that pass at all — so the priced total is not an
+  upper bound on the budgeted spend, it IS the budgeted spend, and going past the limit
+  is a fact. That ends the round, files a veto line and costs the round its confidence.
+  `false` means the premise held and the pass stayed inside its budget, which is a
+  stronger statement than `within: true`. `null` is the ordinary case and means no
+  strict verdict was available; `brief` beside it says which of the reasons it was, in a
+  sentence, and carries the prior round's finding count and how many of them were
+  budgeted so you can check the claim rather than take it. **A `null` here is evidence
+  of nothing** — do not read it as a pass and do not read it as a failure. There is
+  still no flag to arm and no new dial: the limit is one the repo already wrote, the
+  band is one its own floors carve out, and the premise is a proof rather than a
+  threshold — the epic this came from is explicit that it adds no dial, and this adds
+  none.
 - **Fix surface** — `round_stop.fix_surface` in the JSON (#619): `files`, the files the
   last fix pass touched; `new_files` and `count`, the subset no earlier round had read;
   `prior_files`, what the rounds before it had. Like Guard-to-guarded it is REPORTED and
@@ -1677,6 +1692,11 @@ Then the part that is new, and is the point of running more than one round:
   been kept, which on a round that cleared a P1 says nothing about the 💸 band at all.
   Where the fixer's own summary counted a spend and this priced a different one, say both
   numbers; that disagreement is the entire reason the count moved out of the fixer.
+  `breach: true` is the one reading here that is an accusation, and it is the only one:
+  say what the pass priced, what the budget was, and that every finding in the prior
+  round's **To fix** list was budgeted — that last clause is what makes the number
+  binding, and a reader given the accusation without it has been asked to take it on
+  trust.
 - **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
   answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
   fix, which finding it answered (now back on the board as reported-and-not-fixed), and
