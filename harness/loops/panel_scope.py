@@ -11,8 +11,8 @@ A MOVE, not a rewrite.
 
 from __future__ import annotations
 
-from panel_core import *            # noqa: F401,F403
-import panel_core                   # noqa: F401
+import panel_core  # noqa: F401
+from panel_core import *  # noqa: F401,F403
 
 #: What a missing fix range MEANS, as a value rather than as a sentence (#500).
 #:
@@ -2777,7 +2777,7 @@ def _settle_no_checks(gh_repo: str, pr_number: int) -> tuple[str, str]:
     to make a prompt tidier — is about tidiness; this is the difference between
     telling a reviewer "there is no CI here" and telling it the truth.
     """
-    import harness_rules                                    # noqa: PLC0415
+    import harness_rules  # noqa: PLC0415
     try:
         raw = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
@@ -3515,7 +3515,7 @@ def _kill_group(proc) -> None:
     catchable, so that only bites a process already stuck in the kernel, but the
     number a repo writes bounds the RUN and not the call.
     """
-    import signal                                            # noqa: PLC0415
+    import signal  # noqa: PLC0415
     try:
         os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
     except OSError:
@@ -3623,7 +3623,7 @@ def review_local_suite(commands, root: str, head_sha: str, *,
     instead of a pipe, a new session, a group kill) are not arguments to `run` and
     would have had to be re-implemented by every caller that passed one.
     """
-    import shlex                                            # noqa: PLC0415
+    import shlex  # noqa: PLC0415
 
     run = run or _run_bounded
     started = now()

@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone, UTC
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,11 +25,11 @@ import pytest
 BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
-import qbdata as qd                                       # noqa: E402
+import qbdata as qd  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import _path_sandbox                                      # noqa: E402
+import _path_sandbox  # noqa: E402
 
 # ---- reading a seat off the board: deleted with the seat name (#540) --------
 #

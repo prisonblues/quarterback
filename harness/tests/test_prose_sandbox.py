@@ -12,10 +12,9 @@ suites, and for the one thing a declaration-based contract cannot catch.
 
 from __future__ import annotations
 
-import pytest
-
 import _flake_sandbox as flake
 import _prose_sandbox as contract
+import pytest
 
 
 @pytest.fixture(scope="module")

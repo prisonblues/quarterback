@@ -116,6 +116,7 @@ def test_the_field_defaults_empty_so_a_round_can_say_nobody_retracted_anything()
 # above, and each is pinned here because that is the only reason it stays fixed.
 
 import json  # noqa: E402
+
 import panel  # noqa: E402
 import panel_core  # noqa: E402
 from conftest import gh_stub  # noqa: E402

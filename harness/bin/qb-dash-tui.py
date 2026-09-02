@@ -103,7 +103,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import qbdata as qd                                             # noqa: E402
+import qbdata as qd  # noqa: E402
 
 
 def sibling(name: str) -> str:

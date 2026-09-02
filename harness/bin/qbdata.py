@@ -19,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone, UTC
+from datetime import UTC, datetime, timedelta, timezone
 
 REPO = "prisonblues/quarterback"          # the fallback, not the answer
 REPO_URL = f"https://github.com/{REPO}"

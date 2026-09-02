@@ -37,7 +37,7 @@ import pytest
 BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
-import qbdata as qd                                       # noqa: E402
+import qbdata as qd  # noqa: E402
 
 REPO = "prisonblues/quarterback"
 OTHER = "prisonblues/lexray"

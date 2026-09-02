@@ -23,9 +23,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
-
 import _flake_sandbox
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # No module-level `COMMANDS`/`HM_MODULE` paths: they were a route straight past `_at` below,

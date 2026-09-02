@@ -10,12 +10,12 @@ implementation runs a seat for both.
 
 from __future__ import annotations
 
-from panel_core import *            # noqa: F401,F403
-import panel_core                   # noqa: F401
-from panel_seats import *           # noqa: F401,F403
-import panel_seats                  # noqa: F401
-from panel_scope import *        # noqa: F401,F403  — re-exported for callers
-import panel_scope               # noqa: F401
+import panel_core  # noqa: F401
+import panel_scope  # noqa: F401
+import panel_seats  # noqa: F401
+from panel_core import *  # noqa: F401,F403
+from panel_scope import *  # noqa: F401,F403  — re-exported for callers
+from panel_seats import *  # noqa: F401,F403
 
 # ----------------------------------------------------------------------------- ask
 

@@ -40,7 +40,6 @@ import panel_core  # noqa: E402
 import panel_seats  # noqa: E402
 from conftest import gh_stub, pr_tarball  # noqa: E402
 
-
 # --------------------------------------------------------------- the strip
 
 def _tree(root: Path, files: dict) -> Path:

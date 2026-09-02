@@ -12,31 +12,34 @@ why that distinction is not optional.
 
 from __future__ import annotations
 
-from panel_core import *            # noqa: F401,F403
-import panel_core                   # noqa: F401
-from panel_seats import *           # noqa: F401,F403
-import panel_seats                  # noqa: F401
-from panel_scope import *        # noqa: F401,F403  — re-exported for callers
-import panel_scope               # noqa: F401
+# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
+# is what lets :class:`CoverageRuling` default to an empty mapping without the
+# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
+import hashlib  # noqa: E402
+
+# #555: asked of the `needs_human` this box actually has, because a harness on PATH
+# can be older than this file and an unexpected keyword would cost the escalation.
+import inspect  # noqa: E402
+
+# Named here for the same reason, and used by exactly one check: a baseline's
+# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
+import math  # noqa: E402
 
 # Named directly, and BELOW the star imports on purpose: `escalated: Iterable[str]`
 # has to still mean `collections.abc.Iterable` the day one of those modules
 # re-exports the name, and the last import wins. Placed above, the guarantee would
 # have been a claim about another module's current contents rather than a property
 # of this file.
-from collections.abc import Iterable, Mapping # noqa: E402
-# Named here for the same reason, and used by exactly one check: a baseline's
-# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
-import math                                   # noqa: E402
-# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
-# is what lets :class:`CoverageRuling` default to an empty mapping without the
-# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
-import hashlib                                # noqa: E402
-# #555: asked of the `needs_human` this box actually has, because a harness on PATH
-# can be older than this file and an unexpected keyword would cost the escalation.
-import inspect                                # noqa: E402
-from types import MappingProxyType            # noqa: E402
-from typing import NamedTuple                 # noqa: E402
+from collections.abc import Iterable, Mapping  # noqa: E402
+from types import MappingProxyType  # noqa: E402
+from typing import NamedTuple  # noqa: E402
+
+import panel_core  # noqa: F401
+import panel_scope  # noqa: F401
+import panel_seats  # noqa: F401
+from panel_core import *  # noqa: F401,F403
+from panel_scope import *  # noqa: F401,F403  — re-exported for callers
+from panel_seats import *  # noqa: F401,F403
 
 # ----------------------------------------------------------------------------- synthesis
 

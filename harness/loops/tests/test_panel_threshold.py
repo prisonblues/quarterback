@@ -43,11 +43,11 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402
 import panel  # noqa: E402
 import panel_core  # noqa: E402
 import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
-import harness_rules  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board",

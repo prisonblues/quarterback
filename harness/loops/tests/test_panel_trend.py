@@ -42,10 +42,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_caps  # noqa: E402  — the ceilings, which must not learn about this
 import panel_core  # noqa: E402  — `sh` lives here since #129
-import panel_rounds  # noqa: E402
 import panel_preflight as pf  # noqa: E402
+import panel_rounds  # noqa: E402
 from conftest import gh_stub  # noqa: E402
-
 
 # --------------------------------------------------------------------------
 # Reading one earlier round out of its payload

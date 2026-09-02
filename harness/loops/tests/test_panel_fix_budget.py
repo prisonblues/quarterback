@@ -44,12 +44,13 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh`, the seam every stub here replaces
 import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
-import harness_rules  # noqa: E402
 from conftest import gh_stub  # noqa: E402
+
 # The band fixture is `test_panel_dials`' — two floors a tier apart, so there IS a
 # budgeted band and the 💸 note renders. Imported rather than rebuilt: the sentence this
 # file asserts on lives inside that note, and a second fixture drifting from the first

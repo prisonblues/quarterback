@@ -116,9 +116,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 # never raises, and it returns the HTTP status because one check has to tell an
 # older board from a broken one.
 from harness_rules import (  # noqa: E402
-    BOARD_TIMEOUT, RepoNotFound, board_config, ci_report, describe, resolve_repo,
+    BOARD_TIMEOUT,
+    RepoNotFound,
+    board_config,
+    ci_report,
+    describe,
+    resolve_repo,
     ssl_context,
 )
+
+# #274's one door. Imported rather than a `board_request(… "post" …)` written
+# here, so that when #328's blocker row becomes the store there is one function
+# to repoint and not one per producer.
+from needs_human import announce, digest  # noqa: E402
+
 # #278's reading lives in `panel_scope` because that is where the review target is
 # decided, and the JUDGEMENT must not exist twice: this gate and the round it rules
 # on have to answer "how involved was that merge" the same way, or a payload and a
@@ -126,13 +137,11 @@ from harness_rules import (  # noqa: E402
 # Only the measurement differs by caller — the panel reads GitHub's compare API and
 # checks nothing out, this runs in a checkout and has real `git`.
 from panel_scope import (  # noqa: E402
-    DEFAULT_DISTANT_MERGE_LINES, Integration, merge_involvement,
+    DEFAULT_DISTANT_MERGE_LINES,
+    Integration,
+    merge_involvement,
 )
 from panel_seats import distant_merge_lines  # noqa: E402
-# #274's one door. Imported rather than a `board_request(… "post" …)` written
-# here, so that when #328's blocker row becomes the store there is one function
-# to repoint and not one per producer.
-from needs_human import announce, digest  # noqa: E402
 
 READY, RECONCILE, HOLD = "READY", "RECONCILE", "HOLD"
 

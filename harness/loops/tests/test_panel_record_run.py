@@ -25,9 +25,9 @@ payload is written) is the part a later edit is most likely to undo.
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
-from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402

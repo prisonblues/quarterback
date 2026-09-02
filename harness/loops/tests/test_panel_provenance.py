@@ -34,13 +34,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
-import panel_scope  # noqa: E402  — scope/range readers moved here in #129
-import panel_seats  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_preflight as pf  # noqa: E402  — the pre-flight verdict (#138)
+import panel_scope  # noqa: E402  — scope/range readers moved here in #129
+import panel_seats  # noqa: E402
 from conftest import gh_stub  # noqa: E402
-
-
 
 TWO_FILES = (
     "diff --git a/a.py b/a.py\n"

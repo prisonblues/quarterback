@@ -25,8 +25,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from harness_rules import (  # noqa: E402
-    RepoNotFound, agent_failure, agent_gist, ci_report, describe, resolve_repo,
-    run_agent, stderr_gist,
+    RepoNotFound,
+    agent_failure,
+    agent_gist,
+    ci_report,
+    describe,
+    resolve_repo,
+    run_agent,
+    stderr_gist,
 )
 
 SECURITY_RE = re.compile(r"security|cve|rce|xss|vuln|advisory", re.I)
