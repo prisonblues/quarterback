@@ -189,6 +189,52 @@ def test_the_baseline_records_which_of_the_brief_was_a_hard_gate_issue(tmp_path)
     assert set(sub) == {CHEAP[0]}
 
 
+def test_an_EXCISED_finding_is_not_the_next_rounds_BRIEF(tmp_path):
+    """The payload's `to_fix` bucket carries every non-dismissed finding with flags, so
+    an excised one is still a row in it — and `load_baseline` read every row as a
+    complaint the fixer had been sent to. It was not: the report says "hand a fixer NONE
+    of the findings below", so no fix answered it and it is evidence about no location.
+
+    The worst of the four false conclusions that follows is the last one: readmitted to
+    the brief, the excised finding is sub-floor again, and the REVERT commit — which
+    names it, because that is what the orchestrator was told to record — reads as a
+    seam. The next round then proposes excising the excision, putting back the very fix
+    this one removed. Found by a Codex second opinion.
+
+    `fixed_severities` keeps it, and that asymmetry is deliberate: that list answers
+    "was ALL of the brief budgeted", where an extra entry can only DECLINE."""
+    path = tmp_path / "r2.json"
+    path.write_text(json.dumps({
+        "round": 2, "cycle": "abc123", "reviewed": True, "repo": "e2e",
+        "github": "acme/e2e", "pr": 77, "head_sha": "b" * 40, "dismissed": [],
+        "sonar_findings": [],
+        "to_fix": [
+            {"key": CHEAP[0], "id": "77-F01", "severity": "P3", "file": CHEAP[2],
+             "synthesis": CHEAP[4], "excised": False},
+            {"key": CAUSED["key"], "id": "77-F09", "severity": "P3",
+             "file": CAUSED["file"], "synthesis": CAUSED["title"], "excised": True},
+        ],
+    }))
+    got = panel.load_baseline(
+        [str(path)], {"repo": "e2e", "github": "acme/e2e", "pr": 77, "round": 3})
+    assert {k for k, *_ in got.fixed_findings} == {CHEAP[0]}
+    assert got.fixed_here == {CHEAP[2]: {CHEAP[0]}}
+    assert got.fixed_ids == {"77-F01": CHEAP[0]}
+    assert CAUSED["key"] not in got.fixed_gate
+    # …and counted where counting can only decline the strict premise.
+    assert got.fixed_severities == ["P3", "P3"]
+    # The consequence: a revert commit naming the excised finding is not a seam, so the
+    # next round cannot propose excising the excision.
+    sub, _floor, why = panel_rounds.sub_floor_brief(got.fixed_findings, WAS,
+                                                    got.fixed_gate)
+    assert why is None and set(sub) == {CHEAP[0]}
+    seams, refused = panel_rounds.excision_seams(
+        [_commit(sha=SHA_B, subject="revert: the docstring fix",
+                 body="Excised 77-F09, which the docstring fix caused.")],
+        sub, got.fixed_findings, got.fixed_ids)
+    assert seams == {} and refused == []
+
+
 def test_a_severity_NOTHING_CAN_READ_is_not_sub_floor():
     """`Baseline` writes `"?"` for a brief entry whose severity nothing could parse,
     and `severity_at_least` reads an unparseable severity as P1 — which is at or above
@@ -517,32 +563,141 @@ def test_the_seam_is_looked_for_in_the_range_the_ROUND_attributed_over():
     assert not any("prior.head_sha" in line for line in code)
 
 
-def test_nothing_here_RUNS_the_excision():
-    """The command is a string in a payload and there is no code path from it to a
-    subprocess. `panel_rounds` shells out to nothing at all — the readers are passed
-    IN, which is what lets the decision live here and the git live in `panel_scope`.
+#: Every name this repo can reach a subprocess or an arbitrary import through. Wider
+#: than the four `test_nothing_here_RUNS_the_excision` used to check, because a Codex
+#: second opinion pointed out that the narrow list passed over `from subprocess import
+#: call`, `os.popen`, `getattr(os, "system")` and
+#: `importlib.import_module("subprocess").run` — an assertion that only rejects the
+#: spelling nobody was going to use is #516's defect class, a test that cannot fail.
+#:
+#: `compile` is deliberately absent: `re.compile` is four calls in this module and the
+#: builtin is not the door this is about.
+_SHELL_DOOR_NAMES = frozenset({
+    "sh", "run", "Popen", "call", "check_call", "check_output", "communicate",
+    "system", "popen", "getoutput", "getstatusoutput", "spawnl", "spawnv", "spawnvp",
+    "execl", "execv", "execvp", "fork", "posix_spawn",
+    "import_module", "__import__", "eval", "exec", "load_module",
+})
+#: The modules an import of which is itself the door, whatever is then called on them.
+_SHELL_DOOR_MODULES = frozenset({"subprocess", "pty", "commands", "importlib"})
 
-    Over the parsed tree and not over the text, because these three functions have to
-    be able to SAY the words: the docstrings explain which module holds the subprocess
+
+def _shell_doors(source: str, inside: set[str] | None = None) -> set[str]:
+    """Every way ``source`` could reach a subprocess, as a set of sentences.
+
+    Over the parsed tree and not over the text, because the excision functions have to
+    be able to SAY the words: their docstrings explain which module holds the subprocess
     and why, and a substring test over prose would either fail on the explanation or be
-    weakened until it proved nothing."""
-    tree = ast.parse(Path(panel_rounds.__file__).read_text())
-    wanted = {"sub_floor_brief", "excision_seams", "excision_state", "_read_once"}
-    found = {node.name for node in ast.walk(tree)
-             if isinstance(node, ast.FunctionDef) and node.name in wanted}
-    assert found == wanted, found
-    # `panel_core.sh` is the package's only door to a subprocess, and this module never
-    # reaches it — from any function, not merely from these four.
-    assert not any(isinstance(node, ast.Import)
-                   and any(a.name == "subprocess" for a in node.names)
-                   for node in ast.walk(tree))
+    weakened until it proved nothing.
+
+    ``inside`` narrows the CALL scan to functions with those names; the IMPORT scan is
+    always module-wide, because a door imported anywhere is reachable from anywhere —
+    which is the hole a scan restricted to four functions leaves open.
+
+    Returned rather than asserted, so that the checker can be pointed at a source that
+    DOES shell out and shown to find it. That is the whole difference between this and
+    the assertion it replaces: this one is proved able to fail.
+    """
+    tree = ast.parse(source)
+    found: set[str] = set()
     for node in ast.walk(tree):
-        if not (isinstance(node, ast.FunctionDef) and node.name in wanted):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in _SHELL_DOOR_MODULES:
+                    found.add(f"import {alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in _SHELL_DOOR_MODULES:
+                found.add(f"from {node.module} import ...")
+            for alias in node.names:
+                if root == "os" and alias.name in _SHELL_DOOR_NAMES:
+                    found.add(f"from os import {alias.name}")
+    for node in ast.walk(tree):
+        if inside is not None and not (isinstance(node, ast.FunctionDef)
+                                       and node.name in inside):
             continue
+        where = getattr(node, "name", "<module>")
         for call in (c for c in ast.walk(node) if isinstance(c, ast.Call)):
             named = (call.func.attr if isinstance(call.func, ast.Attribute)
                      else getattr(call.func, "id", ""))
-            assert named not in ("sh", "run", "Popen", "system"), (node.name, named)
+            if named in _SHELL_DOOR_NAMES:
+                found.add(f"{where} calls {named}()")
+            # A door reached by NAME rather than by attribute — `getattr(os, "system")`
+            # is the spelling a static scan for `os.system` walks straight past, and
+            # the self-test below caught this checker walking past it too on its first
+            # cut. Only a literal is decidable; a computed name is not, and a module
+            # that built one would be doing something this repo does nowhere.
+            if named == "getattr":
+                for arg in call.args[1:2]:
+                    if (isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                            and arg.value in _SHELL_DOOR_NAMES):
+                        found.add(f"{where} calls getattr(..., {arg.value!r})")
+    return found
+
+
+def test_the_shell_door_checker_CAN_FAIL():
+    """#516: an assertion that cannot fail is worse than no assertion, because it reads
+    as coverage. The guard below is only worth its line if it finds a door when there is
+    one, so it is pointed at seven sources that each have exactly one — including the
+    four spellings the previous version of that guard passed over."""
+    violations = [
+        "import subprocess\nsubprocess.run(['git'])\n",
+        "from subprocess import call\ndef f():\n    call(['git'])\n",
+        "import os\ndef f():\n    os.popen('git')\n",
+        "from os import system\ndef f():\n    system('git')\n",
+        "import os\ndef f():\n    getattr(os, 'system')('git')\n",
+        "import importlib\ndef f():\n    importlib.import_module('subprocess')\n",
+        "def f():\n    exec('import subprocess')\n",
+    ]
+    for source in violations:
+        assert _shell_doors(source), source
+    # …and it is not simply true of everything: a module that only calls what it was
+    # handed is clean, which is the shape `excision_state` is in.
+    assert _shell_doors("def f(reader, of):\n    return reader(of)\n") == set()
+
+
+def test_nothing_here_RUNS_the_excision():
+    """The command is a string in a payload and there is no code path from it to a
+    subprocess. `panel_rounds` shells out to nothing at all — the readers are passed
+    IN, which is what lets the decision live here and the git live in `panel_scope`."""
+    source = Path(panel_rounds.__file__).read_text()
+    wanted = {"sub_floor_brief", "excision_seams", "excision_state", "_read_once"}
+    found = {node.name for node in ast.walk(ast.parse(source))
+             if isinstance(node, ast.FunctionDef) and node.name in wanted}
+    assert found == wanted, found
+    # MODULE-WIDE and not just these four, which is the correction: a helper one of
+    # them calls could shell out without any of their own bodies naming a door.
+    # `panel_core.sh` is the package's only door to a subprocess and this module never
+    # reaches it.
+    assert _shell_doors(source) == set()
+
+
+def test_the_excision_runs_nothing_with_every_shell_DOOR_NAILED_SHUT():
+    """The behavioural half, because a static guard proves a shape and not a run. Every
+    door out of this process is replaced with something that raises, and the happy path
+    is walked end to end: if any part of `excision_state` reached a subprocess — itself
+    or through a helper the AST scan spelled differently — this would raise instead of
+    returning the excision."""
+    import os
+    import subprocess
+
+    def boom(*_a, **_k):
+        raise AssertionError("excision_state reached a subprocess")
+
+    doors = [(subprocess, "run"), (subprocess, "Popen"), (subprocess, "call"),
+             (subprocess, "check_call"), (subprocess, "check_output"),
+             (os, "system"), (os, "popen"), (os, "execv"), (os, "fork")]
+    was = [(mod, name, getattr(mod, name)) for mod, name in doors
+           if hasattr(mod, name)]
+    try:
+        for mod, name, _old in was:
+            setattr(mod, name, boom)
+        got = _state()
+    finally:
+        for mod, name, old in was:
+            setattr(mod, name, old)
+    assert got["count"] == 1
+    assert got["excise"][0]["command"] == f"git revert --no-commit {SHA_A}"
 
 
 def test_an_excision_moves_no_verdict_in_round_stop():
@@ -683,6 +838,37 @@ def test_nothing_landed_between_the_rounds_is_its_own_answer(tmp_path):
     r, _anchor, fix = _pass(tmp_path)
     got = panel_scope.fix_commit_seams(str(r.path), fix, fix)
     assert got["commits"] == [] and "nothing landed between the rounds" in got["why"]
+
+
+def test_a_commit_body_carrying_the_RECORD_SEPARATOR_cannot_forge_a_commit(tmp_path):
+    """The seam reader parses one delimited `git log` stream, and a commit MESSAGE is
+    arbitrary text a fixer pastes a report line into. A body carrying the record
+    separator splits its own entry in two and the tail is parsed as a commit of its
+    own — so a body ending `\x1e<the blocking fix's sha>\x1f<anything>\x1fAnswers
+    77-F01` produces a fully-formed record naming a commit whose real message never
+    named that finding. `excision_seams` keys seams by sha, so the excision is then
+    aimed at THAT commit: `git revert --no-commit <the P2's fix>`, which is the one
+    outcome this whole rule exists to prevent.
+
+    Real git, because the claim is about what `git log --format` writes. Found by a
+    Codex second opinion; the constant's own comment already claimed a message carrying
+    a separator was treated as unreadable, and it was not."""
+    r = _new_repo(tmp_path)
+    (r.path / "app").mkdir()
+    anchor = r.commit("app/sync.py", "import os\n\nTAIL = 1\n", "under review")
+    blocking = r.commit("app/sync.py", "import os\n\nRETRY = 2\nTAIL = 1\n",
+                        "fix: back the retry off\n\nAnswers 77-F02.")
+    r.commit("app/sync.py", 'import os\n\nRETRY = 2\n"""paths."""\nTAIL = 1\n',
+             f"docs: unstale the docstring\n\nnothing to see"
+             f"\x1e{blocking}\x1fdeadbeef\x1fAnswers 77-F01.")
+    got = panel_scope.fix_commit_seams(str(r.path), anchor, r.at("HEAD"))
+    assert got["commits"] == []
+    assert "carries the record separator" in got["why"]
+    # And the consequence, asserted rather than inferred: nothing downstream can be
+    # handed a seam that points at the blocking fix.
+    seams, refused = panel_rounds.excision_seams(got["commits"], {CHEAP[0]: {}},
+                                                 BRIEF, IDS)
+    assert seams == {} and refused == []
 
 
 def test_a_pass_past_the_commit_CEILING_declines_rather_than_reading_part_of_it(
@@ -881,11 +1067,15 @@ def test_the_orchestrator_is_pointed_at_the_payload_rather_than_asked_to_derive_
     assert "What it does NOT price is what the excision destroys (#558)" in flat
     assert "the sole coverage of the mechanism the PR existed to build" in flat
     # #692's unit, answered rather than left implicit: the excision costs no budget and
-    # its churn is counted anyway. An orchestrator that charged the correction to
-    # `low_severity_fix_lines` would make it unaffordable in the cycles it fires in.
-    assert "**The excision costs the round no budget, and its churn is not hidden.**" \
+    # its churn is counted by every reading in the next round, that budget included.
+    assert "**The excision's churn is churn, and `low_severity_fix_lines` counts it.**" \
         in flat
-    assert "Do not charge it to `low_severity_fix_lines`" in flat
+    # And it does NOT tell the orchestrator to apply an exemption the harness does not
+    # implement and the orchestrator cannot apply by hand (found by a Codex second
+    # opinion): `fix_budget_state` prices the referee's split and the revert commit is
+    # in it. What the brief asks for instead is that the cost be NAMED.
+    assert "Do not charge it to `low_severity_fix_lines`" not in flat
+    assert "report it as the cost of the correction" in flat
 
 
 # ------------------------------------------------- and it does not trip #559
@@ -903,7 +1093,25 @@ def test_the_churn_question_is_ANSWERED_in_the_docs_and_not_left_implicit():
     assert "Its own restoration is CHURN, it is counted, and #559 is why that is not a " \
            "contradiction." in readme
     assert "**None of it is exempted.**" in readme
-    assert "The excision is not charged to `low_severity_fix_lines`." in readme
+    # AND `low_severity_fix_lines` IS ONE OF THOSE READINGS. Three documents used to
+    # claim an exemption from it — this README, the changelog fragment and the
+    # orchestrator's brief, which told the orchestrator not to charge it — and nothing
+    # anywhere implemented one: `fix_budget_state` prices `referee_state`'s split, the
+    # revert commit is in that split, and its churn is priced like any other. A claim a
+    # reader cannot act on is worse than silence, and this one contradicted the
+    # paragraph above it. Found by a Codex second opinion.
+    assert "the excision IS charged to it" in readme
+    assert "not charged to `low_severity_fix_lines`" not in readme
+    fragment = " ".join(
+        (REPO_ROOT / "changelog.d/627.feat.md").read_text(encoding="utf-8").split())
+    assert "the excision is charged to it like any other commit" in fragment
+    assert "not charged to `low_severity_fix_lines`" not in fragment
+    brief = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "`low_severity_fix_lines` counts it" in brief
+    assert "Do not charge it to `low_severity_fix_lines`" not in brief
+    # The exposure is named rather than closed, in all three.
+    for text in (readme, fragment):
+        assert "stated rather than closed" in text
     # And the two questions are named apart, because conflating them is how a
     # correction comes to read as the disease.
     assert "*How much surface was disturbed*" in readme

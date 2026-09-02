@@ -1805,11 +1805,20 @@ byte-identical to lines in almost any file. An excision smaller than that is not
 distinguished from authorship, and the exposure is one round's `introduced` count leaning
 high by a handful of lines.
 
-**The excision is not charged to `low_severity_fix_lines`.** That budget bounds what a
-round may SPEND on the sub-floor band; an excision is not a fix in that band, it is the
-removal of one. Charging it would make the cheap correction unaffordable in exactly the
-cycles where the budget is tight — which is where this fires most — and would price a
-round for undoing work it is being told not to have done.
+**`low_severity_fix_lines` is one of those readings, and the excision IS charged to it.**
+`fix_budget_state` prices the referee's split; the revert commit is in that split; its
+churn is priced at insertions plus deletions exactly as the fix it removes was. An
+earlier draft of this section claimed the exemption and no code implemented it — a
+different-vendor review of PR #708 found the contradiction with the paragraph above.
+There is an argument for the exemption (a round should not be priced for undoing work it
+was told not to have done, and that bites hardest where the budget is tightest, which is
+where this fires most), but taking it would mean finding the revert commit inside the
+next round's fix range and subtracting its churn from a total the fixer's own brief
+prices the same way — and #692 settled the unit as churned lines so that no correction
+gets to be free. **The exposure is stated rather than closed:** where the rest of the
+anchor round's brief was wholly budgeted, `budgeted_brief` supplies the strict premise
+and a large excision can fire an overspend against a pass that only did what the rule
+ordered.
 
 **Where this joins the fix-pass record (#624).** That record is an *assembly* of the
 five rungs a round already derives, at the grain of the **pass**; this is the one thing

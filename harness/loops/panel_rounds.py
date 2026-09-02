@@ -2587,6 +2587,38 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                     # unplaceable P1 would turn a mixed list into an all-budgeted one
                     # exactly as dropping the malformed entry above would.
                     b.fixed_severities.append(str(f.get("severity") or "?"))
+                    # #627, AND IT IS THE ONE THING IN THIS LOOP THAT DROPS A READABLE
+                    # RECORD. A finding flagged `excised` is one the round that raised
+                    # it took OUT of its fixer's list, because the sub-floor fix that
+                    # caused it is being reverted instead — the report says "hand a
+                    # fixer NONE of the findings below". So nothing below this line is
+                    # true of it: no fixer was sent to it, no fix answered it, and it is
+                    # evidence about no location.
+                    #
+                    # Left in, it became next round's brief, and the four readers of that
+                    # brief each drew a false conclusion from it: `fix_pass_outcome`
+                    # counted it `still_open` against a pass that was told to ignore it,
+                    # `_recurrence` treated a finding at that line as a repeat of a fix
+                    # nobody attempted, `recurrence_brief` printed it as a complaint the
+                    # fixer had answered, and — worst — `sub_floor_brief` re-admitted it
+                    # to the sub-floor band, so a revert commit naming it read as a SEAM
+                    # and the next round could propose excising the excision, putting
+                    # back the very fix this one removed. Found by a Codex second
+                    # opinion.
+                    #
+                    # `fixed_severities` above KEEPS it, and the asymmetry is the one
+                    # this loop already has: that list answers "was ALL of the brief
+                    # budgeted", which only ever DECLINES on an extra entry, and
+                    # declining is the direction `budgeted_brief` is documented to
+                    # prefer. Dropping it there would let a round whose excised finding
+                    # was mandatory work read as wholly cheap.
+                    #
+                    # `is True` and not truthiness: a payload written by an older
+                    # release carries no such key, and a hand-edited one carrying junk
+                    # must read as the old behaviour rather than silently emptying a
+                    # brief.
+                    if f.get("excised") is True:
+                        continue
                     file = str(f.get("file") or "")
                     key = str(f.get("key") or "") or _key_from_title(file, _baseline_title(f))
                     if not file or not key:
@@ -5220,11 +5252,23 @@ def excision_state(kind: str, *, why: str | None = None, commits: dict | None = 
     not distinguished from authorship, so an excision smaller than that leans one
     round's `introduced` high by a handful of lines.
 
-    **And it is not charged to `low_severity_fix_lines`.** That budget bounds what a
-    round may SPEND on the sub-floor band; an excision is not a fix in that band, it is
-    the removal of one. Charging it would make the cheap correction unaffordable in
-    exactly the cycles where the budget is tight — which is where this fires most — and
-    would price a round for undoing work it is being told not to have done.
+    **`low_severity_fix_lines` IS ONE OF THOSE READINGS, AND THE EXCISION IS CHARGED TO
+    IT LIKE ANY OTHER COMMIT.** An earlier draft of this docstring claimed the opposite
+    — that the budget bounds what a round may SPEND on the sub-floor band and an excision
+    is the removal of such a fix rather than one more of them — and a Codex second
+    opinion pointed out that it contradicted the paragraph above it and that no code
+    anywhere implemented it. It does not, and the paragraph above is the one that is
+    true: `fix_budget_state` prices :func:`referee_state`'s split, the revert commit is
+    in that split, and its churn is priced at insertions plus deletions exactly as the
+    fix it removes was. There is an argument for exempting it — a round can be priced
+    for undoing work it was told not to have done, and that bites hardest where the
+    budget is tightest, which is where this fires most — but exempting it would mean
+    finding the revert commit inside the next round's fix range and subtracting its
+    churn from a total the fixer's own brief prices the same way, and #692 settled the
+    unit as churned lines precisely so that no correction gets to be free. The exposure
+    is stated rather than closed: where the rest of the anchor round's brief was wholly
+    budgeted, :func:`budgeted_brief` supplies the strict premise and a large excision can
+    fire an overspend against a pass that only did what this rule ordered.
 
     **What ``destroys`` does NOT price, said in the payload rather than left to be
     discovered (#558).** An excision removes the artefact the sub-floor fix wrote, and

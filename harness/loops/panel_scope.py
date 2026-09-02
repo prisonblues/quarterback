@@ -653,16 +653,34 @@ def fix_commit_seams(repo_path: str, base_sha: str | None, head_sha: str | None
                f"--format={_LOG_RS}%H{_LOG_FS}%P{_LOG_FS}%B", span)
     if log is None or len(log) > FIX_RANGE_MAX_CHARS:
         return {**out, "why": f"the commit messages in {span} could not be read"}
+    # ONE FRAGMENT PER COMMIT, COUNTED AGAINST `rev-list` BEFORE ANY OF IT IS BELIEVED.
+    # `--format` writes the record separator BEFORE each entry, so the stream opens with
+    # an empty fragment and holds exactly `total` after it. A message carrying the RECORD
+    # separator splits its own entry in two, and the tail is then parsed as a commit of
+    # its own: a body ending `\x1e<some other sha>\x1f<anything>\x1fAnswers 77-F01`
+    # yields a fully-formed record naming a commit whose real message never named that
+    # finding — and `excision_seams` keys seams by sha, so the excision is then aimed at
+    # THAT commit, which may be the blocking fix this rule exists to leave alone. A
+    # separator that only truncates rather than forging still loses the tail of a
+    # message, which is where the finding is named.
+    #
+    # The count is the whole guard and it is complete: every mis-split ADDS a fragment
+    # (the real entries each still begin with their own `%H`), so a stream that does not
+    # hold exactly one fragment per commit is one this cannot read. Refused for the whole
+    # range rather than per record, on the rule below — a commit this cannot read is a
+    # commit that cannot be checked for having built on a seam. Found by a Codex second
+    # opinion; the docstring already claimed this and the code did not do it.
+    records = log.split(_LOG_RS)
+    if len(records) != total + 1 or records[0].strip():
+        return {**out, "why": f"a commit message in {span} carries the record separator "
+                              "this reads the log back with, so the pass cannot be "
+                              "split into its commits"}
     commits = []
-    for record in log.split(_LOG_RS):
-        if not record.strip():
-            continue
+    for record in records[1:]:
         parts = record.split(_LOG_FS)
         if len(parts) != 3:
-            # A message carrying the field separator itself, which splits a record
-            # into more pieces than it has fields. Refused for the whole range on the
-            # rule above rather than skipped: a commit this cannot read is a commit
-            # that cannot be checked for having built on a seam.
+            # A message carrying the FIELD separator, which splits a record into more
+            # pieces than it has fields. Same refusal and for the same reason.
             return {**out, "why": f"a commit message in {span} could not be split "
                                   "into its fields, so this pass cannot be read"}
         sha, parents, message = parts

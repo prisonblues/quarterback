@@ -1121,13 +1121,18 @@ attributes a finding to the fix *pass*; an excision needs the individual fix, an
   from `review_panel`: a floor moved between rounds would otherwise have you naming a cut
   the classification did not use.
 
-**The excision costs the round no budget, and its churn is not hidden.** Do not charge
-it to `low_severity_fix_lines` — that budget bounds what a round may spend fixing
-sub-floor findings, and this is the removal of such a fix rather than one more of them.
-Its churn is still churn: the revert commit lands in the next round's fix range and every
-churn reading there counts it, which is #692's unit working as intended. What comes out of
-the next round's **attribution** is only the lines the revert restored, because those sat
-at an earlier round's head and #559 is what stops a correction reading as the disease.
+**The excision's churn is churn, and `low_severity_fix_lines` counts it.** The revert
+commit lands in the next round's fix range, and every churn reading there counts it —
+the split, the guard ceiling, the surface count and the budget pricing alike. That is
+#692's unit working as intended, and it means `round_stop.fix_budget.spend` on the NEXT
+round includes the lines this excision removed. An earlier version of this section told
+you not to charge it to that budget; nothing in the harness implements that exemption and
+you cannot apply it by hand, so it is gone. What you can do is SAY SO: if the next round
+prices an overspend whose lines are the excision you were ordered to make, report it as
+the cost of the correction rather than as a fixer spending its budget badly. What comes
+out of the next round's **attribution** is only the lines the revert restored, because
+those sat at an earlier round's head and #559 is what stops a correction reading as the
+disease.
 
 **What it does NOT price is what the excision destroys (#558).** `destroys` names the
 files, the lines and how many of them sit in test or documentation paths, and that is a
