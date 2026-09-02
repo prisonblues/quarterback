@@ -1197,6 +1197,12 @@ class Dash(App):
         #: times should move one thing four places, which is the whole point of
         #: having a key rather than a modal.
         self.follow: str | None = None
+        #: Which rebuild of WORK the pending scroll restore belongs to. Counted
+        #: rather than flagged: the restore is deferred a refresh (see
+        #: `restore_work_scroll`) and rebuilds can arrive faster than the callbacks
+        #: run, so the only way to tell a live restore from one a later rebuild has
+        #: already superseded is which rebuild asked for it.
+        self.work_scroll = 0
         #: The plan as the board last stated it, kept while a move is in flight so
         #: a refusal can put the rows back. `None` when nothing is optimistic.
         self.rollback: dict | None = None
@@ -2137,12 +2143,29 @@ class Dash(App):
         #
         # Rows here are one line tall and the header is not scrolled, so `scroll_y`
         # counts rows and the row at the top of the view is `int(scroll_y)`.
+        #
+        # THE VIEWPORT AND NOT THE SELECTION, deliberately. `clear()` sends the
+        # cursor to row 0 as well, and it is left there for two reasons. The
+        # mechanical one: `watch_cursor_coordinate` scrolls the cursor into view, so
+        # restoring the cursor MOVES the viewport to it — which is the very thing
+        # this is here to stop for a reader who has wheeled away from their cursor,
+        # arriving from the other direction. The argued one: the cursor decides what
+        # `selected_work` answers, so carrying it across a poll changes which row a
+        # keypress acts on, and that is a behaviour change with its own tests to
+        # write rather than a side effect of keeping the view still.
         anchor = None
         if not self.follow and table.scroll_y >= 1:
             top = int(table.scroll_y)
             keys = [str(rk.value) for rk in table.rows]
             if top < len(keys):
                 anchor = keys[top]
+        # BUMPED ON EVERY REBUILD, whether or not one is scheduled below. The
+        # restore is deferred (see `restore_work_scroll`), so two rebuilds close
+        # together put two callbacks in the queue and the older one would land last
+        # and scroll to an anchor a newer rebuild has already superseded. A rebuild
+        # that captured no anchor still has to invalidate a pending one, which is
+        # why this is not inside the `if`.
+        self.work_scroll += 1
         table.clear()
         for row in rows:
             glyph, colour = row["glyph"]
@@ -2227,19 +2250,22 @@ class Dash(App):
                     table._scroll_cursor_into_view(animate=False)
                     break
         elif anchor is not None:
-            # The anchor row back at the top of the view. Gone from the table —
-            # merged, closed, filtered out — is the one case with no right answer,
-            # and the top is a better wrong one than a position computed from a row
-            # that no longer exists.
+            # The anchor row back where it was, which is the top of the view
+            # everywhere except the end of a table that has SHRUNK: `scroll_to`
+            # clamps at the last screenful, so a row that is now within one screen
+            # of the bottom lands part-way down the view instead. That is the right
+            # answer and there is no better one — there is nothing below it to
+            # scroll — and it is still the reader's row on screen rather than the
+            # top of the table.
+            #
+            # An anchor that is GONE — merged, closed, filtered out — is the one
+            # case with no right answer, and the view stays where `clear()` left it,
+            # at the top. A position computed from a row that no longer exists would
+            # be a guess wearing the shape of the reader's place.
             for i, rk in enumerate(table.rows):
                 if str(rk.value) == anchor:
-                    # AFTER THE REFRESH, not now. `clear()` marks the table's
-                    # dimensions stale and they are recomputed on the next idle, and
-                    # a scroll set before that is clamped against a virtual size of
-                    # nothing — which lands on 0, i.e. exactly the top this is here
-                    # to avoid. Measured on textual 8.2.8: set inline, the value
-                    # reads back correctly and is 0 one pause later.
-                    table.call_after_refresh(table.scroll_to, y=i, animate=False)
+                    table.call_after_refresh(
+                        self.restore_work_scroll, self.work_scroll, i)
                     break
 
         # The heading is one line and clips at the pane edge, so it is given the
@@ -3186,6 +3212,35 @@ class Dash(App):
         self.refresh_prs()
         self.refresh_issues()
         self.say("refreshing…")
+
+    def restore_work_scroll(self, generation: int, row: int) -> None:
+        """Put the row that was at the top of WORK back where the reader had it.
+
+        DEFERRED A REFRESH, and that is not a preference. `DataTable.clear()` marks
+        the table's dimensions stale and they are recomputed on the next idle, so a
+        scroll set inline is clamped against a virtual size of nothing — it reads
+        back correctly and is 0 one pause later. Measured on textual 8.2.8.
+
+        Deferring opens a gap, and both guards below are about what can happen in
+        it. Neither is theoretical: the whole defect this restores from is a repaint
+        moving the ground under somebody, and a restore that fired regardless would
+        be the same defect with this method's name on it.
+
+        **A NEWER REBUILD WINS.** Two rebuilds close together queue two callbacks,
+        and they run in the order they were queued — so without this the first one's
+        anchor lands last and the table ends up where the older rebuild wanted it.
+
+        **AND SO DOES THE READER.** `clear()` left the view at the top, so a
+        `scroll_y` that is no longer 0 is somebody else's scroll — the reader's
+        wheel, or a `follow` from a move they just made — and overwriting it would
+        be this method doing to them exactly what it exists to prevent.
+        """
+        if generation != self.work_scroll:
+            return
+        table = self.query_one("#work", DataTable)
+        if table.scroll_y:
+            return
+        table.scroll_to(y=row, animate=False)
 
     def render_blockers(self, blockers: dict) -> None:
         """The open questions a person owes an answer to (#328, #274).

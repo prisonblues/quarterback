@@ -453,6 +453,19 @@ def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
     assert asyncio.run(_drive_issues()) == []
 
 
+#: How long `_let_the_workers_finish` will wait for the in-flight fetches to drain.
+#:
+#: A DEADLINE and not a read count, unlike `_SETTLE_READS` above, because what is
+#: being waited for is different in kind: that one waits for a pane to settle, which
+#: takes as many chances as a loaded box needs to give it, and this one waits for
+#: network calls whose own timeouts are the thing that bounds them. `fetch_prs`
+#: shells out to `gh` and the board calls go over http; 90s is several times the
+#: worst honest answer and short enough that a wedged worker fails a test rather
+#: than hanging a CI job with no signal at all — which is the one outcome worse than
+#: a red build.
+_WORKER_DRAIN = float(os.environ.get("QB_DASH_WORKER_DRAIN", "90"))
+
+
 async def _let_the_workers_finish(app) -> None:
     """Freezing the refreshers is half of it — this is the other half (#678).
 
@@ -470,15 +483,58 @@ async def _let_the_workers_finish(app) -> None:
     last cell without changing a single key; the table is cleared and rebuilt
     either way, and a `clear()` used to take the scroll with it.
 
-    MEASURED, not reasoned about. On unmodified main this was two failures in
-    thirty runs of the four live drivers, reading `work never settled with a row at
-    (3, 22)` — and before #679 the same race clicked anyway and reported `the icon
-    did not raise the confirmation`, which is what #678 was filed about. With the
-    blockers call closed and the PR list still in flight it came back in a new
-    costume: a ⚒ click that raised the PANEL confirmation, for a PR that had
-    appeared on the board a moment earlier.
+    MEASURED, not reasoned about — and the measurement is of a board on a day, not
+    of this code, so nobody re-running it later will reproduce the numbers. On
+    2026-09-01, against `prisonblues/quarterback` as the fleet had it that evening,
+    unmodified main failed two of thirty runs of the four live drivers, reading
+    `work never settled with a row at (3, 22)`; before #679 the same race clicked
+    anyway and reported `the icon did not raise the confirmation`, which is what
+    #678 was filed about. With the blockers call closed and the PR list still in
+    flight it came back in a new costume: a ⚒ click that raised the PANEL
+    confirmation, for a PR that had appeared on the board a moment earlier. What
+    generalises is the shape — a rebuild between reading a row's position and
+    clicking it — not the rate.
+
+    BOUNDED, because `WorkerManager.wait_for_complete` is not: it gathers every
+    worker's `wait()` and has no deadline of its own, so one wedged fetch would hang
+    all four of these drivers for as long as the runner allows — and a job killed at
+    its own timeout reports nothing at all about what it was doing, which is the one
+    outcome worse than a red build. The refusal names the workers still running,
+    because that is the only fact that makes a drain which did not finish
+    actionable.
+
+    POLLED RATHER THAN `asyncio.wait_for(app.workers.wait_for_complete(), …)`, and
+    the reason is in textual 8.2.8's `Worker.wait`: it awaits the worker's task
+    inside `except asyncio.CancelledError`, and that handler sets
+    `self.state = WorkerState.CANCELLED` on the WORKER. So cancelling the waiter —
+    which is all `wait_for` does on timeout — marks a worker that is still happily
+    running as cancelled, and then raises `WorkerCancelled` out of the gather before
+    `wait_for` can raise `TimeoutError`. Tried first, and it fails with
+    `textual.worker.WorkerCancelled` rather than with the message above. Waiting
+    without cancelling anything cannot corrupt the state it is reading.
     """
-    await app.workers.wait_for_complete()
+    # IMPORTED HERE, not at module scope, for the reason `_click_row_index` imports
+    # `Coordinate` here: this module must SKIP without textual rather than fail to
+    # collect, and the CI job that proves the rest of the harness needs no dashboard
+    # extras is the one a top-level import turns red.
+    from textual.worker import WorkerState
+
+    unfinished = (WorkerState.PENDING, WorkerState.RUNNING)
+    deadline = time.monotonic() + _WORKER_DRAIN
+    while True:
+        still = [w for w in app.workers if w.state in unfinished]
+        if not still:
+            return
+        if time.monotonic() >= deadline:
+            raise AssertionError(
+                f"the dashboard's fetches did not drain within {_WORKER_DRAIN}s — "
+                f"still going: "
+                + ", ".join(sorted(f"{w.group or w.name}={w.state.name}"
+                                   for w in still))
+                + ". Nothing below this line has been clicked, so this is not a "
+                  "failure of whatever the test went on to assert. Raise "
+                  "QB_DASH_WORKER_DRAIN if the board is genuinely that slow today")
+        await asyncio.sleep(0.05)
 
 
 def _no_confirm(app, what: str) -> str:
@@ -1902,8 +1958,9 @@ def test_a_poll_that_lands_keeps_the_reader_where_they_had_scrolled_to():
     that changed something — a reader picks a row by looking at it — and this is
     what the polls that DID change something were still costing.
 
-    It is also half of what made the live `_drive_issues` fail — two runs in thirty
-    on unmodified main — as "the icon did not raise the confirmation".
+    It is also half of what made the live `_drive_issues` fail as "the icon did not
+    raise the confirmation" — two runs in thirty on unmodified main, measured on one
+    board on 2026-09-01 and not a rate anybody will reproduce.
     `refresh_board` fetches the claims and THEN the questions a person owes, the
     driver freezes the workers as soon as the claims land, and the second call
     arrives from the worker already in flight: after the driver has scrolled its
@@ -1923,6 +1980,125 @@ def test_a_poll_that_lands_keeps_the_reader_where_they_had_scrolled_to():
         f"a poll threw the reader from row {before} back to row {after}"
     assert top_after == top_before, \
         f"the row at the top of the view changed: {top_before} -> {top_after}"
+
+
+async def _drive_scroll_when_the_anchor_goes() -> tuple:
+    """Two rebuilds from the same scrolled position: one that keeps the row the
+    reader is anchored on, and one that does not.
+
+    The pair is the test. "Back at the top when the anchor is gone" is also what an
+    unpatched renderer does with every rebuild, so on its own it would pass against
+    the defect — the half that cannot is the rebuild which KEEPS the row, and the
+    two only mean something read together.
+    """
+    app_module, app = _quiet_dash()
+    numbers = list(range(460, 400, -1))
+    async with app.run_test(size=(100, 20)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.repo_slug = app_module.qd.REPO
+        app.render_issues(_issues_for(*numbers), None)
+        app.render_board({"agents": [], "claims": []})
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+        table.move_cursor(row=table.row_count - 1, animate=False)
+        table._scroll_cursor_into_view(animate=False)
+        await pilot.pause(0.2)
+        before = table.scroll_y
+        anchor = str(list(table.rows)[int(before)].value)
+
+        # A rebuild that keeps the anchor row — a question landing on a row this
+        # table already draws, which changes its state and its verb and no keys.
+        app.render_blockers({"blockers": [dict(BLOCKERS[0],
+                                               subject={"kind": "issue",
+                                                        "value": "430"})],
+                             "counts": {}, "error": None})
+        await pilot.pause(0.4)
+        kept = table.scroll_y
+        top_kept = (str(list(table.rows)[int(kept)].value) if kept >= 1 else None)
+
+        # And one that loses it: the issue the reader was anchored on is closed
+        # between polls, which is the ordinary way a row leaves this table.
+        gone = int(anchor.rsplit("#", 1)[1])
+        app.render_issues(_issues_for(*[n for n in numbers if n != gone]), None)
+        await pilot.pause(0.4)
+        lost = table.scroll_y
+        return (before, kept, top_kept, anchor, lost,
+                [str(rk.value) for rk in table.rows])
+
+
+def test_a_rebuild_that_loses_the_readers_row_goes_back_to_the_top():
+    """The one case where keeping the reader's place has no right answer.
+
+    An anchor that has been merged, closed or filtered away is not somewhere the
+    table can be put back to, and a position computed from a row that no longer
+    exists would be a guess wearing the shape of the reader's place. So the view
+    stays where `clear()` left it, at the top — deliberately, and now checked,
+    because a deliberate behaviour nothing tests is one revision away from being an
+    accidental one.
+    """
+    before, kept, top_kept, anchor, lost, keys = asyncio.run(
+        _drive_scroll_when_the_anchor_goes())
+    # THE HALF THAT CANNOT PASS AGAINST THE DEFECT, and the state the other half
+    # depends on: the table really did scroll, and a rebuild really did keep it.
+    assert before >= 1, f"the table never scrolled, so nothing was at stake: {before}"
+    assert kept == before, \
+        f"a poll that kept the anchor row still moved the view: {before} -> {kept}"
+    assert top_kept == anchor, f"the row at the top changed: {anchor} -> {top_kept}"
+    # And the row really is gone, so "back to the top" is about a missing anchor
+    # rather than about a rebuild that quietly did nothing.
+    assert anchor not in keys, f"{anchor} is still in the table"
+    assert lost == 0, \
+        f"the view was put somewhere computed from a row that no longer exists: {lost}"
+
+
+async def _drive_restore_guards() -> tuple:
+    """Call `restore_work_scroll` three ways: live, superseded, and against a
+    reader who has scrolled since.
+
+    Called directly rather than raced into existence. Both guards are about the gap
+    that deferring the restore opens — a second rebuild, or a hand on the wheel —
+    and a test that tried to land either inside that gap would be timing-dependent
+    about the very thing it is asserting.
+    """
+    app_module, app = _quiet_dash()
+    async with app.run_test(size=(100, 20)) as pilot:
+        app.cfg = app.cfg or SimpleNamespace(base_url="http://board.invalid",
+                                             agent="host")
+        app.render_issues(_issues_for(*range(460, 400, -1)), None)
+        app.render_board({"agents": [], "claims": []})
+        await pilot.pause(0.2)
+        table = app.query_one("#work")
+
+        async def restore(generation, from_row):
+            table.scroll_to(y=from_row, animate=False)
+            await pilot.pause(0.2)
+            app.restore_work_scroll(generation, 20)
+            await pilot.pause(0.2)
+            return table.scroll_y
+
+        # THE CONTROL FIRST: with nothing in the way it moves the view, so the two
+        # refusals below are this method declining rather than this method being
+        # unable to do anything at all.
+        live = await restore(app.work_scroll, 0)
+        stale = await restore(app.work_scroll - 1, 0)
+        readers = await restore(app.work_scroll, 5)
+        return live, stale, readers
+
+
+def test_a_superseded_scroll_restore_and_a_readers_own_scroll_both_win():
+    """The restore is deferred a refresh, and both guards are about that gap.
+
+    A newer rebuild wins because two callbacks run in the order they were queued,
+    so without the check the OLDER rebuild's anchor lands last. And the reader wins
+    because `clear()` left the view at the top, so a `scroll_y` that is no longer
+    zero belongs to somebody else — and overwriting it would be this method doing
+    to a reader exactly what it exists to stop being done to them.
+    """
+    live, stale, readers = asyncio.run(_drive_restore_guards())
+    assert live == 20, f"the restore did not move the view at all: {live}"
+    assert stale == 0, f"a superseded restore scrolled anyway: {stale}"
+    assert readers == 5, f"the restore overwrote the reader's own scroll: {readers}"
 
 
 #: A plan with three open items in one scope, one in another and one fleet-wide —
