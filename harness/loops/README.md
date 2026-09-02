@@ -1348,7 +1348,9 @@ any board call. A flat per-PR total does not bound spend per unit of work, it bo
 *how many units of work a PR is allowed*, and it binds latest and hardest on the round
 that matters most: spent on rounds 1 and 2, which were happening anyway, it refuses
 round 3 — the first round that reads the fixer's own commit, and the band
-`max_rounds: 6` was raised to buy. Measured over this board's own 115 recorded review runs,
+`max_rounds: 6` was raised to buy. Measured over this board's own 115 recorded review runs
+(`GET /reviews?days=365&limit=500`; `limit` defaults to 50, so the counts here do not
+reproduce without the params),
 of the seven PRs that reached round 3 at all rounds 1 and 2 take a **median 57%** of the PR's whole
 measured spend (n=7, 0%–89%, where the 0% is a PR whose first two rounds recorded no
 tokens at all); on the worst of them a flat total had 11% of itself left for the four
@@ -1372,7 +1374,7 @@ neither is that nobody looked. Setting *any* key in this block wakes the budget 
 every repo on the fleet and turns an unanswerable board into a refusal on the
 unattended path — the property that reverted `tokens_per_pr: 20,000,000` the day after
 it was set, and one this dial does not change. And the board's own history cannot state
-a per-round figure: 72 of its 115 recorded review runs are the fleet's ordinary four-seat shape and **not one of them measured all four seats** (62 measured three, five measured two, five measured none). Over the 62 that measured three, the measured — therefore undercounting — spend is a median of 729,755 tokens per round, p75 1,973,566, p90 4,506,368, min 185,377, max 10,049,641: a 54x spread inside one seat configuration, which makes any single value a policy choice rather than a measurement. #483 carries the arithmetic at each candidate value.
+a per-round figure: 72 of its 115 recorded review runs (same query as above) are the fleet's ordinary four-seat shape and **not one of them measured all four seats** (62 measured three, five measured two, five measured none). Over the 62 that measured three, the measured — therefore undercounting — spend is a median of 729,755 tokens per round, p75 1,973,566, p90 4,506,368, min 185,377, max 10,049,641: a 54x spread inside one seat configuration, which makes any single value a policy choice rather than a measurement. #483 carries the arithmetic at each candidate value.
 
 **What spend is measured in.** Tokens, input + output — `/review/stats`' own
 `billable`, since cached input is a slice *of* input and reasoning sits inside

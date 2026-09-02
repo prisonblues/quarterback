@@ -65,7 +65,8 @@ supposed to make on evidence.
 And it binds latest and hardest on the round that matters most. It is spent on rounds
 1 and 2 — the reviews that were already happening — and refuses round 3, which is the
 first round that reads the fixer's own commit and the whole reason `/panel-review-pr`
-§5 exists. Measured over this board's own recorded history (`GET /reviews`, 115 recorded
+§5 exists. Measured over this board's own recorded history (`GET /reviews?days=365&limit=500`,
+115 recorded
 review runs): of the seven PRs that reached round 3 at all, rounds 1 and 2 take a
 **median 57%** of the PR's entire measured spend (n=7, 0%-89%, where the 0% is a PR
 whose first two rounds recorded no tokens at all). On the worst of them a flat total

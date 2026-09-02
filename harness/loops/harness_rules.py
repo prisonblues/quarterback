@@ -1990,7 +1990,9 @@ DEFAULTS: dict = {
             # 1 and 2, which were happening anyway, and refuses round 3 — the first
             # round that reads the fixer's own commit, and the band `max_rounds: 6`
             # was raised to buy. Measured over this board's own 115 recorded rounds
-            # (`GET /reviews`, 115 recorded review runs): of the seven PRs that
+            # (`GET /reviews?days=365&limit=500` — the params matter, `limit`
+            # defaults to 50 and the counts below do not reproduce without them; 115
+            # recorded review runs): of the seven PRs that
             # reached round 3 at all, rounds 1 and 2 take a MEDIAN 57% of the PR's
             # whole measured spend (n=7, 0%-89%, where the 0% is a PR whose first two
             # rounds recorded no tokens at all), and on the worst of them a flat total
