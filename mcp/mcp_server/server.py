@@ -1841,9 +1841,24 @@ def _read_dial_value(value: DialValue) -> tuple[DialValue, str]:
 
     JSON where it parses, the string where it does not: `qbdata.parse_dial_value`'s
     rule, which `app/static/dials.html` also implements, and this is the third place
-    — deliberately, because none of the three can import either of the others (this
-    package depends on httpx and nothing else, and `test_package_contract.py` is why
-    that stays true).
+    — deliberately, because none of the three can import either of the others. This
+    package may reach httpx and the MCP SDK and nothing else: NOT the app, NOT the
+    harness. `test_package_contract.py` is what keeps that true, and `flake.nix`'s
+    `mcp-tests` check builds the package without even the SDK.
+
+    **It is not the same rule to the letter, and the two differences are decided
+    rather than inherited.** Both of those read a TEXT BOX, where a person has no
+    way to say which type they meant; this reads a parameter that already declares
+    every JSON type, so what arrives is evidence and not a keystroke.
+
+    - Whitespace is PRESERVED here and stripped there. `"  P2  "` is what a caller
+      sent, and a text box's tolerance for a stray space is not a reason to edit a
+      string somebody passed through an API. `json.loads` skips its own surrounding
+      whitespace, so this changes nothing for the values that get read.
+    - `NaN` and the infinities stay text here, as they do in the browser, and are
+      read as floats by `qbdata` — which is that implementation's bug and not a rule
+      worth copying: the board refuses them outright, so it turns a value it could
+      have stored into a 422.
 
     **The typed parameter above is the fix and this is the belt.** A caller that
     honours the schema needs nothing here; one that does not — the boundary #699 was
@@ -1858,12 +1873,19 @@ def _read_dial_value(value: DialValue) -> tuple[DialValue, str]:
     seat somebody switched off being dispatched anyway, and the reason this reads a
     text value rather than passing it along and hoping.
 
-    Nothing in the harness's table takes a string that parses as JSON — a severity
-    is `P2`, a gate is `shape`, a model is `sonnet`, and none of those parse — so
-    the rule costs those values nothing. What it costs is the ability to set a dial
-    to the literal string `"8000000"`, which no dial wants; the two implementations
-    above accept exactly the same trade, and a caller that needs the string back has
-    the board's own `POST /dials` for it.
+    **What it costs, stated in full:** no dial can be set through this tool to a
+    string that parses as JSON — `"false"`, `"null"`, `"0"`, `"[]"`, `"{}"`, or a
+    doubly-encoded `'"8000000"'`. Every string-valued dial the harness has is a word
+    that does not parse (`P2`, `shape`, `always`, `sonnet`), so the loss is real but
+    currently empty, and a caller who needs one has the board's own `POST /dials`.
+
+    **Refusing such a string instead was considered and is worse.** It is the safer
+    move on its face — no write, no guess — but the string arrives *because* the
+    boundary mangled it, so refusing does not send the caller back with a number: it
+    makes every `number` and `flag` dial unsettable through this tool, for the exact
+    caller the refusal was meant to protect. `qbdata.dial_refusal` settles the same
+    question the same way for the same reason — *"the cost of the false negative is
+    today's behaviour; the cost of a false refusal is a dial nobody can set at all"*.
     """
     if not isinstance(value, str):
         return value, ""

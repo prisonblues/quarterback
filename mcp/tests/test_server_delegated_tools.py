@@ -287,17 +287,89 @@ def test_the_reply_says_what_it_read_and_only_when_it_read_something(monkeypatch
     assert "value_read_as" not in out
 
 
-def test_the_value_parameter_declares_its_types(monkeypatch):
+def test_the_value_parameter_declares_its_types():
     """The half of the fix that has to hold at the boundary, where no assertion in
     this suite can reach: `object` yields `{"title": "Value"}` — no `type` — and a
-    parameter with no declared type is one a caller may hand over as text. This is
-    the only thing that keeps it spelled out, since every other test here passes
-    the value straight to the function and never sees the schema at all."""
+    parameter with no declared type is one a caller may hand over as text.
+
+    EVERY branch is checked for a type, not just the seven looked for. A subset
+    assertion passes just as happily with an eighth, untyped branch sitting beside
+    them — and an untyped branch is the whole of the original defect, so a test that
+    tolerates one is testing the wrong thing."""
     tool, = (t for t in srv.mcp._tool_manager.list_tools() if t.name == "dial_set")
     spec = tool.parameters["properties"]["value"]
-    declared = {branch.get("type") for branch in spec.get("anyOf", [])}
-    assert {"string", "integer", "number", "boolean", "array", "object",
-            "null"} <= declared
+    branches = spec.get("anyOf", [])
+    assert {branch.get("type") for branch in branches} == {
+        "string", "integer", "number", "boolean", "array", "object", "null"}
+    assert all(branch.get("type") for branch in branches), branches
+    assert "type" not in spec  # the union IS the type; a bare one beside it is not
+
+
+async def test_every_json_type_survives_the_tool_manager_s_own_call_path(monkeypatch):
+    """One step closer to the boundary than any other test here can get.
+
+    Everything else in this block calls `srv.dial_set(...)` directly, which proves
+    what the FUNCTION does and nothing about what reaches it — and #699 was a defect
+    of what reaches it. Going through `call_tool` puts the arguments through the
+    schema and pydantic validation the SDK actually applies, so a union that
+    silently rounded a bool to an int, or a float to a string, is caught here.
+
+    The wire itself — JSON-RPC encode/decode, and whatever the caller did before
+    that — is still out of reach from inside this process. That is the half the
+    typed schema is for, and `test_the_value_parameter_declares_its_types` is as
+    close to it as this suite gets."""
+    rec = wire(monkeypatch)
+    for value in (8000000, 3.5, True, False, None, ["a"], {"P3": 2}, "P2"):
+        rec.calls.clear()
+        await srv.mcp._tool_manager.call_tool(
+            "dial_set", {"dial": "review_panel.max_rounds", "value": value,
+                         "reason": "asked to"})
+        (_, body), = rec.calls
+        assert body["value"] == value
+        assert type(body["value"]) is type(value)
+
+
+def test_a_json_looking_string_cannot_be_set_and_that_is_the_trade(monkeypatch):
+    """The cost of the rule, asserted rather than left to the docstring.
+
+    A caller who genuinely means the STRING `"false"` cannot express it through this
+    tool — the same trade `qbdata.parse_dial_value` and `dials.html` make. It is
+    written down as a test because it is the one thing this fix takes away, and an
+    unstated loss is one nobody can find when a dial that wants such a value finally
+    exists. Today none does: every string-valued dial in `BOARD_DIALS` is a word that
+    does not parse as JSON."""
+    rec = wire(monkeypatch)
+    for text, becomes in (("false", False), ("null", None), ("0", 0),
+                          ("[]", []), ("{}", {}), ('"8000000"', "8000000")):
+        rec.calls.clear()
+        out = srv.dial_set(None, dial="review_panel.max_rounds", value=text,
+                           reason="asked to")
+        (_, body), = rec.calls
+        assert body["value"] == becomes
+        assert out["value_read_as"]           # never silently, always named
+
+
+def test_whitespace_is_the_caller_s_and_is_not_edited(monkeypatch):
+    """Where this deliberately parts company with the two parsers it mirrors: both
+    of those read a text box and strip it, because a person cannot see a trailing
+    space. This reads an API parameter, where a string is data somebody sent.
+
+    It matters for exactly one dial today — `review_panel.judge_model` is the only
+    `text` kind, and `board_dials` normalises severities and scopes but not that —
+    so a stripped `'  sonnet  '` would be this tool editing a value nobody asked it
+    to edit. `json.loads` skips its own surrounding whitespace, so the values that
+    DO get read are unaffected."""
+    rec = wire(monkeypatch)
+    srv.dial_set(None, dial="review_panel.judge_model", value="  sonnet  ",
+                 reason="asked to")
+    (_, body), = rec.calls
+    assert body["value"] == "  sonnet  "
+
+    rec.calls.clear()
+    srv.dial_set(None, dial="review_panel.max_rounds", value="  4  ",
+                 reason="asked to")
+    (_, body), = rec.calls
+    assert body["value"] == 4
 
 
 def test_a_non_finite_number_is_left_as_the_text_it_was(monkeypatch):
