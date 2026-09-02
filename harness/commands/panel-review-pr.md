@@ -343,6 +343,36 @@ From its output collect:
   says so on the line. Absent on round 1 and on a round with no readable fix range,
   because there was then no pass to measure and a line of zeroes would claim one
   wrote nothing.
+- **The fix pass this round read** — the line printed under that name
+  (`fix_pass` in the JSON, #624): the record of the pass that landed between the last
+  round and this one, as one artifact rather than as the five rungs of `round_stop`
+  that used to carry its pieces. Its commit range and how many fix phases that range
+  actually `spans`; which round's **To fix** list briefed it and how big that list was;
+  the churn split; the files it touched and which of them no earlier round had read;
+  which of the brief's findings this round no longer raises; and how many of THIS
+  round's findings were attributed to it. `null` where there was no pass — round 1, or
+  a run outside a cycle.
+
+  **Nothing here is a score and you must not turn it into one.** Every number on the
+  record is a count, deliberately: #624 is explicit that every obvious ratio over a fix
+  pass is gameable in a direction worse than the disease, and it names four —
+  lines per finding cleared, findings introduced per pass, new files opened, and share
+  of fixes still standing a round later. So do not compute one, do not rank the rounds
+  of a cycle against each other on it, and do not brief the next fixer as though a
+  previous pass had scored badly. Carry the numbers into §6 the way you carry
+  Guard-to-guarded, which is as a diagnostic.
+
+  **`cleared` is not `verified fixed`.** It means this round did not raise the complaint
+  again, and under the default `increment` scope this round re-read only the fix range —
+  so a complaint in a file it never looked at again is in there too. `scope` sits on the
+  record so the sentence you write can say which it was, and `gaps` is the record's own
+  list of what it cannot say.
+
+  **`declared` is a declaration and the rest is not.** `narrowed`, `declined` and
+  `escalated` are what the pass reported about itself; everything else was derived from
+  the range, the commits and the brief. The record keeps them apart and so should your
+  §6 sentence — the whole reason this exists is that the fixer's own account of its work
+  was the only account there was (#622).
 - **Budget spend of the last fix pass** — the line printed under that name
   (`round_stop.fix_budget` in the JSON, #622): what the pass that landed between the last
   round and this one COST, priced the way `low_severity_fix_lines` is spent — production
@@ -1692,6 +1722,15 @@ Then the part that is new, and is the point of running more than one round:
   the two should agree, and a disagreement is worth a sentence of its own. It gates
   nothing, so this is a report and not a verdict — but a P1 in a file that entered the PR
   through a fix pass is the shape both halves of this exist to make visible.
+- **The fix pass (#624):** `fix_pass` from each round that read one — range, `spans`,
+  brief size, churn split, surface, `cleared`/`still_open` and `introduced`. Report it as
+  a description of the pass and never as a verdict on it: no ratio, no ranking of the
+  cycle's rounds against each other, and no "this pass was worse than that one". Where
+  the fixer's own summary described its pass and the record describes it differently, say
+  both — that is the disagreement the record exists to make visible, and it is the same
+  reason the budget count moved out of the fixer. Where `spans` is greater than 1 the
+  word "pass" is wrong about that row and you should say how many phases it covers.
+  A `null` record means there was no pass to describe, never that a pass did nothing.
 - **Budget spend (#622):** `fix_budget` from each round that measured one. Report
   `within: true` as what it is — the pass was shown from outside to fit inside the round's
   budget — and `within: false` as what it is not: the budget could not be shown to have

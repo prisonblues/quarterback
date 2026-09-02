@@ -418,6 +418,53 @@ to resolve a rev against, does not recompute a digest and does not parse a store
 path. The first three ride every view because a recalibration slices a
 population on them; the path is detail-only, on ``unread_files``' rule.
 
+**#624 — and the fix pass itself, which is the one actor here nothing recorded.**
+Everything above is about a ROUND: what it read, under which dials, with which
+seats, produced by which harness, ending in which verdict. Reviewers have
+scorecards, findings have keys and terminal outcomes, rounds have this row. The
+actor BETWEEN two rounds — the fix pass, which writes the code that produces the
+next round's findings — had a paragraph in a markdown brief and nothing else. On
+``prisonblues/lexray#1780`` its four passes ran to +850/-314 across 11 files,
++322/-49 across 9, +356/-41 across 12 (seven of them files no round had read) and
++142/-31 across 7, and every one of those numbers was reconstructed from ``git`` by
+hand, afterwards, in order to file the issue.
+
+* ``fix_pass`` — the record, verbatim and opaque
+  (:func:`_fix_pass_or_none`): the commit range and which of the three readers
+  supplied the diff, which round's To fix list briefed it and how big that list
+  was, the production / test / prose churn split, the files it touched and which of
+  them no earlier round of the cycle had read, which of the brief's findings this
+  round no longer raises, how many of this round's findings were attributed to it,
+  the ``narrowed``/``declined``/``escalated`` keys the pass declared, and ``gaps``
+  — the record's own account of what it cannot say. Detail-only on ``rules``' rule,
+  since it carries the file list and the finding keys.
+* ``fix_pass_counts`` — the record's own integer summary, LIFTED rather than
+  computed (:func:`_fix_pass_counts_or_none`), riding every view for the reason the
+  three tallies do: #624's instruction is to calibrate against real cycles before
+  anything is scored, and a calibration reads a population. Lifted off the value AS
+  SENT, so a record refused for its size still leaves its eleven integers — a pass
+  wide enough to blow the cap is wide because its file list is long, which is the
+  runaway #619 and #624 exist to expose, and coupling the two would have left that
+  row as the one with no numbers on it.
+
+Every value in the record was derived by the panel from the diff, the commits and
+the payload the pass was given — never from the pass's account of itself, which is
+what #622 and #621 exist to remove — so this board derives none of them.
+
+**And it is deliberately not a leaderboard**, which is half of #624's title and a
+constraint on the schema rather than a note above it. Its second opinion is that
+every obvious ratio over a fix pass is gameable in a direction worse than the
+disease: lines per finding cleared rewards compressed and superficial fixes,
+findings introduced per pass rewards weakening tests and avoiding the files most
+likely to be read, new files opened rewards refusing a cross-file repair that is
+genuinely required, and share still standing a round later is invalid under
+increment scope. So the record carries **no actor key at all** — it names the pass
+by its range and the round that briefed it, never the agent, model or session that
+performed it, which is a stronger guarantee than a policy of not writing the query
+— there is no ratio column, nothing is indexed to invite an aggregation, and
+``GET /review/stats``, the leaderboard this table already feeds, does not read
+either field.
+
 **#646 — a value Postgres will not store, anywhere in the body, and the round is
 still recorded.** Every note above fixed the instance it created: ``review_panel``
 refused a NUL and a ``NaN`` in its own validator, #647's two blocks joined it, and
@@ -1620,6 +1667,36 @@ MAX_HARNESS_DIGEST_CHARS = 128
 #: honest value needs. This sits between the two: generous against real paths,
 #: closed against a locator used as a text field.
 MAX_HARNESS_PATH_CHARS = 512
+#: How big a stored ``fix_pass`` may be, serialised (#624). Measured against the
+#: worst pass this fleet has actually seen rather than picked: on
+#: ``prisonblues/lexray#1780`` round 3's pass touched 12 files and its round's To fix
+#: list held 12 findings, which is a record of about 3,500 characters. What can grow
+#: is the two path lists and the two key lists, and both are bounded by real limits
+#: on the producer — ``MAX_CHANGED_FILES`` files in a PR and a To fix list a round
+#: has to print — so this leaves room for a pass an order of magnitude wider than
+#: any observed and still refuses a record being used as a text field.
+#:
+#: REFUSED WHOLE rather than trimmed, on :func:`_opaque_or_none`'s rule and with a
+#: reason of its own: half a fix-pass record is not a smaller pass, it is a
+#: different one. Drop the new-file list and the pass reads as having opened nothing
+#: — the flattering direction on the one claim this record was filed to make.
+MAX_FIX_PASS_CHARS = 65536
+
+#: The keys a ``fix_pass.counts`` block may carry, and the vocabulary
+#: :func:`_fix_pass_counts_or_none` reads it against. It mirrors
+#: ``panel_rounds.FIX_PASS_COUNTS`` — the panel is the producer and this is the same
+#: list, written out here because the two halves cannot import each other
+#: (``harness/loops`` is installed without ``app/`` beside it) and
+#: ``tests/test_review_fix_pass.py`` is the place both are readable at once, which is
+#: where the drift check lives.
+#:
+#: **Every one is a COUNT, and there is deliberately no share, rate, ratio, score or
+#: rank among them** — #624's "do not leaderboard it", expressed as a vocabulary. The
+#: numerators and the denominators are all here; a consumer that wants a quotient has
+#: to write it down in its own code, where somebody can argue with which one it means.
+FIX_PASS_COUNTS = ("briefed", "placed", "cleared", "still_open",
+                   "production", "test", "prose", "churn",
+                   "files", "new_files", "introduced")
 
 
 def _has_nul(node: object) -> bool:
@@ -1642,18 +1719,20 @@ def _has_nul(node: object) -> bool:
     return False
 
 
-#: The three blocks :func:`_storable` does not walk into, because they are refused
+#: The blocks :func:`_storable` does not walk into, because they are refused
 #: WHOLE and a whole-body normalisation would quietly make them storable (#646).
 #:
 #: This is the exception the rest of that pass exists to justify. ``review_panel``
 #: (#643), ``rules`` and ``provenance_restored`` (#647) are policy records kept
-#: verbatim and never interpreted, and :func:`_opaque_or_none` argues at length
+#: verbatim and never interpreted, and ``fix_pass`` (#624) is a measurement record
+#: kept the same way; :func:`_opaque_or_none` argues at length
 #: that half a dial set is not a smaller policy but one no round ran under. A
 #: normalisation that reached inside one would produce exactly that: a stored
 #: policy differing by a character from the policy that ran, with the row saying
 #: it was stored intact. So they keep their own refusal and their own
 #: ``*_dropped`` signal, and the walk leaves them alone.
-_OPAQUE_FIELDS = frozenset({"review_panel", "rules", "provenance_restored"})
+_OPAQUE_FIELDS = frozenset({"review_panel", "rules", "provenance_restored",
+                            "fix_pass"})
 
 #: Keys whose value is a token MATCHED BY EXACT STRING — the one class
 #: :func:`_storable` drops rather than marks.
@@ -1967,6 +2046,67 @@ def _restored_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
                            why_whole=("a restored count without the rounds it was "
                                       "measured against is a number with no "
                                       "denominator"))
+
+
+def _fix_pass_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``fix_pass`` as this board will store it, and why it did not (#624).
+
+    The record of the fix pass the round read: its commit range, the round whose To
+    fix list briefed it, its churn split, the surface it opened, which of the brief's
+    findings the round no longer raises, how many of the round's own findings were
+    attributed to it, the declarations the pass made, and the record's own account of
+    what it cannot say.
+
+    Opaque on :func:`_opaque_or_none`'s rule and for a reason that is sharper here
+    than for the three policy records. Every value in this block was derived by the
+    panel from the diff, the commits and the payload the pass was given — never from
+    the fix pass's own account of itself, which is the constraint #622 and #621 rest
+    on. A board that re-derived one of them would be a second implementation of "how
+    much did this pass churn", free to disagree with the panel about the same pass:
+    what ``m6bc45ff1`` refuses for ``converged`` and what #305 was filed over.
+
+    What a trimmed record would falsely assert is its own thing. Half a dial set is a
+    policy no round ran under; half a fix-pass record is a DIFFERENT PASS — drop the
+    new-file list and it reads as a pass that opened nothing, which is the flattering
+    direction on the one claim #624 was filed to make.
+    """
+    return _opaque_or_none(v, field="fix_pass", cap=MAX_FIX_PASS_CHARS,
+                           why_whole=("a fix-pass record with its file or finding "
+                                      "lists dropped is not a smaller pass, it is "
+                                      "one that reads as having opened nothing"))
+
+
+def _fix_pass_counts_or_none(v: object) -> dict[str, int] | None:
+    """The integer summary lifted out of a stored ``fix_pass``, or None (#624).
+
+    **A LIFT, NOT AN INTERPRETATION**, and the distinction is the whole reason this
+    is three lines. The panel computes the ``counts`` block itself, as a projection
+    of the record it sits inside — one producer, one derivation, pinned on that side
+    by ``test_every_count_is_the_records_own_number``. This reads the named
+    sub-object, checks its keys against :data:`FIX_PASS_COUNTS` and its values
+    against :func:`_count_or_none`, and stores what survives. Nothing here sums,
+    divides, compares or fills in a missing key.
+
+    It exists because of where the two halves are read. The record carries path lists
+    and finding keys, so it is deferred and detail-only (``rules``' argument, at
+    ``GET /reviews?limit=500``); the counts are eleven integers, and #624's own
+    instruction — "calibrate against real cycles before anything is scored" — is a
+    question about a population, which detail-only would have made one fetch per run
+    to ask.
+
+    ``None`` rather than ``{}`` on a record with no readable ``counts``: an empty
+    tally would say a pass was measured and every answer came back zero, which is the
+    absent-versus-zero collapse the panel's own null discipline exists to prevent.
+    :func:`_tally_or_none` already returns ``{}`` only for a caller that sent ``{}``,
+    and the panel never does — so that shape is passed through as the honest record of
+    a producer this board has not met.
+    """
+    if not isinstance(v, Mapping):
+        return None
+    counts = v.get("counts")
+    if not isinstance(counts, Mapping) or not counts:
+        return None
+    return _tally_or_none(counts, FIX_PASS_COUNTS)
 
 
 def _word_or_none(v: object, *, cap: int = MAX_SCOPE_CHARS) -> str | None:
@@ -2318,6 +2458,34 @@ class ReviewIn(BaseModel):
     #: as a round that looked for restored lines and found none, and this model
     #: keeps the two apart for the reason ``provenance_counts`` beside it does.
     provenance_restored: dict[str, Any] | None = None
+    #: THE FIX PASS THIS ROUND READ (#624) — the record of the loop's one unrecorded
+    #: actor, stored verbatim on :func:`_fix_pass_or_none`'s terms.
+    #:
+    #: Everything on this model above describes a ROUND: what it reviewed, under
+    #: which dials, with which seats, produced by which harness, ending in which
+    #: verdict. The pass BETWEEN two rounds writes the code that produces the next
+    #: round's findings and had no field at all. #624 filed it after four passes on
+    #: one PR had to be reconstructed from ``git`` by hand in order to be described.
+    #:
+    #: ``null`` is "there was no pass to record": round 1, a run outside a cycle, and
+    #: every skip and refusal path — those reviewed nothing, so they measured nothing,
+    #: and a record of zeros there would attribute an unread pass's silence to the
+    #: pass. Never ``{}``: a pass that HAPPENED and could not be read arrives as a
+    #: record with nulls in it, because "opened no file and churned no line" is the
+    #: flattering direction on every claim it makes.
+    #:
+    #: **Nothing on this board ranks, scores or gates on it**, which is a requirement
+    #: of the feature and not an omission — see
+    #: :attr:`app.models.review.ReviewRun.fix_pass` for the four gameable ratios that
+    #: argument comes from, and note that the record carries no actor key at all.
+    fix_pass: dict[str, Any] | None = None
+    #: The record's own ``counts`` block, lifted from the submitted value by
+    #: :meth:`_count_files_sent` rather than sent as a key of its own — DERIVED here
+    #: and never taken from the sender, which is why it is spread after ``**v``.
+    #:
+    #: Lifted off the RAW value, so it survives a record :func:`_fix_pass_or_none`
+    #: refused. See that spread for why the two are deliberately decoupled.
+    fix_pass_counts: dict[str, int] | None = None
     #: WHICH range the attribution read (#512, stored by #647): ``increment``,
     #: ``compare`` or ``reconstructed``. Stored verbatim against no vocabulary —
     #: :func:`_word_or_none` argues why this field of all fields must not have one.
@@ -2409,6 +2577,11 @@ class ReviewIn(BaseModel):
     #: nowhere else. See :func:`_word_or_none`.
     rules_dropped: str = ""
     provenance_restored_dropped: str = ""
+    #: Why a fix-pass record arrived and was not stored (#624). Its own key beside
+    #: the three above rather than folded into them, on `rules_dropped`'s rule: they
+    #: are bounded differently and a producer told only "something you sent was too
+    #: big" cannot tell which field the board refused.
+    fix_pass_dropped: str = ""
     #: #646, and set by :func:`_storable_body` rather than by any one field's
     #: coercer: where in this body a NUL arrived and was replaced by
     #: :data:`UNPRINTABLE`, where a matched token was dropped for holding one, and
@@ -2523,6 +2696,9 @@ class ReviewIn(BaseModel):
         # #647's five. `since` is read here beside the other commit ids because it
         # goes through the same `_sha_or_none` and earns the same drop signal.
         rules, restored = v.get("rules"), v.get("provenance_restored")
+        # #624's record, read here with the other opaque blocks because it is
+        # refused on the same terms and earns the same named drop signal.
+        fix_pass = v.get("fix_pass")
         scope, range_source = v.get("scope"), v.get("fix_range_source")
         since = v.get("since_sha")
         # #112's four. `harness_rev` is read here with the other commit ids because
@@ -2600,6 +2776,30 @@ class ReviewIn(BaseModel):
                 # the wrong field.
                 "rules_dropped": _rules_or_none(rules)[1],
                 "provenance_restored_dropped": _restored_or_none(restored)[1],
+                # #624, on that same rule. A fix-pass record refused for its size
+                # would otherwise land on the NULL that means "there was no pass",
+                # which is a true statement about round 1 and a false one about a
+                # round that measured one and sent it.
+                "fix_pass_dropped": _fix_pass_or_none(fix_pass)[1],
+                # …and the eleven integers, lifted from the value AS SENT rather than
+                # from the field after coercion — which is what keeps them when the
+                # record itself is refused.
+                #
+                # **That decoupling is the point and it took a second look.** Read off
+                # the coerced field, an over-cap record would take the counts down with
+                # it: a pass wide enough to blow `MAX_FIX_PASS_CHARS` is wide because
+                # its file list is long, and that is exactly the runaway #619 and #624
+                # exist to make visible — so the one row a population most needs would
+                # be the one row with no numbers on it, and the loss would read as a
+                # round with no pass. The counts cannot carry an unstorable value by
+                # construction (`_bucket_or_none` matches a fixed vocabulary and
+                # `_count_or_none` admits only counts), so lifting them early trades
+                # nothing away.
+                #
+                # After `**v`, so a sender that spells this key itself has its own
+                # account overwritten — `FindingIn._keep_provenance_sent`'s rule:
+                # evidence the sender can write is not evidence.
+                "fix_pass_counts": _fix_pass_counts_or_none(fix_pass),
                 "unreadable_fields": sorted(
                     name for name, val, ok in (
                         ("unread_files", unread, isinstance(unread, (str, list))),
@@ -2617,6 +2817,11 @@ class ReviewIn(BaseModel):
                         ("rules", rules, isinstance(rules, Mapping)),
                         ("provenance_restored", restored,
                          isinstance(restored, Mapping)),
+                        # #624, on that same rule: a `fix_pass` that is not an object
+                        # would land on the NULL that means "there was no pass to
+                        # record", which is a claim about the cycle rather than about
+                        # a producer sending the wrong shape.
+                        ("fix_pass", fix_pass, isinstance(fix_pass, Mapping)),
                         # ...and #647's two words. One signal covers all three
                         # ways to get them wrong — a non-string, a blank and an
                         # over-long value — because a one-word field has one
@@ -2710,6 +2915,13 @@ class ReviewIn(BaseModel):
         """What the round declined to attribute, verbatim or not at all — #559,
         #647. See :func:`_restored_or_none`."""
         return _restored_or_none(v)[0]
+
+    @field_validator("fix_pass", mode="before")
+    @classmethod
+    def _fix_pass(cls, v: object) -> dict[str, Any] | None:
+        """The fix-pass record verbatim, or not at all — #624. See
+        :func:`_fix_pass_or_none` for what a trimmed one would falsely assert."""
+        return _fix_pass_or_none(v)[0]
 
     @field_validator("scope", "fix_range_source", mode="before")
     @classmethod
@@ -3420,6 +3632,17 @@ async def record_review(
         # consumer to ask for it first.
         rules=body.rules,
         provenance_restored=body.provenance_restored,
+        # #624: the fix pass this round read, stored AS SENT and never interpreted —
+        # every value in it was derived by the panel from the diff, the commits and
+        # the payload the pass was given, and a second derivation here would be free
+        # to disagree with the panel about the same pass.
+        #
+        # `fix_pass_counts` is the record's own `counts` block, LIFTED rather than
+        # computed (`_fix_pass_counts_or_none`), so that a run LIST can carry the
+        # numbers without the path lists riding with them. Both from one object, so
+        # the flat copy and the block it came from cannot describe two passes.
+        fix_pass=body.fix_pass,
+        fix_pass_counts=body.fix_pass_counts,
         fix_range_source=body.fix_range_source,
         # What the round reviewed, and the anchor it reviewed from. Both stored
         # even where they restate the default (`scope: "pr"` on a round 1), for
@@ -3711,6 +3934,13 @@ async def record_review(
         dropped["rules_dropped"] = body.rules_dropped
     if body.provenance_restored_dropped:
         dropped["provenance_restored_dropped"] = body.provenance_restored_dropped
+    # #624, on the same argument again and with the sharpest version of it: a
+    # fix-pass record refused in silence reads as "there was no pass to record",
+    # which is what round 1 and every skip legitimately send — so a producer that
+    # measured a pass and sent it would be told nothing, and the row would say the
+    # pass did not exist.
+    if body.fix_pass_dropped:
+        dropped["fix_pass_dropped"] = body.fix_pass_dropped
     # #646. Where in this payload a value arrived that Postgres would not have
     # taken, and what this board did with it. Reported for the reason every drop on
     # this path is, and with one extra: these are the only signals whose absence
@@ -4635,6 +4865,19 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "provenance_counts": r.provenance_counts,
         "recurrence_counts": r.recurrence_counts,
         "premise_counts": r.premise_counts,
+        # #624's integer summary of the fix pass this round read — eleven keys at
+        # most, so it rides everywhere the three tallies above do and for their
+        # reason. The RECORD itself does not: it carries the file list and the
+        # finding keys, so it is deferred and detail-only on `rules`' argument, and
+        # `GET /review/{id}` is what carries it.
+        #
+        # It is here because #624's own instruction is to calibrate against real
+        # cycles before anything is scored, and a calibration reads a POPULATION —
+        # "how big were the passes on rounds that then attributed nothing to them" is
+        # a question about thousands of rows, which detail-only would have made one
+        # fetch per run to ask. Counts and no arithmetic over them: nothing on this
+        # board divides one of these by another (see the column's docstring).
+        "fix_pass_counts": r.fix_pass_counts,
         "changed_lines": r.changed_lines,
         # The count only — the paths themselves are per-run children and would
         # turn every page of `GET /reviews` into a file dump. `GET /review/{id}`
@@ -8070,7 +8313,8 @@ async def get_review(
     # which is the failure mode worth having, since it cannot go unnoticed.
     run = await session.scalar(
         select(ReviewRun).where(ReviewRun.id == run_id)
-        .options(undefer(ReviewRun.unread_files), undefer(ReviewRun.rules))
+        .options(undefer(ReviewRun.unread_files), undefer(ReviewRun.rules),
+                 undefer(ReviewRun.fix_pass))
     )
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no review run {run_id}")
@@ -8142,6 +8386,17 @@ async def get_review(
         # anchor — and neither is the same as an empty object.
         "rules": run.rules,
         "provenance_restored": run.provenance_restored,
+        # #624: the fix pass this round read, in full. Detail-only on `rules`' rule
+        # — it carries the file list and the finding keys — while its integer summary
+        # rides `_run_view` as `fix_pass_counts`, which is the cut this endpoint
+        # makes for `unread_files` two keys up and for `harness_path` below.
+        #
+        # Unmasked. NULL is "there was no pass to record": round 1, a run outside a
+        # cycle, every skip, and every round recorded before the column. A pass that
+        # HAPPENED and could not be read arrives as a record with nulls INSIDE it, so
+        # the two cases are told apart by the record's own `range.kind` and never by
+        # this key being absent.
+        "fix_pass": run.fix_pass,
         # #112: where the harness that produced this round ran from. Detail-only,
         # on the rule directly above and for the cut `_run_view` states: the three
         # fields a population is GROUPED by ride every view, and the one a reader

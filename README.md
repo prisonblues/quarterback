@@ -1135,6 +1135,53 @@ detail-only. There is deliberately no release NUMBER among them — `package.nix
 `pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
 a merge, so a running harness has none to report and a branch's harness never had one.
 
+**And the FIX PASS itself, which is the one actor here nothing recorded (#624).** Everything above
+is about a round: what it read, under which dials, with which seats, produced by which harness,
+ending in which verdict. Reviewers have scorecards, findings have keys and terminal outcomes,
+rounds have a row. The actor *between* two rounds — the fix pass, which writes the code that
+produces the next round's findings — had a paragraph in a markdown brief. On `lexray#1780` its four
+passes ran to +850/−314 across 11 files, +322/−49 across 9, +356/−41 across 12 (seven of them files
+no round had read) and +142/−31 across 7, and every one of those numbers was reconstructed from
+`git` by hand, afterwards, in order to file the issue.
+
+`fix_pass` is that record, and it is an **assembly** rather than a new measurement: the churn split
+(#554), the surface (#619), the range and the brief's fate (#506), the pricing (#622) and the
+attribution (#489) were each already derived once a round and then filed under the round's *stop
+decision* as five unrelated rungs. #624's own words: the interesting field "already exists per-round
+as `introduced` — it simply is not attached to the pass that caused it".
+
+| field | what it is | authority |
+|---|---|---|
+| `range` | both ends of the commit range, which of three readers supplied the diff, how many commits and merges it holds, and `spans` — how many fix phases it actually covers | derived |
+| `brief` | which round's **To fix** list briefed it, how many findings that list held, and how many of them this round could key | derived |
+| `churn` | production / test / prose / total, over insertions plus deletions | derived |
+| `surface` | the files it touched, and which of them no earlier round of the cycle had read | derived |
+| `cleared` / `still_open` | brief entries this round no longer raises, and those it still does — keys and severities | derived |
+| `introduced` | how many of **this** round's findings were attributed to that pass | derived |
+| `declared` | the `narrowed` / `declined` / `escalated` keys the pass reported, dated to this round | **declared** |
+| `counts` | the eleven-key integer summary, which is what rides `GET /reviews` | derived |
+| `gaps` | the record's own account of what it cannot say | — |
+
+Every measurement comes from the diff, the commits and the payload the pass was given — never from
+the pass's account of itself, which is what #622 and #621 exist to remove — and the two things that
+*are* declarations sit under a key that says so and feed no count. The record is opaque JSONB on
+`GET /review/{id}`; `fix_pass_counts` is its own `counts` block, lifted rather than recomputed, and
+rides `GET /reviews` on the rule the three tallies already state.
+
+**And it is deliberately not a leaderboard**, which is the other half of #624's title. Its second
+opinion, adopted in full: every obvious ratio here is gameable in a direction worse than the
+disease — *lines per finding cleared* rewards compressed and superficial fixes, *findings introduced
+per pass* rewards weakening tests and avoiding the files most likely to be read, *new files opened*
+rewards refusing a cross-file repair that is genuinely required (a P1 left unfixed to protect a
+metric), and *share still standing a round later* is invalid under increment scope because the later
+round may never have re-read the repair. So the record carries **no actor key at all** — it names
+the pass by its range and the round that briefed it, never the agent, model or session that
+performed it, which is a stronger guarantee than a policy of not writing the query. No ratio is
+stored, nothing is indexed to invite an aggregation, `round_stop` is not passed it and does not read
+it, no dial governs it, and `GET /review/stats` — the leaderboard this table already feeds — does
+not touch it. The fixer's brief says the record is made and says it is not scored, because a
+measurement the measured party is not told about is a trap rather than a brake.
+
 **And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
 A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;
 `json.loads` accepts all four, so a round carrying one passed every validator and 500ed at the

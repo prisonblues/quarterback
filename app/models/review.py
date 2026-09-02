@@ -322,6 +322,84 @@ class ReviewRun(Base):
     #: only prior round IS the anchor. Not the same as a round that looked for
     #: restored lines and found none, which sends a ``count`` of 0.
     provenance_restored: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: THE FIX PASS THIS ROUND READ (#624) — the artifact for the one actor in this
+    #: loop nothing recorded.
+    #:
+    #: Reviewers have scorecards (:class:`ReviewReviewer`), findings have keys and
+    #: terminal outcomes (:class:`ReviewFindingOutcome`), rounds have this row, and
+    #: the machinery that produced a round has four columns of its own. The pass
+    #: BETWEEN two rounds — which writes the code that produces the next round's
+    #: findings — had nothing. On ``prisonblues/lexray#1780`` its four passes came
+    #: out at +850/-314 across 11 files, +322/-49 across 9, +356/-41 across 12 (7 of
+    #: them files no round had read) and +142/-31 across 7, and every one of those
+    #: numbers had to be reconstructed from ``git`` by hand afterwards to file the
+    #: issue.
+    #:
+    #: What is in it: the commit range and which of three readers supplied the diff,
+    #: which round's To fix list briefed it, the production/test/prose churn split,
+    #: the files it touched and which of them no earlier round had read, which of the
+    #: brief's findings this round no longer raises, how many of this round's
+    #: findings were attributed to it, and — segregated under ``declared`` and named
+    #: as declarations — the ``narrowed``/``declined``/``escalated`` keys the pass
+    #: reported. ``gaps`` is the record's own account of what it cannot say.
+    #:
+    #: **Opaque JSON, on :attr:`rules`' and :attr:`provenance_restored`' rule.** Every
+    #: value in here was derived by the panel from the diff, the commits and the
+    #: payload the pass was given; a board that re-derived one would be a second
+    #: implementation free to disagree with the panel about the same pass. The one
+    #: thing ingest does read is the ``counts`` sub-object, lifted verbatim into
+    #: :attr:`fix_pass_counts` beside it so a run LIST can carry the numbers without
+    #: the path lists — a lift, not an interpretation, and
+    #: ``_fix_pass_counts_or_none`` says so.
+    #:
+    #: **DEFERRED**, for :attr:`rules`' reason: it carries the file list and the
+    #: finding keys, so a ``GET /reviews?limit=500`` that fetched it would have
+    #: Postgres ship five hundred of them to serialise none. ``GET /review/{id}``
+    #: asks with ``undefer()``.
+    #:
+    #: **NOTHING RANKS, SCORES OR GATES ON IT, AND THAT IS A REQUIREMENT OF THE
+    #: FEATURE RATHER THAN A GAP IN IT.** #624's title carries it in the parenthesis
+    #: and its own second opinion supplies the argument: every obvious ratio over a
+    #: fix pass is gameable in a direction worse than the disease — lines per finding
+    #: cleared rewards compressed and superficial fixes, findings introduced per pass
+    #: rewards weakening tests and avoiding the files most likely to be read, new
+    #: files opened rewards refusing a cross-file repair that is genuinely required (a
+    #: P1 left unfixed to protect a metric), and share still standing a round later is
+    #: invalid under increment scope because the later round may never have re-read
+    #: the repair. So the record has no actor key at all — it names the pass by its
+    #: range and the round that briefed it, never the agent, model or session that
+    #: performed it — no endpoint aggregates it, no index invites one, and
+    #: ``GET /review/stats``, which is the leaderboard this table already feeds, does
+    #: not read it. ``tests/test_review_fix_pass.py`` pins each of those.
+    #:
+    #: NULL = there was no pass to record, which is round 1, a run outside a cycle,
+    #: and any round that reviewed nothing. Never ``{}``: a pass that could not be
+    #: read gets a record with nulls in it, because "opened no file and churned no
+    #: line" is the flattering direction on every claim this record makes.
+    fix_pass: Mapped[dict[str, Any] | None] = mapped_column(JSONB, deferred=True)
+    #: The integer summary of :attr:`fix_pass`, lifted out of the record's own
+    #: ``counts`` block so that it can ride the run LIST (#624).
+    #:
+    #: Eleven keys at most and every value a count or NULL, which is why this one is
+    #: not deferred and its parent is — the same cut :attr:`provenance_counts` and
+    #: ``unread_files_count`` already make on this row, and #112's grouping-key /
+    #: locator cut one field over. A population question about fix passes ("how big
+    #: were the passes on rounds that then attributed nothing to them") is a question
+    #: about thousands of rows, and detail-only would have meant one fetch per run to
+    #: ask it — which is precisely what #624 wants possible, since the issue's own
+    #: instruction is to calibrate against real cycles before anything is scored.
+    #:
+    #: **Counts, and no arithmetic over them.** There is deliberately no share, rate,
+    #: ratio or score in here and no column that is one: the numerators and the
+    #: denominators are both stored, and a consumer that wants a quotient has to
+    #: write it down in its own code where somebody can argue with it. See
+    #: :attr:`fix_pass` for why.
+    #:
+    #: NULL wherever :attr:`fix_pass` is NULL, and also where the record arrived
+    #: without a readable ``counts`` block — a producer this board has not met. Not
+    #: ``{}``: an empty tally would say a pass was measured and every answer was
+    #: zero.
+    fix_pass_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: WHICH HARNESS PRODUCED THIS ROUND (#112) — four fields, because no one of
     #: them is true in every case and a field that is sometimes a lie is worse than
     #: three that are each honest about their scope.
