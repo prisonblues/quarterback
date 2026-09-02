@@ -10,6 +10,7 @@ from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
 from app.models.plan_reconcile import PlanReconcile
+from app.models.plan_reconcile_pass import PlanReconcilePass
 from app.models.plan_scope import PlanScope
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
@@ -39,6 +40,7 @@ __all__ = [
     "Plan",
     "PlanItem",
     "PlanReconcile",
+    "PlanReconcilePass",
     "PlanScope",
     "Post",
     "ResourceLease",

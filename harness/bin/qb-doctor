@@ -1262,13 +1262,47 @@ def unit_state(verb: str, unit: str) -> tuple[str, str | None]:
     return "", f"{verb} said nothing"
 
 
+#: How long the FLEET may go without a reconcile pass before this row says so.
+#: The timer that writes one fires every fifteen minutes on the hosts that hold
+#: it, so an hour is four missed ticks — long enough that a desktop rebooting or a
+#: laptop shut for lunch raises nothing, short enough to notice inside the window
+#: `plan_read`'s answers are still worth acting on. It buys a `warn` and never a
+#: `fail`: "the machines that hold the timer are off" is a fact about the fleet's
+#: day, and not one the host reading this row can repair.
+RECONCILE_STALE_MINUTES = 60
+
+
 def check_reconcile(host: Host) -> Check:
-    """Is the reconcile timer enabled and running ON THIS HOST?
+    """Is the reconcile pass running — HERE if this host holds the timer, in the FLEET if not.
 
     It shipped with its units in `harness/loops/systemd/` and was installed on no
     host at all, so the plan `plan_read` hands a cold agent went 39% wrong — 13 of
     33 items pointing at closed issues — while every component involved reported
     itself healthy.
+
+    **Which host runs it was never the question (#695).** The pass reports on the
+    board's plan, which is one shared object, and `/plan/reconcile` is built for
+    more than one reporter — "two hosts hold this timer and their passes can land
+    together". Asking every host whether it personally holds the timer called
+    three of the fleet's five unwired for running their own design: in nix-fleet
+    the units come from `home/rich-workstation.nix`, which only the two desktops
+    import, so atlas, sisyphus and daedalus could never pass. One `fail` sets the
+    headline in `summary()` and makes `exit_code()` 2, so the whole report went
+    out under a verdict that was false.
+
+    So the row splits on whether this host has the units at all. It HAS them: the
+    old local check, unchanged, because a timer that exists here and is dead is
+    this host's fault and the board cannot see it. It does NOT: ask the board, via
+    :func:`_reconcile_in_the_fleet`.
+
+    **Not answered from board posts, and this is the trap.** `qb-reconcile --post`
+    is gated on `has_content`, so a pass that finds nothing posts nothing at all,
+    and `REPOST_AFTER` only bounds how often a pass WITH something to say repeats
+    itself. "No `finding` post in four hours" is therefore the signature of a
+    healthy fleet as much as a stopped one — the absent-result-as-benign reading
+    that `_edge_spoof_refused` is annotated against, arriving in the row where it
+    would be hardest to notice, since it fails open exactly when nothing else is
+    complaining either.
     """
     if shutil.which("systemctl") is None:
         return Check("reconcile", "qb-reconcile.timer",
@@ -1289,16 +1323,84 @@ def check_reconcile(host: Host) -> Check:
                      manual="check the user bus is up (loginctl enable-linger, or run "
                             "inside a login session) and re-run")
     if enabled == "not-found":
-        return Check("reconcile", unit,
-                     "no such unit on this host — the units are in harness/loops/systemd/ "
-                     "and were never installed", "fail",
-                     manual="install harness/loops/systemd/qb-reconcile.{service,timer} into "
-                            "~/.config/systemd/user (nix-fleet does this) and "
-                            "`systemctl --user daemon-reload`")
+        return _reconcile_in_the_fleet(host, unit)
     if enabled != "enabled" or active != "active":
         return Check("reconcile", unit, f"is-enabled={enabled}, is-active={active}", "fail",
                      manual="systemctl --user enable --now " + unit, fix=fix)
     return Check("reconcile", unit, f"enabled, active{_last_run()}", "ok")
+
+
+def _reconcile_in_the_fleet(host: Host, unit: str) -> Check:
+    """Is ANY host reconciling — asked of the board, for a host that holds no timer.
+
+    `ok` still names the pass and its age rather than saying "not my job", because
+    a reader who cannot see what this host is trusting has only been told to stop
+    worrying. `fail` is kept for the one state that is a genuine fault — nothing
+    anywhere has ever run one, which is #255's original night — and staleness buys
+    a `warn`, per :data:`RECONCILE_STALE_MINUTES`.
+
+    **A board too old to answer is `unknown`, not `fail`.** The endpoint arrives
+    with this change, so every board predating it 404s, and reading that as "no
+    host is reconciling" would invent an outage out of a deployment lag —
+    `check_board`'s `_board_by_capability` reasoning, in the row that would
+    otherwise be first to trip over it.
+    """
+    absent = "no such unit on this host"
+    install = ("install harness/loops/systemd/qb-reconcile.{service,timer} into "
+               "~/.config/systemd/user (nix-fleet does this on the hosts that hold "
+               "the timer) and `systemctl --user daemon-reload`")
+    if not host.base_url:
+        return Check("reconcile", unit,
+                     f"{absent}, and no board configured, so whether the fleet runs a "
+                     "pass could not be asked", "unknown", manual=install)
+    payload, why = board_get(host, "/plan/reconcile")
+    if why:
+        return Check("reconcile", unit, f"{absent}, and the board could not be asked: {why}",
+                     "unknown", manual=install)
+    passes = payload.get("passes")
+    if not isinstance(passes, list):
+        return Check("reconcile", unit,
+                     f"{absent}, and the board did not answer a list of passes",
+                     "unknown", manual=install)
+    if not passes:
+        # The one genuine fault this row can still report, and #255 exactly: the
+        # units exist in the repo and on no host in the fleet, so the plan ages
+        # against a GitHub nobody is comparing it to.
+        return Check("reconcile", unit,
+                     f"{absent}, and NO host has recorded a reconcile pass on this board "
+                     "— nothing in the fleet is comparing the plan against GitHub",
+                     "fail", manual=install)
+    # `min` over the ages, not `passes[0]`: the board orders by its own column and a
+    # row this could not read a timestamp from must not silently become the answer.
+    dated = [(age, p) for p in passes
+             if isinstance(p, dict)
+             and (age := _age_minutes(p.get("at"))) is not None]
+    if not dated:
+        return Check("reconcile", unit,
+                     f"{absent}, and no pass the board listed carried a readable time",
+                     "unknown", manual=install)
+    age, freshest = min(dated, key=lambda pair: pair[0])
+    who = freshest.get("reported_by") or "an unnamed host"
+    where = freshest.get("repo") or "an unnamed scope"
+    if age < 0:
+        # Skew, not freshness. `_age_minutes` returns negative rather than clamping
+        # precisely so this stays distinguishable from "just now" — a pass dated in
+        # the future would otherwise read as the healthiest state there is.
+        return Check("reconcile", unit,
+                     f"{absent}, and the board's newest pass ({where}, by {who}) is dated "
+                     f"{_spell_age(-age)} in the FUTURE — a clock disagrees",
+                     "unknown", manual=install)
+    scopes = f"{len(passes)} scope(s)" if len(passes) != 1 else "1 scope"
+    if age > RECONCILE_STALE_MINUTES:
+        return Check("reconcile", unit,
+                     f"{absent}, and the fleet's newest pass is {_spell_age(age)} old "
+                     f"({where}, by {who}) across {scopes}",
+                     "warn",
+                     manual="the hosts that hold the timer are not running it — check "
+                            "qb-reconcile.timer there, or install it here: " + install)
+    return Check("reconcile", unit,
+                 f"not this host's timer; {who} reconciled {where} {_spell_age(age)} ago "
+                 f"across {scopes}", "ok")
 
 
 def _last_run() -> str:
@@ -4323,24 +4425,44 @@ CHECKS = (
             "closed. The timer existed in-repo and on no host, so the plan went 39% wrong "
             "— 13 of 33 items pointing at closed issues — while every component involved "
             "reported itself healthy. Nothing downstream can detect this: a stale plan "
-            "reads exactly like a plan."),
+            "reads exactly like a plan. The pass is a FLEET singleton over one shared "
+            "plan, so a host that does not hold the timer is not thereby unwired (#695); "
+            "what matters is that some host is running it, which the board is asked."),
         briefs={
             "fail": Brief(
                 audience="agent",
-                task=("The reconcile timer is not running on this host. The units are in "
-                      "`{repo}/harness/loops/systemd/`; install them for this user and "
-                      "enable the timer, then confirm it has actually fired rather than "
-                      "merely being enabled."),
+                task=("Either this host holds the timer and it is dead, or no host in the "
+                      "fleet has recorded a pass at all — the detail says which. The units "
+                      "are in `{repo}/harness/loops/systemd/`; install them for this user "
+                      "and enable the timer, then confirm it has actually fired rather "
+                      "than merely being enabled."),
                 constraints=(
                     "User units, not system ones. This runs as the agent's own user and "
                     "needs no privileges.",
                     "`systemctl --user enable --now` exits 0 on a bus that will drop the "
                     "unit at logout. If the box has no lingering session, say so — "
                     "`loginctl enable-linger` is a person's call.",
+                    "If the detail says NO host has recorded a pass, check whether the "
+                    "hosts that are supposed to hold the timer are simply off before "
+                    "installing it somewhere new. A second timer is cheap and harmless, "
+                    "but it is not the fix for a desktop that is powered down.",
                 ),
                 verify=(
                     "`systemctl --user list-timers qb-reconcile.timer` shows a LAST that "
                     "is not `n/a`",
+                )),
+            "warn": Brief(
+                audience="agent",
+                task=("The fleet's newest reconcile pass is older than an hour, on a host "
+                      "that does not hold the timer itself. Find out whether the hosts "
+                      "that do hold it are running — this is usually a machine that is "
+                      "off, not a mechanism that is broken."),
+                constraints=(
+                    "Do not install the timer here to clear the row. That silences the "
+                    "symptom on one host and leaves the fleet's pass exactly as stopped.",
+                ),
+                verify=(
+                    "`GET /plan/reconcile` shows an `at` inside the last hour",
                 )),
         }),
     CheckSpec(

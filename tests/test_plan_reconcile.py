@@ -333,3 +333,78 @@ async def test_a_repeat_of_the_same_condition_keeps_its_age(client):
 
     assert now["since"] == was["since"]
     assert now["said"] == "said again, differently worded"
+
+
+# --------------------------------------------------------------------------- #
+# that a pass RAN, as opposed to what it found (#695)
+# --------------------------------------------------------------------------- #
+
+async def passes(client, headers=LAPTOP) -> list[dict]:
+    r = await client.get("/plan/reconcile", headers=headers)
+    assert r.status_code == 200, r.text
+    return r.json()["passes"]
+
+
+def _for(rows: list[dict], repo: str) -> dict | None:
+    return next((p for p in rows if p["repo"] == repo), None)
+
+
+async def test_a_pass_that_found_nothing_still_says_it_ran(client):
+    """The whole of #695. A clean scope re-reports nothing, so `report_reconcile`
+    deletes every row it has — and `plan_reconcile` empty is the same table state as
+    a board nothing has ever reconciled. Those are the two states a monitor most
+    needs to tell apart, and the findings cannot tell them apart by construction:
+    the absence of a finding is what the table is FOR."""
+    repo = "acme/reconcile-ran-clean"
+    await issue(client, repo, 695)
+
+    await report(client, repo, [])
+
+    row = _for(await passes(client), repo)
+    assert row is not None, "a pass with nothing to say left no evidence it ran"
+    assert row["at"]
+
+
+async def test_the_pass_names_the_machine_that_ran_it(client):
+    """`ok` on the doctor's side quotes this. A row that cannot say who reconciled
+    tells a reader to stop worrying without saying what they are trusting."""
+    repo = "acme/reconcile-attributed"
+
+    await report(client, repo, [], headers=DESKTOP)
+
+    assert _for(await passes(client), repo)["reported_by"]
+
+
+async def test_a_scope_keeps_one_row_however_many_passes_land(client):
+    """One row per scope, not a log. The timer fires every fifteen minutes on more
+    than one host and only ever the newest matters, so this must not grow with time."""
+    repo = "acme/reconcile-one-row"
+
+    await report(client, repo, [])
+    first = _for(await passes(client), repo)["at"]
+    await report(client, repo, [done(695)])
+    again = await passes(client)
+
+    assert len([p for p in again if p["repo"] == repo]) == 1
+    assert _for(again, repo)["at"] >= first, "the row did not move forward"
+
+
+async def test_a_pass_with_findings_records_that_it_ran_too(client):
+    """Not only the empty case: the row is about the pass, so it is written whatever
+    the pass found. A version that wrote it only when the report was empty would be
+    silent for exactly the fleet that has something wrong with it."""
+    repo = "acme/reconcile-ran-dirty"
+    await issue(client, repo, 696)
+
+    await report(client, repo, [done(696)])
+
+    assert _for(await passes(client), repo) is not None
+
+
+async def test_a_scope_nobody_reconciled_has_no_row(client):
+    """`null` is a real answer. Nothing invents a pass for a scope that never had one
+    — that would be the false pass the doctor's row is being rescued from."""
+    repo = "acme/reconcile-never-touched"
+    await issue(client, repo, 697)
+
+    assert _for(await passes(client), repo) is None
