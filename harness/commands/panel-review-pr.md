@@ -372,7 +372,12 @@ From its output collect:
   stronger statement than `within: true`. `null` is the ordinary case and means no
   strict verdict was available; `brief` beside it says which of the reasons it was, in a
   sentence, and carries the prior round's finding count and how many of them were
-  budgeted so you can check the claim rather than take it. **A `null` here is evidence
+  budgeted so you can check the claim rather than take it. One of those reasons is
+  worth knowing about: since #551 the budget is `min(dial, its pro-rata share of the
+  cycle's first round)`, so the number a round SPENDS against is not the dial — and a
+  cycle whose two rounds applied different budgets reaches no strict verdict, because
+  a breach priced against a bound the fixer was never given is an accusation about a
+  policy nobody ran. **A `null` here is evidence
   of nothing** — do not read it as a pass and do not read it as a failure. There is
   still no flag to arm and no new dial: the limit is one the repo already wrote, the
   band is one its own floors carve out, and the premise is a proof rather than a
