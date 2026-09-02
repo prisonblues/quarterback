@@ -88,14 +88,16 @@ report prints them on its **Panel dials** line). Five of them define this pass:
   it; what matters here
   is that it is a budget for the round and not a cap per fix, because the failure it
   answers was 408 lines of individually reasonable small fixes on a 185-line PR.
-- **`low_severity_fix_pct`** (default `22.4`) — the proportional half of that same
-  budget: the most of the cycle's FIRST round the band may spend, with the round
-  spending whichever half is SMALLER (#551). **The report states the number this round
-  actually got, and that number is the one to spend** — on a small PR it is less than
-  40, because a fixed budget is a bigger share of a smaller change and the failure this
-  budget answers was 74% of one PR being review-response code. Nothing here changes
-  which findings are on the budget or the order they are spent in; it changes how many
-  lines there are.
+- **`low_severity_fix_full_chars`** (default `14325`) — the proportional half of that
+  same budget: the chars of the cycle's FIRST round at or above which the whole line
+  budget applies, with a smaller PR getting it pro rata and the round spending whichever
+  half is SMALLER (#551). **The report states the number this round actually got, and
+  that number is the one to spend** — on a small PR it is less than 40, because a fixed
+  budget is a bigger share of a smaller change and the failure this budget answers was
+  74% of one PR being review-response code. It never goes below one honest one-line fix
+  (`2 x unrefereed_line_weight`), so there is always something to spend. Nothing here
+  changes which findings are on the budget or the order they are spent in; it changes
+  how many lines there are.
 - **`unrefereed_line_weight`** (default `2`) — what ONE churned line of test or prose
   costs that budget, against a line of production code at 1. The budget's unit is
   exposure, not length. Step 3 has the arithmetic; what matters here is that it is
@@ -414,8 +416,8 @@ nothing** today — instrumented, printed and read, per #67's instrument-before-
 **The low-severity band is on a budget, and you spend it by COUNTING.** Findings
 below `round_trigger_floor` — the ones a panel report marks 💸 — share
 `low_severity_fix_lines` churned lines for the whole round (40 by default, and LESS on
-a small PR, where `low_severity_fix_pct` caps the same budget at a share of the cycle's
-first round — take the number the report states, never the default). Findings
+a small PR, where `low_severity_fix_full_chars` scales the same budget to the size of
+the cycle's first round — take the number the report states, never the default). Findings
 at or above the cut are not on the budget; what IS on it whatever their severity is the
 test and doc work no finding asked for, which is the split in item 3 below.
 

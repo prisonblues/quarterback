@@ -456,9 +456,10 @@ with these overrides:
   one, and a **To fix** list pasted without them briefs the pre-#297 behaviour: every
   low-severity finding unconditional, which is the 408-line round-1 fix pass this
   budget exists to stop. Copy the note under the heading verbatim — it carries the
-  line count and the spend rule, and since #551 that count is **this round's**, which on
-  a small PR is less than `low_severity_fix_lines`: never substitute the dial's value
-  for the number the note states.
+  line count and the spend rule, and since #551 that count is **this round's**, scaled
+  to the size of the cycle's first round: on a small PR it is less than
+  `low_severity_fix_lines`, so never substitute the dial's value for the number the note
+  states.
 - **Selecting findings and capping churn are INDEPENDENT controls, and naming
   findings NEVER lifts the budget (#492).** A human who says "just fix the
   concurrency ones" has narrowed *which* findings this pass may touch. They have said

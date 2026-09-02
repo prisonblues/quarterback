@@ -893,8 +893,11 @@ DEFAULTS: dict = {
         # none of the band, which is `fix_severity_floor` raised to the cut without
         # saying so twice.
         "low_severity_fix_lines": 40,
-        # The PROPORTIONAL half of that same budget (#551), as a percentage of the
-        # cycle's FIRST round, with the round spending whichever of the two is SMALLER.
+        # The PROPORTIONAL half of that same budget (#551), written as the first
+        # round's SIZE rather than as a rate: at or above this many chars the whole
+        # `low_severity_fix_lines` budget applies, and below it the budget is pro rata
+        # — `lines x first_chars / this` — so the round spends whichever of the two
+        # ceilings is smaller.
         #
         # **A CEILING, AND THE OPPOSITE OPERATOR TO #664's FLOOR ONE BLOCK DOWN.** The
         # two are the same sizing question read from opposite ends and the obvious
@@ -902,92 +905,108 @@ DEFAULTS: dict = {
         # proportional allowance shrinks with the PR while diff framing does not, so a
         # tiny PR cannot afford one honest fix — that wants a floor. The measurement
         # THIS budget answers (#297) is accumulation RELATIVE TO THE CHANGE: PR #188's
-        # 185-line feature became 721 churned lines, 74% of it review-response code. Its
+        # feature became 721 churned lines, 74% of it review-response code. Its
         # dangerous end is therefore the SMALL PR, where a fixed 40 lines can exceed the
-        # diff it is polishing — 40 is ~22% of a 179-line change and larger than a
-        # 30-line one. On a 5,000-line PR 40 lines of P3 work is not the failure mode,
-        # it is harmless noise. So the companion tightens on small PRs and never loosens
-        # on large ones, which is a `min` and not a `max`. Anyone implementing this from
-        # "40 lines is noise on a big PR" writes the `max`, and that is the version that
-        # reintroduces #188.
+        # diff it is polishing. On a 5,000-line PR 40 lines of P3 work is not the
+        # failure mode, it is harmless noise. So the companion tightens on small PRs and
+        # never loosens on large ones, which is a `min` and not a `max`. Anyone
+        # implementing this from "40 lines is noise on a big PR" writes the `max`, and
+        # that is the version that reintroduces #188.
         #
-        # **22.4, and it is the allowance the absolute already grants.** 40 / 179 =
-        # 22.35%, the "sane ~22% allowance" #551 measures on the one run anybody has
-        # watched this dial on — a 179-line PR where the round spent 31 of its 40 lines
-        # and dropped a 17-line fix against 9 remaining, which is the dial working. So
-        # the crossover is 40 / 0.224 = 178.6 churned lines: at or above that the
-        # absolute binds and NOTHING CHANGES, and below it the proportion does. Rounded
-        # UP from 22.35 rather than down, because a ceiling should not tighten the case
-        # its own calibration says is fine: at 22.4 that 179-line run keeps all 40 of
-        # its lines and this key is a provable no-op on every run anybody has measured.
-        # A 30-line PR gets 6, a 100-line one 22, a 500-line one the full 40.
+        # **CHARS, AND NOT A PERCENTAGE OF SOMETHING COUNTED IN LINES.** The budget is
+        # spent in churned lines and the only size a baseline records for the cycle's
+        # first round is `pr_chars`, so a proportional companion has to be written in
+        # one unit or the other. It is written in CHARS because that is the unit the
+        # comparison actually happens in: a percentage calibrated in lines would need a
+        # chars-per-line rate to be applied at all, every sentence about where it
+        # crosses would be true only at that rate, and the rate itself is the thing #692
+        # is open about — PR #188's 34,717 chars reproduce and its 521 churned lines do
+        # not. A size in chars needs no rate, states its crossing in the unit the code
+        # compares, and cannot inherit that dispute. The earlier draft of this key was a
+        # percentage over a `CHARS_PER_CHURNED_LINE` constant; it is gone, and this is
+        # why.
         #
-        # **The conversion is measured, and it does not agree with the 66 written one
-        # key down.** The first round's size exists on a baseline only as `pr_chars`, so
-        # turning it into the churned lines this budget is spent in needs a rate:
-        # `panel_seats.CHARS_PER_CHURNED_LINE`, 58. That is PR #188's own MERGED diff —
-        # 34,635 chars over 597 churned lines — re-measured for this key rather than
-        # taken on trust, and it is not the 34,717-over-521 (66 a line) that
-        # `max_fix_growth_chars` calibrates against below. 34,717 reproduces on today's
-        # PR; 521 does not, and neither does the 721 in #297's own measurement, so both
-        # line counts appear to be from a pre-rebase state nothing can now read. 66 is
-        # left where it is rather than corrected on a guess, and this key uses the
-        # number that can be reproduced. Cross-checked against this repo's last 25
-        # non-merge commits, which run 60-95 chars a churned line with a median of 81
-        # (three outliers above, to 741). 58 sits at the BOTTOM of that on purpose:
-        # under-stating chars-per-line over-states the PR's line count and so LOOSENS
-        # this ceiling, and #664 has just measured what a fix budget that binds too
-        # early actually costs — a regression the next round pays to rediscover.
+        # **14,325, AND IT IS MEASURED IN CHARS RATHER THAN CONVERTED INTO THEM.** The
+        # policy #551 states is a ratio — "on a 179-line PR, 40 lines is a sane ~22%
+        # allowance" — which puts the full budget at a PR of about 40 / 0.22 = 182
+        # churned lines. Turning that into a size could have been done with a rate; it
+        # was done by measurement instead. Every merged PR of this repo whose churn is
+        # between 120 and 260 lines (n=21) was fetched, its diff measured in chars, and
+        # each scaled to exactly 182 churned lines: median 14,325 chars, range 9,538 to
+        # 18,604. So this is not "182 lines times an assumed rate", it is the size PRs
+        # of that shape ACTUALLY ARE here, and a reader who disagrees can re-run the
+        # measurement rather than argue about a constant. The spread is wide and is
+        # stated rather than hidden: n=21 supports a median and not a fourth
+        # significant figure, and the number is quoted unrounded because rounding it
+        # would be choosing a number where a measurement was available.
         #
-        # **A DERIVED BUDGET IS NEVER ZERO, because `0` is a written value with its own
-        # meaning.** An operator's `low_severity_fix_lines: 0` says "fix none of the
-        # band" and raises the applied floor to the trigger cut (`Dials.fix_floor`). A
-        # proportion that floored to 0 on a very small PR would express that decision
-        # without the operator having made it, and would move a floor as a side effect
-        # of the PR's size. So the derived value is clamped at 1 — the smallest budget
-        # that is still a budget — and a written `0` is left exactly where it is: this
-        # key may lower a budget and may never raise one or switch one off.
+        # What that buys, in the unit the dial is written in: a 40,000-char PR gets the
+        # full 40 lines, 10,000 chars gets 27, 5,000 gets 13, 2,000 gets 5.
         #
-        # **THE OBJECTION, WHICH IS #664's OWN ARGUMENT TURNED ROUND, AND WHY IT DOES
-        # NOT LAND.** #664 measured a ceiling pricing an honest correction out into a
-        # regression, and this key makes a ceiling tighter on exactly the PR size that
-        # happened on. The difference is WHICH FINDINGS EACH BOUNDS. `max_fix_growth`
-        # bounds the whole pass, blocking band included, so a fix it prices out is a
-        # correctness fix that nothing else will make. This budget bounds only the band
-        # ABOVE `fix_severity_floor` and BELOW `round_trigger_floor` — the P3/P4 tier at
-        # the shipped floors — which is unbudgeted work by decision (#614) at the top
-        # and, at the bottom, work whose unpaid remainder is reported and recorded
-        # exactly like a below-floor finding rather than lost. Nothing correctness-
-        # blocking is on this budget for this key to price out. That is the whole of the
-        # reply, and it is why the same operator on the same dial block gets a floor in
-        # one place and a ceiling in the other.
+        # **THE BUDGET IS CLAMPED AT ONE HONEST ONE-LINE FIX, AND THAT IS A FLOOR THAT
+        # LOOSENS.** Pro rata alone reaches 1 line at 359 chars and 3 at 1,075, and a
+        # budget of one or two lines is not a small budget, it is "fix nothing" written
+        # in a way that reads like a budget. `git diff --numstat` reports a CHANGED line
+        # as one insertion plus one deletion — verified, not assumed — so the cheapest
+        # correction to an existing line costs 2, and the commonest below-floor fix is a
+        # comment or a stale docstring, which `unrefereed_line_weight` prices at 2
+        # apiece. So the clamp is `2 x unrefereed_line_weight` — 4 at the shipped weight
+        # — the smallest budget that can pay for one changed line WHEREVER IT LANDS, and
+        # it moves with the weight because the weight is the unit the budget is counted
+        # in.
+        #
+        # **WHY A STARVED BUDGET IS NOT AN ACCEPTABLE OUTCOME, WHICH CHANGED WITH
+        # #674.** A fix a budget cannot pay for is declared `--declined <key>:budget` —
+        # "a ceiling the fix did not fit under" — that declaration appends a VETO, the
+        # veto costs the round its `stop_confident`, and `preland --require-earned-stop`
+        # turns a false `stop_confident` into a failed check. So a budget too small to
+        # buy anything does not merely fix nothing: it holds the PR out of a strict
+        # landing for the rest of the cycle. A clamp of 1 would have been a zero wearing
+        # a budget's clothes, and #674 is what makes that expensive rather than merely
+        # untidy.
+        #
+        # The clamp is the whole budget below 1,791 chars of first round, which is where
+        # pro rata first pays for a second such fix. That is a concession and is written down as
+        # one: on a PR that small there is no proportional answer that is also a
+        # workable one, and given #674's price the dial concedes toward the workable.
+        # It can still never exceed what the file wrote — the clamp is applied INSIDE
+        # `min(written, ...)`, so a repo at `low_severity_fix_lines: 3` gets 3 and not
+        # 4, and the pair remains tightening-only at every setting.
+        #
+        # **A DERIVED BUDGET IS NEVER ZERO**, which the clamp also settles. An
+        # operator's `low_severity_fix_lines: 0` says "fix none of the band" and raises
+        # the applied floor to the trigger cut (`Dials.fix_floor`). A proportion that
+        # floored to 0 would express that decision without the operator having made it,
+        # as a side effect of the PR's size. A written `0` is left exactly where it is:
+        # this key may lower a budget and may never raise one or switch one off.
+        #
+        # **THE OBJECTION, WHICH IS #664's OWN ARGUMENT TURNED ROUND.** #664 measured a
+        # ceiling pricing an honest correction out into a regression, and this key makes
+        # a ceiling tighter on exactly that PR size. The difference is WHICH FINDINGS
+        # EACH BOUNDS. `max_fix_growth` bounds the whole pass, blocking band included,
+        # so a fix it prices out is a correctness fix nothing else will make. This
+        # budget bounds only the band ABOVE `fix_severity_floor` and BELOW
+        # `round_trigger_floor` — the P3/P4 tier at the shipped floors — which is
+        # unbudgeted work by decision (#614) at the top and, at the bottom, work whose
+        # unpaid remainder is reported and recorded exactly like a below-floor finding.
+        # Nothing correctness-blocking is on this budget for this key to price out.
         #
         # **A SECOND KEY RATHER THAN A TWO-PART `low_severity_fix_lines`**, on
-        # `max_fix_growth_chars`' own reasoning, which is why that answer is quoted
-        # rather than re-argued: `BOARD_DIALS` types each of these as a scalar `number`
-        # and the board's column stores one JSON value per dial, so a pair needs a new
-        # value shape at both ends; and `null` is already the documented off switch for
-        # `low_severity_fix_lines`, so a pair would have to say which half a bare `null`
-        # switches off — on a key where `null` and `0` already mean two different
-        # things. Two keys, two nulls, two independent answers, either settable from the
-        # board on its own. `null` here is the exact pre-#551 behaviour, which is what
-        # makes a shape decision reversible without a release — the property that made
-        # #664's floor defensible to land while it was still a decision.
+        # `max_fix_growth_chars`' own reasoning: `BOARD_DIALS` types each of these as a
+        # scalar `number` and the board's column stores one JSON value per dial, so a
+        # pair needs a new value shape at both ends; and `null` is already the
+        # documented off switch for `low_severity_fix_lines`, so a pair would have to
+        # say which half a bare `null` switches off — on a key where `null` and `0`
+        # already mean two different things. Two keys, two nulls, either settable from
+        # the board on its own. `null` here is the exact pre-#551 behaviour, which is
+        # what makes a shape decision reversible without a release.
         #
-        # **A PERCENTAGE RATHER THAN A LINES-PER-CHAR RATE.** The percentage and the
-        # conversion above fold into one number (0.224 / 58 lines per char), and one
-        # dial would be one number to calibrate rather than two. Rejected: the folded
-        # form hides which half is the POLICY. 22.4% is a judgement an operator makes
-        # and may argue with; 58 chars a line is a fact about diffs that nobody should
-        # be tuning, and a repo that moved the folded number would have no way to say
-        # which of the two it meant.
-        #
-        # **NOT a churned-line count on the baseline**, which would need no rate at all
-        # and is the better measurement. Rejected for the reason #492 used to reject a
-        # `_lines` growth dial, unchanged: no baseline written before this key carries a
-        # churned-line count for the PR, so a line-denominated first round would decline
-        # to run on every cycle in flight and every payload behind it — #169's
-        # ships-unwired failure.
+        # **NOT a churned-line count on the baseline**, which would let the two halves
+        # share one unit and need no size at all. Rejected for the reason #492 used to
+        # reject a `_lines` growth dial, unchanged: no baseline written before this key
+        # carries a churned-line count for the PR, so a line-denominated first round
+        # would decline to run on every cycle in flight and every payload behind it —
+        # #169's ships-unwired failure.
         #
         # **NOT a change to cheapest-first ordering**, which #551 rules out in as many
         # words. That ordering has no value term in it deliberately: reintroducing one
@@ -999,11 +1018,11 @@ DEFAULTS: dict = {
         # `low_severity_fix_lines: null` there is no budget for a proportion to bound,
         # and this key does NOT become one on its own — a repo that wrote "no budget"
         # must not get one back from a key it never touched. `resolve_dials` says so in
-        # `config_notes` rather than leaving it to be discovered. Inert too on a round
-        # whose first-round size cannot be read (round 2 with an unreadable baseline, or
-        # one written before `pr_chars`), where `max_fix_growth` does not run either:
-        # the denominator is unknown, and a guessed one is worse than none.
-        "low_severity_fix_pct": 22.4,
+        # `config_notes`. Inert too on a round whose first-round size cannot be read
+        # (round 2 with an unreadable baseline, or one written before `pr_chars`), where
+        # `max_fix_growth` does not run either: the denominator is unknown, and a
+        # guessed one is worse than none.
+        "low_severity_fix_full_chars": 14_325,
         # What one UNREFEREED churned line costs that budget, against a production
         # line's 1 (#554). The budget above prices work by LENGTH; this makes its
         # unit exposure instead.
@@ -3272,8 +3291,8 @@ BOARD_DIALS: dict[str, Dial] = {
     # own — `null` is the exact pre-#551 behaviour — which is the whole reason it is a
     # second key rather than a pair inside the one above, and what makes the shape
     # reversible from the board rather than by a release.
-    "review_panel.low_severity_fix_pct": Dial("number", True, "either",
-        'the most of the first round the same budget may spend, as a percent; the smaller half binds'),
+    "review_panel.low_severity_fix_full_chars": Dial("number", True, "either",
+        'first-round chars that buy the WHOLE fix budget; a smaller PR gets it pro rata'),
     # #554's unit for that budget. NOT nullable, and it is the one dial here where
     # that is a statement rather than an omission: `1` already means "price every line
     # alike", so a `null` spelling for the same thing would be one written value with

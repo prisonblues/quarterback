@@ -908,12 +908,12 @@ def test_the_weight_is_on_the_dials_line_the_fixers_brief_is_built_from():
     own, because it is not a second setting a reader weighs separately — a line saying
     "40 lines" beside one saying "x2" leaves the reader to work out what 40 buys."""
     gist = panel_seats.resolve_dials({}, None, []).gist()
-    assert ("below-P2 fix budget 40 lines or 22.4% of round 1, whichever is smaller, "
-            "unrefereed x2") in gist
+    assert ("below-P2 fix budget 40 lines, in full at 14,325+ chars of round 1 and "
+            "pro rata below, unrefereed x2") in gist
     # Printed at `1` too: a dial that vanishes from the line at some settings is one a
     # reader cannot tell from a dial that was never applied.
     off = panel_seats.resolve_dials({"unrefereed_line_weight": 1}, None, []).gist()
-    assert "whichever is smaller, unrefereed x1" in off
+    assert "pro rata below, unrefereed x1" in off
     # ...and suppressed where the budget is off, where it is a unit of nothing.
     none = panel_seats.resolve_dials(
         {"low_severity_fix_lines": None}, None, []).gist()
@@ -939,7 +939,7 @@ def test_the_budget_NOTE_carries_the_weight_into_the_fixers_brief(
                                  # note says about the WEIGHT, and the fixture PR is
                                  # small enough that the proportion would cut the
                                  # number the sentence quotes.
-                                 "low_severity_fix_pct": None})
+                                 "low_severity_fix_full_chars": None})
     note = next(line for line in capsys.readouterr().out.splitlines()
                 if "budget for the WHOLE round" in line)
     assert "2x a line of production code" in note

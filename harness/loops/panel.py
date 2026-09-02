@@ -4714,7 +4714,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #
     # BELOW the trend block since #551, which is a move rather than an accident: the
     # budget is no longer a dial value read straight off `dials`, it is
-    # `min(low_severity_fix_lines, low_severity_fix_pct x the cycle's first round)`, and
+    # `min(low_severity_fix_lines, its pro-rata share of the cycle's first round)`, and
     # the denominator that needs is the one the block below already computes once for
     # itself and for the payload. Deriving a second `first_chars` here is the
     # duplicated-measurement failure this file keeps writing down, and it would show up
@@ -4773,13 +4773,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          else len(review.diff) if round_no == 1 else None)
 
     # #551's budget, off THAT denominator and no other: the churned lines this round
-    # may actually spend on the 💸 band, `min(low_severity_fix_lines,
-    # low_severity_fix_pct x the first round)`. One expression for the number the
+    # may actually spend on the 💸 band, which is `low_severity_fix_lines` or its
+    # pro-rata share of the first round (`low_severity_fix_full_chars`), whichever is
+    # smaller, floored at one honest one-line fix. One expression for the number the
     # fixer's brief states and the number #622's reader prices the pass against — they
     # were one dial field until the budget stopped being a constant, and two
     # computations of it is how a report and a payload come to disagree about the policy
     # a round ran under. `None` where nothing is bounded, and the WRITTEN value wherever
-    # the proportion cannot apply — a null percentage, a repo with no budget, a
+    # the proportion cannot apply — a null size, a repo with no budget, a
     # first-round size this run could not read — so a round that cannot see round 1 is
     # briefed exactly as it was before this key existed. `Dials.budget_for` carries
     # which of those is which.
@@ -6540,11 +6541,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # string: it is the phrase the suites and an orchestrator both look for, and a
         # clause spliced through the middle of it makes the budget unfindable at exactly
         # the settings where knowing the number matters most.
-        cut_to = ("" if budget_lines == dials.low_severity_fix_lines else
-                  f" — cut from {dials.low_severity_fix_lines} lines by "
-                  f"`low_severity_fix_pct` at {dials.low_severity_fix_pct:g}% of the "
-                  "cycle's first round, because a fixed budget is a bigger share of a "
-                  "smaller change (#551)")
+        #
+        # Stated in the unit the arithmetic is done in — the first round's chars against
+        # `low_severity_fix_full_chars` — because a clause that explained the cut in
+        # churned lines would be describing a comparison the code does not make.
+        # The clamp gets its own wording where IT is what decided the number: told
+        # "4 lines" with no more said, a fixer cannot tell a pro-rata share from a floor,
+        # and the two call for different reactions to a fix that will not fit.
+        cut_to = ""
+        if budget_lines != dials.low_severity_fix_lines:
+            least = (panel_seats.MIN_HONEST_FIX_CHURN
+                     * dials.unrefereed_line_weight)
+            why = ("and this is the smallest budget that pays for one changed line "
+                   "wherever it lands, which is as low as it goes (#674)"
+                   if budget_lines == least and trend_first_chars is not None
+                   and dials.low_severity_fix_lines * trend_first_chars
+                   // dials.low_severity_fix_full_chars < least
+                   else "so the budget is pro rata")
+            cut_to = (f" — cut from {dials.low_severity_fix_lines} lines because the "
+                      f"cycle's first round is {trend_first_chars:,} chars, under the "
+                      f"{dials.low_severity_fix_full_chars:,} of "
+                      f"`low_severity_fix_full_chars` that buys the whole budget, "
+                      f"{why} (#551)")
         lines.append(
             f"_💸 marks the {len(on_budget)} finding(s) below the "
             f"`{dials.round_trigger_floor}` cut. They share a "
