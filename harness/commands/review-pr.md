@@ -671,11 +671,13 @@ path yourself (one file per PR, alongside the payloads) and pass the same path t
 every round's `--premise-file`, because a register the round cannot read counts
 nothing. Declaring after the pass is written is not a late brake, it is no brake:
 exit 4 means *do not write the patch*, and there is no patch left to refuse. Each
-declaration records the commit the tree was on and whether that tree was already
-edited, and a later round names both shapes in `config_notes` (#560) — a premise
-declared after its own patch was committed, and one declared with the patch already
-sitting in the working tree. Run `--premise` from the tree the patch lands in: run it
-anywhere else and it records a tree that has nothing to do with your fix pass.
+declaration records the commit the tree was on and a fingerprint of its tracked
+contents, and a later round compares that against what it recorded of the same
+checkout before the fix pass ran — so it names both shapes in `config_notes` (#560): a
+premise declared after its own patch was committed, and one declared with the patch
+already sitting in the working tree. Run `--premise` from the tree the patch lands in,
+and run the panel there too: two readings of two different checkouts are never
+compared, so standing somewhere else does not clear the record, it empties it.
 
 `--premise-decidable` is **test 4, answered where it can brake something**. Pass
 `no` when the runtime the assertion runs in cannot observe the property the fix
