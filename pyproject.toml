@@ -57,14 +57,6 @@ asyncio_default_test_loop_scope = "session"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# harness/ arrived verbatim from the repo that used to own it, and lints under
-# different conventions — 13 of its 32 findings here are RUF100 "unused noqa",
-# fired only because this config does not enable E402. "Fixing" those would strip
-# suppressions that are correct wherever E402 IS enabled, i.e. make the files
-# worse to satisfy a linter they were not written against. Excluded so this stays
-# a faithful move rather than a move plus 32 unrelated edits; reconciling the
-# harness onto its own ruff config is tracked separately.
-extend-exclude = ["harness"]
 
 [tool.ruff.lint]
 select = [
@@ -80,6 +72,32 @@ ignore = [
     "B008",   # function-call-in-default-argument (FastAPI Depends pattern)
     "E501",   # line-too-long (handled by formatter)
 ]
+
+# `harness/` used to be excluded wholesale (#47). It is the most-edited code in the
+# repo — `panel.py` above all — and the exclusion meant the cheapest possible class
+# of defect was being caught by the most expensive possible reviewer: `ci_txt ={…`,
+# a missing space with the continuation left at its old indent, reached review on #34
+# because no tool was looking. Two narrow ignores buy the whole directory instead.
+[tool.ruff.lint.per-file-ignores]
+# The `# noqa: E402` on an import that follows a `sys.path.insert` is the reason the
+# exclusion existed, and it is NOT a dead directive — ruff simply tolerates the idiom
+# where pycodestyle does not, so RUF100 calls 326 of them unused and stripping them
+# would make the files worse under any other linter. (The exclusion's own comment said
+# these fire "because this config does not enable E402"; that premise is stale — `E` is
+# selected, E402 is on, and there are 4 real E402 findings in here. They are unused for
+# the opposite reason: ruff does not flag what they suppress.) The remaining 73 name
+# rules this config does not select at all — BLE001, PLC0415, N802, A003, S603 — and are
+# suppressions for a stricter selection, not mistakes. Both kinds are worth keeping and
+# neither is worth a rule; what is not worth having is the whole directory unlinted for
+# them. Revisit if the harness ever becomes ruff-only.
+"harness/**" = ["RUF100"]
+# The panel is split across modules that re-export each other's names by design — every
+# one of these files already carries `# noqa: F401,F403` on the star import itself. F405
+# is the same architecture seen from the other end ("may be undefined, or from a star
+# import"), 802 times, and silencing it here is consistent with the suppression that is
+# already on the import. Replacing the star imports is a refactor of the most-edited
+# file in the repo and is not this issue.
+"harness/loops/panel*.py" = ["F405"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
