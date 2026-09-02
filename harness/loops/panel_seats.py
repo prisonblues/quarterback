@@ -1605,11 +1605,14 @@ def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
 #: pro-rata budget at.
 #:
 #: **2, and it is arithmetic on the counting rule rather than an estimate.** `git diff
-#: --numstat` reports a CHANGED line as one insertion plus one deletion, which was
-#: checked rather than assumed, and :func:`_referee_kind_lines` counts churn the same
-#: way ("insertions plus deletions, which is what `git diff --numstat` reports"). So the
-#: cheapest correction to a line that already exists costs two, and a budget under two
-#: can buy only an ADDED line — which is not the shape most below-floor findings have.
+#: --numstat` reports AGGREGATE insertions and deletions per file; it has no notion of a
+#: "changed line", and an earlier draft of this comment said it did. What is true and
+#: sufficient: a one-line replacement COMMONLY comes out as one deletion plus one
+#: insertion — checked rather than assumed — and :func:`_referee_kind_lines` counts every
+#: `-` and every `+` alike ("insertions plus deletions, which is what `git diff
+#: --numstat` reports"). So the cheapest correction to a line that already exists
+#: commonly costs two, and a budget under two can buy only an ADDED line — which is not
+#: the shape most below-floor findings have.
 #:
 #: Weighted at the point of use rather than baked in here: the commonest below-floor fix
 #: is a comment or a stale docstring, `unrefereed_line_weight` prices those at 2 apiece,
@@ -1641,10 +1644,11 @@ def low_severity_full_budget_chars(panel: dict, notes: list[str]) -> int | None:
     counted in churned lines and the only first-round size a baseline records is
     `pr_chars`, so the companion had to be written in one unit or the other. Chars is
     the unit the comparison happens in, so a size in chars states its crossing in the
-    unit the code compares and needs no chars-per-line rate to be applied — which also
-    keeps it clear of #692, where PR #188's char count reproduces and its churned-line
-    count does not. An earlier draft of this key was a percentage over a
-    `CHARS_PER_CHURNED_LINE` constant, and both are gone.
+    unit the code compares and needs no chars-per-line rate AT RUN TIME. An earlier draft
+    of this key was a percentage over a `CHARS_PER_CHURNED_LINE` constant, and both are
+    gone. The CALIBRATION of the default still anchors on a churned-line count, so it is
+    less exposed to #692 rather than immune to it — `harness_rules` says exactly how
+    far that goes.
 
     **Absent inherits the default and a written ``null`` switches it off**, the reading
     :func:`low_severity_budget` and the three growth keys already have. ``null`` is the
@@ -2552,9 +2556,10 @@ class Dials:
         **Chars in, lines out, and nothing converts between them.** The pro-rata term is
         `written x first_chars / low_severity_fix_full_chars` — a ratio of two char
         counts multiplied by a line count — so the units cancel and no chars-per-line
-        rate appears anywhere. That is why the dial is a SIZE and not a percentage: a
-        percentage calibrated in lines would need such a rate, and the rate is what #692
-        is open about.
+        rate appears anywhere in this arithmetic. That is why the dial is a SIZE and not
+        a percentage: a percentage calibrated in lines would need such a rate at every
+        call. The claim is about THIS FUNCTION and not about the default's calibration,
+        which does anchor on a churned-line count (`harness_rules`).
 
         **The outer `min` is the safety property and must stay outermost.** Both terms
         are ceilings and the written value is the outer bound, so no setting of the size
@@ -2567,17 +2572,20 @@ class Dials:
         **The clamp, and why a starved budget is not an acceptable outcome.** Pro rata
         alone reaches 1 line at 359 chars and 3 at 1,075, and a budget of one or two
         lines is not a small budget — it is "fix nothing" written so that it reads like
-        a budget. Since #674 that costs something concrete: a fix the budget cannot pay
+        a budget. (Two, because `git diff --numstat` reports aggregate insertions and
+        deletions rather than edits, and a one-line replacement commonly arrives as one
+        of each — see :data:`MIN_HONEST_FIX_CHURN`.) Since #674 that costs something concrete: a fix the budget cannot pay
         for is declared `--declined <key>:budget`, the declaration appends a veto, the
         veto costs the round its `stop_confident`, and `preland --require-earned-stop`
         turns that into a failed check — so a starved budget holds the PR out of a
         strict landing for the rest of the cycle. So the floor is
-        :data:`MIN_HONEST_FIX_CHURN` times `unrefereed_line_weight`: one changed line
-        priced wherever it might land, 4 at the shipped weight, moving with the weight
-        because the weight is the unit the budget is counted in.
+        :data:`MIN_HONEST_FIX_CHURN` times `unrefereed_line_weight`: one one-line
+        correction priced wherever it might land, 4 at the shipped weight, moving with
+        the weight because the weight is the unit the budget is counted in.
 
-        Below 1,791 chars of first round the clamp IS the budget — that is where pro
-        rata first pays for a second such fix. That is a concession and is written down as one: on a PR that
+        Below 1,791 chars of first round the clamp IS the budget, that being simply
+        where the pro-rata share first rises above it, at 5. It is not where a SECOND
+        such fix becomes affordable — that is 2,865. That is a concession and is written down as one: on a PR that
         small there is no proportional answer that is also a workable one, and #674's
         price is why it concedes toward the workable.
 
@@ -2593,15 +2601,26 @@ class Dials:
           written before `pr_chars`. `max_fix_growth` declines to run there too; a
           guessed denominator is worse than none.
 
+        **A first round MEASURED at zero chars is not that case and gets the opposite
+        answer**: the clamp, not the whole budget. Unknown and zero are different claims
+        — the first says nothing was read, the second says something was read and it was
+        nothing — and the smallest measurement there is must not buy the largest budget
+        there is. No guard is needed for it: `written x 0 // size` is 0, which the clamp
+        lifts to one honest fix. A guard against it is what an earlier draft had, and it
+        failed open.
+
         A written ``0`` also comes back as ``0``: that is an operator saying "fix none
         of the band", it already moves :attr:`fix_floor` to the trigger cut, and this
         key may lower a budget and may never raise one. The clamp does not reach it, for
         the same reason — a floor that turned a written zero into four would be this
         key deciding what the file meant."""
         written = self.low_severity_fix_lines
+        # `first_chars is None` and not `<= 0`: a size of zero is a MEASUREMENT and is
+        # handled by the arithmetic below, which floors it at the clamp. Excluding it
+        # here returned the whole budget for the smallest reading there is.
         if (written is None or written == 0
                 or self.low_severity_fix_full_chars is None
-                or first_chars is None or first_chars <= 0):
+                or first_chars is None):
             return written
         pro_rata = written * first_chars // self.low_severity_fix_full_chars
         least = MIN_HONEST_FIX_CHURN * self.unrefereed_line_weight

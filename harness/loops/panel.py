@@ -6552,8 +6552,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if budget_lines != dials.low_severity_fix_lines:
             least = (panel_seats.MIN_HONEST_FIX_CHURN
                      * dials.unrefereed_line_weight)
-            why = ("and this is the smallest budget that pays for one changed line "
-                   "wherever it lands, which is as low as it goes (#674)"
+            why = ("and this is the smallest budget that pays for one one-line "
+                   "correction wherever it lands, which is as low as it goes (#674)"
                    if budget_lines == least and trend_first_chars is not None
                    and dials.low_severity_fix_lines * trend_first_chars
                    // dials.low_severity_fix_full_chars < least

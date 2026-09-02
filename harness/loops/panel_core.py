@@ -249,12 +249,14 @@ DEFAULT_LOW_SEVERITY_FIX_LINES = 40
 #: accumulation `low_severity_fix_lines` measures is dangerous on the SMALL PR, where a
 #: fixed 40 lines can exceed the diff it is polishing.
 #:
-#: **Denominated in chars because `pr_chars` is what a baseline records**, so nothing
-#: here converts between chars and lines and the value cannot inherit #692's dispute
-#: about PR #188's churn. 14,325 is the median `pr_chars` of this repo's merged PRs
-#: scaled to the ~182 churned lines at which 40 lines is the ~22% allowance #551 calls
-#: sane (n=21, range 9,538-18,604). None switches the proportional half off and
-#: restores the pre-#551 behaviour exactly; `harness_rules` carries the calibration.
+#: **Denominated in chars because `pr_chars` is what a baseline records**, so the
+#: RUNTIME arithmetic converts nothing: a ratio of two char counts multiplying a line
+#: count. 14,325 is the median `pr_chars` of this repo's merged PRs scaled to the ~182
+#: churned lines at which 40 lines is the ~22% allowance #551 calls sane (n=21, range
+#: 9,538-18,604) — so the CALIBRATION is still anchored to a line count, and what it is
+#: free of is the disputed 66-versus-58 rate, not #692 as a whole. `harness_rules` says
+#: exactly how far that goes. None switches the proportional half off and restores the
+#: pre-#551 behaviour exactly.
 DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS = 14_325
 #: How much of the low-severity budget one UNREFEREED churned line costs, against a
 #: production line's 1 (#554). The budget's unit becomes exposure rather than length:

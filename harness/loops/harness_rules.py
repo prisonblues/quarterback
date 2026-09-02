@@ -918,13 +918,12 @@ DEFAULTS: dict = {
         # first round is `pr_chars`, so a proportional companion has to be written in
         # one unit or the other. It is written in CHARS because that is the unit the
         # comparison actually happens in: a percentage calibrated in lines would need a
-        # chars-per-line rate to be applied at all, every sentence about where it
-        # crosses would be true only at that rate, and the rate itself is the thing #692
-        # is open about — PR #188's 34,717 chars reproduce and its 521 churned lines do
-        # not. A size in chars needs no rate, states its crossing in the unit the code
-        # compares, and cannot inherit that dispute. The earlier draft of this key was a
-        # percentage over a `CHARS_PER_CHURNED_LINE` constant; it is gone, and this is
-        # why.
+        # chars-per-line rate to be applied at all, and every sentence about where it
+        # crosses would then be true only at that rate. A size in chars needs no rate at
+        # RUN TIME — the arithmetic is a ratio of two char counts multiplying a line
+        # count, so the units cancel — and it states its crossing in the unit the code
+        # compares. The earlier draft of this key was a percentage over a
+        # `CHARS_PER_CHURNED_LINE` constant; it is gone, and this is why.
         #
         # **14,325, AND IT IS MEASURED IN CHARS RATHER THAN CONVERTED INTO THEM.** The
         # policy #551 states is a ratio — "on a 179-line PR, 40 lines is a sane ~22%
@@ -940,20 +939,40 @@ DEFAULTS: dict = {
         # significant figure, and the number is quoted unrounded because rounding it
         # would be choosing a number where a measurement was available.
         #
+        # **WHAT THAT IS AND IS NOT FREE OF, STATED NARROWLY BECAUSE THE WIDE VERSION IS
+        # WRONG.** The RUN-TIME arithmetic is rate-free and that part is unqualified.
+        # The CALIBRATION is not: it anchors on 182 CHURNED LINES and scales each of the
+        # 21 PRs to that line count, which needs each PR's own chars-per-line. The line
+        # framing did not leave the key, it moved out of the formula and into the number.
+        # What the number IS free of is the DISPUTED 66-versus-58 rate, because every PR
+        # contributed its own measured chars and its own measured churn instead of one
+        # assumed rate standing in for all of them, so no single contested figure can
+        # move it. What it still rests on is churn being counted the same way across this
+        # repo — which is the very thing #692 is open about, since PR #188 carries three
+        # different line counts (521, 597, 721) in three places. Less exposed, not
+        # immune, and an earlier draft of this block said immune.
+        #
         # What that buys, in the unit the dial is written in: a 40,000-char PR gets the
         # full 40 lines, 10,000 chars gets 27, 5,000 gets 13, 2,000 gets 5.
         #
         # **THE BUDGET IS CLAMPED AT ONE HONEST ONE-LINE FIX, AND THAT IS A FLOOR THAT
         # LOOSENS.** Pro rata alone reaches 1 line at 359 chars and 3 at 1,075, and a
         # budget of one or two lines is not a small budget, it is "fix nothing" written
-        # in a way that reads like a budget. `git diff --numstat` reports a CHANGED line
-        # as one insertion plus one deletion — verified, not assumed — so the cheapest
-        # correction to an existing line costs 2, and the commonest below-floor fix is a
+        # in a way that reads like a budget.
+        #
+        # `git diff --numstat` reports AGGREGATE insertions and deletions per file and
+        # has no notion of a "changed line" at all — the phrasing an earlier draft of
+        # this block used, which claimed of git a concept git does not have. What is
+        # true is narrower and enough: a one-line replacement COMMONLY comes out as one
+        # deletion plus one insertion, which is 2, and `panel_seats._referee_kind_lines`
+        # counts every `-` and every `+` alike ("insertions plus deletions, which is
+        # what `git diff --numstat` reports"). So 2 is what the cheapest correction to a
+        # line that already exists commonly costs, and the commonest below-floor fix is a
         # comment or a stale docstring, which `unrefereed_line_weight` prices at 2
         # apiece. So the clamp is `2 x unrefereed_line_weight` — 4 at the shipped weight
-        # — the smallest budget that can pay for one changed line WHEREVER IT LANDS, and
-        # it moves with the weight because the weight is the unit the budget is counted
-        # in.
+        # — the smallest budget that can pay for one one-line correction WHEREVER IT
+        # LANDS, and it moves with the weight because the weight is the unit the budget
+        # is counted in.
         #
         # **WHY A STARVED BUDGET IS NOT AN ACCEPTABLE OUTCOME, WHICH CHANGED WITH
         # #674.** A fix a budget cannot pay for is declared `--declined <key>:budget` —
@@ -965,10 +984,13 @@ DEFAULTS: dict = {
         # a budget's clothes, and #674 is what makes that expensive rather than merely
         # untidy.
         #
-        # The clamp is the whole budget below 1,791 chars of first round, which is where
-        # pro rata first pays for a second such fix. That is a concession and is written down as
-        # one: on a PR that small there is no proportional answer that is also a
-        # workable one, and given #674's price the dial concedes toward the workable.
+        # The clamp is the whole budget below 1,791 chars of first round — simply where
+        # the pro-rata share first rises above it, at 5. It is NOT where a second such
+        # fix becomes affordable; that is 2,865, and an earlier draft of this block said
+        # otherwise. The concession is written down as one: on a PR that small there is
+        # no proportional answer that is also a workable one, and given #674's price the
+        # dial concedes toward the workable.
+        #
         # It can still never exceed what the file wrote — the clamp is applied INSIDE
         # `min(written, ...)`, so a repo at `low_severity_fix_lines: 3` gets 3 and not
         # 4, and the pair remains tightening-only at every setting.
@@ -1022,6 +1044,14 @@ DEFAULTS: dict = {
         # (round 2 with an unreadable baseline, or one written before `pr_chars`), where
         # `max_fix_growth` does not run either: the denominator is unknown, and a
         # guessed one is worse than none.
+        #
+        # A first round MEASURED at zero chars is a different case and gets the opposite
+        # answer — the clamp, not the whole budget. Unknown and zero are not the same
+        # claim: the first says nothing was read, the second says something was read and
+        # it was nothing, and the smallest measurement there is must not buy the largest
+        # budget there is. It falls out of the arithmetic rather than being
+        # special-cased (`40 x 0 // 14,325` is 0, which the clamp lifts), and an earlier
+        # draft guarded against it and so failed open.
         "low_severity_fix_full_chars": 14_325,
         # What one UNREFEREED churned line costs that budget, against a production
         # line's 1 (#554). The budget above prices work by LENGTH; this makes its

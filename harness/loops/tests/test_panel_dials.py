@@ -2118,15 +2118,17 @@ def test_the_budget_takes_the_MIN_and_a_max_would_reintroduce_188():
 def test_the_budget_never_falls_below_one_honest_one_line_fix():
     """The clamp, and the reason it is not 1.
 
-    `git diff --numstat` reports a CHANGED line as one insertion plus one deletion, so
-    the cheapest correction to a line that already exists costs 2 churn; the commonest
+    `git diff --numstat` reports aggregate insertions and deletions and has no notion of
+    a changed line, but a one-line replacement commonly arrives as one of each — so the
+    cheapest correction to a line that already exists commonly costs 2 churn; the
+    commonest
     below-floor fix is a comment or a stale docstring, which `unrefereed_line_weight`
     prices at 2 apiece. A budget of 1 or 2 is therefore not a small budget — it is "fix
     nothing" written so that it reads like a budget, and since #674 that is expensive
     rather than untidy: an unpayable fix is declared `--declined <key>:budget`, the
     declaration appends a veto, the veto costs the round its `stop_confident`, and
     `preland --require-earned-stop` turns that into a failed check. So the floor is one
-    changed line priced wherever it might land."""
+    one-line correction priced wherever it might land."""
     dials = panel_seats.resolve_dials({}, None, [])
     # Pro rata alone would starve these, which is the case the clamp exists for.
     assert 40 * 439 // 14325 == 1
@@ -2136,8 +2138,28 @@ def test_the_budget_never_falls_below_one_honest_one_line_fix():
     # at 1 a production line and a docstring line cost the same and 2 buys either.
     light = panel_seats.resolve_dials({"unrefereed_line_weight": 1}, None, [])
     assert light.budget_for(439) == panel_seats.MIN_HONEST_FIX_CHURN == 2
-    # And it stops mattering the moment pro rata can pay for that fix itself.
-    assert dials.budget_for(1791) > clamp()
+    # And it stops binding the moment the pro-rata share rises above it — at 1,791,
+    # where that share is 5. NOT where a second such fix becomes affordable, which is
+    # 2,865: the clamp buys one, and pro rata buys the second only later.
+    assert dials.budget_for(1791) == 5 > clamp()
+    assert dials.budget_for(2865) == 2 * clamp()
+
+
+def test_a_first_round_measured_at_zero_gets_the_clamp_and_not_the_whole_budget():
+    """The one input that could make this key fail OPEN, and the distinction it turns on.
+
+    An UNKNOWN first-round size restores the absolute — round 2 with an unreadable
+    baseline, where the denominator genuinely is not there and a guessed one is worse
+    than none. A first round MEASURED at zero chars is a different claim: something was
+    read and it was nothing. The smallest measurement there is must not buy the largest
+    budget there is, which is what a `first_chars <= 0` guard did.
+
+    No special case carries this — `written x 0 // size` is 0 and the clamp lifts it —
+    and an impossible negative lands in the same place rather than anywhere surprising."""
+    dials = panel_seats.resolve_dials({}, None, [])
+    assert dials.budget_for(None) == 40           # unknown: the absolute, as before
+    assert dials.budget_for(0) == clamp()         # measured as nothing: the floor
+    assert dials.budget_for(-500) == clamp()
 
 
 def test_the_clamp_can_never_raise_a_budget_above_what_the_file_wrote():
@@ -2192,7 +2214,8 @@ def test_the_note_tells_a_clamped_budget_from_a_pro_rata_one(
     report, payload, _ = band_run(monkeypatch, capsys, tmp_path, [finding("P3")],
                                   diff=TIGHT)
     assert f"share a {clamp()}-line budget for the WHOLE round" in report
-    assert "smallest budget that pays for one changed line wherever it lands" in report
+    assert ("smallest budget that pays for one one-line correction wherever it lands"
+            in report)
     assert "(#674)" in report
     assert payload["round_stop"]["fix_budget"]["limit"] == clamp()
 
