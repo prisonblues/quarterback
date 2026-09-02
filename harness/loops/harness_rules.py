@@ -1624,7 +1624,12 @@ DEFAULTS: dict = {
         #
         # **THE RECALIBRATION WAS ATTEMPTED ON 2026-09-02 AND THE POPULATION IS n=1**
         # (#637, measured over the whole board, all time, via
-        # `GET /review/convergence?days=3650` and `GET /reviews?limit=500`):
+        # `GET /review/convergence?days=3650`, `GET /reviews?limit=500` and
+        # `GET /review/{id}` on each rated round — the third read because `rules`
+        # and `provenance_restored` are deferred columns that only the per-run
+        # endpoint publishes, so the two figures resting on them cannot be
+        # re-derived from the list views alone. The board held 115 runs in that
+        # window, so the 500 cap truncated nothing):
         #   - **One attributable round exists since `f53bdcd`.** lexray#1813 round 2:
         #     13 new outstanding findings, 6 attributed, rate **0.462** — under the
         #     threshold, so it did not fire. One round, one repo, one PR. It is also
@@ -1641,16 +1646,42 @@ DEFAULTS: dict = {
         #     rather than a large one. That is the missing number, not a small one.
         #   - **The old population is one-sided and cannot locate a boundary.** 38
         #     attributable rounds, every one at or above `FIX_INJECTION_MIN_NEW`: min
-        #     0.000, p25 0.460, median 0.696, p75 0.876, max 1.000, and 28 of 38
-        #     (73.7%) over 0.5. Swept, the share firing goes 86.8% at 0.3, 73.7% at
+        #     0.000, p25 0.474, median 0.696, p75 0.873, max 1.000, and 28 of 38
+        #     (73.7%) over 0.5. **Quantiles on `percentile_cont`'s convention**,
+        #     which is `injection_by_round`'s own, pooled across round numbers where
+        #     the endpoint publishes one row per round number. Said out loud because
+        #     the estimator moves them and this block tells you to re-run rather than
+        #     re-derive: Python's `statistics.quantiles` default reads 0.460 and
+        #     0.876 over this same population, and those were the figures quoted here
+        #     until they were checked against the instrument (#706 second opinion).
+        #     Min and max are the same number either way — rounding is monotone, so
+        #     they coincide exactly with a round's published `rate`; the three
+        #     interpolated quantiles need not equal any round's rate at all.
+        #     Swept, the share firing goes 86.8% at 0.3, 73.7% at
         #     0.5, 47.4% at 0.7, 13.2% at 0.9 — monotone, no elbow, no second mode.
         #     Ten of the 38 rounds fall at or below 0.5, so the threshold sits around
         #     the 26th percentile of what has actually been observed: a cut near the
         #     bottom of a one-sided sample, which is what a threshold looks like when
         #     the population it was fitted to contains almost no negatives.
+        #     **THREE OF THOSE TEN ARE NOT MEASUREMENTS**, and they are the only
+        #     zeros in the sample: quarterback #480 r3, #188 r2 and #87 r2 carry
+        #     41, 37 and 34 findings ALL in `unknown` — the fix range could not be
+        #     read, so `panel_scope._provenance` could place nothing. Such a round
+        #     is still attributable (a prior round exists) and so still divides, to
+        #     0.0, which is `injection_state`'s own answer and therefore what
+        #     `injection_by_round` publishes; `attributed()` is the predicate that
+        #     refuses them a number in the trend block. Drop the three and the
+        #     population is 35 rounds — min 0.050, p25 0.540, median 0.769, p75
+        #     0.878, 28 of 35 (80.0%) over 0.5, seven at or below, so 0.5 sits
+        #     nearer the 20th percentile. The one-sidedness is WORSE on the honest
+        #     population, not better; what changes is that `rate_min: 0.000` is not
+        #     evidence of a clean fix pass and must not be read as the bottom of
+        #     the range.
         #   - **And it is structurally silent about behaviour at a cap of 6.** 20 of
         #     the 27 cycles cross the threshold, every one of them first at ROUND 2,
-        #     and 15 of those 20 have no round 3 recorded — under the cap of 2 in
+        #     and 15 of those 20 have no round 3 that reviewed anything (14 have no
+        #     round 3 row at all; lexray#1761's reviewed nothing, so neither this
+        #     endpoint nor `/reviews` counts it) — under the cap of 2 in
         #     force at the time, firing forgave nothing and bought a better `reason`,
         #     which is exactly what the paragraphs below say a default-on used to
         #     buy. Five cycles forgo a round at all (#161 and #480 one each, #299 and

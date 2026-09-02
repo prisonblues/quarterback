@@ -6151,11 +6151,27 @@ def _injection_rate():
     the threshold.
 
     NULL and not ``0.0`` where the denominator is 0, on :func:`_rate`'s rule and
-    ``injection_state``'s: zero is a claim about a fix pass, and a round 1 or a
-    round whose fix range could not be read at all is the absence of one. NULL
-    also keeps such rounds out of the quantiles below, since ``percentile_cont``
-    ignores them — which is what stops "attribution did not arise" being read as
-    "the fix pass introduced nothing".
+    ``injection_state``'s: zero is a claim about a fix pass, and a round that was
+    never asked is the absence of one. NULL also keeps such rounds out of the
+    quantiles below, since ``percentile_cont`` ignores them — which is what stops
+    "attribution did not arise" being read as "the fix pass introduced nothing".
+
+    **What lands there is exactly ``{}``, jsonb ``null``, SQL NULL and an all-zero
+    tally** — a round 1, a round outside a cycle, a round of pure repeats. A round
+    whose FIX RANGE could not be read does NOT: ``panel.py`` marks a round 2+
+    attributable on the strength of there being a prior round, and
+    ``panel_scope._provenance`` answers ``unknown`` for every finding when it has
+    no range, so such a round arrives as an all-``unknown`` tally with a positive
+    denominator and rates ``0.0``. That is ``injection_state``'s answer for the
+    same row and this endpoint exists to publish that quantity, so it is not a bug
+    to be fixed here — but it is a trap for the reader this key was added for, and
+    the reason ``panel_rounds.attributed()`` refuses those rounds a number in the
+    trend block. On 2026-09-02 three of the board's 38 rated rounds were of that
+    shape (quarterback #480 r3, #188 r2, #87 r2, 41/37/34 findings all
+    ``unknown``) and they are the ONLY zeros in the population, so ``rate_min``
+    read 0.000 off three measurements that did not happen. A recalibration reading
+    the low tail has to check ``provenance_counts`` for it; ``fix_range_source``
+    on ``/reviews`` is the field that names it.
     """
     introduced = func.coalesce(
         ReviewRun.provenance_counts["introduced"].as_integer(), 0)
@@ -6283,12 +6299,16 @@ async def review_convergence(
     * ``attributed_runs`` — rounds whose tally is a non-empty object, i.e. rounds
       where attribution RAN (``review_stats.provenance_runs``' own test).
     * ``rated_runs`` — of those, the ones with a non-zero denominator, so a rate
-      exists. This is the denominator of every figure beside it. A round that
-      attributed and summed to zero is real and is not a rate.
+      exists. This is the denominator of every SUM and every RATE beside it, and
+      of nothing else: ``rounds``, ``attributed_runs`` and ``dial_runs`` are the
+      markers a reader divides BY it. A round that attributed and summed to zero
+      is real and is not a rate.
     * ``introduced`` / ``new`` and ``pooled_rate`` — the sums, and their ratio.
       **Not the quantity the rule reads**, and published because a reader wants
-      the volume: a pooled ratio weights a 44-finding round the same as a
-      4-finding one, and the rule does not.
+      the volume. It weights each round BY ITS FINDING COUNT — a 44-finding round
+      pulls it eleven times as hard as a 4-finding one — where the rule gives
+      every round one verdict and so weights the two alike. That is the whole
+      reason the quantiles below are published beside it and not instead of it.
     * ``rate_min`` / ``rate_p25`` / ``rate_median`` / ``rate_p75`` / ``rate_max``
       — the distribution of the PER-ROUND rate, which is the quantity the rule
       reads. Where a cut belongs is a question about this row and not the one
@@ -6563,9 +6583,10 @@ async def review_convergence(
             "rated_runs": int(rated_n or 0),
             "introduced": int(intro) if rated_n else None,
             "new": int(total) if rated_n else None,
-            # The sums' ratio, which weights a 44-finding round and a 4-finding
-            # one alike. The rule does not; the quantiles below are its own
-            # quantity.
+            # The sums' ratio, which weights each round by how many findings it
+            # raised: a 44-finding round moves it eleven times as far as a
+            # 4-finding one. The rule weights them alike — one round, one verdict
+            # — so the quantiles below are its quantity and this is not.
             "pooled_rate": (round(int(intro) / int(total), 4)
                             if rated_n and total else None),
             "rate_min": _q(lo),
@@ -6628,7 +6649,11 @@ async def review_convergence(
             for rnd, n, new, measured, conv, conv_measured in marginal
         ],
         # #637: the quantity `escalate_on.fix_injection` divides, at the grain it
-        # divides it. Every figure is over `rated_runs` and not over `rounds`.
+        # divides it. Every SUM and every RATE in a row is over `rated_runs` and
+        # not over `rounds` — the three counts beside them are the population
+        # markers themselves (`rounds` every in-cycle row, `attributed_runs` the
+        # tallies, `dial_runs` the rated rounds that can name their threshold),
+        # so a reader can see how much of the window each figure rests on.
         "injection_by_round": injection_by_round,
     }
 

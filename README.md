@@ -265,10 +265,11 @@ GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by
                           `/review/stats` (a ratio of sums across a window) both miss. Read
                           `rate_min`/`rate_p25`/`rate_median`/`rate_p75`/`rate_max` and not
                           `pooled_rate`: the rule weights a 4-finding round like a
-                          44-finding one and a pooled ratio does not. Every figure is over
-                          `rated_runs` (a non-zero denominator existed), which is smaller
-                          than `attributed_runs` (the panel sent a tally) and smaller again
-                          than `rounds`. `dial_runs` counts the RATED rounds carrying a
+                          44-finding one and a pooled ratio does not. Every SUM and RATE is
+                          over `rated_runs` (a non-zero denominator existed), which is
+                          smaller than `attributed_runs` (the panel sent a tally) and
+                          smaller again than `rounds`; those three are the markers, not
+                          figures over it. `dial_runs` counts the RATED rounds carrying a
                           `rules` record — the only field that says what the threshold WAS
                           while the round ran — and it read 1 of 38 on 2026-09-02; it
                           shares `rated_runs`' population deliberately, a marker over any

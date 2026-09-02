@@ -707,8 +707,9 @@ async def test_injection_by_round_publishes_the_rate_the_rule_actually_reads(
 
     `/review/stats` adds the four `provenance_counts` buckets across a window per
     reviewer, and a ratio of sums is not the distribution of per-round ratios: the
-    pooled figure weights a 44-finding round like a 4-finding one and
-    `escalate_on.fix_injection` weights them alike too — one round each, one
+    pooled figure weights each round by its finding count, so a 44-finding round
+    pulls it eleven times as hard as a 4-finding one, where
+    `escalate_on.fix_injection` weights the two alike — one round each, one
     verdict each. So a recalibration had to pull `/reviews` and divide by hand,
     which is why the instruction to re-measure stood for as long as it did.
 
@@ -775,8 +776,9 @@ async def test_a_round_that_was_never_asked_to_attribute_is_not_a_rate_of_zero(
     introduced nothing" and dragging a median down to it.
     """
     repo = "acme/c637-notasked"
-    # Round 1: no tally at all. Round 2: `{}`, which the panel sends where the
-    # fix range could not be read. Round 3: a real rate of 1.0.
+    # Round 1: no tally at all. Round 2: `{}`, which the panel sends on a round
+    # it never asked to attribute — NOT what an unreadable fix range produces,
+    # which is the all-`unknown` tally the test below pins. Round 3: a rate of 1.0.
     await record(client, repo, 6373, cycle="c1", round=1, to_fix=[],
                  round_stop=stop(stopped=False, confident=False, converged=False,
                                  reason="go again"))
@@ -796,6 +798,44 @@ async def test_a_round_that_was_never_asked_to_attribute_is_not_a_rate_of_zero(
     assert rows[2]["attributed_runs"] == 0, "`{}` is not attribution running"
     assert rows[2]["rate_median"] is None
     assert rows[3]["rated_runs"] == 1 and rows[3]["rate_median"] == 1.0
+
+
+async def test_an_unreadable_fix_range_rates_zero_rather_than_dropping_out(
+        client):
+    """The low tail of #637's population, and it is not what the prose said it was.
+
+    A round 2+ whose fix range could not be read is still ATTRIBUTABLE — `panel.py`
+    decides that on there being a prior round — and `panel_scope._provenance`
+    answers `unknown` for every finding when it has no range to place them in. So
+    the row that arrives is an all-`unknown` tally with a positive denominator, and
+    it rates **0.0**, not NULL: `injection_state` computes 0.0 for the same row and
+    this endpoint publishes the quantity the rule reads.
+
+    Pinned because it is the shape a reader of `rate_min` will misread. All three
+    zeros in the board's 38 rated rounds on 2026-09-02 were of exactly this shape
+    (quarterback #480 r3, #188 r2, #87 r2), so `rate_min: 0.000` was three
+    measurements that did not happen rather than three clean fix passes — and
+    `panel_rounds.attributed()` refuses those rounds a number in the trend block
+    for that reason. The endpoint does not, deliberately, and this test is what
+    stops that being quietly changed into a filter or documented as one.
+    """
+    repo = "acme/c637-blind"
+    await record(client, repo, 6386, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    # What `_provenance` returns for every finding when `have_range` is false.
+    await record(client, repo, 6386, cycle="c1", round=2,
+                 provenance_counts={"introduced": 0, "missed": 0,
+                                    "missed-unread": 0, "unknown": 7},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["attributed_runs"] == 1, "the panel did send a tally"
+    assert row["rated_runs"] == 1, "and it had a denominator, so it has a rate"
+    assert row["new"] == 7 and row["introduced"] == 0
+    assert row["rate_min"] == 0.0 and row["rate_median"] == 0.0, \
+        "an unplaceable round reads 0.0, which is `injection_state`'s own answer"
 
 
 async def test_a_tally_that_ran_and_summed_to_zero_is_covered_but_unrated(
