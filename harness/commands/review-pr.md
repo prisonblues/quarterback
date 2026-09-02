@@ -501,16 +501,29 @@ Spend it like this, and do not improvise around it:
    rows and no GitHub issue at all, which is the orchestrator's call and not yours
    (#620).
 
-**Land each budgeted fix so it can be taken out on its own.** You are already making
-them one at a time and re-applying them cheapest-first, so the ordering exists; what this
-adds is that each one stays its **own hunk or its own commit**, named in the commit body
-by the finding it answers. The reason is #627: when a later round attributes a new
-finding to a fix that answered a below-`round_trigger_floor` finding, the response is to
-**excise that fix** rather than repair it — and an excision needs something to excise. A
-sub-floor fix smeared through a pass with three others cannot be removed without taking
-them too, and when the cheap correction is unavailable somebody writes a patch instead,
-which is the round this whole page is about. The orchestrator runs that excision; you
-only have to leave it a seam.
+**Land each budgeted fix as its own commit, and name the finding in the commit body.**
+You are already making them one at a time and re-applying them cheapest-first, so the
+ordering exists; what this adds is that each one stays its **own commit**, whose body
+carries the finding's id exactly as the **To fix** list prints it — the `[1609-F03]`
+form. Nothing else is required and the format is not fussy: the id anywhere in the
+message is enough, in a sentence like `Answers 1609-F03.` if you want one. The finding's
+16-character key works too if you have it, but the id is what the report gives you, so
+the id is the expected spelling.
+
+**One finding per commit, and no other finding's id in that body.** A commit naming two
+findings is read as a mixed one and is left alone, which is the same outcome as leaving
+no seam at all: the harness refuses to remove a commit that also carries a fix nobody
+attributed a finding to.
+
+The reason is #627: when a later round attributes a new finding to a fix that answered a
+below-`round_trigger_floor` finding, the response is to **excise that fix** rather than
+repair it — and an excision needs something to excise, aimed by something better than a
+guess. A sub-floor fix smeared through a pass with three others cannot be removed without
+taking them too, and when the cheap correction is unavailable somebody writes a patch
+instead, which is the round this whole page is about. The next round works out which
+commit answered which finding by blaming the line each new finding sits on, publishes
+what it found at `round_stop.excision`, and the orchestrator runs the command; you only
+have to leave the seam and name it.
 
 **A pass that is ALL test and prose ends the cycle, so make the production change
 where there is one to make.** `escalate_on.unrefereed_fix` stops a cycle whose last

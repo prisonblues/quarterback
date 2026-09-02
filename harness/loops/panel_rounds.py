@@ -30,7 +30,7 @@ import math  # noqa: E402
 # re-exports the name, and the last import wins. Placed above, the guarantee would
 # have been a claim about another module's current contents rather than a property
 # of this file.
-from collections.abc import Iterable, Mapping  # noqa: E402
+from collections.abc import Callable, Iterable, Mapping  # noqa: E402
 from types import MappingProxyType  # noqa: E402
 from typing import NamedTuple  # noqa: E402
 
@@ -1635,6 +1635,40 @@ class Baseline:
     #: different consumers at different grains: the mechanical test wants a file
     #: index, and the judge wants sentences it can recognise the fix in.
     fixed_findings: list[tuple[str, str, str, int | None, str]] = field(default_factory=list)
+    #: The anchor round's ``{round-local id: key}`` map — #627's other spelling for a
+    #: finding, and the only one a fixer is actually shown.
+    #:
+    #: An excision has to be aimed at the commit that answered ONE named finding, and
+    #: `review-pr.md` asks a fixer to name it in the commit body. What the fixer has in
+    #: front of it is the **To fix** list, which prints ``[1609-F03]`` beside every
+    #: finding and prints no key at all — so a rule that accepted only keys would be
+    #: asking a fixer to join its own commit message against a payload it never opened,
+    #: and would find no seam on every pass that did exactly what it was told.
+    #:
+    #: Run-LOCAL by construction (:func:`_finding_id`), which is why it is read off the
+    #: ANCHOR round's payload and no other: the numbering follows output position, so
+    #: the same defect is ``F03`` in one round and ``F07`` in the next. That is also
+    #: what bounds the risk of accepting it — the map holds one round's ids, and the
+    #: round it holds is the one whose fixer wrote the commits being read.
+    fixed_ids: dict[str, str] = field(default_factory=dict)
+    #: Which keys in that brief were SONAR HARD-GATE issues rather than panel findings.
+    #:
+    #: ``fixed_findings`` is read out of both of the fixer's brief buckets, `to_fix`
+    #: and `sonar_findings`, because for every consumer above this one they are one
+    #: list: the fixer was sent to all of them and the pass answered all of them.
+    #: #627's excision is the one reader for which they are not. A hard-gate issue is
+    #: exempt from both severity floors at every rule in :func:`round_stop` — it is an
+    #: external gate's verdict rather than a judged opinion — and an excision's whole
+    #: argument is that the finding it hands back was never owed. That argument cannot
+    #: be made about a finding no floor applies to, so a `P3` Sonar issue in the brief
+    #: must not read as sub-floor work whose fix can be thrown away (found by a Codex
+    #: second opinion, on the answering side of a filter this already had on the
+    #: caused side).
+    #:
+    #: Keys only, and empty for every payload whose `sonar_findings` bucket was empty
+    #: — which is every repo with no Sonar seat, where this costs nothing and says
+    #: nothing.
+    fixed_gate: set[str] = field(default_factory=set)
     #: The SEVERITY of every finding in the anchor round's brief, in payload order —
     #: #622's strict half, and the one field here that has to count the findings
     #: ``fixed_findings`` deliberately drops.
@@ -2561,7 +2595,25 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                         # under "" — which `_same_file` would suffix-match against
                         # every path there is.
                         continue
+                    if bucket == "sonar_findings":
+                        # #627, and the only thing in this loop that cares which
+                        # bucket a record came from. Recorded rather than derived
+                        # later: nothing downstream of `fixed_findings` can tell a
+                        # hard-gate issue from a panel finding, because the tuple
+                        # carries a severity and no source.
+                        b.fixed_gate.add(key)
                     b.fixed_here.setdefault(file, set()).add(key)
+                    # #627's other spelling, off the same record. Recorded only where
+                    # the payload names one and it is not already taken by a different
+                    # finding: an id is round-local, two buckets are read into one map,
+                    # and an id resolving to two keys would aim an excision at whichever
+                    # of them was written last. A collision drops BOTH readings rather
+                    # than picking one — the key spelling still works, and a seam that
+                    # cannot be identified must read as no seam.
+                    got_id = str(f.get("id") or "")
+                    if got_id:
+                        b.fixed_ids[got_id] = ("" if b.fixed_ids.get(got_id, key) != key
+                                               else key)
                     line = f.get("line")
                     b.fixed_findings.append(
                         (key, str(f.get("severity") or "?"), file,
@@ -4879,6 +4931,428 @@ def _by_severity(records: Iterable[dict]) -> str:
     return ", ".join(f"{counts[s]}\u00d7{s}" for s in ranked)
 
 
+# ------------------------------------------------------------------- #627: the one
+# backtrack the loop takes on its own.
+#
+# Everything above this line REPORTS a revert and refuses to run one, and the reason is
+# stated there: a fix pass is MIXED, so reverting one that cleared three P2s to remove
+# five P3s puts the P2s back, and nothing in the loop knows which half is which without
+# asking. That refusal is not being relaxed. What #627 identifies is a case that is not
+# a mixed pass at all.
+#
+# A single fix that answered a finding BELOW `round_trigger_floor` answered one
+# complaint that was, by definition, not blocking the close. If the next round
+# attributes a new finding to that fix, the whole cost of removing it is one P3 or P4
+# returning to a state this repo's own policy already calls reportable and
+# non-blocking — an unpaid budget item, which every budgeted cycle produces on
+# purpose. There is nothing to weigh, and where there is nothing to weigh there is no
+# decision to hand upstairs. So: excise the fix, hand the sub-floor finding back to the
+# board unfixed, drop the finding it caused, and let the cycle carry on.
+#
+# THREE THINGS MAKE IT SAYABLE, and each is a way this declines rather than guesses:
+#
+# * attribution at the grain of the FIX. `panel_scope._provenance` works at the grain
+#   of the pass — its added-line set is the whole range's — so a finding standing on
+#   one commit's line is indistinguishable from one standing on another's.
+#   `panel_scope.blame_owners` is the finer instrument, and a pass that left no seam
+#   for it to read is reported as such rather than aimed at approximately;
+# * a revert that CANNOT CASCADE. A sub-floor fix whose lines a later blocking fix
+#   built on is no longer a clean excision — taking it out takes part of a P1's fix
+#   with it, which is the mixed revert this rule is careful not to be. The test is that
+#   every line the commit added is still the commit's own at the head;
+# * a COUNT, because a repo where this fires often is saying something about its
+#   sub-floor budget that no other number in the payload says.
+#
+# NOTHING HERE RUNS ANYTHING EITHER. The excision is a command in the payload, exactly
+# as #506's proposal is, and the actor that runs it is the orchestrator holding the
+# checkout (`panel-review-pr.md` §5). The difference between the two is not who
+# executes but whether a human has to decide first: #506's is a decision, and this is
+# not one.
+
+
+def sub_floor_brief(brief: Iterable[tuple], dials: dict | None,
+                    gate: Iterable[str] = ()) -> tuple[dict[str, dict], str, str | None]:
+    """The anchor round's findings BELOW its own trigger floor, as `({key: record},
+    floor, why)` — which of the complaints the last fix pass answered were sub-floor,
+    and the floor that decided it.
+
+    The floor travels with the verdict rather than being looked up again by whoever
+    prints it. It is the ANCHOR round's, and this round's report is written under
+    THIS round's dials, so a floor moved between the two would otherwise have the
+    report naming a cut the classification did not use (found by a Codex second
+    opinion).
+
+    ``brief`` is :attr:`Baseline.fixed_findings` and ``dials`` is
+    :attr:`Baseline.fixed_dials`: the list the fixer was sent to answer and the policy
+    it was banded under, off ONE payload, on :func:`budgeted_brief`'s rule and for its
+    reason — a brief paired with another round's floors would reclassify what that pass
+    was paying for.
+
+    **The ANCHOR round's trigger floor and not this round's.** An operator who moved
+    `round_trigger_floor` between rounds must not thereby make a fix that answered
+    mandatory work look like a cheap one that can be thrown away. Where the payload does
+    not name it as a severity this declines, exactly as :func:`budgeted_brief` does, and
+    the asymmetry is the same: an unreadable floor read as no floor would admit
+    EVERYTHING to the sub-floor band, which is the loosening direction on the one test
+    that decides whether a fix may be removed without asking.
+
+    ``gate`` is :attr:`Baseline.fixed_gate` — the keys in that brief that were SONAR
+    HARD-GATE issues — and they are never sub-floor whatever severity they carry. A
+    hard-gate issue is exempt from both severity floors at every rule in
+    :func:`round_stop`, because it is an external gate's verdict rather than a judged
+    opinion, and this rule's argument is that the finding it hands back to the board
+    was never owed. That argument cannot be made about a finding no floor applies to.
+    It is the answering-side twin of the filter `panel.py` puts on the caused side,
+    and both are needed: one keeps a gate issue out of the list an excision drops, the
+    other keeps a gate issue's own fix from being the thing excised.
+
+    Severity is the only test otherwise. `fix_severity_floor` is deliberately NOT
+    applied: a finding below the fix floor was never in the brief to begin with — no
+    fixer was sent to it, so no fix answered it — and adding the floor as a second
+    condition would only describe the same set in a way that a later change to one dial
+    could break.
+
+    An entry whose severity nothing can parse is not sub-floor. That falls out of
+    :func:`severity_at_least`, which reads an unparseable severity as P1, and P1 is at or
+    above every trigger floor — so an unreadable record declines through the predicate
+    the rest of the round already uses rather than through a branch written here to
+    agree with it (:class:`Baseline`'s ``"?"`` sentinel, same mechanism).
+    """
+    floor = (dials or {}).get("round_trigger_floor")
+    if not isinstance(floor, str) or floor.strip().upper() not in SEVERITIES:
+        return {}, "", ("the round that briefed this fix pass does not name "
+                    "`round_trigger_floor` as a severity in its payload, so which of "
+                        "its findings were below the floor cannot be read back out "
+                        "of it")
+    floor = floor.strip().upper()
+    exempt = {str(k) for k in gate}
+    out: dict[str, dict] = {}
+    for key, severity, file, line, title in brief:
+        if severity_at_least(severity, floor) or str(key) in exempt:
+            continue
+        out[str(key)] = {"key": str(key), "severity": severity, "file": file,
+                         "line": line, "title": title}
+    return out, floor, None
+
+
+def _names_finding(message: str, spelling: str) -> bool:
+    """Does this commit message NAME this finding — by its key or by its round-local
+    id?
+
+    A substring test with both ends fenced, and the fence is the whole of it. Both
+    spellings are short alphanumeric tokens: a round-local id is `1609-F03` and a
+    finding key is sixteen hex characters, so a bare `in` matches `34-F10` inside
+    `34-F100` on a round with a hundred findings, and matches a key inside any longer
+    hex string that happens to contain it — a commit sha, most obviously, which every
+    fix pass's message may quote. Either match aims an excision at the wrong hunk,
+    which is the one failure `panel-review-pr.md` names for this rule.
+    """
+    if not (message and spelling):
+        return False
+    return bool(re.search(rf"(?<![0-9A-Za-z_-]){re.escape(spelling)}"
+                          rf"(?![0-9A-Za-z_-])", message, re.IGNORECASE))
+
+
+def excision_seams(commits: Iterable[dict], sub_floor: Mapping[str, dict],
+                   brief: Iterable[tuple], ids: Mapping[str, str] | None = None
+                   ) -> tuple[dict[str, dict], list[dict]]:
+    """Which commits of the fix pass are a SEAM — `({sha: seam}, refused)`.
+
+    A seam is a commit whose message names exactly ONE finding out of the anchor
+    round's brief, and that finding is below the trigger floor. That is the shape
+    `review-pr.md` step 3 asks a fixer to leave ("each one stays its own hunk or its own
+    commit, named in the commit body by the finding it answers") and the only shape an
+    excision can be aimed at without guessing.
+
+    ``ids`` is the anchor round's ``{round-local id: key}`` map, so a commit body may
+    name the finding either way. The id is what a fixer actually has: the **To fix**
+    list prints `[1609-F03]` beside every finding and prints no key at all, so a rule
+    that accepted only keys would ask a fixer to join its own commit message against a
+    payload. Both spellings resolve to the key, which is what everything downstream is
+    keyed on.
+
+    ``refused`` carries the commits that named a sub-floor finding and are NOT seams,
+    each with a sentence. That list is the point of the function as much as the seams
+    are: a commit that answered one P3 and one P1 together is a mixed pass in
+    miniature, and the difference between reporting that and silently not finding a
+    seam is the difference between a rule that declined and a rule that appeared not to
+    apply.
+
+    **A merge commit is never a seam.** `git revert` refuses one without `-m`, and a
+    merge is how a base branch gets inside a range in the first place — the same
+    argument :func:`revert_state` makes for withholding a range command, asked one
+    commit at a time.
+    """
+    every = {str(key): str(key) for key, *_ in brief}
+    for spelling, key in (ids or {}).items():
+        if str(key) in every:
+            every[str(spelling)] = str(key)
+    seams: dict[str, dict] = {}
+    refused: list[dict] = []
+    for commit in commits:
+        message = str(commit.get("message") or "")
+        named = {key for spelling, key in every.items()
+                 if _names_finding(message, spelling)}
+        sub = named & set(sub_floor)
+        if not sub:
+            # Not a seam and not a refusal: a commit that answered mandatory work, or
+            # one that named nothing at all, is simply not what this rule is about.
+            continue
+        record = {"commit": str(commit.get("sha") or ""),
+                  "subject": str(commit.get("subject") or ""),
+                  # ONE shape for every entry in `declined`, on `injection_state`'s
+                  # rule applied inside a list: a consumer walking it must not have to
+                  # test for a key's presence to know what kind of refusal it is
+                  # reading. A refusal made here has no finding attributed to it yet
+                  # and may never get one, so both fields are the empty answer rather
+                  # than absent.
+                  "answered": None, "caused": []}
+        if commit.get("merge"):
+            refused.append({**record, "why":
+                            "the commit is a merge, and `git revert` refuses one "
+                            "without `-m` — a merge is also how other people's commits "
+                            "get into a fix range, so undoing it is not the removal of "
+                            "one fix"})
+            continue
+        if len(named) > 1:
+            mandatory = sorted(named - set(sub_floor))
+            refused.append({**record, "why":
+                            f"the commit names {len(named)} of the round's findings"
+                            + (f", {len(mandatory)} of them mandatory work above the "
+                               "trigger floor" if mandatory else
+                               " — more than one sub-floor fix landed in it")
+                            + ", so removing it would remove fixes nothing attributed "
+                              "a finding to"})
+            continue
+        seams[record["commit"]] = {**record,
+                                   "answered": sub_floor[next(iter(sub))]}
+    return seams, refused
+
+
+def _read_once(reader, seen: dict, of: str):
+    """One reader called at most once per subject, answer cached — including a
+    ``None``.
+
+    A miss and a failure are both answers here, and both are expensive: a `git blame`
+    that could not run is asked about the same file twice, once for the finding
+    standing on it and once for the cascade test over the commit that wrote it. The
+    cache is what makes "called at most once" a property of the code rather than of the
+    order the branches happen to run in, and it must cache the ``None`` too — a reader
+    that returns ``None`` for a file this checkout does not carry would otherwise be
+    re-run for every line of it.
+    """
+    if of in seen:
+        return seen[of]
+    seen[of] = reader(of) if callable(reader) else None
+    return seen[of]
+
+
+def excision_state(kind: str, *, why: str | None = None, commits: dict | None = None,
+                   brief: Iterable[tuple] = (), dials: dict | None = None,
+                   gate: Iterable[str] = (),
+                   ids: Mapping[str, str] | None = None,
+                   caused: Iterable[dict] = (),
+                   blame: Callable[[str], Mapping[int, str] | None] | None = None,
+                   added: Callable[[str], Mapping[str, int] | None] | None = None
+                   ) -> dict:
+    """#627's excisions as this round can name them, for :func:`round_stop` and the
+    payload — the same division of labour :func:`revert_state` has: the arithmetic
+    lives beside the thing it measures and the stop rule stays a rule about findings.
+
+    ``kind`` is :func:`panel_scope._fix_range_diff`'s own verdict for this round's fix
+    range, or :data:`REVERT_NOT_ASKED` where there was no earlier round to have a range
+    with — #500's vocabulary reused rather than restated, exactly as
+    :func:`revert_state` reuses it. Only `ok` can name a commit, and a rebased round
+    says so in #500's words rather than guessing at one.
+
+    ``caused`` is the findings this round attributed to the fix pass — the same
+    ``introduced`` records :attr:`revert_state.removes` carries.
+
+    ``blame`` and ``added`` are READERS and not data: ``blame(file)`` is
+    :func:`panel_scope.blame_owners` for that file at this round's head, ``added(sha)``
+    is :func:`panel_scope.commit_insertions` for that commit, and each returns ``None``
+    where the checkout could not answer. They are passed as callables rather than as
+    two pre-read maps because the caller cannot know WHICH files and commits to read
+    until the seams have been worked out, and working that out twice — once in the
+    caller to decide what to read and once here to decide what it means — is two
+    derivations of one answer with two chances to disagree. Handing over the readers
+    keeps the derivation here, in one place, and keeps this module's rule that nothing
+    in it shells out: the only subprocess in reach belongs to the function that was
+    passed in. Each is called at most once per file and per commit.
+
+    Every field is present on every round, :func:`injection_state`'s rule and for its
+    reason: an absent key and "there was nothing to excise" are different claims.
+
+    **``count`` IS ``None`` WHERE NOTHING COULD BE READ AND MUST NEVER BE A ZERO.**
+    Round 1, a rebased range, an anchor payload whose trigger floor is unreadable and a
+    checkout that could not list the pass are all "nobody looked", and a `0` published
+    for any of them says a round found no fix to excise — which is the flattering
+    direction on the very number #627 asks for, since a repo where this fires often is
+    being told something about its sub-floor budget. ``why`` says which.
+
+    ``declined`` is the other half of the answer and it is never empty for a reason the
+    payload does not carry. A caused finding whose seam a later commit built on stays
+    in the cycle and gets handed to a fixer like any other, and a reader has to be able
+    to tell that from the rule not applying — #627's own words: report it instead of
+    forcing it.
+
+    **THE EXCISION'S OWN RESTORATION IS CHURN, AND IT IS COUNTED (#692).** The unit
+    #692 settled on is churned lines — "a line that is touched is a surface area for
+    bugs", cumulative across passes rather than the size of the surviving diff — and by
+    that definition an excision is itself a pass that touches lines: it deletes what the
+    sub-floor fix wrote and puts back what that fix replaced. Nothing here exempts any
+    of it. The excision commit lands inside the NEXT round's fix range, so
+    :func:`referee_state`'s split, :func:`guard_churn_state`, :func:`fix_budget_state`
+    and #619's surface all see it, exactly as they see any other commit, and that is
+    the honest answer: the branch was touched, and a correction that touched code is
+    still a touch.
+
+    **What is exempted is ATTRIBUTION, which is a different question and only that
+    one.** #559 established that restoring reviewed code counts as WRITING it to a line
+    diff, so a naive revert inflates `escalate_on.fix_injection` and the remedy for the
+    gate reads to the gate as the disease. The lines an excision puts back sat at an
+    earlier round's head by construction — the sub-floor fix landed after it — so
+    :func:`panel_scope.restored_lines` is looking for exactly them and takes them out of
+    `introduced`. "How much surface was disturbed" and "who wrote this line" are two
+    questions; #692 settles the first and #559 the second, and this mechanism answers
+    yes to the first and no to the second on purpose. The honest limit is
+    :data:`panel_scope.RESTORED_RUN_MIN`: below five consecutive lines a restoration is
+    not distinguished from authorship, so an excision smaller than that leans one
+    round's `introduced` high by a handful of lines.
+
+    **And it is not charged to `low_severity_fix_lines`.** That budget bounds what a
+    round may SPEND on the sub-floor band; an excision is not a fix in that band, it is
+    the removal of one. Charging it would make the cheap correction unaffordable in
+    exactly the cycles where the budget is tight — which is where this fires most — and
+    would price a round for undoing work it is being told not to have done.
+
+    **What ``destroys`` does NOT price, said in the payload rather than left to be
+    discovered (#558).** An excision removes the artefact the sub-floor fix wrote, and
+    the only column here that describes it is a line count split by path. #558 is open
+    on exactly this: a revert proposal prices what comes back and never what gets
+    destroyed, and on lexray#1697 two "P3 findings return" entries were the sole
+    coverage of the mechanism the PR existed to build. The rule #627 decided is not
+    conditioned on that pricing and this does not invent one — but a consumer reading
+    ``answered`` as the whole cost of an excision is making #558's mistake, and the
+    field names the guard lines so that the reading is available rather than implied.
+    """
+    seen_blame: dict[str, Mapping[int, str] | None] = {}
+    seen_added: dict[str, Mapping[str, int] | None] = {}
+    out: dict = {"kind": kind, "why": None, "floor": None, "sub_floor": None,
+                 "seams": None, "count": None, "excise": [], "declined": []}
+    if kind != FIX_RANGE_OK:
+        return {**out, "why": why or ("there was no fix pass between two rounds for a "
+                                      "sub-floor fix to be excised from")}
+    sub_floor, floor, floor_why = sub_floor_brief(brief, dials, gate)
+    if floor_why:
+        return {**out, "why": floor_why}
+    out["floor"], out["sub_floor"] = floor, len(sub_floor)
+    if not sub_floor:
+        # Read and answered: the pass had no sub-floor fix in it, so there is nothing
+        # this rule can apply to. A measured zero and not a null — the question was
+        # asked and the answer is none.
+        return {**out, "seams": 0, "count": 0,
+                "why": "the round that briefed this fix pass sent it to no finding "
+                       f"below its `{floor}` trigger floor, so no fix in the pass "
+                       "answered one"}
+    read = commits if isinstance(commits, dict) else {}
+    listed = read.get("commits") or []
+    if not listed:
+        return {**out, "why": read.get("why") or
+                "the commits in this fix range could not be read, so which fix "
+                "answered a sub-floor finding cannot be said"}
+    seams, refused = excision_seams(listed, sub_floor, brief, ids)
+    out["seams"], out["declined"] = len(seams), list(refused)
+    if not seams:
+        return {**out, "count": 0,
+                "why": f"none of the {len(listed)} commit(s) in this fix pass names one "
+                       f"of the {len(sub_floor)} sub-floor finding(s) it was sent to, so "
+                       "there is no seam to excise — a fix smeared through a pass cannot "
+                       "be removed without taking the others with it"}
+    # From here the round KNOWS which fixes are sub-floor and which commit each is, so
+    # every answer below is a measured one and `count` is a number rather than a null.
+    out["count"] = 0
+    by_commit: dict[str, list[dict]] = {}
+    for finding in caused:
+        file, line = str(finding.get("file") or ""), finding.get("line")
+        if not file or not isinstance(line, int) or isinstance(line, bool):
+            # A finding nothing can place is no evidence about which fix wrote the line
+            # it sits on. Dropped rather than attributed — the same posture
+            # `Baseline.fixed_findings` takes on an unplaceable record.
+            continue
+        blamed = _read_once(blame, seen_blame, file)
+        if blamed is None:
+            out["declined"].append({
+                "commit": None, "subject": "", "answered": None, "caused": [finding],
+                "why": f"`{file}` could not be blamed in this checkout, so which fix "
+                       "wrote the line this finding sits on is not known"})
+            continue
+        owner = blamed.get(line)
+        if owner in seams:
+            by_commit.setdefault(owner, []).append(finding)
+    for sha, findings in by_commit.items():
+        seam = seams[sha]
+        wrote = _read_once(added, seen_added, sha)
+        if wrote is None:
+            out["declined"].append({**seam, "caused": findings, "why":
+                                    "the lines this commit added could not be counted "
+                                    "in this checkout, so it cannot be shown that "
+                                    "nothing later in the pass built on them"})
+            continue
+        unblamed = sorted(path for path in wrote
+                          if _read_once(blame, seen_blame, str(path)) is None)
+        if unblamed:
+            out["declined"].append({**seam, "caused": findings, "why":
+                                    f"{', '.join(f'`{p}`' for p in unblamed)} could not "
+                                    "be blamed in this checkout, so it cannot be shown "
+                                    "that nothing later in the pass built on this fix"})
+            continue
+        # NOT `added`, which is the READER this loop calls once per commit: rebinding
+        # it here left the second seam of a two-seam round asking an integer for its
+        # line counts, getting a `None` back through `_read_once`'s `callable` test,
+        # and declining with "could not be counted" over a checkout that answered
+        # perfectly well (found by a Codex second opinion).
+        wrote_lines = sum(int(n) for n in wrote.values())
+        kept = sum(1 for path in wrote
+                   for owner in (_read_once(blame, seen_blame, str(path)) or {}).values()
+                   if owner == sha)
+        if kept != wrote_lines:
+            # THE CASCADE, and it is refused in both directions. Fewer surviving lines
+            # than the commit wrote means a later commit in the pass rewrote or removed
+            # part of this fix — very often a blocking fix building on it, which is the
+            # one case #627 excludes by name. MORE means blame credits the commit with
+            # lines its own diff did not count, which is what a rename looks like from
+            # here; either way the commit's lines and the head's are not the same set,
+            # and a revert of it is no longer the removal of one fix.
+            out["declined"].append({**seam, "caused": findings, "why":
+                                    f"{kept} of the {wrote_lines} line(s) this fix added are "
+                                    "still its own at the head, so a later commit in "
+                                    "the pass has built on it — reverting it now would "
+                                    "take part of another fix with it"})
+            continue
+        guard = sum(int(n) for path, n in wrote.items()
+                    if _guard_kind(str(path)) in ("test", "doc"))
+        out["excise"].append({
+            **seam,
+            # What comes BACK on the board, unfixed — the whole priced cost of the
+            # excision under #627's argument, and the field a reader must not mistake
+            # for the whole cost of it (see the docstring, and #558).
+            "answered": seam["answered"],
+            # What goes away with it and is not handed to a fixer.
+            "caused": findings,
+            # The action, spelled out, run by nothing here. ONE commit and the FULL
+            # sha, on `revert_state`'s rule: a display span is read and a command is
+            # executed, and an abbreviation ambiguous in this repository resolves to
+            # nothing or to something else.
+            "command": f"git revert --no-commit {sha}",
+            # #558's gap, named rather than priced.
+            "destroys": {"files": sorted(str(p) for p in wrote),
+                         "lines": wrote_lines, "guard_lines": guard},
+        })
+    out["count"] = len(out["excise"])
+    return out
+
+
 def premise_report(verdict: dict, register_path: str, notes: list[str],
                    problems: list[str], board: str = "") -> str:
     """The one screen a fixer sees when it declares a premise. Plain text, because
@@ -5243,6 +5717,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                premises: dict | None = None,
                injection: dict | None = None,
                revert: dict | None = None,
+               excision: dict | None = None,
                not_falling: dict | None = None,
                unrefereed: dict | None = None,
                guard_churn: dict | None = None,
@@ -5926,6 +6401,20 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     the field that says a proposal was actually put, and it is ``fired``'s counterpart
     one rule down.
 
+    **``excision`` (#627) is the ONE backtrack the loop takes without asking, and it
+    is not a smaller version of the rule above.** A whole fix pass is mixed, which is
+    why reverting one is a human's decision; a single fix that answered a finding below
+    `round_trigger_floor` is not, because the entire cost of removing it is one P3 or
+    P4 returning to the board unfixed — the state an unpaid budget item is already in.
+    So :func:`excision_state` names the commit, the sub-floor finding that comes back,
+    the finding that goes away with it and the `git revert` for it, and declines by
+    name wherever a later commit in the pass has built on that fix.
+
+    It moves nothing in this function. The caused finding is still outstanding to every
+    rule here, so a round that names an excision goes again exactly as it would have
+    without one — which is #627's "the cycle continues", and the reason there is no
+    ``fired`` or ``offered`` beside ``count``.
+
     **``converged`` (#626) is the payload saying, in one boolean, whether this was a
     clean finish** — and it exists because until now the reader had to assemble that
     from four fields and could assemble it wrong. It is true only where the cycle
@@ -6353,6 +6842,17 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # and it cannot keep it going — a REMEDY is not a rule — so it hangs entirely off
     # `injected` below and adds one veto line beside the one that already fired.
     reverting = revert_state(REVERT_NOT_ASKED) if revert is None else revert
+    # #627's excision beside it, built by the caller for the same reason and read here
+    # in exactly one place: the payload. It changes no verdict either, and the reason
+    # is not #506's. That proposal decides nothing because reverting a whole pass is a
+    # human's call; this one decides nothing because it is a CORRECTION rather than a
+    # rule — #627's own words are that it is "not an escalation, not a stop, and not a
+    # human's decision", so a rung that ended a cycle on it would be the expensive
+    # reading of a cheap fact. It cannot relax one either: the caused finding is still
+    # outstanding to every rule in this function, so a round that names an excision
+    # goes again exactly as it would have without one, which is what "the cycle
+    # continues" asks for.
+    excising = (excision_state(REVERT_NOT_ASKED) if excision is None else excision)
     # `going_again` below, and NOT #506's original `not stop and triggering`:
     # #505 named the corrected rule-1 bound after codex found the old form
     # let either rung end a cycle that was going again for a P1 an earlier
@@ -7021,6 +7521,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # AND a commit range could be named, so this round is putting a revert to a
         # human. Every other round records what it knows and proposes nothing.
         "revert": {**reverting, "offered": offered},
+        # #627's excision, ALWAYS present for `revert`'s reason and with its
+        # vocabulary: `kind` carries `_fix_range_diff`'s own verdict, so a consumer
+        # reading `count: null` never has to guess whether the branch was rebased, the
+        # round was the first one, or the checkout could not be read — `why` says.
+        #
+        # There is no `offered` counterpart here, and its absence is the design.
+        # `revert.offered` marks the round that is putting a decision to a human;
+        # nothing about an excision is conditioned on a verdict, because the rule
+        # applies to a round whether or not the cycle is ending — a sub-floor fix that
+        # caused a finding is excised on the round that found it, and the cycle carries
+        # on. `count` is what a consumer acts on and it is a measurement.
+        "excision": excising,
         # #505's measurement, ALWAYS present for the reason `fix_injection` beside it
         # is: a payload with no key and a cycle with nothing to compare are different
         # claims. `counts` is the whole series the verdict was taken over rather than
@@ -7167,6 +7679,8 @@ __all__ = [
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
+    "sub_floor_brief", "_names_finding", "excision_seams", "_read_once",
+    "excision_state",
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
     "unrefereed_fix_brake", "referee_state", "fix_surface_state", "fix_budget_state",

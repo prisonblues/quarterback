@@ -1092,11 +1092,51 @@ to it, and the blocking fix that now rests on it, and let the round proceed norm
 the caused finding handed to a fixer like any other. A forced excision that breaks a P1
 fix has converted the cheapest correction in the loop into the most expensive one.
 
-**And it needs attribution at the granularity of the fix, not the pass.** `_provenance`
-attributes a finding to the fix *pass*; this needs the individual fix. Where the pass
-landed its budgeted fixes as separate hunks or commits, naming the finding each answers,
-you have it. Where it did not, say so and do not guess — an excision aimed at the wrong
-hunk removes work nobody asked to remove.
+**The round works out which fix, and publishes it — you do not have to.** `_provenance`
+attributes a finding to the fix *pass*; an excision needs the individual fix, and
+`round_stop.excision` is that answer:
+
+- **`count`** — how many excisions this round names. `null` is "nobody looked" (round 1,
+  a rebased range, an anchor payload whose trigger floor cannot be read, a checkout that
+  could not list the pass) and `why` says which; `0` is a measured none.
+- **`excise[]`** — one per fix, each carrying the `commit`, its `subject`, the
+  `command` (`git revert --no-commit <sha>` — **run it**), `answered` (the sub-floor
+  finding that goes back on the board unfixed: record it `deferred` with its one-line
+  note, §4b) and `caused` (the findings that go away with it: hand a fixer **none** of
+  them). The report lists the same thing under **Excised, not fixed**, and every caused
+  row in `to_fix` is flagged `excised: true`, so a list pasted out of the report cannot
+  pick one up by accident.
+- **`declined[]`** — a seam it refused, with a sentence: a later commit in the pass built
+  on the fix, the commit answered more than one finding, it is a merge, or the checkout
+  could not be read. Those caused findings are still in the cycle and are fixed like any
+  other finding. **Relay the sentence** — this is the case #627 says to report rather
+  than force.
+- **`seams`** and **`sub_floor`** — how many commits in the pass named exactly one
+  sub-floor finding, against how many sub-floor findings the pass was sent to. `seams: 0`
+  with `sub_floor` above zero means the pass left nothing to excise; that is the fixer
+  brief's instruction not being followed, and it is worth a sentence to the user because
+  the cheap correction was unavailable on this round as a result.
+- **`floor`** — the trigger floor that decided which findings were sub-floor. It is the
+  **anchor** round's, not the round you are reading, so quote it from here rather than
+  from `review_panel`: a floor moved between rounds would otherwise have you naming a cut
+  the classification did not use.
+
+**The excision costs the round no budget, and its churn is not hidden.** Do not charge
+it to `low_severity_fix_lines` — that budget bounds what a round may spend fixing
+sub-floor findings, and this is the removal of such a fix rather than one more of them.
+Its churn is still churn: the revert commit lands in the next round's fix range and every
+churn reading there counts it, which is #692's unit working as intended. What comes out of
+the next round's **attribution** is only the lines the revert restored, because those sat
+at an earlier round's head and #559 is what stops a correction reading as the disease.
+
+**What it does NOT price is what the excision destroys (#558).** `destroys` names the
+files, the lines and how many of them sit in test or documentation paths, and that is a
+line count rather than a valuation. A sub-floor fix is very often the only test over the
+path it was written for — on lexray#1697 two "P3 findings return" entries were the sole
+coverage of the mechanism the PR existed to build — and `answered` says nothing about
+that. The rule still applies: this is Rich's decision on #621 and it is not conditioned
+on a pricing that does not exist yet. But when `destroys.guard_lines` is most of the
+commit, say so to the user in the same breath as the excision.
 
 ### When the range between the rounds is an integration (#278)
 
@@ -1707,12 +1747,15 @@ Then the part that is new, and is the point of running more than one round:
   lifecycle (a Sonar hard-gate issue keeping the cycle alive, or a cycle continued by
   hand) rather than the ordinary budgeted-fix path. Do not report a `null` here as
   evidence that a pass stayed inside its budget.
-- **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
-  answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
-  fix, which finding it answered (now back on the board as reported-and-not-fixed), and
-  which finding went away with it. Say it too when the excision was **declined** because
-  a blocking fix had built on it — that is the case where a caused finding is still in
-  the cycle and a reader needs to know why.
+- **A sub-floor fix excised (#627):** `round_stop.excision` from each round that named
+  one. Say which fix (the commit and its subject), which finding it answered — now back
+  on the board as reported-and-not-fixed — and which findings went away with it, plus
+  what `destroys` says came out with it and that its worth is unpriced (#558). Say it too
+  when the excision was **declined**, with the sentence `declined[].why` gives: a
+  blocking fix built on it, the commit answered more than one finding, or the checkout
+  could not be read. That is the case where a caused finding is still in the cycle and a
+  reader needs to know why. A `count: null` is not evidence that nothing was excisable —
+  it is the round saying nobody could look.
 - **A revert proposed (#506):** if `round_stop.revert.offered` is true, relay it as
   a decision the user has to take, not as a footnote — the commit range, what
   reverting it would remove, what it would cost, and that nothing has run it. If the
