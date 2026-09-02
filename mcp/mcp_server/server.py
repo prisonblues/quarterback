@@ -14,12 +14,14 @@ Configuration via environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import NoReturn
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
@@ -463,8 +465,12 @@ def board_get(ctx: Context, id: int) -> dict:
         raise ToolError(f"board get failed: {e.response.status_code} {e.response.text}") from e
 
 
-def _raise(e: httpx.HTTPStatusError, prefix: str):
+def _raise(e: httpx.HTTPStatusError, prefix: str) -> NoReturn:
     # Surface the server's JSON error detail (e.g. a lease conflict) to the caller.
+    #
+    # `NoReturn` because a caller that does anything AFTER its `except` arm — as
+    # `dial_set` now does — is otherwise reading a function that looks as though it
+    # might fall through, and the value it goes on to use would be unbound if it did.
     raise ToolError(f"{prefix}: {e.response.status_code} {e.response.text}") from e
 
 
@@ -1813,8 +1819,74 @@ def dials(ctx: Context, repo: str | None = None) -> dict:
         _raise(e, "dials")
 
 
+#: What a dial value may be — every JSON type, named rather than left as `object`,
+#: and the naming is the point. An `object` annotation produces a schema entry with
+#: no `type` at all (`{"title": "Value"}`), and a parameter whose schema declares no
+#: type is one a caller may serialise as text: `dial_set("…tokens_per_pr", 8000000)`
+#: reached the board as the STRING `"8000000"` (#699). Spelled out, the same
+#: parameter carries an `anyOf` over every JSON type — with `integer` and `number`
+#: as separate branches, which is how JSON Schema spells one of them — and the
+#: number arrives as a number. `test_the_value_parameter_declares_its_types` is
+#: what keeps it spelled out.
+DialValue = str | int | float | bool | list | dict | None
+
+
+def _not_a_dial_value(constant: str) -> NoReturn:
+    """`json.loads`' hook for `NaN`/`Infinity`; refusing is the whole body."""
+    raise ValueError(f"{constant} is not a value any dial takes")
+
+
+def _read_dial_value(value: DialValue) -> tuple[DialValue, str]:
+    """`(the value, what was read)` — a value that arrived as TEXT, read as itself.
+
+    JSON where it parses, the string where it does not: `qbdata.parse_dial_value`'s
+    rule, which `app/static/dials.html` also implements, and this is the third place
+    — deliberately, because none of the three can import either of the others (this
+    package depends on httpx and nothing else, and `test_package_contract.py` is why
+    that stays true).
+
+    **The typed parameter above is the fix and this is the belt.** A caller that
+    honours the schema needs nothing here; one that does not — the boundary #699 was
+    filed about — hands over `"8000000"` for a `number` dial or `"false"` for a
+    `flag`, and `harness_rules.board_dials` then REFUSES that row and runs the repo
+    on its own defaults. The refusal is printed hours later into a panel nobody is
+    watching, while `dials` goes on reporting the value as in force, so the caller
+    who set it is the one person who never finds out.
+
+    `"false"` is the one that decides the shape of this. It is a non-empty string,
+    so a reader that has not been told the vocabulary takes it for ON — which is a
+    seat somebody switched off being dispatched anyway, and the reason this reads a
+    text value rather than passing it along and hoping.
+
+    Nothing in the harness's table takes a string that parses as JSON — a severity
+    is `P2`, a gate is `shape`, a model is `sonnet`, and none of those parse — so
+    the rule costs those values nothing. What it costs is the ability to set a dial
+    to the literal string `"8000000"`, which no dial wants; the two implementations
+    above accept exactly the same trade, and a caller that needs the string back has
+    the board's own `POST /dials` for it.
+    """
+    if not isinstance(value, str):
+        return value, ""
+    try:
+        # `parse_constant` refuses `NaN`, `Infinity` and `-Infinity` — which
+        # `json.loads` accepts as an extension and JSON itself does not have.
+        # Reading one would turn text somebody typed into a float the board then
+        # refuses outright (`json.dumps(..., allow_nan=False)`, `POST /dials`), so a
+        # value that WAS storable as the string it is would come back 422 and
+        # unstorable. Refusing here leaves it the string, which is the one reading
+        # under which no dial's value changes meaning. Raised rather than returned
+        # because `parse_constant` fires at any depth, so `[NaN]` lands here too.
+        read = json.loads(value, parse_constant=_not_a_dial_value)
+    except ValueError:
+        # `P2`, `eager`, `shape` — and the empty string, which `json.loads` refuses
+        # and which is a value the board stores like any other.
+        return value, ""
+    return read, (f"{value!r} arrived as text and was read as {read!r} "
+                  f"({type(read).__name__}) — see quarterback #699")
+
+
 @mcp.tool()
-def dial_set(ctx: Context, dial: str, value: object, reason: str,
+def dial_set(ctx: Context, dial: str, value: DialValue, reason: str,
              repo: str | None = None, expires_at: str | None = None) -> dict:
     """Put a dial in force. **A human's decision, which you may be asked to apply.**
 
@@ -1838,12 +1910,19 @@ def dial_set(ctx: Context, dial: str, value: object, reason: str,
     not recognise. A typo is stored and ignored, loudly, rather than refused here,
     so read `dials` first and match a name that is already in use.
 
+    **A value that arrives as TEXT is read as the value it looks like** (#699):
+    `"8000000"` is stored as the number, `"false"` as the boolean, `"P2"` and
+    `"eager"` as themselves. The reply carries `value_read_as` when that happened,
+    naming what went to the board — the alternative was a row the board accepts,
+    `dials` reports as in force, and the harness refuses on every read.
+
     Args:
         dial: a dotted path into the harness rules, e.g.
             `review_panel.fix_severity_floor`.
         value: any JSON. `null` is a real value for several dials (their documented
             off switch) and is NOT the same as clearing the dial — use `dial_clear`
-            for that.
+            for that. A string that parses as JSON is read as what it parses to, so
+            this cannot set a dial to the literal `"8000000"`; no dial wants one.
         reason: why. Required, and a dial whose argument is not written down is one
             nobody can later decide to remove. Name who asked you.
         repo: `owner/name` or `project:<name>`; omit for a FLEET-wide dial, which
@@ -1852,17 +1931,24 @@ def dial_set(ctx: Context, dial: str, value: object, reason: str,
             Prefer setting one when you are applying a temporary instruction — a
             setting that cannot outlive its reason is the cheapest safety there is.
     """
+    value, read_as = _read_dial_value(value)
     body: dict = {"dial": dial, "value": value, "reason": reason}
     if repo is not None:
         body["repo"] = repo
     if expires_at is not None:
         body["expires_at"] = expires_at
     try:
-        return _get_client(ctx).dial_set(body)
+        out = _get_client(ctx).dial_set(body)
     except RuntimeError as e:
         raise ToolError(f"dial_set: {e}") from e
     except httpx.HTTPStatusError as e:
         _raise(e, "dial_set")
+    if read_as and isinstance(out, dict):
+        # BESIDE the board's answer, never in place of it: the row it echoes is the
+        # record of what is now in force, and this says how the value in that row
+        # was arrived at. A caller that reads neither is no worse off than before.
+        out["value_read_as"] = read_as
+    return out
 
 
 @mcp.tool()
