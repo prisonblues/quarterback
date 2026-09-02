@@ -1643,9 +1643,16 @@ class Baseline:
     #: no file, or no key — which is right for recurrence (a finding nothing can place
     #: is no evidence the fixer was working anywhere) and would be exactly wrong here:
     #: dropping an unplaceable P1 turns a mixed list into an all-budgeted one and
-    #: manufactures the premise for an accusation. So every record is counted, and one
-    #: whose severity is unreadable is recorded ``"?"`` — a band no floor admits, which
-    #: declines the strict verdict rather than guessing at it.
+    #: manufactures the premise for an accusation.
+    #:
+    #: **So EVERY ENTRY IN THE TWO BRIEF BUCKETS IS COUNTED, including one that is not
+    #: a mapping at all.** Both unreadable shapes — a record whose severity nothing
+    #: could parse, and a bucket entry that is not a record — are written ``"?"``, a
+    #: band no floor admits, which declines the strict verdict rather than guessing at
+    #: it. The non-mapping case was skipped in the first cut of this field and a
+    #: different-vendor review of PR #694 found it: a brief of one P3 and one malformed
+    #: entry read as wholly budgeted, and a pass legitimately spending on whatever that
+    #: entry said would have been accused of overspending.
     #:
     #: Empty for a round with no anchor payload, which reads as "no brief to test" and
     #: not as "a brief with nothing in it": :func:`budgeted_brief` refuses both, and
@@ -2510,17 +2517,38 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         if anchor_payload is not None:
             for bucket in ("to_fix", "sonar_findings"):
                 for f in anchor_payload.get(bucket) or []:
+                    # #622's strict half, and a NON-MAPPING ENTRY IS COUNTED RATHER
+                    # THAN SKIPPED — which is the opposite of what the two readers
+                    # below do with it, and the asymmetry is the whole point.
+                    #
+                    # `fixed_here` and `fixed_findings` answer "where was the fixer
+                    # working", and an entry nothing can read is no evidence about
+                    # that, so they drop it. This list answers "was ALL of the brief
+                    # budgeted", which is a claim about the WHOLE list — and there,
+                    # dropping an entry is the one thing that must never happen: a
+                    # brief of one P3 and one unreadable record would read as wholly
+                    # budgeted, and a pass that was legitimately spending on whatever
+                    # that record said would be accused of overspending. The first
+                    # draft of this block skipped it and justified the skip in a
+                    # comment ("the one case that cannot be counted, since there is
+                    # nothing in it to read a severity off"), which was true about the
+                    # severity and false about the finding. A different-vendor review
+                    # of PR #694 found it.
+                    #
+                    # It is recorded as `"?"` — the same sentinel a dict entry whose
+                    # severity nothing could parse gets, one line down — so both
+                    # unreadable shapes decline the brief through ONE mechanism:
+                    # `severity_at_least` reads `"?"` as P1, P1 is at or above every
+                    # trigger floor, and `Dials.budgeted` is false there. No branch in
+                    # `budgeted_brief` has to know that this case exists.
                     if not isinstance(f, dict):
+                        b.fixed_severities.append("?")
                         continue
-                    # #622's strict half, and it is recorded BEFORE the placement
-                    # guard below rather than after it. The question this list
-                    # answers is whether the WHOLE brief was budgeted, so a record
-                    # that cannot be placed still counts as a finding the fixer was
-                    # sent to: dropped, an unplaceable P1 would turn a mixed list
-                    # into an all-budgeted one and manufacture the premise for an
-                    # accusation. A non-dict entry is skipped above and is the one
-                    # case that cannot be counted, since there is nothing in it to
-                    # read a severity off.
+                    # Recorded BEFORE the placement guard below rather than after it,
+                    # on the same argument: a record that cannot be PLACED still
+                    # counts as a finding the fixer was sent to, and dropping an
+                    # unplaceable P1 would turn a mixed list into an all-budgeted one
+                    # exactly as dropping the malformed entry above would.
                     b.fixed_severities.append(str(f.get("severity") or "?"))
                     file = str(f.get("file") or "")
                     key = str(f.get("key") or "") or _key_from_title(file, _baseline_title(f))
@@ -4277,9 +4305,9 @@ def budgeted_brief(prior: "Baseline | None", round_no: int, limit: int | None,
     ``all_budgeted`` says only whether the strict reading is available; the arithmetic
     stays where it was, in one place, priced once.
 
-    **Six conditions, and every one of them declines rather than guesses.** The failure
-    this guards against is not a missed breach — that is where the loop already is —
-    it is a breach announced against a round that did not commit one, which is a
+    **Seven conditions, and every one of them declines rather than guesses.** The
+    failure this guards against is not a missed breach — that is where the loop already
+    is — it is a breach announced against a round that did not commit one, which is a
     machine calling a fix pass dishonest on the strength of a payload it misread:
 
     * **an anchor brief exists** (``prior.fixed_severities``). Round 1 has none, and
@@ -4325,15 +4353,24 @@ def budgeted_brief(prior: "Baseline | None", round_no: int, limit: int | None,
       not this round's. The fixer was briefed under that policy and spent under it, so
       it is the policy it is fairly measured against — and an operator who dropped the
       fix floor between rounds must not thereby reclassify what the last pass was
-      paying for.
+      paying for;
+    * **and every finding in it can be READ.** A record whose severity nothing could
+      parse, and a bucket entry that is not a mapping at all, are both findings the
+      fixer was sent to and neither can be shown to be budgeted. An unreadable finding
+      must DECLINE the brief rather than disappear from it: a list of one P3 and one
+      malformed record, with the malformed one dropped, reads as wholly budgeted and
+      would have a pass accused of overspending on work nobody can identify. That is
+      the defect a different-vendor review found in PR #694's first cut, and it is
+      listed as its own condition here because that is the shape it will come back in.
 
-    An unreadable severity (``"?"``, which is what :class:`Baseline` records for a
-    finding whose band nothing could parse) declines the whole brief, and it does so
-    through :meth:`panel_seats.Dials.budgeted` rather than through a special case
-    here: :func:`severity_at_least` reads an unparseable severity as P1, P1 is at or
-    above every trigger floor, and a finding at or above the trigger floor is not
-    budgeted. The safe direction falls out of the predicate the rest of the round
-    already uses, which is better than a second one written to agree with it.
+    Both unreadable shapes decline through :meth:`panel_seats.Dials.budgeted` rather
+    than through a special case here — :class:`Baseline` records ``"?"`` for either,
+    :func:`severity_at_least` reads an unparseable severity as P1, P1 is at or above
+    every trigger floor, and a finding at or above the trigger floor is not budgeted.
+    So no branch below knows this condition exists, and the safe direction falls out of
+    the predicate the rest of the round already uses rather than out of a second one
+    written to agree with it. ``why`` still tells the two apart, because "the pass had
+    mandatory work" and "nobody knows what it had" are different news.
 
     ``prior`` is the :class:`Baseline` and nothing else, on
     :func:`guard_churn_state`'s rule: the anchor's list, its dials and its round number
@@ -4422,11 +4459,33 @@ def budgeted_brief(prior: "Baseline | None", round_no: int, limit: int | None,
                 round_trigger_floor=str(floors[1]).strip().upper(),
                 low_severity_fix_lines=written)
     budgeted = sum(1 for sev in listed if was.budgeted(sev))
+    # The VERDICT above is `Dials.budgeted`'s and only its. This is for the SENTENCE,
+    # and it exists because the two ways of not being budgeted are not the same news:
+    # a P1 in the brief means the pass had work the budget never applied to, and an
+    # entry nothing could read means nobody knows what it had. Reported as "mandatory
+    # work" either way — which is what the first draft did — the second reads as a
+    # statement about severity that nothing established.
+    #
+    # Normalised the way `_severity` normalises, and read only to choose wording: a
+    # disagreement between this and the predicate above can change which sentence is
+    # printed and can never change `all_budgeted`.
+    unreadable = sum(1 for sev in listed if str(sev).strip().upper() not in SEVERITIES)
+    unbudgeted = len(listed) - budgeted
+    if budgeted == len(listed):
+        why = None
+    elif unreadable:
+        why = (f"{unreadable} of round {at}'s {len(listed)} finding(s) carry no severity "
+               "this round can read, so whether the pass had mandatory work in front of "
+               "it is not known — and an unreadable finding must decline the brief "
+               "rather than disappear from it"
+               + (f" ({unbudgeted - unreadable} more were mandatory work)"
+                  if unbudgeted > unreadable else ""))
+    else:
+        why = (f"{unbudgeted} of round {at}'s {len(listed)} finding(s) were mandatory "
+               "work, which this spend may have gone on and a diff cannot say it did "
+               "not")
     return {**got, "budgeted": budgeted, "all_budgeted": budgeted == len(listed),
-            "why": None if budgeted == len(listed) else
-            (f"{len(listed) - budgeted} of round {at}'s {len(listed)} finding(s) were "
-             "mandatory work, which this spend may have gone on and a diff cannot say "
-             "it did not")}
+            "why": why}
 
 
 def fix_budget_state(referee: dict | None, limit: int | None, weight: int,
@@ -6354,11 +6413,15 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # the more specific truth wins the `reason`. Both of the rungs above it are volume
     # claims — `flat` says the work is not shrinking, `overguarded` says how much of one
     # bucket the pass wrote against a ceiling — and this is the volume claim that comes
-    # with an attribution PROOF: the whole of the last round's To fix list was budgeted,
-    # so every line of the pass answering it was budget spend and the pass went past a
-    # number this repo wrote. `unchecked` still takes the reason from it, because what
-    # KIND of work a pass did says more than how much of it there was, and `injected`
-    # takes it from both by naming the pass as the author of this round's findings.
+    # with an attribution PROOF: every entry in the last round's To fix list was read
+    # and every one of them was budgeted, so any line of the pass that answered that
+    # list was budget spend and the pass went past a number this repo wrote. The word
+    # is EVERY ENTRY and not "every finding", and the distinction is not pedantry — a
+    # brief with one record this round cannot read is a brief whose premise is unknown,
+    # and :func:`budgeted_brief` declines it rather than counting the readable ones.
+    # `unchecked` still takes the reason from it, because what KIND of work a pass did
+    # says more than how much of it there was, and `injected` takes it from both by
+    # naming the pass as the author of this round's findings.
     #
     # **`breach` and NOT `within`, and the difference is the whole of the rule.**
     # `within: False` means the round could not SHOW the budget was kept; it is true of
@@ -6366,7 +6429,12 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # cycle on it would be a machine calling an honest fix pass a spendthrift. `breach`
     # is `False` inverted under a premise that makes the inversion sound
     # (:func:`budgeted_brief`), and it is `None` — never `False` — wherever that premise
-    # could not be established, so this rung fires on a proof and on nothing else.
+    # could not be established. So this rung fires on a proof, and the proof is only as
+    # good as the reader that establishes it: it holds while every one of that
+    # function's seven conditions declines rather than guesses, and PR #694's first cut
+    # shipped with a malformed bucket entry silently dropped, which manufactured the
+    # premise out of a brief nobody could read in full. The guarantee lives there, not
+    # here.
     #
     # **No arming flag, and that is not the same omission `fix_surface` makes.** #67's
     # instrument-before-gate rule applies to a measurement whose threshold nobody has
@@ -6382,6 +6450,23 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # input, so it may not cancel the repair round for a P1 an earlier round raised and
     # this pass did not clear. A round it stops is a round that was going again only for
     # findings the budget itself says are not worth one.
+    #
+    # **WHICH MEANS THIS RUNG ENFORCES AN EXCEPTIONAL LIFECYCLE AND NOT THE ORDINARY
+    # BUDGETED-FIX PATH, and a reader who believes otherwise will trust a brake that
+    # mostly does not fire.** The two conditions pull against each other by
+    # construction: `going_again` needs new triggering findings and no held-over
+    # blocker or repeat, while the premise needs the PRIOR round's whole To fix list to
+    # have been budgeted — and a round whose list is wholly below the trigger floor is
+    # a round rules 1, 2 and 3 all stop. The practical routes in are rule 2's Sonar
+    # hard-gate exemption, which keeps a cycle going at ANY severity, and a cycle a
+    # caller continued by hand (`--round N --baseline`, #617's shape).
+    #
+    # That is stated rather than fixed. Widening the rung to reach the ordinary path
+    # would mean dropping or loosening `going_again`, and that bound is the only thing
+    # standing between this and a rule that can cancel the repair round for a P1 — a
+    # strictly worse trade than a brake with a narrow domain. The honest reading is
+    # that it closes a hole (there was NO input that reported a breach) rather than
+    # that it polices every fix pass.
     budgeting = (fix_budget_state(None, None, 1, False) if fix_budget is None
                  else fix_budget)
     # `.get` on the one key, and index on the rest: a `fix_budget` block written before

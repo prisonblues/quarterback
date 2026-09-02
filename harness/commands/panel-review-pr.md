@@ -363,10 +363,11 @@ From its output collect:
   range, or no budget in force. The upper bound is REPORTED and gates nothing (#67).
 
   **`breach` is the side `within` does not have, and it is the one that gates.** It is
-  `true` only where every finding the LAST round sent the fixer to answer sat in the 💸
-  band — no mandatory work in front of that pass at all — so the priced total is not an
-  upper bound on the budgeted spend, it IS the budgeted spend, and going past the limit
-  is a fact. That ends the round, files a veto line and costs the round its confidence.
+  `true` only where every entry in the LAST round's To fix list could be READ and every
+  one of them sat in the 💸 band — no mandatory work in front of that pass, and nothing
+  in the list this round cannot identify — so the priced total is not an upper bound on
+  the budgeted spend, it IS the budgeted spend, and going past the limit is a fact.
+  That ends the round, files a veto line and costs the round its confidence.
   `false` means the premise held and the pass stayed inside its budget, which is a
   stronger statement than `within: true`. `null` is the ordinary case and means no
   strict verdict was available; `brief` beside it says which of the reasons it was, in a
@@ -1696,7 +1697,11 @@ Then the part that is new, and is the point of running more than one round:
   say what the pass priced, what the budget was, and that every finding in the prior
   round's **To fix** list was budgeted — that last clause is what makes the number
   binding, and a reader given the accusation without it has been asked to take it on
-  trust.
+  trust. Note also what it does NOT cover: the rung needs the round to be going again,
+  which a wholly-budgeted prior list normally prevents, so it enforces an exceptional
+  lifecycle (a Sonar hard-gate issue keeping the cycle alive, or a cycle continued by
+  hand) rather than the ordinary budgeted-fix path. Do not report a `null` here as
+  evidence that a pass stayed inside its budget.
 - **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
   answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
   fix, which finding it answered (now back on the board as reported-and-not-fixed), and

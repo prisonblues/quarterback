@@ -869,6 +869,72 @@ def test_an_UNPLACEABLE_finding_still_counts_against_the_premise(tmp_path):
     assert panel_rounds.budgeted_brief(got, 2, 40, 2)["all_budgeted"] is False
 
 
+def test_a_MALFORMED_entry_DECLINES_the_brief_rather_than_vanishing_from_it(tmp_path):
+    """The defect a different-vendor review found in PR #694's first cut, and it is the
+    same shape as the guard one line below it.
+
+    `load_baseline` skipped any bucket entry that was not a mapping, because there is
+    nothing in a bare string to read a severity off. True about the severity and false
+    about the FINDING: a brief of one P3 and one malformed record then read as wholly
+    budgeted, and a pass spending 41 lines against a 40-line budget — possibly on
+    whatever that record said — was reported as a proven overspend. An unreadable
+    finding must DECLINE the brief, exactly as an unreadable severity already does, and
+    through the same sentinel so that no branch has to know this case exists.
+
+    Driven through `load_baseline` and then all the way to `breach`, because the bug was
+    in the reader and a unit test over `budgeted_brief` alone would never have seen it.
+    """
+    got = _loaded(tmp_path, _payload([
+        {"severity": "P3", "file": "a.py", "key": "k1"},
+        "malformed",
+    ]))
+    assert got.fixed_severities == ["P3", "?"]
+    # And the two readers that answer "where was the fixer working" still drop it: an
+    # entry nothing can read is no evidence about that, and the asymmetry is the point.
+    assert list(got.fixed_here) == ["a.py"] and len(got.fixed_findings) == 1
+    brief = panel_rounds.budgeted_brief(got, 2, 40, 2)
+    assert brief["findings"] == 2 and brief["budgeted"] == 1
+    assert brief["all_budgeted"] is False
+    assert "carry no severity this round can read" in brief["why"]
+    assert "must decline the brief rather than disappear from it" in brief["why"]
+    assert _spend(production=41, limit=40, brief=brief)["breach"] is None
+
+
+def test_an_unreadable_entry_and_a_mandatory_one_are_DIFFERENT_news(tmp_path):
+    """Both decline, and the sentence has to say which. "The pass had mandatory work in
+    front of it" is a statement about severity; a malformed entry establishes no such
+    thing, and reporting it that way would assert something nothing measured. The
+    verdict is `Dials.budgeted`'s either way — this only chooses wording, so a
+    disagreement here can change a sentence and can never change `all_budgeted`."""
+    mandatory = _loaded(tmp_path, _payload([
+        {"severity": "P3", "file": "a.py", "key": "k1"},
+        {"severity": "P1", "file": "b.py", "key": "k2"},
+    ]))
+    why = panel_rounds.budgeted_brief(mandatory, 2, 40, 2)["why"]
+    assert "were mandatory work" in why and "no severity this round can read" not in why
+    both = _loaded(tmp_path, _payload([
+        {"severity": "P3", "file": "a.py", "key": "k1"},
+        {"severity": "P1", "file": "b.py", "key": "k2"},
+        "malformed",
+    ]))
+    mixed = panel_rounds.budgeted_brief(both, 2, 40, 2)
+    assert mixed["findings"] == 3 and mixed["budgeted"] == 1
+    assert "1 of round 1's 3 finding(s) carry no severity" in mixed["why"]
+    assert "(1 more were mandatory work)" in mixed["why"]
+
+
+def test_a_brief_of_NOTHING_BUT_malformed_entries_is_not_an_empty_one(tmp_path):
+    """The two refusals are next to each other and must not collapse. An empty brief is
+    "the round asked for nothing"; a brief of unreadable entries is "the round asked for
+    things nobody can identify", and the second has to keep its finding count or the
+    payload under-states what the pass was sent to do."""
+    got = _loaded(tmp_path, _payload(["a", "b"]))
+    brief = panel_rounds.budgeted_brief(got, 2, 40, 2)
+    assert got.fixed_severities == ["?", "?"] and brief["findings"] == 2
+    assert brief["budgeted"] == 0 and brief["all_budgeted"] is False
+    assert "asked its fixer to fix nothing" not in brief["why"]
+
+
 def test_the_SONAR_bucket_is_in_the_brief_and_the_DISMISSED_one_is_not(tmp_path):
     """The two buckets a fixer's brief is built from, and the one it is not: a finding
     the master ruled not real was sent to nobody, so a pass cannot have spent on it.
