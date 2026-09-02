@@ -93,7 +93,8 @@ def _no_real_browser(monkeypatch):
 # developer's venv.
 def _why_no_tui() -> str | None:
     try:
-        import rich, textual  # noqa: F401
+        import rich
+        import textual  # noqa: F401
     except ImportError:
         return "textual/rich are not importable"
     return None
@@ -209,7 +210,7 @@ def _find_row(app, table, prefix: str) -> int:
     return -1
 
 
-async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
+async def _click_row_index(pilot, table, index: int | str, x: int = 4,
                            scroll: bool = False, column: int | None = None) -> str:
     """Click a row of `table`, wherever on screen that row has ended up.
 

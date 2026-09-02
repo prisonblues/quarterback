@@ -38,7 +38,7 @@ import sys
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -179,7 +179,7 @@ class Board:
                 "holder": f"zeus/{body.get('session')}",
                 "session": body.get("session"),
                 "note": body.get("note") or f"plan: {item['title']}",
-                "expires": (datetime.now(timezone.utc)
+                "expires": (datetime.now(UTC)
                             + timedelta(hours=1)).isoformat(),
             }
             out = {**item, "claimed": True, "renewed": False,

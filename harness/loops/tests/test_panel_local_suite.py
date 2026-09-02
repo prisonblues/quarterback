@@ -126,7 +126,7 @@ def test_it_only_answers_for_the_states_github_left_empty():
     """A real CI result about this exact commit is never displaced by a weaker local
     one, and `PENDING` belongs to #501's bounded wait — running a suite instead of
     waiting spends minutes to arrive at a worse answer than the one on its way."""
-    assert panel_scope.LOCAL_SUITE_WHEN == {"none", "unknown"}
+    assert {"none", "unknown"} == panel_scope.LOCAL_SUITE_WHEN
     for settled in ("PASS", "FAIL", "PENDING"):
         assert settled not in panel_scope.LOCAL_SUITE_WHEN
 

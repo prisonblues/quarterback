@@ -32,7 +32,7 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -195,7 +195,7 @@ def load_repo_cfg(name: str) -> dict:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 # ----------------------------------------------------------------- run state

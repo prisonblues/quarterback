@@ -211,7 +211,7 @@ READS = frozenset({
 })
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def doc(relpath: str) -> str:
     # Encoding spelled out: these files are prose full of em dashes, and `read_text()` takes the
     # platform default, which under a C/POSIX locale is ASCII. A nix build and a minimal CI

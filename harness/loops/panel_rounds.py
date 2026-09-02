@@ -1135,7 +1135,7 @@ REWORD_RATIO = 0.85
 #: words are what this list must leave alone: "not" and "never" are deliberately
 #: absent, since "is closed" and "is never closed" are two different defects.
 _TITLE_NOISE = frozenset(
-    "a an the of in on at to by is it its as be or and for with this that".split())
+    ["a", "an", "the", "of", "in", "on", "at", "to", "by", "is", "it", "its", "as", "be", "or", "and", "for", "with", "this", "that"])
 
 
 def _stem(word: str) -> str:
@@ -4280,7 +4280,7 @@ NO_PRIOR_BRIEF = {"round": None, "findings": None, "budgeted": None,
                   "why": "no earlier round's To fix list reached this round"}
 
 
-def budgeted_brief(prior: "Baseline | None", round_no: int, limit: int | None,
+def budgeted_brief(prior: Baseline | None, round_no: int, limit: int | None,
                    weight: int) -> dict:
     """Was the WHOLE of the prior round's To fix list budgeted? — #622's strict half,
     and the only premise under which a priced overspend is a breach rather than an

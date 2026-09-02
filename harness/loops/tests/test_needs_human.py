@@ -103,7 +103,7 @@ def test_the_two_arms_of_the_vocabulary_are_one_tuple():
     `app/needs_human.py` actually says, is `tests/test_needs_human_drift.py` in
     the app suite — the only suite where both files are readable at once.
     """
-    assert nh._FALLBACK_CLASSES == tuple(nh.NEEDS_HUMAN_CLASSES)
+    assert tuple(nh.NEEDS_HUMAN_CLASSES) == nh._FALLBACK_CLASSES
     assert nh.VOCABULARY_FROM
 
 

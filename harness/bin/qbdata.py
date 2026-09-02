@@ -19,7 +19,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 
 REPO = "prisonblues/quarterback"          # the fallback, not the answer
 REPO_URL = f"https://github.com/{REPO}"
@@ -510,7 +510,7 @@ def ago(stamp: str | None) -> str:
         then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return ""
-    secs = int((datetime.now(timezone.utc) - then).total_seconds())
+    secs = int((datetime.now(UTC) - then).total_seconds())
     if secs < 60:
         return f"{secs}s"
     if secs < 3600:
@@ -526,7 +526,7 @@ def until(stamp: str | None) -> str:
         then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return "—"
-    secs = int((then - datetime.now(timezone.utc)).total_seconds())
+    secs = int((then - datetime.now(UTC)).total_seconds())
     if secs <= 0:
         return "—"
     if secs < 3600:
@@ -542,7 +542,7 @@ def minutes_left(stamp: str | None) -> int | None:
         then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return int((then - datetime.now(timezone.utc)).total_seconds() // 60)
+    return int((then - datetime.now(UTC)).total_seconds() // 60)
 
 
 #: How long a `working` may stand before a reader calls it stalled. Tool calls
@@ -577,7 +577,7 @@ def agent_state(agent: dict) -> tuple[str, str]:
             then = datetime.fromisoformat((agent.get("state_at") or "").replace("Z", "+00:00"))
         except ValueError:
             return "working", "grey50"
-        if (datetime.now(timezone.utc) - then).total_seconds() >= STALL_AFTER:
+        if (datetime.now(UTC) - then).total_seconds() >= STALL_AFTER:
             return "stalled", "bold red"
         return "working", "grey50"
     return {"waiting": ("waiting", "bold yellow"),
@@ -1017,7 +1017,7 @@ class HumanClient:
         return json.loads(text) if text.strip() else {}
 
     @staticmethod
-    def _refusal(exc: "urllib.error.HTTPError") -> str:
+    def _refusal(exc: urllib.error.HTTPError) -> str:
         """What the board said, in words a panel can show.
 
         The board names its own mechanism in the body, so the body is what is
@@ -1696,7 +1696,7 @@ CI_CACHE_MAX = 256
 #: the incident had two, and a third would have hidden the failure just as well.
 CI_RUN_PAGE = 30
 
-_ci_cache: dict[tuple, tuple[float, "CiReport"]] = {}
+_ci_cache: dict[tuple, tuple[float, CiReport]] = {}
 
 
 @dataclass(frozen=True)
@@ -2516,7 +2516,7 @@ def plan_detail(item: dict, envelope: dict | None = None) -> str:
     blockers = item.get("blocked_by") or []
     if blockers:
         bits.append("waits on " + ", ".join(
-            f"{b.get('ref') and '#' + str(b['ref']) or ''} {b.get('title') or ''}".strip()
+            f"{(b.get('ref') and '#' + str(b['ref'])) or ''} {b.get('title') or ''}".strip()
             for b in blockers))
     if item.get("stale"):
         bits.append(f"stale, idle {item.get('idle_days')}d")
@@ -2921,7 +2921,7 @@ def plan_index(items: list[dict] | None, repos: list[str] | None = None) -> dict
 
 
 def claim_summary(claim: dict, items: list[dict] | None = None,
-                  scope: "Scope | None" = None,
+                  scope: Scope | None = None,
                   index: dict[str, dict] | None = None) -> str:
     """What a claim is on, in one cell: ``#554 The panel prices a fix by cost…``.
 
@@ -2994,7 +2994,7 @@ def _agent_row(agent: dict, mine: list[dict], items, scope, index) -> dict:
             "ttl": until(agent.get("expires"))}
 
 
-def agent_rows(data: dict, scope: "Scope | None" = None,
+def agent_rows(data: dict, scope: Scope | None = None,
                items: list[dict] | None = None,
                seats: list[dict] | None = None) -> tuple[list[dict], int]:
     """Who is here and how they are doing — SEATS, FLEET and CLAIMED as one table.
@@ -3238,7 +3238,7 @@ def _block(row: dict, blockers: list[dict], used: set | None = None) -> dict:
 
 def work_rows(plan: dict | None, prs: list[dict] | None, queue: dict | None,
               issues: list[dict] | None, held: dict | None = None,
-              scope: "Scope | None" = None, backlog: bool = False,
+              scope: Scope | None = None, backlog: bool = False,
               repos: list[str] | None = None, blockers: list[dict] | None = None,
               waiting_only: bool = False) -> tuple[list[dict], int]:
     """What is in flight, in the board's order — PLANS, REVIEW QUEUE, PRs, ISSUES.
@@ -3645,7 +3645,7 @@ def blocker_detail(blockers: list[dict]) -> str:
 
 
 def blocker_tally(blockers: dict | None,
-                  scope: "Scope | None" = None) -> tuple[str, str] | None:
+                  scope: Scope | None = None) -> tuple[str, str] | None:
     """``('WAITING 7', 'magenta')`` — what the header line says about the one door.
 
     `None` before the board has answered, and a **zero still draws** once it has:
@@ -3988,7 +3988,7 @@ def parse_dial_expiry(text: str, now: str | None = None) -> str | None:
     if seconds <= 0:
         raise ValueError("an expiry of zero is a dial that is absent the moment "
                          "it is written — leave it empty for no end")
-    base = datetime.now(timezone.utc)
+    base = datetime.now(UTC)
     if now:
         try:
             base = datetime.fromisoformat(now.replace("Z", "+00:00"))
@@ -4579,7 +4579,7 @@ def resets_in_s(stamp: str | None) -> int | None:
         then = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return max(0, int((then - datetime.now(timezone.utc)).total_seconds()))
+    return max(0, int((then - datetime.now(UTC)).total_seconds()))
 
 
 def limit_reset(stamp: str | None) -> str:

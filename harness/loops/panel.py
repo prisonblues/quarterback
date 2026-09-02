@@ -108,7 +108,7 @@ from panel_core import (          # noqa: F401  — explicit, so a reader can gr
 # The seats moved to panel_seats (#129) — that section alone was over
 # antigravity's argv cap, so the one seat whose prompt travels in argv could
 # never read the file reviewing it. Imported back so `run()` below still calls
-# `review_llm(...)` as a plain global, which is what keeps the suites' 
+# `review_llm(...)` as a plain global, which is what keeps the suites'
 # `setattr(panel, "review_llm", …)` doubles working.
 from panel_seats import *        # noqa: F401,F403
 import panel_seats               # noqa: F401
@@ -157,6 +157,7 @@ import panel_timing               # noqa: F401
 from preland import board_config, board_get, board_request, mergeability   # noqa: E402
 # #274's one door, and #279's escalation list read back through it.
 from needs_human import announce, digest as nh_digest   # noqa: E402
+from datetime import UTC
 
 #: What `GET /review/findings` calls the escalation list (#279). Named because
 #: two things read it: the fetch below, and the note it writes when a board is
@@ -370,8 +371,8 @@ def _age_of(ts: object) -> str:
         # The board stores UTC and `isoformat()` on a naive column drops the
         # offset. Reading it as local time is how a verdict from an hour ago comes
         # out as "1 hour ago" on one machine and "2 hours ago" on the next.
-        when = when.replace(tzinfo=timezone.utc)
-    return _ago(max(0.0, (datetime.now(timezone.utc) - when).total_seconds()))
+        when = when.replace(tzinfo=UTC)
+    return _ago(max(0.0, (datetime.now(UTC) - when).total_seconds()))
 
 
 #: What `GET /review/next-door` calls the hint list (#508). Named for the reason

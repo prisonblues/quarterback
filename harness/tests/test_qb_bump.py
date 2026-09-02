@@ -560,7 +560,7 @@ def test_nothing_in_the_agent_path_ever_runs_nixos_rebuild(consumer_repo, quarte
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture
-def prepared(consumer_repo, monkeypatch) -> "qb.Proposal":
+def prepared(consumer_repo, monkeypatch) -> qb.Proposal:
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
     proposal, _, _ = qb.prepare(qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"),
