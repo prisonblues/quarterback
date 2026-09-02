@@ -26,10 +26,12 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import math
 import os
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -463,7 +465,50 @@ def test_the_hammer_starts_a_fix_and_the_rest_of_the_issue_row_opens():
 #: worst honest answer and short enough that a wedged worker fails a test rather
 #: than hanging a CI job with no signal at all — which is the one outcome worse than
 #: a red build.
-_WORKER_DRAIN = float(os.environ.get("QB_DASH_WORKER_DRAIN", "90"))
+_WORKER_DRAIN_DEFAULT = 90.0
+
+
+def _worker_drain() -> float:
+    """`QB_DASH_WORKER_DRAIN` as a number of seconds that can actually expire.
+
+    **`nan` IS THE REASON THIS FUNCTION EXISTS.** `float("nan")` is a perfectly good
+    float, and `time.monotonic() >= start + nan` is False forever — so a deadline
+    built from it never expires, and the bound this knob was added to guarantee is
+    gone. Typing a three-letter word into an environment variable restored the
+    unbounded wait it replaced. `inf` does the same thing by a shorter route, and 0
+    or a negative expires before the first poll, which is not a bound either but at
+    least fails loudly.
+
+    That is the `QB_DASH_LIVE=0` lesson one constant up, in a different costume: a
+    knob that silently means something other than what it says. So an unusable value
+    is refused rather than honoured, and the refusal is `warnings.warn` rather than
+    `print` — pytest captures stdout and shows it only on failure, which is exactly
+    the run where this would not surface, while it lists warnings on a green one.
+
+    A value that is not a number at all is a typo and gets an error instead of a
+    default: silently running a suite for 90s when somebody asked for `9O` teaches
+    them nothing. Raised HERE and not at import, so it arrives as a readable failure
+    in the test that wanted it rather than as a collection error over the file.
+
+    Read at call time and not once at import, so `monkeypatch.setenv` in a test
+    reaches it — a module-level read is fixed before any test can set anything.
+    """
+    raw = os.environ.get("QB_DASH_WORKER_DRAIN", "").strip()
+    if not raw:
+        return _WORKER_DRAIN_DEFAULT
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise AssertionError(
+            f"QB_DASH_WORKER_DRAIN={raw!r} is not a number of seconds") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        warnings.warn(
+            f"QB_DASH_WORKER_DRAIN={raw!r} is not a positive, finite number of "
+            f"seconds — a deadline built from it would never expire, which is the "
+            f"unbounded wait this setting exists to prevent. Using "
+            f"{_WORKER_DRAIN_DEFAULT}s.", stacklevel=2)
+        return _WORKER_DRAIN_DEFAULT
+    return seconds
 
 
 async def _let_the_workers_finish(app) -> None:
@@ -520,14 +565,15 @@ async def _let_the_workers_finish(app) -> None:
     from textual.worker import WorkerState
 
     unfinished = (WorkerState.PENDING, WorkerState.RUNNING)
-    deadline = time.monotonic() + _WORKER_DRAIN
+    drain = _worker_drain()
+    deadline = time.monotonic() + drain
     while True:
         still = [w for w in app.workers if w.state in unfinished]
         if not still:
             return
         if time.monotonic() >= deadline:
             raise AssertionError(
-                f"the dashboard's fetches did not drain within {_WORKER_DRAIN}s — "
+                f"the dashboard's fetches did not drain within {drain}s — "
                 f"still going: "
                 + ", ".join(sorted(f"{w.group or w.name}={w.state.name}"
                                    for w in still))
@@ -2053,13 +2099,18 @@ def test_a_rebuild_that_loses_the_readers_row_goes_back_to_the_top():
 
 
 async def _drive_restore_guards() -> tuple:
-    """Call `restore_work_scroll` three ways: live, superseded, and against a
-    reader who has scrolled since.
+    """Call `restore_work_scroll` four ways: live, superseded, and twice against a
+    reader who has scrolled since — once away from the top, and once BACK to it.
 
     Called directly rather than raced into existence. Both guards are about the gap
     that deferring the restore opens — a second rebuild, or a hand on the wheel —
     and a test that tried to land either inside that gap would be timing-dependent
     about the very thing it is asserting.
+
+    The fourth case is the one a position check cannot see. A reader who scrolled
+    away and came deliberately back to the top leaves `scroll_y` at 0, which is
+    exactly what `clear()` leaves it at, so only a flag set by their own wheel or
+    key can tell the two apart.
     """
     app_module, app = _quiet_dash()
     async with app.run_test(size=(100, 20)) as pilot:
@@ -2070,35 +2121,102 @@ async def _drive_restore_guards() -> tuple:
         await pilot.pause(0.2)
         table = app.query_one("#work")
 
-        async def restore(generation, from_row):
+        async def restore(generation, from_row, touched=False):
             table.scroll_to(y=from_row, animate=False)
             await pilot.pause(0.2)
+            # AFTER the scroll above, which is this test moving the view and not the
+            # reader — `scroll_to` sets no flag, so the two cannot be conflated.
+            table.reader_scrolled = touched
             app.restore_work_scroll(generation, 20)
             await pilot.pause(0.2)
             return table.scroll_y
 
-        # THE CONTROL FIRST: with nothing in the way it moves the view, so the two
+        # THE CONTROL FIRST: with nothing in the way it moves the view, so the three
         # refusals below are this method declining rather than this method being
         # unable to do anything at all.
         live = await restore(app.work_scroll, 0)
         stale = await restore(app.work_scroll - 1, 0)
         readers = await restore(app.work_scroll, 5)
-        return live, stale, readers
+        back_at_top = await restore(app.work_scroll, 0, touched=True)
+        return live, stale, readers, back_at_top
 
 
 def test_a_superseded_scroll_restore_and_a_readers_own_scroll_both_win():
     """The restore is deferred a refresh, and both guards are about that gap.
 
-    A newer rebuild wins because two callbacks run in the order they were queued,
-    so without the check the OLDER rebuild's anchor lands last. And the reader wins
-    because `clear()` left the view at the top, so a `scroll_y` that is no longer
-    zero belongs to somebody else — and overwriting it would be this method doing
-    to a reader exactly what it exists to stop being done to them.
+    A NEWER REBUILD WINS, and the reason is the row index rather than the ordering.
+    Callbacks run in the order they were queued, so an older one runs FIRST — which
+    would be harmless if a newer one were behind it to correct the view. The case
+    that is not harmless is the older one running alone: its index belongs to the
+    row list of the rebuild that queued it, and a second rebuild renumbers every row
+    while capturing no anchor of its own (it reads `scroll_y` as 0, because the
+    first restore has not run yet) and so queues no correction. The generation is
+    what stops the stale index landing unopposed.
+
+    AND THE READER WINS, asked of a flag their own wheel or key sets rather than of
+    where the view happens to be. `clear()` leaves `scroll_y` at 0, so a reader who
+    scrolled away and came deliberately back to the top is indistinguishable by
+    position from one who never touched it — and the restore would then override a
+    real choice, which is this change's own defect arriving from the other side.
     """
-    live, stale, readers = asyncio.run(_drive_restore_guards())
+    live, stale, readers, back_at_top = asyncio.run(_drive_restore_guards())
     assert live == 20, f"the restore did not move the view at all: {live}"
     assert stale == 0, f"a superseded restore scrolled anyway: {stale}"
     assert readers == 5, f"the restore overwrote the reader's own scroll: {readers}"
+    assert back_at_top == 0, \
+        (f"a reader who scrolled back to the top was treated as one who never "
+         f"scrolled, and the restore moved them to {back_at_top}")
+
+
+@pytest.mark.parametrize("value", ["nan", "NaN", "inf", "-inf", "0", "-5"])
+def test_a_drain_that_can_never_expire_is_refused_and_says_so(monkeypatch, value):
+    """`nan` in this variable is the unbounded wait, back, spelled as three letters.
+
+    The bound exists because a wedged worker that hangs the drivers forever gets a
+    CI job killed with no signal at all. `float("nan")` is a valid float and
+    `time.monotonic() >= start + nan` is False FOREVER, so a deadline built from it
+    never expires and the guarantee is gone — reachable by typing a word into an
+    environment variable. `inf` gets there by a shorter route, and 0 or a negative
+    is not a bound either, it is a deadline in the past.
+
+    The property asserted is the one that matters and not the specific number: what
+    comes back is finite and positive, so a deadline built on it can expire.
+    """
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", value)
+    with pytest.warns(UserWarning, match="QB_DASH_WORKER_DRAIN"):
+        drain = _worker_drain()
+    assert math.isfinite(drain) and drain > 0, \
+        f"{value!r} produced a deadline that cannot expire: {drain}"
+    assert drain == _WORKER_DRAIN_DEFAULT, drain
+    # The thing being prevented, stated as the arithmetic rather than trusted: this
+    # is what the loop's own test does with the deadline it is given.
+    assert not (time.monotonic() >= time.monotonic() + float("nan")), \
+        "a nan deadline is expected to be one that never expires"
+
+
+def test_a_drain_that_is_not_a_number_says_which_setting_and_what_was_in_it(monkeypatch):
+    """A typo gets an error, not the default.
+
+    Silently waiting 90s for somebody who asked for `9O` teaches them nothing, and
+    the failure it eventually produces is attributed to whatever the test went on to
+    do. Raised where it is read rather than at import, so it lands as a readable
+    failure inside the test that wanted it instead of as a collection error over the
+    whole file.
+    """
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", "9O")
+    with pytest.raises(AssertionError, match="QB_DASH_WORKER_DRAIN='9O'"):
+        _worker_drain()
+
+
+def test_a_drain_that_is_a_usable_number_of_seconds_is_taken_as_given(monkeypatch):
+    """The knob still works, which is what makes the three refusals above refusals
+    rather than the setting being ignored."""
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", "12.5")
+    assert _worker_drain() == 12.5
+    monkeypatch.delenv("QB_DASH_WORKER_DRAIN")
+    assert _worker_drain() == _WORKER_DRAIN_DEFAULT
+    monkeypatch.setenv("QB_DASH_WORKER_DRAIN", "   ")
+    assert _worker_drain() == _WORKER_DRAIN_DEFAULT
 
 
 #: A plan with three open items in one scope, one in another and one fleet-wide —
