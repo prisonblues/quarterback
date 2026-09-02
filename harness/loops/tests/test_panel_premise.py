@@ -619,48 +619,18 @@ HEADS = {1: R1_HEAD, 2: R2_HEAD, 3: R3_HEAD}
 @pytest.fixture
 def at(monkeypatch):
     """Where the tree stood when `--premise` ran. Patched rather than driven through a
-    real checkout, because what is being pinned is the comparison and not `git`.
-
-    It stubs the tree fingerprint as well, so a declaration made in a test never
-    shells out to `git status` in whatever checkout the suite happens to be running
-    from — which would make these assertions depend on whether the developer had
-    edited anything."""
+    real checkout, because what is being pinned is the comparison and not `git`."""
     def use(sha):
         monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: sha)
-    monkeypatch.setattr(panel_rounds, "tree_fingerprint", lambda *a, **k: BEFORE)
     use(R1_HEAD)
     return use
 
 
-#: Two readings of one checkout: what round 1 recorded of it, and what it looked like
-#: after a fix pass had edited it. Same root, because two readings of two DIFFERENT
-#: trees are never compared — see `test_two_readings_of_different_trees_are_not_compared`.
-ROOT = "/w/pr34"
-BEFORE = (ROOT, "1" * 16)
-AFTER = (ROOT, "2" * 16)
-
-
-@pytest.fixture
-def tree(monkeypatch):
-    """What the declaring tree's tracked contents were, patched for `at`'s reason.
-    `BEFORE` is the honest default: unchanged since the round read it."""
-    def use(state):
-        monkeypatch.setattr(panel_rounds, "tree_fingerprint", lambda *a, **k: state)
-    use(BEFORE)
-    return use
-
-
-def _stamped(rounds_and_heads, limit=2, tree=("", "")):
+def _stamped(rounds_and_heads, limit=2):
     reg = panel_rounds.new_premise_register("acme/board", 34)
     for r, head in rounds_and_heads:
-        panel_rounds.declare_premise(reg, LANDED, r, [KEY_A], limit, head=head,
-                                     tree=tree)
+        panel_rounds.declare_premise(reg, LANDED, r, [KEY_A], limit, head=head)
     return reg
-
-
-#: What each round recorded of its own checkout, for the rounds `HEADS` names. The
-#: honest declaration matches the round it answers; a late one does not.
-REVIEWED = {1: BEFORE, 2: BEFORE, 3: BEFORE}
 
 
 def test_a_premise_declared_from_the_tree_its_round_reviewed_is_in_order():
@@ -787,230 +757,80 @@ def test_the_payload_says_how_many_declarations_could_be_checked_at_all():
     assert state["stamped"] == 1 and state["retroactive"] == []
 
 
-# ------------------------------ #560 reopened: declared after the patch was WRITTEN
+# ------------------ #560 reopened: what the stamp settles, and what it cannot
 
-# The head stamp above answers "which commit was this tree on", and a second-opinion
-# review of PR #669 established that this is a narrower question than the mechanism
-# claimed to settle. A fix pass that edits the working tree and declares BEFORE
-# committing has not moved HEAD: its stamp is its own round's head, `at == was`, and
-# every assertion in the block above reads that as the honest shape. Edit, then commit
-# is the ORDINARY shape of a fix pass, so what the stamp alone caught was "declared
-# after the fix was COMMITTED" while #560 is about "declared after the fix was
-# WRITTEN".
+# The stamp answers "which commit was this tree on", and three reviews established
+# what that does and does not buy. It settles the pass that was written, COMMITTED and
+# pushed before the premise was declared — which is the shape #560 reports, twice, on
+# lexray#1697. It cannot settle the pass that was written and not yet committed:
+# editing does not move HEAD, so that declaration's stamp is its own round's head,
+# byte-identical to the honest declaration made before the first edit.
 #
-# A second review of the first attempt at THIS half found the fix worse than the gap:
-# it asked `git status` whether the declaring tree was dirty and called a yes a late
-# declaration, so an unrelated ` M notes.txt` predating the round, a tracked generated
-# file, a staged unrelated change or a dirty submodule accused an honest fixer — and
-# `review-pr.md` permits pre-existing dirt outright in fix-in-place mode. What is
-# pinned here is the COMPARISON that replaced it: the round records its checkout
-# before the fix pass can have run, the declaration records the same checkout, and
-# only a difference between two readings of ONE tree is reported.
+# Two mechanisms were built for that second case and both are gone. A dirty-tree flag
+# accused any fixer whose checkout carried an unrelated modification. A porcelain
+# fingerprint the round and the declaration each took, compared, accused any fixer
+# whose checkout a concurrent agent, an autosave or a background build touched between
+# the two readings — routine in this fleet — while a file already modified when the
+# round ran fingerprinted the same both times however much the fix pass changed it.
+# Hashing contents closes the second and not the first: the ambiguity is in the
+# inference, not the digest. Attributing a tree change to a particular actor from
+# evidence read in that actor's own environment is #622. These pin the silence.
 
 
-def test_a_premise_declared_into_a_tree_its_own_pass_had_already_edited():
-    """The reopening in one assertion. Same round, same head, and the only difference
-    from the honest declaration is that the tracked tree had moved on from what the
-    round recorded of it. Before this the two were indistinguishable."""
-    late, = panel_rounds.retroactive_declarations(
-        _stamped([(1, R1_HEAD)], tree=AFTER), HEADS, REVIEWED)
-    assert (late["round"], late["head_round"], late["shape"]) == (1, 1, "uncommitted")
-    assert late["head"] == R1_HEAD and late["text"] == LANDED
-
-
-def test_the_same_stamp_from_an_unchanged_tree_is_still_the_honest_shape():
-    """The declaration this must never be aimed at: read `round_stop`, declare, THEN
-    edit. Identical head, and the tree the round recorded, so nothing moved."""
-    assert panel_rounds.retroactive_declarations(
-        _stamped([(1, R1_HEAD)], tree=BEFORE), HEADS, REVIEWED) == []
-
-
-def test_dirt_that_predates_the_round_is_not_an_accusation():
-    """The defect this replaced. A checkout carrying an unrelated ` M notes.txt`
-    before the round began fingerprints the same on both sides — the round saw that
-    dirt too — so the honest declaration made from it says nothing. Asking one side
-    "are you dirty" accused it; comparing two readings does not."""
-    dirty_before = (ROOT, "d" * 16)
-    reg = _stamped([(1, R1_HEAD)], tree=dirty_before)
-    assert panel_rounds.retroactive_declarations(
-        reg, HEADS, {1: dirty_before, 2: BEFORE, 3: BEFORE}) == []
-
-
-def test_two_readings_of_different_trees_are_not_compared():
-    """The false accusation the root check exists to prevent. The canonical checkout
-    carries its own dirt and a fresh worktree carries none, and neither fact says
-    anything about when a premise was declared — so a round that read one tree and a
-    declaration made in another are silence, not evidence."""
-    elsewhere = ("/w/canonical", "9" * 16)
-    assert panel_rounds.retroactive_declarations(
-        _stamped([(1, R1_HEAD)], tree=elsewhere), HEADS, REVIEWED) == []
-
-
-def test_a_stamp_with_no_fingerprint_beside_it_is_not_read_as_late():
-    """Every register the first version of #560 wrote carries a head and no
-    fingerprint at all. That is ordinary history, and reading a missing field as an
-    accusation would fire this on every cycle recorded before the field existed."""
-    reg = _stamped([(1, R1_HEAD)], tree=("", ""))
-    assert reg["premises"][0]["trees"] == {}
-    assert panel_rounds.retroactive_declarations(reg, HEADS, REVIEWED) == []
-
-
-def test_a_round_that_recorded_no_tree_of_its_own_reports_nothing():
-    """The other side of the same silence: a payload predating `tree_state`, or a
-    round whose `git` could not run. "Not checkable" is not "it checked out"."""
-    reg = _stamped([(1, R1_HEAD)], tree=AFTER)
-    assert panel_rounds.retroactive_declarations(reg, HEADS, {}) == []
+def test_the_uncommitted_pass_is_left_unchecked_rather_than_guessed_at():
+    """The removal, pinned. A fix pass that edits and does not commit leaves the stamp
+    on its own round's head, and NOTHING here separates that from the honest
+    declaration. Two mechanisms tried and each accused honest fixers more often than
+    it caught anything; the third would have closed one half of one of them. Silence
+    is the answer the evidence supports, and it has to be a decision somebody can
+    find rather than a gap that looks like an oversight."""
+    reg = _stamped([(1, R1_HEAD)])
     assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+    assert panel_rounds.premise_state(reg, 2, 2, True, HEADS, wired=True)[
+        "retroactive"] == []
 
 
-def test_a_half_read_fingerprint_is_recorded_as_nothing():
-    """`("", "")` is git having failed. A root with no digest describes no tree state
-    and a digest with no root describes one nothing may be compared against, so
-    neither is half-kept — "nobody looked" must not read as "nothing changed"."""
-    reg = panel_rounds.new_premise_register("acme/board", 34)
-    panel_rounds.declare_premise(reg, LANDED, 1, [KEY_A], 2, head=R1_HEAD,
-                                 tree=(ROOT, ""))
-    panel_rounds.declare_premise(reg, LANDED, 2, [KEY_A], 2, head=R2_HEAD,
-                                 tree=("", "2" * 16))
-    assert reg["premises"][0]["trees"] == {}
+def test_no_entry_claims_more_than_the_commit_ids_carry():
+    """Every reported entry is `committed`-shaped and says so with a `head_round` that
+    is a LATER round than the declaration's. There is no second kind and no `shape`
+    discriminator, because a list with one member of one kind that hints at others is
+    how the last two attempts got read as more than they were."""
+    late, = panel_rounds.retroactive_declarations(_stamped([(1, R2_HEAD)]), HEADS)
+    assert set(late) == {"key", "text", "round", "head", "head_round"}
+    assert late["head_round"] > late["round"]
 
 
-def test_an_earlier_rounds_head_is_not_late_however_far_the_tree_moved():
-    """A declaration for round 2 made from the tree round 1 reviewed is BEHIND the
-    round it answers — a stale checkout, a reset — and "which pass had been written
-    when this was said" has no answer there that does not involve guessing."""
-    assert panel_rounds.retroactive_declarations(
-        _stamped([(2, R1_HEAD)], tree=AFTER), HEADS, REVIEWED) == []
-
-
-def test_the_two_shapes_are_named_apart():
-    """They are found by different evidence and a reader checks different things
-    against them: `committed` is read off commit ids the cycle recorded, `uncommitted`
-    off two readings of one checkout taken either side of the fix pass."""
-    committed, = panel_rounds.retroactive_declarations(
-        _stamped([(1, R2_HEAD)], tree=BEFORE), HEADS, REVIEWED)
-    edited, = panel_rounds.retroactive_declarations(
-        _stamped([(1, R1_HEAD)], tree=AFTER), HEADS, REVIEWED)
-    assert committed["shape"] == "committed" and edited["shape"] == "uncommitted"
-
-
-def test_the_fingerprint_is_recorded_only_beside_the_stamp_and_the_first_one_wins():
-    """One reading of one tree at one moment, and the comparison reads the two halves
-    together. If a restatement moved the fingerprint forward without the head, a fixer
-    that declared in order and stated it again mid-pass would carry round 1's head
-    beside the tree it had since edited — the honest case wearing the exact accusation
-    this field exists to make."""
-    reg = _stamped([(1, R1_HEAD)], tree=BEFORE)
-    panel_rounds.declare_premise(reg, LANDED, 1, [KEY_A], 2, head=R2_HEAD, tree=AFTER)
-    assert reg["premises"][0]["heads"] == {1: R1_HEAD}
-    assert reg["premises"][0]["trees"] == {1: BEFORE}
-    assert panel_rounds.retroactive_declarations(reg, HEADS, REVIEWED) == []
-
-
-def test_the_fingerprint_survives_the_register_file(repo, at, tree, tmp_path):
-    """`heads`' rule and its reason: JSON has no integer keys and no tuples, so an
-    unconverted round number or a list that does not come back as a pair makes the
-    comparison unavailable the moment the next declaration loads the register."""
-    tree(AFTER)
+def test_the_declaration_records_no_tree_state_at_all(repo, at, tmp_path):
+    """The register carries the stamp and nothing about the working tree. A field that
+    nothing reads is a field a later reader infers a mechanism from, and both removed
+    mechanisms would have left one."""
     reg = tmp_path / "premises.json"
     declare(reg, LANDED, 1, KEY_A)
-    assert register(reg)["premises"][0]["trees"] == {"1": list(AFTER)}
-    back, problems = panel_rounds.load_premises(str(reg), "acme/board", 34)
-    assert back["premises"][0]["trees"] == {1: AFTER} and problems == []
+    entry, = register(reg)["premises"]
+    assert entry["heads"] == {"1": R1_HEAD}
+    assert not [k for k in entry if k in ("dirty", "trees", "tree")]
 
 
-def test_a_fingerprint_on_disk_that_is_not_a_pair_is_dropped_and_not_reported(tmp_path):
-    """A hand edit, a truncation or another harness wrote it. `heads`' rule for a bad
-    value on disk, and the sharper reason here: this value decides whether a note
-    ACCUSES a declaration, so an unreadable one must make the comparison unavailable
-    rather than make it say something."""
-    path = tmp_path / "premises.json"
-    path.write_text(json.dumps({
-        "version": panel_rounds.PREMISE_REGISTER_VERSION, "repo": "acme/board", "pr": 34,
-        "premises": [{"text": LANDED, "rounds": [1], "heads": {"1": R1_HEAD},
-                      # A bare string, a round this entry does not claim, a key that is
-                      # not a round, and a digest that is not one.
-                      "trees": {"1": ROOT, "2": list(AFTER), "later": list(AFTER),
-                                "3": [ROOT, "not a digest"]}}]}))
-    reg, problems = panel_rounds.load_premises(str(path), "acme/board", 34)
-    assert reg["premises"][0]["trees"] == {} and problems == []
-    assert panel_rounds.retroactive_declarations(reg, HEADS, REVIEWED) == []
-
-
-def test_the_declaration_records_the_tree_without_judging_it(repo, at, tree,
-                                                             tmp_path, capsys):
-    """This screen CANNOT say whether the ordering held — that takes the reading the
-    round took before the fix pass could have run, and a declaration has no access to
-    it. An earlier cut printed "ALREADY EDITED" off this side alone, which is the
-    accusation a dirty checkout earns for free. What is said is that the reading was
-    taken, so a fixer learns the ordering is being recorded."""
-    tree(AFTER)
+def test_the_declaration_screen_records_the_stamp_and_judges_nothing(
+        repo, at, tmp_path, capsys):
+    """A declaration has no access to what any round recorded, so this screen cannot
+    say whether the ordering held and must not appear to. It says the stamp was taken,
+    which is what tells a fixer the ordering is on the record at the one moment it can
+    still act on that."""
     assert declare(tmp_path / "premises.json", LANDED, 1, KEY_A) == 0
     out = capsys.readouterr().out
-    assert f"tree     {AFTER[1]} in {ROOT}" in out
-    assert "EDITED" not in out and "DO NOT WRITE" not in out
+    assert R1_HEAD[:12] in out
+    assert "EDITED" not in out and not [
+        ln for ln in out.splitlines() if ln.startswith("tree ")]
 
 
-def test_a_fingerprint_that_could_not_be_read_says_so_rather_than_reading_as_clean(
-        repo, at, tree, tmp_path, capsys):
-    """The screen has to distinguish "not read" from "unchanged" for the same reason
-    the register does: only one of them leaves the ordering checkable at all."""
-    tree(("", ""))
-    declare(tmp_path / "premises.json", LANDED, 1, KEY_A)
-    assert "tree     NOT READ" in capsys.readouterr().out
-
-
-def test_the_fingerprint_is_the_tracked_tree_and_its_root(monkeypatch):
-    """`--untracked-files=no`, and the gap it leaves is named in the docstring rather
-    than left to be found: build output, a virtualenv and an editor's scratch file are
-    the ordinary furniture of a checkout. The root is read too and is half the
-    evidence — without it two readings of two different trees would be compared."""
-    seen = []
-    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
-                        lambda path, *args: (seen.append(args),
-                                             "/w/pr34\n" if args[0] == "rev-parse"
-                                             else " M f.py\n")[1])
-    root, digest = panel_rounds.tree_fingerprint("/w/pr34")
-    assert seen == [("rev-parse", "--show-toplevel"),
-                    ("status", "--porcelain", "--untracked-files=no")]
-    assert root == "/w/pr34" and panel_rounds._SHA_RE.fullmatch(digest)
-
-
-def test_one_tree_in_one_state_fingerprints_the_same_twice(monkeypatch):
-    """What makes the comparison mean anything: the digest is over `XY path` lines and
-    carries no absolute path and no timestamp, so two readings of one unchanged tree
-    agree and pre-existing dirt cancels on both sides."""
-    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
-                        lambda path, *a: "/w/pr34\n" if a[0] == "rev-parse"
-                        else " M notes.txt\n")
-    assert panel_rounds.tree_fingerprint(".") == panel_rounds.tree_fingerprint(".")
-    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
-                        lambda path, *a: "/w/pr34\n" if a[0] == "rev-parse"
-                        else " M notes.txt\n M src.py\n")
-    assert panel_rounds.tree_fingerprint(".")[1] != BEFORE[1]
-
-
-def test_a_git_that_could_not_run_gives_no_half_answer(monkeypatch):
-    """`_git` returns `None` for no git on PATH, no checkout and no commit alike.
-    Either read failing has to take the other down with it: a root with no digest and
-    a digest with no root are both unusable, and a half-answer on disk would have to
-    be defended everywhere it is read instead of once here."""
-    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
-                        lambda path, *a: None if a[0] == "rev-parse" else "")
-    assert panel_rounds.tree_fingerprint(".") == ("", "")
-    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
-                        lambda path, *a: "/w/pr34\n" if a[0] == "rev-parse" else None)
-    assert panel_rounds.tree_fingerprint(".") == ("", "")
-
-
-def test_a_clean_tree_is_a_reading_and_not_a_failure(monkeypatch):
-    """`""` from `git status` is a checkout with nothing modified, which is a real
-    reading and the commonest one. Collapsing it into the `None` above would make the
-    ordinary honest cycle the one case this cannot check."""
-    monkeypatch.setattr(panel_rounds.panel_scope, "_git",
-                        lambda path, *a: "/w/pr34\n" if a[0] == "rev-parse" else "")
-    root, digest = panel_rounds.tree_fingerprint(".")
-    assert root == "/w/pr34" and digest
+def test_a_round_carries_no_tree_reading_on_its_payload(
+        repo, at, monkeypatch, capsys, tmp_path):
+    """The other half of the removal. A round recorded its own checkout so a later one
+    could compare; with nothing comparing, the key is data no reader has a use for and
+    a contract the board's ingest would have to carry."""
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=1)
+    assert "tree_state" not in payload
 
 
 # --------------------------------------------------------------- the stop rule's half
@@ -1294,9 +1114,10 @@ def test_a_cycle_that_never_wired_the_brake_is_not_nagged_every_round(
 def test_a_round_names_a_premise_that_followed_its_own_fix_pass(
         repo, monkeypatch, capsys, tmp_path):
     """#560 end to end. The declaration for round 2 was made from the commit THIS round
-    is reviewing, so the round-2 fix pass was written and pushed before the premise was
-    stated — the shape the collapsed orchestrator-is-fixer configuration produces, and
-    the one that used to leave a register entry indistinguishable from an honest one."""
+    is reviewing, so the round-2 fix pass was written, committed and pushed before the
+    premise was stated — the shape the collapsed orchestrator-is-fixer configuration
+    produced on lexray#1697, twice, and the one that used to leave a register entry
+    indistinguishable from an honest one."""
     reg = tmp_path / "premises.json"
     # "abc" is the head `stub` gives the PR, so this is a declaration made from the tree
     # round 3 reviews — after round 2's fix pass had already landed.
@@ -1306,86 +1127,23 @@ def test_a_round_names_a_premise_that_followed_its_own_fix_pass(
                            premise_file=str(reg))
     late, = payload["round_stop"]["premises"]["retroactive"]
     assert (late["round"], late["head_round"]) == (2, 3)
-    assert any("BEFORE the premise was declared" in n and "not a brake" in n
-               for n in payload["config_notes"])
+    assert any("written, committed and pushed BEFORE the premise" in n
+               and "not a brake" in n for n in payload["config_notes"])
 
 
-def _cycle(repo_ctl, at, tree, monkeypatch, capsys, tmp_path, declared):
-    """Round 1, then a declaration against round 1 made from a checkout in state
-    ``declared``, then round 2 reading the register. Round 1 records `BEFORE` of its
-    own checkout, which is the reading `_tree_moved` compares against — so this is the
-    whole ordering check end to end rather than the predicate on its own."""
-    tree(BEFORE)
-    _, _, r1 = _round(monkeypatch, capsys, tmp_path, round_no=1)
+def test_the_round_says_nothing_about_a_pass_that_never_committed(
+        repo, monkeypatch, capsys, tmp_path):
+    """The same cycle where the fix pass edited and did not commit. Its stamp is round
+    2's own head, `stub` gives every round that head, and there is nothing anywhere in
+    the loop that separates it from the honest declaration — which is the conclusion
+    three attempts reached and this pins so it is not re-derived a fourth time."""
     reg = tmp_path / "premises.json"
-    # "abc" is the head `stub` gives the PR, so this stamp is round 1's own head — the
-    # value an honest declaration produces too, which is exactly the point.
-    at("abc")
-    tree(declared)
-    declare(reg, LANDED, 1, KEY_A)
-    tree(BEFORE)
-    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=2, baseline=[r1],
+    monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: "abc")
+    declare(reg, LANDED, 3, KEY_A)
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=3,
                            premise_file=str(reg))
-    return payload
-
-
-def test_a_round_names_a_premise_declared_into_a_tree_its_own_pass_had_edited(
-        repo, at, tree, monkeypatch, capsys, tmp_path):
-    """#560 reopened, end to end and through the whole loop rather than through the
-    comparison alone. Round 1 reviews the PR's head and records its checkout; the fixer
-    edits, then declares against round 1 from that same unmoved head; round 2 reads the
-    register and compares. The head is round 1's own, so the check PR #669 shipped says
-    nothing — the tree having moved is what makes the ordering visible."""
-    payload = _cycle(repo, at, tree, monkeypatch, capsys, tmp_path, AFTER)
-    late, = payload["round_stop"]["premises"]["retroactive"]
-    assert (late["round"], late["shape"]) == (1, "uncommitted")
-    assert any("TRACKED CONTENTS had changed" in n and "not a brake" in n
-               for n in payload["config_notes"])
-
-
-def test_the_honest_declaration_makes_the_same_round_say_nothing(
-        repo, at, tree, monkeypatch, capsys, tmp_path):
-    """The same cycle with the ordering kept: declared before the first edit, so the
-    checkout still fingerprints as round 1 recorded it. One round, one register, one
-    head — and the only difference is the one thing this is entitled to report."""
-    payload = _cycle(repo, at, tree, monkeypatch, capsys, tmp_path, BEFORE)
     assert payload["round_stop"]["premises"]["retroactive"] == []
-    assert not [n for n in payload["config_notes"] if "premise" in n]
-
-
-def test_the_round_records_its_own_checkout_for_the_next_one_to_compare(
-        repo, at, tree, monkeypatch, capsys, tmp_path):
-    """The half that has to be on the payload: the comparison needs a reading taken
-    when the fix pass had not yet run, and only the round is at that moment. A payload
-    that carried the declaration's side alone could ask "is this tree dirty" and
-    nothing better, which is what accused honest fixers."""
-    tree(BEFORE)
-    _, payload, r1 = _round(monkeypatch, capsys, tmp_path, round_no=1)
-    assert payload["tree_state"] == {"root": BEFORE[0], "print": BEFORE[1]}
-    # And read back the way the next round reads it, because a key written in a shape
-    # `load_baseline` drops is a comparison that silently never runs.
-    assert panel_rounds.load_baseline([r1]).tree_states == {1: BEFORE}
-
-
-def test_a_round_that_could_not_read_its_checkout_records_no_tree_state(
-        repo, at, tree, monkeypatch, capsys, tmp_path):
-    """`None` rather than a half-filled object, on `head_sha`'s rule: a later round
-    reading this must be able to tell "nobody looked" from a reading, because only the
-    first leaves the ordering uncheckable rather than checked."""
-    tree(("", ""))
-    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=1)
-    assert payload["tree_state"] is None
-
-
-def test_that_round_still_does_not_end_the_cycle_on_it(
-        repo, at, tree, monkeypatch, capsys, tmp_path):
-    """Evidence, not a rung, and the second shape does not change that. A stop taken
-    here would be the late half again, which `repeated` and `undecidable` already
-    occupy — what was missing was never another way to end a cycle."""
-    stop = _cycle(repo, at, tree, monkeypatch, capsys, tmp_path, AFTER)["round_stop"]
-    assert stop["premises"]["retroactive"]
-    assert not [v for v in stop["veto"] if "premise" in v]
-    assert "premise" not in stop["reason"]
+    assert not [n for n in payload["config_notes"] if "was declared against round" in n]
 
 
 def test_naming_it_does_not_end_the_cycle(repo, monkeypatch, capsys, tmp_path):
@@ -1500,14 +1258,15 @@ def test_both_briefs_place_the_declaration_where_the_fixer_is_the_orchestrator()
     assert "passes\n  the same path to every round's `--premise-file`" in PANEL_REVIEW_PR
 
 
-def test_both_briefs_say_which_checkout_both_commands_have_to_run_in():
-    """#560 reopened, documentation half, and it is load-bearing rather than advice:
-    the ordering check compares the round's reading of a checkout against the
-    declaration's, and two readings of two different checkouts are never compared. An
-    agent that runs the panel in one tree and `--premise` in another does not defeat
-    the check, it empties it — and neither brief said where to stand."""
-    assert "run the panel there too" in REVIEW_PR
-    assert "Run the panel and `--premise` in the same checkout" in PANEL_REVIEW_PR
+def test_both_briefs_say_what_the_check_does_not_cover():
+    """#560's documentation half, and the part that matters most now that one of the
+    two shapes is undetectable. A brief that says "the round records the tree each
+    declaration was made from" and stops reads as a safety net over the whole
+    ordering, and the common workflow — edit, then commit — is precisely the half it
+    does not cover. An agent that believes it is being checked declares carelessly."""
+    assert "does not cover you for the common case" in REVIEW_PR
+    assert "It catches nothing else, deliberately" in PANEL_REVIEW_PR
+    assert "(#622)" in REVIEW_PR and "(#622)" in PANEL_REVIEW_PR
 
 
 def test_neither_brief_claims_the_check_survives_an_actor_working_around_it():

@@ -1039,15 +1039,6 @@ def _payload_defaults() -> dict:
         # still moved the head, and a round 3 whose only baseline is a skipped
         # round 2 must still be able to find its anchor.
         "head_sha": None,
-        # What this round's checkout looked like, as `{"root": ..., "print": ...}`
-        # (#560). Not about the review at all — it is one end of an ORDERING check
-        # made by a LATER round: a premise declared halfway through a fix pass carries
-        # its own round's head, because editing does not move `HEAD`, so the commit id
-        # cannot tell it from a premise declared before the first edit. The tree
-        # having moved can, and a move needs a reading from before the pass ran. This
-        # round is that moment. `None` is a run that never took one, which reads as
-        # "not checkable" and accuses nobody.
-        "tree_state": None,
         # The other end of the range, and the two are NOT interchangeable (#98).
         #
         # `merge_base` is the PR's base commit: `gh pr diff` is the three-dot
@@ -4919,17 +4910,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                  for c, bucket in placed if bucket == "introduced"],
         costs=revert_cleared, still_open=revert_open, shape=revert_shape)
 
-    # #560's reading of this round's own checkout, taken here and used twice — once
-    # by `premise_state` below as the "before the fix pass" side of the ordering
-    # comparison, and once on the payload so the NEXT round has it. Anywhere in the
-    # round is early enough: the whole round runs before the fix pass it precedes.
-    # `cfg["path"]` and not the process's cwd, unlike `--premise`, and the asymmetry
-    # is deliberate — a round is TOLD which checkout to review and a declaration is
-    # not told anything, so the round's honest reading is of the tree it was pointed
-    # at. When those two are different trees the comparison is skipped rather than
-    # guessed at, which is what `_tree_moved`'s root check is for.
-    tree_state = panel_rounds.tree_fingerprint(cfg.get("path") or "")
-
     # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
     # ones itself, so the rule lives in one place instead of depending on every
     # caller to filter first. It takes keys and nothing else — the count overload
@@ -4984,15 +4964,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # a premise declared after its own pass produced the same
                       # entry as one declared before it. The heads this cycle
                       # already recorded — every earlier round's, plus this one's —
-                      # are what the round compares against, so that half costs no
-                      # call. The heads settle only the pass that was already
-                      # COMMITTED when the premise was declared. The pass that was
-                      # merely WRITTEN needs `trees`: what each round recorded of its
-                      # own checkout before its fix pass could have run, against what
-                      # the declaration recorded of the same checkout. Comparing two
-                      # readings rather than asking one of them "are you dirty" is
-                      # what keeps a checkout that was already dirty before the round
-                      # from reading as a late declaration.
+                      # are what it compares against, so the check costs no call.
+                      # They settle ONE of the two ways the ordering fails — the pass
+                      # already committed and pushed when the premise was declared,
+                      # which is the shape #560 reported. The pass that was merely
+                      # written moves no head and is not settled here or anywhere:
+                      # `retroactive_declarations` carries the three attempts at it
+                      # and why the evidence does not reach.
                       # `wired` says this ROUND was handed a register path and
                       # nothing more — see `premise_state` for why that is not the
                       # same claim as "the fixer could reach one".
@@ -5000,9 +4978,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                                              premise_undecidable,
                                              heads={**prior.head_shas,
                                                     round_no: head_sha},
-                                             wired=bool(premise_file),
-                                             trees={**prior.tree_states,
-                                                    round_no: tree_state}),
+                                             wired=bool(premise_file)),
                       # #489's injection gate. The measurement is `provenance_counts`
                       # above — `introduced` over every new outstanding finding — and
                       # `injection_state` turns it into the verdict `round_stop`
@@ -5093,29 +5069,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # #491 itself prices as "worse than stopping before the fix, better than the cap".
     # What was missing was not another way to end a cycle. It was a way for anyone
     # downstream to tell a brake from an annotation, and that is a fact in the record.
-    # Two shapes, and they are told apart in the note because the evidence differs
-    # and so does what a reader should check. `committed` is read off commit ids the
-    # cycle recorded; `uncommitted` is read off the tree state the declaration itself
-    # observed, which is the shape #560 was opened on and the one the commit ids
-    # cannot see at all.
+    # One shape, and only the one the commit ids settle on their own: the pass was
+    # on the branch when the premise was declared, which no honest history produces.
+    # The pass that was written and not yet committed moves no head, and three
+    # attempts at reading it off the working tree are recorded on
+    # `retroactive_declarations` along with why none of them could be said out loud.
     for late in stop["premises"]["retroactive"]:
-        if late.get("shape") == "uncommitted":
-            was = (f"from a tree still on {late['head'][:12]}, the commit round "
-                   f"{late['round']} reviewed, whose TRACKED CONTENTS had changed "
-                   f"since round {late['round']} recorded them. Editing does not move "
-                   "`HEAD`, so a fix pass written and not yet committed looks exactly "
-                   "like this. The pass it explains had been started")
-        else:
-            was = (f"from a tree that was already on {late['head'][:12]}, the commit "
-                   f"round {late['head_round']} reviewed. The fix pass it explains "
-                   "was written and pushed")
         notes.append(
             f"premise {late['key']} was declared against round {late['round']} — "
-            f"{late['text']!r} — {was} BEFORE the premise was declared, so `panel.py "
-            "--premise` could not have refused it: for that pass the brake was an "
-            "annotation, not a brake (#560). Where the orchestrator is also the "
-            "fixer, declare the premise after reading `round_stop` and before the "
-            "first edit")
+            f"{late['text']!r} — from a tree that was already on "
+            f"{late['head'][:12]}, the commit round {late['head_round']} reviewed. The "
+            "fix pass it explains was written, committed and pushed BEFORE the premise "
+            "was declared, so `panel.py --premise` could not have refused it: for that "
+            "pass the brake was an annotation, not a brake (#560). Where the "
+            "orchestrator is also the fixer, declare the premise after reading "
+            "`round_stop` and before the first edit")
     for repeated in stop["premises"]["repeated"]:
         notes.append(
             f"premise {repeated['key']} was declared in rounds "
@@ -5543,12 +5511,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # provenance measures its fix range to it. One key, because two would be
         # one fact with two chances to disagree.
         "head_sha": head_sha,
-        # #560's other end, read off the checkout this round was pointed at. See
-        # `_payload_defaults` for what it is for; the next round reads it back through
-        # `Baseline.tree_states` and compares it against what a declaration for THIS
-        # round recorded of the same tree.
-        "tree_state": ({"root": tree_state[0], "print": tree_state[1]}
-                       if tree_state[0] and tree_state[1] else None),
         # Both ends of what this round was judged against (#98). `merge_base` is
         # the PR's base commit — read `scope` before calling it this round's own
         # anchor, which under increment scope is `since_sha`. `base_sha` is where
