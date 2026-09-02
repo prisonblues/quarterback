@@ -2119,6 +2119,30 @@ class Dash(App):
         self.plan_sig = sig
 
         table = self.query_one("#work", DataTable)
+        # WHERE THE READER HAD SCROLLED TO, carried across the rebuild. `clear()`
+        # sends `scroll_y` to 0, so every poll that changed anything at all threw a
+        # reader thirty rows back up a seventy-row table — and the row they were
+        # reaching for went with it. That is the same defect `work_sig` exists to
+        # limit (#433: a reader picks a row by looking at it), left unfinished: the
+        # signature stops the rebuilds that change nothing, and this is what the
+        # rebuilds that DO change something were still costing.
+        #
+        # ANCHORED ON THE ROW AT THE TOP OF THE VIEW, not on the offset. A rebuild
+        # can insert rows ABOVE the view — a leftover blocker gets a row of its own
+        # and they are drawn first — and an offset restored through that shows a
+        # different stretch of the table while claiming to have kept the reader's
+        # place. The key is the one identifier a rebuild does not invalidate, which
+        # is the argument `follow` makes for itself where this is restored, at the
+        # far end of the loop below.
+        #
+        # Rows here are one line tall and the header is not scrolled, so `scroll_y`
+        # counts rows and the row at the top of the view is `int(scroll_y)`.
+        anchor = None
+        if not self.follow and table.scroll_y >= 1:
+            top = int(table.scroll_y)
+            keys = [str(rk.value) for rk in table.rows]
+            if top < len(keys):
+                anchor = keys[top]
         table.clear()
         for row in rows:
             glyph, colour = row["glyph"]
@@ -2201,6 +2225,21 @@ class Dash(App):
                 if str(rk.value) == self.follow:
                     table.move_cursor(row=i, animate=False)
                     table._scroll_cursor_into_view(animate=False)
+                    break
+        elif anchor is not None:
+            # The anchor row back at the top of the view. Gone from the table —
+            # merged, closed, filtered out — is the one case with no right answer,
+            # and the top is a better wrong one than a position computed from a row
+            # that no longer exists.
+            for i, rk in enumerate(table.rows):
+                if str(rk.value) == anchor:
+                    # AFTER THE REFRESH, not now. `clear()` marks the table's
+                    # dimensions stale and they are recomputed on the next idle, and
+                    # a scroll set before that is clamped against a virtual size of
+                    # nothing — which lands on 0, i.e. exactly the top this is here
+                    # to avoid. Measured on textual 8.2.8: set inline, the value
+                    # reads back correctly and is 0 one pause later.
+                    table.call_after_refresh(table.scroll_to, y=i, animate=False)
                     break
 
         # The heading is one line and clips at the pane edge, so it is given the
