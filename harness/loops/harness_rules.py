@@ -597,9 +597,14 @@ DEFAULTS: dict = {
         # ------------------------------------------------------------------ #165
         # THOROUGHNESS AGAINST CONVERGENCE. Seven settings, one measurement.
         #
-        # Across the seven PRs panelled on 2026-08-16, the last round of each
-        # raised 201 findings no earlier round had — and 128 of them, 63.7%, were
-        # created by the fix pass immediately before it. The industry baseline for
+        # Across the seven PRs panelled on 2026-08-16 — quarterback #151, #152,
+        # #153, #154, #158, #160 and #161 — the last round of each raised 201
+        # findings no earlier round had, and 128 of them, 63.7%, were created by
+        # the fix pass immediately before it. **Named as of #637**, because the
+        # board holds FOURTEEN PRs panelled that day and "the seven" identified
+        # none of them: 128/201 reproduces from the stored rounds and picks out
+        # exactly one subset of seven, so the population is nameable and was one
+        # arithmetic step from being unrecoverable. The industry baseline for
         # bad-fix injection is ~7% (Capers Jones), passing 25% only for novices in
         # high-complexity code, so the fix pass is the largest single source of
         # defects in this loop's own queue. Every one of those panels terminated on
@@ -1485,6 +1490,15 @@ DEFAULTS: dict = {
         # not a validation of 0.5, they are the data that will set it, and #626 is
         # where the marginal-findings-per-round count they feed belongs.
         #
+        # **AND AS OF 2026-09-02 THOSE CYCLES NUMBER ONE** (#637). The measurement was
+        # taken and reported the size of its own population: a single attributable
+        # round has been recorded since this key moved, and no cycle on the board has
+        # ever been recorded as CONVERGED, so the false-positive rate this trade rests
+        # on has no denominator at all. 0.5 therefore still stands on the old
+        # population and this key is still the reason that matters. The full figures
+        # are in `escalate_on.fix_injection`'s block below, beside the number they
+        # cannot yet move.
+        #
         # The way back is one key. `2` restores the 2026-08-22 setting and `1` the
         # 2026-08-20 one; both arguments are kept in `.harness-rules.sample`
         # (`_165_max_rounds`) rather than deleted. Note what `1` also does — it
@@ -1582,29 +1596,127 @@ DEFAULTS: dict = {
         # day is an observation, not a calibrated rule", and "a few dozen cycles of
         # it are what would justify wiring it to anything". The cycles are in. 128 of
         # 201 new findings across the seven PRs in `round_stop`'s docstring were
-        # created by the fix pass immediately before them; 39 of 53 after round 1 on
-        # PR #299, and 17 of 17 in its round 2; 64% then 87% on the cycle #489 was
-        # filed from, over a PR whose actual change was 113 lines. Every one of those
-        # is far above 0.5 and every one of those cycles ran to its cap.
+        # created by the fix pass immediately before them — quarterback #151, #152,
+        # #153, #154, #158, #160 and #161, last round of each, 63.68%, and they are
+        # NAMED here because "the seven PRs panelled on 2026-08-16" is fourteen PRs
+        # on the board and the arithmetic picks out exactly one subset of seven;
+        # 39 of 53 after round 1 on PR #299, and 17 of 17 in its round 2; 64% then
+        # 87% on the cycle #489 was filed from — lexray#1709 rounds 2 and 3, 9/14
+        # and 13/15 — over a PR whose actual change was 113 lines. Each of those
+        # three AGGREGATES is far above 0.5 and every one of those cycles ran to its
+        # cap. Not every round behind them is: the seven last rounds run 0.321,
+        # 0.513, 0.541, 0.694, 0.824, 0.889, 0.923, so one of the seven sits well
+        # under the threshold its own pooled figure justifies and two more are
+        # barely over it. Every figure in this paragraph was re-derived from the
+        # board's stored rounds on 2026-09-02 (#637) and reproduces; the sentence
+        # about "every one" did not, and is now the narrower claim it can support.
         #
-        # **What is still NOT calibrated is where a HEALTHY cycle sits**, which is the
-        # number that decides the false-positive rate, and the answer is now owed
-        # sooner than it was. Every measurement above was taken on rounds whose
-        # outstanding findings were P3/P4-heavy. The population this rate divides is
-        # about to be smaller and more serious than that: observations no longer count
-        # as outstanding work (#623), a `narrowed` outcome clears rather than
-        # accumulates (#615), and the floors moved under it on the same day. A rate
-        # over a smaller, more serious denominator is noisier AND differently
-        # distributed, so neither 0.5 nor the false-positive rate that went with it
-        # carries over.
+        # **WHERE A HEALTHY CYCLE SITS IS STILL NOT CALIBRATED, AND #637 MEASURED WHY
+        # IT CANNOT BE YET.** That is the number deciding the false-positive rate,
+        # and every measurement above was taken on rounds whose outstanding findings
+        # were P3/P4-heavy. The population this rate divides is smaller and more
+        # serious since `f53bdcd` (2026-08-31): observations no longer count as
+        # outstanding work (#623), a `narrowed` outcome clears rather than
+        # accumulates (#615), the floors moved, and `max_rounds` went to 6 — all in
+        # ONE commit, which is why nothing separates their effects. A rate over a
+        # smaller, more serious denominator is noisier AND differently distributed,
+        # so neither 0.5 nor the false-positive rate that went with it carries over.
         #
-        # **SO TREAT THE FIRST CYCLES UNDER `max_rounds: 6` AS THE RECALIBRATION, AND
-        # EXPECT THIS NUMBER TO MOVE.** They are the measurement, not a confirmation
-        # of the number they run under; #626 is where the per-round counts that will
-        # move it belong. What made a false positive cheap while the cap was 2 was the
-        # cap, not this rule — see the properties under "on by default" below, where
-        # that is now said plainly — and `null` switches the rung off in one line
-        # while the number is being learned.
+        # **THE RECALIBRATION WAS ATTEMPTED ON 2026-09-02 AND THE POPULATION IS n=1**
+        # (#637, measured over the whole board, all time, via
+        # `GET /review/convergence?days=3650` and `GET /reviews?limit=500`):
+        #   - **One attributable round exists since `f53bdcd`.** lexray#1813 round 2:
+        #     13 new outstanding findings, 6 attributed, rate **0.462** — under the
+        #     threshold, so it did not fire. One round, one repo, one PR. It is also
+        #     the ONLY round on the board whose `rules` record says what this dial
+        #     was set to while it ran — `dial_runs` on the endpoint below sums to 1
+        #     across every round number, against 38 rated rounds — so the other 37
+        #     cannot be held against any threshold at all, this one included.
+        #   - **No false-positive rate is computable: there are no healthy cycles.**
+        #     27 cycles carry an attributable round and `converged` is TRUE on none
+        #     of them — 1 false, 26 not measured. Fleet-wide the endpoint reports 42
+        #     cycles and `decided: 1`. A false positive is this rung stopping a cycle
+        #     that was converging, and the population contains no converging cycle
+        #     for it to have stopped — so the false-positive rate has no denominator
+        #     rather than a large one. That is the missing number, not a small one.
+        #   - **The old population is one-sided and cannot locate a boundary.** 38
+        #     attributable rounds, every one at or above `FIX_INJECTION_MIN_NEW`: min
+        #     0.000, p25 0.460, median 0.696, p75 0.876, max 1.000, and 28 of 38
+        #     (73.7%) over 0.5. Swept, the share firing goes 86.8% at 0.3, 73.7% at
+        #     0.5, 47.4% at 0.7, 13.2% at 0.9 — monotone, no elbow, no second mode.
+        #     Ten of the 38 rounds fall at or below 0.5, so the threshold sits around
+        #     the 26th percentile of what has actually been observed: a cut near the
+        #     bottom of a one-sided sample, which is what a threshold looks like when
+        #     the population it was fitted to contains almost no negatives.
+        #   - **And it is structurally silent about behaviour at a cap of 6.** 20 of
+        #     the 27 cycles cross the threshold, every one of them first at ROUND 2,
+        #     and 15 of those 20 have no round 3 recorded — under the cap of 2 in
+        #     force at the time, firing forgave nothing and bought a better `reason`,
+        #     which is exactly what the paragraphs below say a default-on used to
+        #     buy. Five cycles forgo a round at all (#161 and #480 one each, #299 and
+        #     lexray#1697 three, lexray#1709 two). Three quarters of the evidence for
+        #     this number was gathered in the configuration where it did not matter.
+        #   - **#559's filter has not moved a recorded number yet.** It landed the
+        #     same day and `provenance_restored` is absent on all 38 rounds:
+        #     correctly so on a round 2, whose only prior round IS the anchor, and no
+        #     round 3 or later has been recorded since. The instrument the issue
+        #     rightly insisted on fixing first is fixed and unexercised.
+        #
+        # **THE UNIT, SAID PLAINLY, BECAUSE #692's DECISION OF 2026-09-02 MAKES IT
+        # A QUESTION.** That decision names CHURNED LINES — every line a pass
+        # touches, counted each time it is touched — as the quantity the growth
+        # ceilings are about. This rung is not counted in that unit and does not
+        # need to be: **its numerator and denominator are both FINDINGS**, so there
+        # is no chars-to-lines conversion anywhere in it and nothing to restate.
+        # What the unit reaches is the ATTRIBUTION under each finding, and there
+        # the answer is a third thing again: `_provenance` asks for exact
+        # membership in the ADDED LINES of `prior.head_sha..head_sha`, and
+        # `_fix_range_diff` reads that as GitHub's `compare/a...b` — a NET DIFF
+        # between two commits. Not `pr_chars`, and not cumulative churn.
+        #
+        # Two consequences, both worth having written down before somebody applies
+        # one unit to the whole block:
+        #   - **This rung already sees the case #702 says the growth ceilings
+        #     miss.** A pass that rewrites 500 reviewed lines in place grows
+        #     `pr_chars` by roughly nothing, so `max_fix_growth` and
+        #     `max_fix_growth_chars` are blind to it; those same 500 lines are
+        #     ADDED lines in the fix range, so a finding landing on one is
+        #     attributed `introduced` and this rung does see it. Two brakes in this
+        #     block disagree about one event, and #702 is where that is fixed for
+        #     the other two. Do not "fix" it here.
+        #   - **And it undercounts churn where a range spans more than one pass.**
+        #     `revert.spans > 1` — no intervening round recorded a commit to anchor
+        #     on — means the compare collapses two passes into one net diff, so a
+        #     line both of them touched is one added line rather than two touches.
+        #     Under #692's definition that is an undercount, in the same direction
+        #     as the two biases `_provenance` already documents. So `introduced`
+        #     stays a FLOOR under the churn reading too; it now has a third reason.
+        #
+        # **#559 is deliberately NOT in that unit and must not be moved into it.**
+        # It subtracts restored lines from `added` before attribution, i.e. it
+        # declines to count a touch that puts already-reviewed content back. Read
+        # strictly, "every line a pass touches is surface area" says a restoration
+        # is a touch — and this rung is not asking about surface area, it is asking
+        # *did the fix pass AUTHOR this defect*. A reader applying #692's unit
+        # uniformly across the block would undo #559 and re-create the failure it
+        # was filed for, where the remedy for this gate reads to this gate as the
+        # disease.
+        #
+        # **SO 0.5 STANDS, AS A DECISION NOT YET TAKEN RATHER THAN AS A VALIDATION.**
+        # Moving it on this evidence would fit a threshold to one round, and fitting
+        # it to the older population would fit it to rounds gathered where firing was
+        # free — the two failures #637 exists to prevent, in opposite directions. What
+        # made a false positive cheap while the cap was 2 was the cap and not this
+        # rule (see the properties under "on by default" below), so the trade this
+        # default makes is real now and is being made on an inherited number; `null`
+        # switches the rung off in one line while that is true. Re-run the measurement
+        # rather than re-deriving it: `GET /review/convergence`'s `injection_by_round`
+        # is the per-round rate distribution this rule divides, added by #637 for this
+        # purpose, with `dial_runs` beside it saying how much of the window can name
+        # its own threshold. What would settle it is `rate_median` and `rate_p25` over
+        # rounds that CONVERGED — a population of one is not a distribution, and the
+        # honest read is that this number has still never been measured against a
+        # cycle that went well.
         #
         # **0.5, read strictly: MORE than half.** Not a percentile off a curve nobody
         # has; the defence of the number is that it is the point where the fix pass is

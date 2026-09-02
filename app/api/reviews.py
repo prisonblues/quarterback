@@ -6101,6 +6101,80 @@ def _rate(t: Mapping[str, int]) -> dict:
 #: reachable — pass `since` — and it is then the caller's own choice.
 CONVERGENCE_DEFAULT_DAYS = 90
 
+#: The three quantiles ``injection_by_round`` publishes, and the keys they are
+#: published as. ``rate_min`` and ``rate_max`` sit beside them and are plain
+#: aggregates, so they are not in here.
+#:
+#: A shape rather than a mean, because the question this distribution is asked is
+#: where a THRESHOLD should sit and a mean answers a different one. Rounds
+#: distributed 0.0/0.0/1.0/1.0 and rounds distributed 0.5/0.5/0.5/0.5 have the
+#: same mean and give opposite evidence about a cut at 0.5.
+INJECTION_QUANTILES: tuple[tuple[str, float], ...] = (
+    ("rate_p25", 0.25), ("rate_median", 0.5), ("rate_p75", 0.75),
+)
+
+
+def _provenance_sum():
+    """Every ``provenance_counts`` bucket added up, in SQL — the DENOMINATOR the
+    panel's own attribution rate divides by.
+
+    Four buckets and not one, and the three that are not ``introduced`` are here
+    on ``panel_rounds.injection_state``'s argument rather than on this module's:
+    ``missed`` is the other half of the same question, and ``unknown`` /
+    ``missed-unread`` DEPRESS the rate, which is the direction a stop should fail
+    in. This is a second implementation of that sum and it is allowed to be one,
+    because a sum over a published vocabulary is not a rule — see
+    :func:`_injection_rate` for the line this file does not cross.
+
+    A missing key reads 0 and a NULL or ``{}`` column therefore sums to 0, which
+    :func:`_injection_rate` turns into a NULL rate rather than into ``0.0``.
+    """
+    total = None
+    for bucket in PROVENANCE:
+        term = func.coalesce(ReviewRun.provenance_counts[bucket].as_integer(), 0)
+        total = term if total is None else total + term
+    return total
+
+
+def _injection_rate():
+    """One round's attribution rate — ``introduced`` over every bucket — in SQL,
+    NULL where there is nothing to divide.
+
+    **This is a distribution and never a verdict, and that boundary is the whole
+    of why the board may compute it at all.** ``escalate_on.fix_injection`` is a
+    repo dial and ``app/api/dials.py`` argues at length that this board must not
+    learn what one means; ``panel_rounds.FIX_INJECTION_MIN_NEW`` is the floor
+    under the same rule and is a harness constant. So nothing here applies either.
+    What is published is the quantity the rule reads — ``introduced`` over the sum
+    of ``PROVENANCE``, which is this module's own vocabulary — at the grain the
+    rule reads it, which is one ROUND. A consumer holding the threshold applies
+    the threshold.
+
+    NULL and not ``0.0`` where the denominator is 0, on :func:`_rate`'s rule and
+    ``injection_state``'s: zero is a claim about a fix pass, and a round 1 or a
+    round whose fix range could not be read at all is the absence of one. NULL
+    also keeps such rounds out of the quantiles below, since ``percentile_cont``
+    ignores them — which is what stops "attribution did not arise" being read as
+    "the fix pass introduced nothing".
+    """
+    introduced = func.coalesce(
+        ReviewRun.provenance_counts["introduced"].as_integer(), 0)
+    return introduced * 1.0 / func.nullif(_provenance_sum(), 0)
+
+
+def _attribution_ran():
+    """Whether the panel sent a tally at all — the coverage marker's predicate.
+
+    ``review_stats.provenance_runs``' test, verbatim and for its reason: coverage
+    is a fact about the RUN, and ``{}`` is excluded because a round 1 has no
+    earlier round to attribute against, so it is not a round that found nothing —
+    it is a round that was never asked. The empty object is built server-side
+    because a Python ``{}`` bound to a JSONB parameter is a different thing from
+    the jsonb ``{}`` this compares against.
+    """
+    return sa_and(func.jsonb_typeof(ReviewRun.provenance_counts) == "object",
+                  ReviewRun.provenance_counts != func.jsonb_build_object())
+
 
 @router.get("/review/convergence")
 async def review_convergence(
@@ -6192,6 +6266,44 @@ async def review_convergence(
     the column is nullable and NULL means the panel did not say, so a window with
     older rounds in it reports an honest sum over a fraction of the population.
 
+    ``injection_by_round`` is the OTHER population, and #637 is why it exists.
+    ``marginal_by_round`` counts findings; ``escalate_on.fix_injection`` divides
+    them — ``provenance_counts.introduced`` over the sum of every bucket, per
+    ROUND — and until this key nothing on this board published that quantity at
+    that grain. ``/review/stats`` sums the four buckets across a window per
+    reviewer, which is a different number: a fleet-wide ratio of sums is not the
+    distribution of per-round ratios, and it is the per-round ratio a threshold is
+    compared against. So a recalibration had to fetch ``/reviews`` and do the
+    arithmetic by hand, which is the reason the paragraph below stood unanswered
+    for as long as it did.
+
+    Per round number N it publishes ``rounds``, two coverage markers, the two sums,
+    and the shape:
+
+    * ``attributed_runs`` — rounds whose tally is a non-empty object, i.e. rounds
+      where attribution RAN (``review_stats.provenance_runs``' own test).
+    * ``rated_runs`` — of those, the ones with a non-zero denominator, so a rate
+      exists. This is the denominator of every figure beside it. A round that
+      attributed and summed to zero is real and is not a rate.
+    * ``introduced`` / ``new`` and ``pooled_rate`` — the sums, and their ratio.
+      **Not the quantity the rule reads**, and published because a reader wants
+      the volume: a pooled ratio weights a 44-finding round the same as a
+      4-finding one, and the rule does not.
+    * ``rate_min`` / ``rate_p25`` / ``rate_median`` / ``rate_p75`` / ``rate_max``
+      — the distribution of the PER-ROUND rate, which is the quantity the rule
+      reads. Where a cut belongs is a question about this row and not the one
+      above it.
+    * ``dial_runs`` — of the rated rounds, the ones carrying a NON-EMPTY ``rules``
+      record, which is the only field on the row that says what the threshold WAS
+      during that round. A threshold fitted across rounds that do not say what
+      they ran under is fitted across a denominator that moved underneath it, and
+      on 2026-09-02 this read 1 of 38. It is an upper bound: a record present but
+      naming no dial counts, because telling that apart needs the dial vocabulary
+      this board does not hold.
+
+    No threshold and no minimum denominator is applied here, and both omissions
+    are the point rather than an unfinished edge. See :func:`_injection_rate`.
+
     ## The window
 
     Unlike the other ``/review/*`` reads this one defaults to a lookback
@@ -6206,10 +6318,14 @@ async def review_convergence(
 
     ## What this does not do
 
-    It does not recalibrate ``escalate_on.fix_injection`` (#637). This is the
-    population that recalibration has to be measured against, and publishing the
-    population is the whole of this issue's job; fitting a threshold to it is
-    another one, and it is also waiting on #559.
+    It does not recalibrate ``escalate_on.fix_injection`` (#637), and after that
+    issue's measurement it still does not. Publishing the population is this
+    endpoint's job; deciding a threshold over it is a repo's, and where the
+    population is too small to decide from — it was n=1 on 2026-09-02, one round
+    since ``max_rounds`` went to 6 — an endpoint that fitted a number anyway would
+    be laundering a guess through a query. ``injection_by_round`` is that
+    measurement's instrument and ``harness_rules.py``'s ``fix_injection`` block
+    records what it said.
 
     Every figure comes from three statements against one connection, so under
     READ COMMITTED each sees its own snapshot and a round recorded between them
@@ -6362,6 +6478,105 @@ async def review_convergence(
         )
     ).all()
 
+    # #637's population, at the ROUND grain and off the table rather than off
+    # `ranked`. The rule this instruments fires on any round from 2 onward, so
+    # restricting it to a cycle's terminal round would measure the rate on the
+    # rounds a cycle ENDED at and call it the distribution over rounds — and the
+    # rounds it would drop are precisely the mid-cycle ones a raised cap buys.
+    #
+    # Aggregated in SQL where the four group-bys above are done in Python, and
+    # the two choices are consistent rather than in tension: the reason those are
+    # in Python is that they restate one precedence rule four times, and there is
+    # no precedence here — this is a group-by returning O(round numbers), which is
+    # what `review_stats` does with every one of its reads. Doing it in Python
+    # would mean a second O(rounds) pass on the event loop, on an endpoint whose
+    # own docstring measures the first one at 1.32s over 200k rows.
+    rate = _injection_rate()
+    ran, rated = _attribution_ran(), rate.isnot(None)
+    injection = (
+        await session.execute(
+            select(
+                ReviewRun.round,
+                func.count(ReviewRun.id),
+                func.count(ReviewRun.id).filter(ran),
+                func.count(ReviewRun.id).filter(rated),
+                func.sum(func.coalesce(
+                    ReviewRun.provenance_counts["introduced"].as_integer(), 0)
+                ).filter(rated),
+                func.sum(_provenance_sum()).filter(rated),
+                func.min(rate),
+                func.max(rate),
+                *(func.percentile_cont(q).within_group(rate.asc())
+                  for _, q in INJECTION_QUANTILES),
+                # The only field on the row that records what the threshold WAS
+                # (#305/#647), so it is the coverage marker a recalibration needs
+                # and not a nicety. Tested for presence and never read into: a
+                # board that pulled `escalate_on.fix_injection` out of here would
+                # be interpreting a dial, which is the one thing this file may not
+                # do with that column.
+                #
+                # `jsonb_typeof`, NOT `rules IS NOT NULL`, and the difference is a
+                # wrong number rather than a style: a Python ``None`` bound to a
+                # JSONB column stores the jsonb scalar ``null``, which is not SQL
+                # NULL, so `IS NOT NULL` counts every round that said nothing —
+                # 38 of 38 where the honest answer was 1. Its own column
+                # docstring says "NULL = the panel did not say", and what the
+                # column actually holds is `'null'`. Same trap `provenance_runs`
+                # documents one query up for the empty OBJECT, one rung further
+                # down the type ladder; every other JSONB test in this file is
+                # already written this way.
+                #
+                # Filtered on `rated` like every figure beside it. A coverage
+                # marker over a different population than its numerator is worse
+                # than none — `converged_runs` above says so in as many words —
+                # and unfiltered this would count a round 1 that named its dials
+                # and never entered the distribution.
+                #
+                # `{}` is excluded on `_attribution_ran`'s rule: an empty rules
+                # record names no dial, so it cannot say what the threshold was.
+                # An UPPER BOUND even so, and deliberately: `{"dials": {}}` is a
+                # record with nothing in it and counts here, because telling that
+                # apart means knowing what `dials` is and then what
+                # `escalate_on.fix_injection` is — a vocabulary this board refuses
+                # at length. Emptiness is checkable without one; naming a dial is
+                # not.
+                func.count(ReviewRun.id).filter(sa_and(
+                    rated,
+                    func.jsonb_typeof(ReviewRun.rules) == "object",
+                    ReviewRun.rules != func.jsonb_build_object())),
+            )
+            .where(*in_cycle)
+            .group_by(ReviewRun.round)
+            .order_by(ReviewRun.round)
+        )
+    ).all()
+    injection_by_round = []
+    for row in injection:
+        rnd, n, ran_n, rated_n, intro, total = row[:6]
+        lo, hi = row[6:8]
+        quantiles = row[8:8 + len(INJECTION_QUANTILES)]
+        dials = row[8 + len(INJECTION_QUANTILES)]
+        injection_by_round.append({
+            "round": rnd,
+            "rounds": int(n or 0),
+            "attributed_runs": int(ran_n or 0),
+            "rated_runs": int(rated_n or 0),
+            "introduced": int(intro) if rated_n else None,
+            "new": int(total) if rated_n else None,
+            # The sums' ratio, which weights a 44-finding round and a 4-finding
+            # one alike. The rule does not; the quantiles below are its own
+            # quantity.
+            "pooled_rate": (round(int(intro) / int(total), 4)
+                            if rated_n and total else None),
+            "rate_min": _q(lo),
+            "rate_max": _q(hi),
+            **{key: _q(v) for (key, _), v
+               in zip(INJECTION_QUANTILES, quantiles, strict=True)},
+            # Not "how many rounds could be rated" — how many could say what
+            # threshold they were rated against.
+            "dial_runs": int(dials or 0),
+        })
+
     return {
         "window": {
             "since": cutoff.isoformat() if cutoff else None,
@@ -6412,7 +6627,32 @@ async def review_convergence(
              "converged_runs": int(conv_measured or 0)}
             for rnd, n, new, measured, conv, conv_measured in marginal
         ],
+        # #637: the quantity `escalate_on.fix_injection` divides, at the grain it
+        # divides it. Every figure is over `rated_runs` and not over `rounds`.
+        "injection_by_round": injection_by_round,
     }
+
+
+def _q(v: object) -> float | None:
+    """A rate off the database as JSON: four places, or nothing.
+
+    Four places for ``injection_state``'s reason — the payload this mirrors rounds
+    to four and takes its verdict on the rounded number, and a distribution
+    published to more places than the rule compares against invites a reader to
+    check one against the other and find them disagreeing in the last digit.
+
+    ``float(v)`` and not a bare ``round``, and it is a guard rather than a no-op:
+    :func:`_injection_rate` multiplies by ``1.0`` so SQLAlchemy types the whole
+    expression as ``Float`` and asyncpg hands back ``float`` for all five figures
+    today — but ``percentile_cont`` over a NUMERIC expression returns
+    ``Decimal``, which ``json`` will not serialise, so one edit to that
+    multiplication would 500 this endpoint. Measured rather than assumed: all
+    five come back ``float``, and this converts anyway.
+
+    ``None`` passes through as ``None``: the group had no round with a
+    denominator, which is not a rate of zero.
+    """
+    return None if v is None else round(float(v), 4)
 
 
 def _size_order(item: tuple[str, object]) -> tuple[int, str]:

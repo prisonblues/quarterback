@@ -691,3 +691,352 @@ def test_the_page_says_which_window_the_tile_was_answered_over():
     """
     page = (Path(__file__).resolve().parents[1] / "app/static/reviews.html").read_text()
     assert 'window from ' in page, "the tile must name the window it was bounded to"
+
+
+# ---- #637: the population `escalate_on.fix_injection` is fitted to -----------
+
+
+async def injection(client, repo: str) -> dict:
+    return {r["round"]: r for r in (await convergence(client, repo))
+            ["injection_by_round"]}
+
+
+async def test_injection_by_round_publishes_the_rate_the_rule_actually_reads(
+        client):
+    """#637 needed the per-ROUND attribution rate and the board published sums.
+
+    `/review/stats` adds the four `provenance_counts` buckets across a window per
+    reviewer, and a ratio of sums is not the distribution of per-round ratios: the
+    pooled figure weights a 44-finding round like a 4-finding one and
+    `escalate_on.fix_injection` weights them alike too — one round each, one
+    verdict each. So a recalibration had to pull `/reviews` and divide by hand,
+    which is why the instruction to re-measure stood for as long as it did.
+
+    Two rounds, deliberately lopsided: 1/9 over a big round and 3/3 over a small
+    one. The pooled rate is 4/12 and the median of the two per-round rates is
+    0.5555, and the two answers point opposite ways about a cut at 0.5.
+    """
+    repo = "acme/c637-grain"
+    await record(client, repo, 6370, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6370, cycle="c1", round=2,
+                 provenance_counts={"introduced": 1, "missed": 8},
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6370, cycle="c1", round=3,
+                 provenance_counts={"introduced": 3},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    rows = await injection(client, repo)
+    assert rows[2]["rated_runs"] == 1
+    assert rows[2]["rate_median"] == pytest.approx(1 / 9, abs=1e-4)
+    assert rows[3]["rate_median"] == 1.0
+    # The pooled ratio is published beside the distribution and is not it.
+    assert rows[2]["introduced"] == 1 and rows[2]["new"] == 9
+    assert rows[2]["pooled_rate"] == pytest.approx(1 / 9, abs=1e-4)
+
+
+async def test_the_distribution_is_over_rounds_and_not_over_findings(client):
+    """Two rounds numbered 2, one big and clean, one small and all-injected.
+
+    Pooled they are 3 of 23 — 13%, comfortably under any threshold anyone has
+    proposed. Per round they are 0.0 and 1.0, and one of those two rounds is a
+    cycle the rule ends. The quantiles have to see both.
+    """
+    repo = "acme/c637-spread"
+    for pr, counts in ((6371, {"introduced": 0, "missed": 20}),
+                       (6372, {"introduced": 3})):
+        await record(client, repo, pr, cycle=f"c{pr}", round=1, to_fix=[],
+                     round_stop=stop(stopped=False, confident=False,
+                                     converged=False, reason="go again"))
+        await record(client, repo, pr, cycle=f"c{pr}", round=2,
+                     provenance_counts=counts,
+                     round_stop=stop(converged=False, confident=False,
+                                     reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["pooled_rate"] == pytest.approx(3 / 23, abs=1e-4)
+    assert row["rate_min"] == 0.0
+    assert row["rate_max"] == 1.0
+    assert row["rate_median"] == 0.5, "the median of 0.0 and 1.0"
+    assert row["rate_p25"] == 0.25 and row["rate_p75"] == 0.75
+
+
+async def test_a_round_that_was_never_asked_to_attribute_is_not_a_rate_of_zero(
+        client):
+    """`{}` is "the question did not arise" and NULL is "nobody said".
+
+    Neither is `0.0`, which is a claim about a fix pass, and a round 1 has no fix
+    pass in front of it. Counted in `rounds`, kept out of `attributed_runs` and
+    out of every rate — `percentile_cont` ignores the NULLs the divisor produces,
+    which is what stops "attribution did not arise" reading as "the fix pass
+    introduced nothing" and dragging a median down to it.
+    """
+    repo = "acme/c637-notasked"
+    # Round 1: no tally at all. Round 2: `{}`, which the panel sends where the
+    # fix range could not be read. Round 3: a real rate of 1.0.
+    await record(client, repo, 6373, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6373, cycle="c1", round=2, provenance_counts={},
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6373, cycle="c1", round=3,
+                 provenance_counts={"introduced": 5},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    rows = await injection(client, repo)
+    assert rows[1]["rounds"] == 1
+    assert rows[1]["attributed_runs"] == 0 and rows[1]["rated_runs"] == 0
+    assert rows[1]["rate_median"] is None, "an unmeasured round is not a 0.0"
+    assert rows[1]["pooled_rate"] is None and rows[1]["introduced"] is None
+    assert rows[2]["attributed_runs"] == 0, "`{}` is not attribution running"
+    assert rows[2]["rate_median"] is None
+    assert rows[3]["rated_runs"] == 1 and rows[3]["rate_median"] == 1.0
+
+
+async def test_a_tally_that_ran_and_summed_to_zero_is_covered_but_unrated(
+        client):
+    """All-zero is not `{}`: attribution ran and placed nothing.
+
+    So it counts as coverage and still has no rate — a denominator of zero is not
+    a rate of zero — and the two markers are published apart for exactly this row.
+    """
+    repo = "acme/c637-zero"
+    await record(client, repo, 6374, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6374, cycle="c1", round=2,
+                 provenance_counts={"introduced": 0, "missed": 0,
+                                    "missed-unread": 0, "unknown": 0},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["attributed_runs"] == 1, "the panel did attribute"
+    assert row["rated_runs"] == 0, "over nothing"
+    assert row["rate_median"] is None and row["pooled_rate"] is None
+
+
+async def test_the_unattributable_buckets_depress_the_rate(client):
+    """`unknown` and `missed-unread` sit in the denominator, on the panel's rule.
+
+    `panel_rounds.injection_state` puts them there because they push the rate
+    DOWN, and a round the harness could not place must not be the round that ends
+    a cycle. A board that divided by `introduced + missed` alone would publish
+    1.0 for this round and the panel would compute 0.25 for the same one.
+    """
+    repo = "acme/c637-buckets"
+    await record(client, repo, 6375, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6375, cycle="c1", round=2,
+                 provenance_counts={"introduced": 1, "missed": 0,
+                                    "missed-unread": 2, "unknown": 1},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["new"] == 4, "all four buckets, not the two that name a verdict"
+    assert row["rate_median"] == 0.25
+
+
+async def test_the_rounds_a_raised_cap_buys_are_in_the_distribution(client):
+    """Off the table and not off `ranked`, and this is the row that decides it.
+
+    `escalate_on.fix_injection` fires on any round from 2 onward. Measured over
+    each cycle's TERMINAL round only, the mid-cycle rounds vanish — and those are
+    precisely the ones `max_rounds: 6` buys and the ones a recalibration for a cap
+    of 6 is about. This cycle ends at round 4; rounds 2 and 3 are the evidence.
+    """
+    repo = "acme/c637-midcycle"
+    await record(client, repo, 6376, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    for rnd, counts in ((2, {"introduced": 4, "missed": 4}),
+                        (3, {"introduced": 6, "missed": 2})):
+        await record(client, repo, 6376, cycle="c1", round=rnd,
+                     provenance_counts=counts,
+                     round_stop=stop(stopped=False, confident=False,
+                                     converged=False, reason="go again"))
+    await record(client, repo, 6376, cycle="c1", round=4,
+                 provenance_counts={"introduced": 1, "missed": 7},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    rows = await injection(client, repo)
+    assert rows[2]["rate_median"] == 0.5
+    assert rows[3]["rate_median"] == 0.75
+    assert rows[4]["rate_median"] == 0.125
+
+
+async def test_a_round_outside_any_cycle_is_not_in_the_population(client):
+    """A one-shot `/panel` read has no fix pass before it and no cycle around it.
+
+    `marginal_by_round` is restricted to `cycle IS NOT NULL` and this is over the
+    same population, so the two are comparable row for row. A standalone read
+    pooled in would report an attribution rate for a round that could not have one.
+    """
+    repo = "acme/c637-nocycle"
+    await record(client, repo, 6377, round=2,
+                 provenance_counts={"introduced": 9},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    assert (await injection(client, repo)) == {}
+
+
+async def test_dial_runs_says_how_many_rounds_can_name_their_own_threshold(
+        client):
+    """The coverage marker #637 turned on, and it read 1 of 38 on 2026-09-02.
+
+    `rules` is the only field on the row that records
+    `escalate_on.fix_injection` (#305/#647) — `review_panel` is
+    `panel_seats.Dials.as_dict()` and `escalate_on` is not in it. A threshold
+    fitted across rounds that cannot say what they ran under is fitted across a
+    denominator that moved underneath it, so the count is published beside the
+    distribution.
+
+    Presence only. Reading the dial OUT of here would make this board a second
+    interpreter of a repo's dials, which `app/api/dials.py` refuses at length.
+    """
+    repo = "acme/c637-dials"
+    await record(client, repo, 6378, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6378, cycle="c1", round=2,
+                 provenance_counts={"introduced": 3, "missed": 3},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+    await record(client, repo, 6379, cycle="c2", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6379, cycle="c2", round=2,
+                 provenance_counts={"introduced": 3, "missed": 3},
+                 rules={"dials": {"review_panel.escalate_on.fix_injection": {
+                     "layer": "defaults", "value": 0.5,
+                     "source": "harness_rules.DEFAULTS"}}},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["rated_runs"] == 2, "both rounds are in the distribution"
+    assert row["dial_runs"] == 1, "only one of them can say what it ran under"
+
+
+async def test_the_board_applies_no_threshold_and_no_minimum_denominator(client):
+    """The line this endpoint does not cross, pinned rather than described.
+
+    `escalate_on.fix_injection` is a repo dial and
+    `panel_rounds.FIX_INJECTION_MIN_NEW` is a harness constant. A board that
+    published `over: true` would be interpreting the first, and one that dropped
+    this two-finding round would be applying the second — and either makes this
+    file a second implementation of a rule it can then disagree with the panel
+    about, which is what `m6bc45ff1` refuses for `converged`.
+
+    A rate over two findings is not a rate; publishing it anyway is honest, and
+    the consumer holding the floor applies the floor.
+    """
+    repo = "acme/c637-noverdict"
+    await record(client, repo, 6380, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6380, cycle="c1", round=2,
+                 provenance_counts={"introduced": 2},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["rated_runs"] == 1 and row["rate_median"] == 1.0
+    assert not any(k in row for k in ("over", "fired", "limit", "min_new")), \
+        "the board publishes the population, never the verdict"
+
+
+async def test_a_round_that_said_nothing_about_its_dials_is_not_counted(client):
+    """The trap under `dial_runs`, and it is a wrong number rather than a nit.
+
+    A Python `None` bound to a JSONB column stores the jsonb scalar `null`, which
+    is not SQL NULL. So `rules IS NOT NULL` is true of every round that never sent
+    a rules record, and the marker would have read 38 of 38 on the fleet where the
+    honest answer was 1 — a coverage marker asserting full coverage of the one
+    thing nothing covered. `jsonb_typeof(...) = 'object'` is the test, the same
+    one `provenance_runs` uses one rung up the type ladder for `{}`.
+    """
+    repo = "acme/c637-jsonnull"
+    await record(client, repo, 6381, cycle="c1", round=1, to_fix=[],
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6381, cycle="c1", round=2,
+                 provenance_counts={"introduced": 3, "missed": 3},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    async with engine.begin() as conn:
+        held = (await conn.execute(text(
+            "SELECT jsonb_typeof(rules) FROM review_runs "
+            "WHERE repo = :repo AND round = 2"), {"repo": repo})).scalar()
+    assert held == "null", "the premise: the column holds jsonb null, not SQL NULL"
+    assert (await injection(client, repo))[2]["dial_runs"] == 0
+
+
+async def test_dial_runs_is_counted_over_the_population_it_annotates(client):
+    """A coverage marker over a different population than its numerator is worse
+    than none — `converged_runs` says so one query up, and this is the same trap.
+
+    A round 1 names its dials and has no rate, so unfiltered `dial_runs` would
+    report coverage for a round that is not in the distribution it sits beside.
+    Filtered on the same `rated` predicate as every figure in the row, round 1
+    reads `rated_runs: 0` and `dial_runs: 0` together, which is the only pair of
+    numbers a reader can divide.
+    """
+    repo = "acme/c637-marker"
+    rules = {"dials": {"review_panel.escalate_on.fix_injection":
+                       {"layer": "defaults", "value": 0.5}}}
+    await record(client, repo, 6382, cycle="c1", round=1, to_fix=[], rules=rules,
+                 round_stop=stop(stopped=False, confident=False, converged=False,
+                                 reason="go again"))
+    await record(client, repo, 6382, cycle="c1", round=2, rules=rules,
+                 provenance_counts={"introduced": 3, "missed": 1},
+                 round_stop=stop(converged=False, confident=False,
+                                 reason="a stop, not convergence"))
+
+    rows = await injection(client, repo)
+    assert rows[1]["rated_runs"] == 0 and rows[1]["dial_runs"] == 0, \
+        "a round with no rate cannot be coverage for the rate"
+    assert rows[2]["rated_runs"] == 1 and rows[2]["dial_runs"] == 1
+
+
+async def test_an_empty_rules_record_is_not_coverage_for_a_threshold(client):
+    """`{}` names no dial, so it cannot say what the threshold was.
+
+    `_attribution_ran`'s rule one field over: a non-empty OBJECT, because a
+    present-but-empty record and a record naming every dial are opposite answers
+    to the question the marker asks. Raised by an independent reviewer on this
+    diff — the first cut tested `jsonb_typeof(...) = 'object'` alone and counted
+    the empty record as coverage.
+
+    An upper bound remains, and the test says which side it errs on: a record
+    carrying `{"dials": {}}` is counted, because telling THAT apart means knowing
+    what `dials` holds and then what `escalate_on.fix_injection` is, which is the
+    vocabulary this board refuses. Emptiness needs no vocabulary; naming a dial
+    does.
+    """
+    repo = "acme/c637-emptyrules"
+    for pr, rules in ((6383, {}), (6384, {"dials": {}}),
+                      (6385, {"dials": {"review_panel.max_rounds":
+                                        {"layer": "defaults", "value": 6}}})):
+        await record(client, repo, pr, cycle=f"c{pr}", round=1, to_fix=[],
+                     round_stop=stop(stopped=False, confident=False,
+                                     converged=False, reason="go again"))
+        await record(client, repo, pr, cycle=f"c{pr}", round=2, rules=rules,
+                     provenance_counts={"introduced": 2, "missed": 2},
+                     round_stop=stop(converged=False, confident=False,
+                                     reason="a stop, not convergence"))
+
+    row = (await injection(client, repo))[2]
+    assert row["rated_runs"] == 3
+    assert row["dial_runs"] == 2, "`{}` is not coverage; `{'dials': {}}` is, and " \
+        "that is the upper bound this marker is documented to be"
