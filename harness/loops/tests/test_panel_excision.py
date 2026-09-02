@@ -1100,18 +1100,17 @@ def test_the_churn_question_is_ANSWERED_in_the_docs_and_not_left_implicit():
     # revert commit is in that split, and its churn is priced like any other. A claim a
     # reader cannot act on is worse than silence, and this one contradicted the
     # paragraph above it. Found by a Codex second opinion.
+    #
+    # The changelog fragment carries the same correction and is NOT asserted here: the
+    # flake's check sandbox stages `harness/` and not `changelog.d/`, so a test reading
+    # it fails in the sandbox and passes everywhere else. `scripts/changelog_fragments.py`
+    # is what reads that file in CI.
     assert "the excision IS charged to it" in readme
     assert "not charged to `low_severity_fix_lines`" not in readme
-    fragment = " ".join(
-        (REPO_ROOT / "changelog.d/627.feat.md").read_text(encoding="utf-8").split())
-    assert "the excision is charged to it like any other commit" in fragment
-    assert "not charged to `low_severity_fix_lines`" not in fragment
+    assert "stated rather than closed" in readme
     brief = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
     assert "`low_severity_fix_lines` counts it" in brief
     assert "Do not charge it to `low_severity_fix_lines`" not in brief
-    # The exposure is named rather than closed, in all three.
-    for text in (readme, fragment):
-        assert "stated rather than closed" in text
     # And the two questions are named apart, because conflating them is how a
     # correction comes to read as the disease.
     assert "*How much surface was disturbed*" in readme
