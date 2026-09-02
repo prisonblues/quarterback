@@ -312,25 +312,150 @@ def _systemctl(answers: dict) -> object:
     return fake
 
 
+def _no_units(monkeypatch, stdout: str = "not-found", stderr: str = "") -> None:
+    """A host on which `qb-reconcile.timer` does not exist at all."""
+    monkeypatch.setattr(qd.shutil, "which", lambda _n: "/usr/bin/systemctl")
+    monkeypatch.setattr(qd, "run_cmd", _systemctl({
+        "is-enabled": (4, stdout, stderr), "is-active": (4, "inactive", "")}))
+
+
+def _passes(*rows: tuple[str, float, str]) -> dict:
+    """`{"passes": [...]}` from `(repo, minutes_ago, reported_by)` triples."""
+    return {"passes": [
+        {"repo": repo,
+         "at": (datetime.now(UTC) - timedelta(minutes=ago)).isoformat(),
+         "reported_by": who}
+        for repo, ago, who in rows], "count": len(rows)}
+
+
 @pytest.mark.parametrize("stdout,stderr", [
     ("", "Failed to get unit file state for qb-reconcile.timer: No such file or directory"),
     ("not-found", ""),
 ])
-def test_a_unit_that_was_never_installed_fails_and_says_where_the_units_live(
+def test_a_host_with_no_units_and_no_board_cannot_answer_and_says_where_they_live(
         monkeypatch, repo, stdout, stderr):
-    """The exact state of every host on the fleet until 2026-08-22: the units were
-    in `harness/loops/systemd/` and on no machine, and the plan went 39% stale.
+    """Absent units are no longer a fault by themselves (#695) — the pass is a fleet
+    singleton and three of five hosts hold no timer by design. With no board to ask,
+    "nothing here can tell" is the honest answer, and the remedy still names the units.
 
     Both spellings, because systemd answers `not-found` on stdout on this fleet and
     puts the same fact on stderr elsewhere. The exit code is 4 either way, and 4 for
     `inactive` too, which is why nothing here reads it as the discriminator."""
-    monkeypatch.setattr(qd.shutil, "which", lambda _n: "/usr/bin/systemctl")
-    monkeypatch.setattr(qd, "run_cmd", _systemctl({
-        "is-enabled": (4, stdout, stderr), "is-active": (4, "inactive", "")}))
+    _no_units(monkeypatch, stdout, stderr)
     check = qd.check_reconcile(host_for(repo))
-    assert check.verdict == "fail"
+    assert check.verdict == "unknown"
     assert "harness/loops/systemd/" in check.manual
     assert check.fix is None, "a unit that does not exist cannot be enabled"
+
+
+def test_a_host_without_the_units_is_ok_when_some_other_host_is_reconciling(
+        monkeypatch, landing_host):
+    """The row #695 is about. daedalus, atlas and sisyphus do not import the units and
+    were each being called NOT wired up for it — one `fail` that set the headline and
+    the exit code for every other row on the box."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, _passes(("prisonblues/quarterback", 4, "zeus/opal-vermeil")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "ok"
+    assert "zeus/opal-vermeil" in check.detail, "an ok that hides who it trusts is not an answer"
+    assert "4m" in check.detail
+
+
+def test_no_pass_recorded_anywhere_is_still_the_original_failure(monkeypatch, landing_host):
+    """#255's night survives the fix: the units in-repo and on no host at all. An empty
+    list is the one state that is genuinely a fault, and it stays a `fail`."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, {"passes": [], "count": 0})
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "fail"
+    assert "NO host" in check.detail
+
+
+def test_a_board_too_old_to_answer_is_unknown_rather_than_an_invented_outage(
+        monkeypatch, landing_host):
+    """`GET /plan/reconcile` ships with this change, so every board predating it 404s.
+    Reading that as "nobody is reconciling" would manufacture an outage out of a
+    deployment lag — `_board_by_capability`'s reasoning, in the row that meets it first."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, "Not Found", status=404)
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "unknown"
+    assert check.verdict != "fail"
+
+
+def test_a_stale_fleet_pass_warns_and_refuses_to_call_a_local_install_the_fix(
+        monkeypatch, landing_host):
+    """Nobody has run one for hours. That is worth saying, but it is not this host's
+    fault and installing a timer here would clear the row while leaving the fleet's
+    pass exactly as stopped."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, _passes(("prisonblues/quarterback", 195, "zeus/opal-vermeil")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "warn"
+    assert "3h 15m" in check.detail
+
+
+def test_the_freshest_pass_wins_not_the_first_the_board_listed(monkeypatch, landing_host):
+    """The board orders by its own column and this must not depend on that. A row whose
+    timestamp could not be read must never become the answer by being first."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, {"passes": [
+        {"repo": "a/one", "at": "not-a-timestamp", "reported_by": "ghost"},
+        {"repo": "a/two", "at": (datetime.now(UTC) - timedelta(minutes=400)).isoformat(),
+         "reported_by": "hermes/old"},
+        {"repo": "a/three", "at": (datetime.now(UTC) - timedelta(minutes=6)).isoformat(),
+         "reported_by": "zeus/fresh"},
+    ], "count": 3})
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "ok"
+    assert "zeus/fresh" in check.detail
+
+
+def test_a_pass_dated_in_the_future_is_skew_and_never_the_healthiest_state(
+        monkeypatch, landing_host):
+    """`_age_minutes` returns negative rather than clamping precisely so this stays
+    distinguishable from "just now". Clamped, a host with a bad clock would read as the
+    freshest pass on the board for as long as the skew lasted."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, _passes(("a/one", -90, "zeus/skewed")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "FUTURE" in check.detail
+
+
+def test_passes_that_carry_no_readable_time_are_unknown_not_ok(monkeypatch, landing_host):
+    """A board answering rows this cannot date has not said the fleet is healthy."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, {"passes": [{"repo": "a/one", "at": None}], "count": 1})
+
+    assert qd.check_reconcile(landing_host).verdict == "unknown"
+
+
+def test_a_host_that_holds_the_timer_is_still_judged_locally(monkeypatch, landing_host):
+    """The board half is only for hosts with no units. A timer that exists HERE and is
+    dead is this host's fault, the board cannot see it, and a fleet that is otherwise
+    reconciling must not excuse it."""
+    monkeypatch.setattr(qd.shutil, "which", lambda _n: "/usr/bin/systemctl")
+    monkeypatch.setattr(qd, "run_cmd", _systemctl({
+        "is-enabled": (1, "disabled", ""), "is-active": (3, "inactive", "")}))
+    _board_says(monkeypatch, _passes(("a/one", 2, "zeus/opal-vermeil")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.fix == ["systemctl", "--user", "enable", "--now", "qb-reconcile.timer"]
 
 
 @pytest.mark.parametrize("broken", ["is-enabled", "is-active"])

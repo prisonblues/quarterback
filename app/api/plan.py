@@ -81,6 +81,7 @@ from app.models.order_proposal import OrderProposal
 from app.models.plan import Plan
 from app.models.plan_item import PlanItem
 from app.models.plan_reconcile import PlanReconcile
+from app.models.plan_reconcile_pass import PlanReconcilePass
 from app.models.plan_scope import PlanScope
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
@@ -2022,9 +2023,64 @@ async def report_reconcile(
             if seen else text("true")))
     resolved = gone.rowcount or 0
 
+    # THAT the pass ran, recorded beside what it found and never folded into it.
+    # The delete above is why: a clean scope re-reports nothing, so every row goes
+    # and `plan_reconcile` ends up empty — the same table state as a board nothing
+    # has ever reconciled. Written unconditionally, including for the empty report,
+    # because the empty report is exactly the case the findings cannot speak for.
+    # `now()` is the server's, not `now` above: a host with a skewed clock would
+    # otherwise be able to report a pass from the future and read as fresh until
+    # the skew ran out.
+    await session.execute(
+        pg_insert(PlanReconcilePass)
+        .values(repo=body.repo, last_pass_at=func.now(), reported_by=reporter)
+        .on_conflict_do_update(
+            constraint="uq_plan_reconcile_pass_repo",
+            set_={"last_pass_at": func.now(), "reported_by": reporter}))
+
     await session.commit()
     return {"repo": body.repo, "stored": stored, "resolved": resolved,
             "reported_by": reporter, "at": now.isoformat()}
+
+
+@router.get("/plan/reconcile")
+async def read_reconcile_passes(
+    caller: str = Depends(reader),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """When a reconcile pass last covered each scope, and which machine ran it (#695).
+
+    **The question is "is anyone reconciling", and it has no local answer.** The
+    pass is a fleet singleton over a plan every host shares, so "is the timer
+    enabled *here*" — which is what `qb-doctor` asked until #695 — is a question
+    about the wrong noun. Three of five hosts in the fleet do not hold the units
+    by design and were being called unwired for it. This is the fact that lets a
+    host on which the pass is somebody else's job say so and still be honest about
+    the case where it is nobody's.
+
+    **Answering `null` is a real answer and not an error.** A scope no pass has
+    covered has no row, and an empty `passes` means no scope has been reconciled
+    at all — which is the original #255 failure, still worth reporting as one.
+    Callers must not read the empty list as "fine": that is the collapse this
+    endpoint exists to make impossible, and the reason a monitor is given the
+    timestamp rather than a verdict.
+
+    **No threshold here.** How old a pass may be before it is stale depends on the
+    timer that writes it (fifteen minutes today) and on what the reader will do
+    about it, and both live with the reader. The board holds when; whoever asks
+    decides what that is worth.
+    """
+    rows = list(await session.scalars(
+        select(PlanReconcilePass).order_by(PlanReconcilePass.last_pass_at.desc())))
+    return {
+        "passes": [
+            {"repo": r.repo,
+             "at": r.last_pass_at.isoformat(),
+             "reported_by": r.reported_by}
+            for r in rows
+        ],
+        "count": len(rows),
+    }
 
 
 @router.get("/plan/scopes")
