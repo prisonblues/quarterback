@@ -2095,6 +2095,30 @@ def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
     reading the two keys beside it already have. ``null`` here is the exact pre-#664
     behaviour, which is what makes a shape decision reversible without a release.
 
+    **The empty string is null too**, said here because the paragraph below reads as
+    though `null` were the only off spelling and a reviewer took it that way (#686).
+    It is not a quirk of this key. EVERY dial resolver in this module reads `""` as
+    null — all seventeen of them, with no exception — so it is the module's
+    convention rather than this dial's behaviour, and refusing it here alone would
+    make this the only dial in the file that answers an emptied value differently
+    from every other. Stated as "every" rather than as a bare count deliberately: a
+    count is what three earlier drafts of this paragraph each got wrong, because the
+    answer moves with what you decide to grep for, while "every resolver, no
+    exception" is checkable against the list of resolvers itself.
+
+    WHY the convention exists is not recorded anywhere and is deliberately not guessed
+    at here. Two routes DO deliver one, so it is not unreachable: a hand-written
+    `.harness-rules` with a key emptied rather than deleted, and `POST /dials`, which
+    `json.dumps`es whatever `value` it is given and stores it — the API validates the
+    dial NAME and the payload size but not the value's type, on the stated rule that
+    "the client owns the vocabulary". `POST /dials/clear` is the one route that cannot:
+    it stamps `cleared_at` and the dial then resolves as ABSENT, which is a different
+    answer from `null` here (absent inherits the default; `null` switches the floor
+    off).
+
+    That is not in tension with `0` below. `0` is a number a repo can mean and whose
+    meaning would be wrong; `""` is the absence of a value, which is what `null` is.
+
     ``0`` is refused rather than read as "no floor". A floor of zero is one every
     growth clears the moment a fix pass writes a character, so it is the OFF position
     written in a spelling that does not say so, and `null` is already that spelling —

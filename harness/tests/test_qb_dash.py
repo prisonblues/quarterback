@@ -5,8 +5,11 @@ with the browser and tmux calls stubbed, because a test that opened Chrome and
 moved the cursor of a live seat screen would be its own bug.
 
 SKIPPED unless the machine can actually run the dashboard: textual and the board
-client come from mcp/'s environment, and the fetches want a configured board. In
-CI today that means this skips; it is written to run where the thing itself runs.
+client come from mcp/'s environment. CI DOES run this file — `tests.yml` gives the
+dashboard step the `tui` extra precisely so it executes, and asserts a non-zero
+pass count so a silently-skipping module fails the build. What skips there is the
+handful of tests that want a configured board and a `gh`, which CI deliberately
+does not have.
 Two defects came out of it that hand-testing had passed:
 
   * a single click did nothing. DataTable treats a click on any row but the
@@ -23,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import sys
 import time
@@ -111,7 +115,34 @@ pytestmark = pytest.mark.skipif(_NO_TUI is not None, reason=_NO_TUI or "")
 #: For the tests that click whatever the repo and the board actually have open
 #: today. They are still the ones that found the defects worth finding, so they
 #: are not weakened — they are just no longer the reason the rest cannot run.
-needs_live_data = pytest.mark.skipif(_NO_BOARD is not None, reason=_NO_BOARD or "")
+#:
+#: OPT-IN, and #644 is the reason. These four read the live board and the live
+#: repo, so their row indices are a function of what the fleet happens to be doing
+#: while the suite runs — and this repo runs several agents that post to that board
+#: and open PRs against that repo at once. Three of the four failures anyone has
+#: recorded for this file are among these four tests, out of 107 in it.
+#:
+#: The value being protected is what a green local suite MEANS. CI already has it:
+#: `tests.yml` runs the dashboard suites serially and with no board configured, so
+#: these skip there and are meant to. A developer or an agent running
+#: `pytest harness/tests` on a box that HAS a board was getting a different suite
+#: from the one CI gates on, and finding out by way of a failure attributed to
+#: whatever they had just changed. Now both mean the same thing.
+#:
+#: Not deleted, and not stubbed. They are the tests that found the defects worth
+#: finding, and stubbing the data is how you keep the clicking and lose the point —
+#: the claim is that the dashboard works on the board as it really is. Ask for them
+#: by name: `QB_DASH_LIVE=1 pytest harness/tests/test_qb_dash.py`.
+#: Read as a switch and not as a string, because `bool("0")` is True and this file
+#: documents `QB_DASH_LIVE=1` in four places — so a reader who tried `=0` to turn the
+#: live tests OFF would have turned them on. That is `low_severity_fix_lines`' own
+#: lesson one repo over: every non-empty string is truthy in Python, `"false"`
+#: included, and a setting whose job is to gate something stops doing it.
+_LIVE_ON = os.environ.get("QB_DASH_LIVE", "").strip().lower() in {"1", "true", "yes", "on"}
+_NO_LIVE = _NO_BOARD or (
+    None if _LIVE_ON else
+    "live board/repo data is opt-in (#644): set QB_DASH_LIVE=1 to run these")
+needs_live_data = pytest.mark.skipif(_NO_LIVE is not None, reason=_NO_LIVE or "")
 
 
 def _numbered_cell(row) -> str:
@@ -244,8 +275,13 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
     # positions and handed the click whatever the new ones put there. Both were
     # seen on this suite, a few runs apart, which is the signature of a paint that
     # has not caught up rather than of anything the dashboard did.
+    # FROM y=0 ON A TABLE WITH NO HEADER. Every table here had one when this was
+    # written, so the scan started below it — and on the chip bar, which is
+    # `show_header=False` and one line tall, `range(1, 1)` is empty and the helper
+    # reported a row that was on screen and under the mouse as unreachable.
+    top = 1 if table.show_header else 0
     for _ in range(40):
-        for y in range(1, table.region.height):
+        for y in range(top, table.region.height):
             for dx in (range(table.region.width) if column is not None else (x,)):
                 meta = table.screen.get_style_at(table.region.offset.x + dx,
                                                  table.region.offset.y + y).meta
@@ -262,6 +298,29 @@ async def _click_row_index(pilot, table, index: "int | str", x: int = 4,
         f"row {index}{'' if column is None else f' column {column}'} of {table.id} "
         f"is not on screen — a click cannot reach it "
         f"(region {table.region}, {table.row_count} rows)")
+
+
+#: How many 0.05s reads `_click_row` spends waiting for a pane to stop moving.
+#: The loop leaves the moment two consecutive reads agree, so on a healthy run this
+#: costs 0.1s whatever it is set to and the ceiling is paid only when something is
+#: genuinely wrong.
+#:
+#: A count of READS, and stated precisely because the imprecise version is
+#: misleading: every unsuccessful read still costs a `pilot.pause(0.05)`, so this is
+#: also a wall-clock floor of ~11.95s that STRETCHES under contention rather than a
+#: quantity independent of time — 239 pauses and not 240, because the read that
+#: succeeds does not pause after itself. The old 60 was ~2.95s by the same arithmetic.
+#: The exact figure does not matter and the off-by-one is written down anyway: a
+#: comment that rounds in its own favour is how the rest of this file's false claims
+#: started.
+#:
+#: The distinction that survives is about what is guaranteed. A real deadline
+#: (`while time.monotonic() < start + N`) expires while the app is descheduled, so a
+#: loaded box buys the pane FEWER chances to settle exactly when it needs more. A
+#: read count guarantees 240 observations however long the scheduler takes to
+#: deliver them. That is why the shape is a count and not a deadline; the 4x is what
+#: makes the count large enough to survive a box under load.
+_SETTLE_READS = int(os.environ.get("QB_DASH_SETTLE_READS", "240"))
 
 
 async def _click_row(pilot, table, offset, row: int | None = None) -> None:
@@ -287,9 +346,18 @@ async def _click_row(pilot, table, offset, row: int | None = None) -> None:
     So: the same coordinate `Pilot.click` will compute, held still across two
     consecutive reads with a real row under it. Two rather than one because a
     single read cannot tell a settled pane from one between passes. Bounded at
-    3s and it clicks anyway when that runs out — a table that genuinely never
-    drew should fail on the assertion that names it, not time out in here — and
-    it costs 0.1s when nothing is moving, which is the normal case.
+    `_SETTLE_READS` reads and it RAISES when that runs out, and it costs 0.1s when
+    nothing is moving, which is the normal case.
+
+    It used to click anyway, on the argument that a table which never drew should
+    fail on the assertion that names it rather than time out in here. That argument
+    is wrong in the one direction that matters, and #644 is what it cost: the
+    assertion that names it is downstream and is about something else, so a pane
+    that never settled reported itself as a hammer that did not start a fix. Four
+    failures were investigated across two agents and two worktrees before anyone
+    read the `never settled` line in the captured output. A helper that cannot do
+    its job must say so in its own words — which is what `_click_row_index` twenty
+    lines up already does when the row it wants is off screen.
     """
     # A MOUSE MOVE FIRST, because the very first Click into a freshly mounted pane
     # is swallowed: no dispatch fires for it, and the same click a moment later
@@ -301,7 +369,7 @@ async def _click_row(pilot, table, offset, row: int | None = None) -> None:
     # whatever the hover left behind.
     await pilot.hover(table, offset=offset)
     previous, still = None, 0
-    for _ in range(60):
+    for _ in range(_SETTLE_READS):
         region = table.region
         x, y = region.offset.x + offset[0], region.offset.y + offset[1]
         under = table.screen.get_style_at(x, y).meta.get("row", -1)
@@ -318,13 +386,31 @@ async def _click_row(pilot, table, offset, row: int | None = None) -> None:
         previous = region
         await pilot.pause(0.05)
     else:
-        # It clicks anyway — but a click that never found a settled row is not the
-        # same event as one that did, and silence makes them the same in the log.
-        # Reachable on an ordinary day: a fixed y=2 offset addresses no row on a
-        # repo with one open PR, and the driver then reports whatever the empty
-        # click did or did not do, under the name of the thing it meant to test.
-        print(f"_click_row: {table.id} never settled with a row at {offset} "
-              f"— clicking anyway, region {table.region}")
+        # RAISES, naming what actually happened. The old branch printed this and
+        # clicked regardless, which made a pane that never settled indistinguishable
+        # from one that did — the click landed on the header, `ClickTable.on_click`
+        # refused it as `row: -1`, and the failure surfaced hundreds of lines later
+        # as whatever verb the test was checking. That is #644.
+        #
+        # The case the old branch was protecting is real and has not gone away: a
+        # fixed `y=2` offset addresses no row on a repo with one open PR, so the
+        # driver would find nothing under the pointer through no fault of the
+        # dashboard. But that case belongs to the four `@needs_live_data` tests,
+        # whose data is whatever the fleet has open this minute, and those are now
+        # opt-in for the same issue. What is left here runs on literals, so a pane
+        # that will not settle is a defect or a wedged event loop, and both want a
+        # name rather than a click.
+        under = table.screen.get_style_at(
+            table.region.offset.x + offset[0],
+            table.region.offset.y + offset[1]).meta.get("row", -1)
+        raise AssertionError(
+            f"{table.id} never settled with a row at {offset} after "
+            f"{_SETTLE_READS} reads — the pane was still moving, or nothing is "
+            f"drawn there. Row under the pointer: {under} (wanted "
+            f"{'any' if row is None else row}); region {table.region}, "
+            f"{table.row_count} rows. This is not a failure of whatever the test "
+            f"went on to assert. If the box is heavily loaded, raise "
+            f"QB_DASH_SETTLE_READS")
     await pilot.click(table, offset=offset)
 
 
@@ -2749,6 +2835,19 @@ class _Sink:
 
     def clear(self, *a, **k): pass
 
+    #: The chip bar rebuilds its columns rather than updating them — the columns
+    #: ARE the chips — and hides itself when there is nothing to choose between.
+    #: A stub missing either is a stub that turns a repo filter into an
+    #: AttributeError inside render_agents, which every seat test goes through.
+    def set_class(self, *a, **k): pass
+
+    def add_columns(self, *a, **k): return []
+
+    #: Keyed, singular — `render_chips` names each column after its repo so that a
+    #: click resolves by identity rather than by position. Every seat test reaches
+    #: render_agents, and render_agents draws the chip bar.
+    def add_column(self, label, key=None, **k): return key
+
     def add_row(self, *a, key=None, **k):
         """Hands back a key like the real one does.
 
@@ -4044,3 +4143,335 @@ def test_expanding_refuses_the_same_way():
     app.seats_error = "tmux could not be run (OSError)"
     app.action_expand()
     assert said and "blind, not empty" in said[0], said
+
+
+# ---- the chip bar ------------------------------------------------------------
+#
+# Sixteen agents across three repos is a list you read rather than one you scan,
+# and the dashboard had no way to narrow it: `s` is binary — this screen's repos
+# or every repo — and `--repo` is a command-line flag you cannot reach from a
+# running dashboard.
+
+
+def _bar(app, board, seats=None):
+    """Drive `render_agents` and read back the bar, the title and whether it hid.
+
+    The chips are read off the stub's `add_row` rather than off a widget, for the
+    reason `_seat_labels` reads labels that way: which repos it offers and which
+    one is lit are decisions, and driving a pilot to find them out would test
+    Textual's layout instead.
+    """
+    chips: list[list[str]] = []
+    hidden: list[bool] = []
+    said: list[str] = []
+
+    class Bar:
+        #: Zero, so the signature guard in `render_chips` reads this stub as a bar
+        #: that has not been drawn yet and rebuilds it — which is what every test
+        #: through this helper wants to observe.
+        row_count = 0
+
+        def set_class(self, on, *names): hidden.append(bool(on))
+        def clear(self, **k): pass
+        def add_column(self, label, key=None, **k): return key
+
+        def add_row(self, *cells, key=None, **k):
+            chips.append([str(getattr(c, "plain", c)).strip() for c in cells])
+            return SimpleNamespace(value=key)
+
+    class Rows(Bar):
+        def add_row(self, *cells, key=None, **k):
+            return SimpleNamespace(value=key)
+
+    app.board = board
+    app.seats = seats or []
+    app.query_one = lambda sel, *a, **k: (
+        Bar() if sel == "#chips" else Rows() if sel == "#agents"
+        else _Sink(said) if sel == "#t_agents" else _Sink())
+    app.render_agents()
+    return (chips[0] if chips else []), (hidden[0] if hidden else False), said
+
+
+def _wide(app):
+    """Fleet-wide scope, and `say` sent nowhere.
+
+    `Scope.on` is TRUE when the scope is NARROWED to this screen's repos — the
+    reading that cost the first cut of these tests an hour — so the fleet-wide
+    one is the toggle of a scope that is on. Several repos is the only state a
+    chip bar has anything to do in, and the narrow scope is what hides them.
+
+    `say` writes to the running app's screen, and there is no screen here.
+    """
+    if app.scope.on:
+        app.scope = app.scope.toggled()
+    app.say = lambda *a, **k: None
+    return app
+
+
+def _fleet(*repos):
+    """A board answer with one live agent per named repo."""
+    return {"agents": [{"holder": f"zeus/a{i}", "session": f"s{i}", "state": "working",
+                        "repo": r, "reported": None}
+                       for i, r in enumerate(repos)], "claims": []}
+
+
+def test_the_bar_offers_a_chip_for_each_repo_the_fleet_is_in():
+    app = _wide(_dash())
+    chips, hid, _ = _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    assert not hid
+    assert chips == ["lexray", "quarterback"]
+
+
+def test_one_repo_is_not_a_choice_so_the_bar_hides():
+    """A line of a 78-column pane is worth more than a control that cannot change
+    what you are looking at."""
+    app = _wide(_dash())
+    _, hid, _ = _bar(app, _fleet("quarterback", "quarterback"))
+    assert hid, "the bar drew a single chip"
+
+
+def test_a_chip_filters_and_the_title_keeps_the_unfiltered_count():
+    """`3 of 16 · lexray` is a fact about what you are looking at. `3 live` alone,
+    on a screen whose bar has scrolled out of a short pane, is a fact about the
+    fleet — and a wrong one."""
+    app = _wide(_dash())
+    _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    app.filter_repo("lexray")
+    _, _, said = _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    assert any("1 of 3" in s and "lexray" in s for s in said), said
+
+
+def test_the_same_chip_is_the_on_and_the_off_switch():
+    """A separate `clear` chip is one more thing to find, and in a pane narrow
+    enough to clip the bar it is the one that gets clipped."""
+    app = _wide(_dash())
+    app.render_agents = lambda: None
+    app.filter_repo("lexray")
+    assert app.repo_filter == "lexray"
+    app.filter_repo("lexray")
+    assert app.repo_filter is None
+
+
+def test_the_bar_keeps_every_chip_while_one_of_them_is_filtered_to():
+    """Built from the rows left AFTER a filter, it would lose every chip but the
+    active one the moment you used it — a filter you cannot leave."""
+    app = _wide(_dash())
+    app.repo_filter = "lexray"
+    chips, hid, _ = _bar(app, _fleet("quarterback", "lexray", "quarterback"))
+    assert not hid
+    assert chips == ["lexray", "quarterback"], chips
+
+
+def test_a_filter_whose_repo_goes_quiet_is_dropped_rather_than_stranding_you():
+    """The last agent in `lexray` exits, so its chip stops being drawn — and a
+    filter that survived that is an empty table with no visible control to clear
+    it."""
+    app = _wide(_dash())
+    app.repo_filter = "lexray"
+    _bar(app, _fleet("quarterback", "selfhost"))
+    assert app.repo_filter is None
+
+
+def _columned(app, *names):
+    """A `#chips` widget carrying columns keyed by repo, as `render_chips` builds
+    them. The keys are the subject: a click resolves through them."""
+    cols = [SimpleNamespace(key=SimpleNamespace(value=n)) for n in names]
+    app.render_agents = lambda: None
+    app.query_one = lambda sel, *a, **k: (
+        SimpleNamespace(ordered_columns=cols) if sel == "#chips" else _Sink())
+    return app
+
+
+def test_a_click_on_the_bar_reaches_the_chip_under_the_pointer():
+    """The bar is one row, so the COLUMN is the whole of which chip was hit — and
+    a chip has no record in `self.rows`, which everything below this reaches for."""
+    app = _columned(_wide(_dash()), "lexray", "quarterback")
+    app.dispatch_row("chips", 1)
+    assert app.repo_filter == "quarterback"
+    app.dispatch_row("chips", 0)
+    assert app.repo_filter == "lexray"
+
+
+def test_a_click_past_the_last_chip_does_nothing():
+    """A stale column index — the bar rebuilt between the render and the click —
+    must not index into the columns it no longer matches."""
+    app = _columned(_wide(_dash()), "lexray")
+    app.dispatch_row("chips", 7)
+    assert app.repo_filter is None
+
+
+def test_the_chip_a_click_lands_on_is_read_off_the_widget_not_off_self_chips():
+    """Two lists that have to stay in step is two lists that come apart, and this
+    pair already did: the bar hides and empties `self.chips` while the widget
+    keeps its columns until the next rebuild. The column KEY is the repo, so what
+    a click resolves to is what that column is."""
+    app = _columned(_wide(_dash()), "lexray", "quarterback")
+    app.chips = []                      # out of step with the widget, as it gets
+    app.dispatch_row("chips", 1)
+    assert app.repo_filter == "quarterback"
+
+
+def test_a_tmux_that_failed_does_not_send_a_pane_to_a_window_instead(monkeypatch):
+    """#675's distinction, in the caller that still discarded it. Falling through
+    to `run_in_window` decides the topology from a query that failed — and then
+    runs the same broken tmux to make the window, failing again with a second and
+    less useful message."""
+    app = _dash()
+    said: list[str] = []
+    windowed: list[str] = []
+    app.say = said.append
+    app.run_in_window = lambda name, command: windowed.append(name)
+    app_module = _load_app()
+    real = app_module.qd.tmux_seats
+    monkeypatch.setenv("TMUX", "/tmp/whatever,1,0")
+    try:
+        app_module.qd.tmux_seats = lambda: ([], "tmux exited 127")
+        app.run_in_pane("panel-42", "claude -- '/panel-review-pr 42'")
+    finally:
+        app_module.qd.tmux_seats = real
+    assert not windowed, "a failed query was read as a screen with no seats"
+    assert said and "cannot reach tmux" in said[0], said
+
+
+def test_the_bar_hiding_takes_the_filter_with_it():
+    """The stranding case the obvious one hides.
+
+    Filter to `lexray` while three repos are live, then watch every OTHER repo go
+    quiet. `lexray` is still on the bar, so the "its repo went quiet" rule does
+    not fire — and the bar hides anyway, because one chip is not a choice. Filter
+    set, no chip drawn, nothing to click.
+    """
+    app = _wide(_dash())
+    app.repo_filter = "lexray"
+    _, hid, _ = _bar(app, _fleet("lexray", "lexray"))
+    assert hid, "the bar drew a single chip"
+    assert app.repo_filter is None, "a hidden bar left its filter on"
+
+
+def test_the_bar_is_not_rebuilt_when_it_would_look_the_same():
+    """`render_agents` runs on the board's timer. An unguarded rebuild is
+    `clear(columns=True)` every four seconds — throwing away the row a click is
+    being dispatched against, and the cursor and hover with it."""
+    app = _wide(_dash())
+    builds: list[int] = []
+
+    class Bar:
+        row_count = 1
+        def set_class(self, *a, **k): pass
+        def clear(self, **k): builds.append(1)
+        def add_column(self, label, key=None, **k): return key
+        def add_row(self, *cells, key=None, **k): return SimpleNamespace(value=key)
+
+    class Rows(Bar):
+        row_count = 0
+        def clear(self, **k): pass
+
+    app.board = _fleet("quarterback", "lexray")
+    app.seats = []
+    app.query_one = lambda sel, *a, **k: (
+        Bar() if sel == "#chips" else Rows() if sel == "#agents" else _Sink())
+    app.render_agents()
+    app.render_agents()
+    app.render_agents()
+    assert builds == [1], f"the bar was rebuilt {len(builds)} times for one state"
+
+
+def test_a_changed_filter_does_redraw_the_bar():
+    """The active chip is drawn differently from the others, so the filter is part
+    of what the bar looks like — a signature of the names alone would leave the
+    lit chip on the repo you just stopped filtering to."""
+    app = _wide(_dash())
+    builds: list[int] = []
+
+    class Bar:
+        row_count = 1
+        def set_class(self, *a, **k): pass
+        def clear(self, **k): builds.append(1)
+        def add_column(self, label, key=None, **k): return key
+        def add_row(self, *cells, key=None, **k): return SimpleNamespace(value=key)
+
+    class Rows(Bar):
+        row_count = 0
+        def clear(self, **k): pass
+
+    app.board = _fleet("quarterback", "lexray")
+    app.seats = []
+    app.query_one = lambda sel, *a, **k: (
+        Bar() if sel == "#chips" else Rows() if sel == "#agents" else _Sink())
+    app.render_agents()
+    app.repo_filter = "lexray"
+    app.render_agents()
+    assert len(builds) == 2, builds
+
+
+# ---- the chip bar, against the real widget -----------------------------------
+#
+# Every test above stubs the table, and a second opinion put the cost plainly:
+# they all pass while the real widget resets its scroll on every poll, throws
+# during column reconstruction, or hands a click metadata from a rendering that
+# is gone. That was not hypothetical — switching the columns to keyed ones broke
+# a seat test the stubs could not see, because only those route `#chips` through
+# `_Sink`. These drive a pilot instead, and they are the ones that would catch it.
+
+
+async def _chip_pilot(repos, click: int | None = None):
+    """The dashboard with a fixture fleet, and optionally a real click on a chip.
+
+    THE FIXTURE IS RE-ASSERTED after the pause. The workers started at mount reach
+    the live board, and one landing here replaces the fleet under the assertion —
+    which is what made a hand-run of this print three chips once and two the next
+    time. Stubbing them out before `run_test` is not enough; they are already in
+    flight by the time the context manager yields.
+    """
+    app_module = _load_app()
+    app = app_module.Dash(interval=3600, gh_interval=3600)
+    async with app.run_test(size=(100, 30)) as pilot:
+        for name in ("refresh_board", "refresh_plan", "refresh_prs",
+                     "refresh_issues", "refresh_seats", "refresh_limits"):
+            setattr(app, name, lambda: None)
+        # AND the render the workers call back into. Stubbing the fetchers is not
+        # enough: one started at mount is already in flight by the time this line
+        # runs, and it lands as `render_board(live_data)` — which replaces the
+        # fixture fleet and redraws the bar from whatever repos the real board is
+        # busy with. This test passed alone and failed in the file for exactly
+        # that reason, which is the shape of a race rather than of a defect.
+        app.render_board = lambda *a, **k: None
+        if app.scope.on:
+            app.scope = app.scope.toggled()
+            app.build_columns()
+        app.board = _fleet(*repos)
+        app.render_agents()
+        await pilot.pause(0.2)
+        app.board = _fleet(*repos)
+        app.render_agents()
+        await pilot.pause(0.1)
+        bar = app.query_one("#chips")
+        keys = [str(c.key.value) for c in bar.ordered_columns]
+        if click is not None:
+            await _click_row_index(pilot, bar, "chips", column=click)
+            await pilot.pause(0.2)
+        return keys, bar.row_count, bar.has_class("empty"), app.repo_filter
+
+
+def test_the_real_bar_draws_a_column_per_repo_keyed_by_its_name():
+    """`add_column(name, key=name)` against the actual DataTable, which the stubs
+    cannot check: they accept any signature and return whatever they like."""
+    keys, rows, hidden, _ = asyncio.run(_chip_pilot(
+        ["quarterback", "lexray", "prisonblues/quarterback", "selfhost"]))
+    assert not hidden
+    assert rows == 1
+    assert keys == ["lexray", "quarterback", "selfhost"], keys
+
+
+def test_a_real_click_on_a_real_chip_filters_to_it():
+    """Through `ClickTable.on_click` and the cell metadata, rather than by calling
+    `dispatch_row` with a number a test chose. The click has to land on the chip
+    the compositor actually drew."""
+    _, _, _, filtered = asyncio.run(_chip_pilot(
+        ["quarterback", "lexray", "selfhost"], click=2))
+    assert filtered == "selfhost", filtered
+
+
+def test_the_real_bar_hides_itself_when_the_fleet_is_one_repo():
+    _, _, hidden, _ = asyncio.run(_chip_pilot(["quarterback", "quarterback"]))
+    assert hidden
