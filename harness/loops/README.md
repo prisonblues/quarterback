@@ -1351,9 +1351,10 @@ round 3 — the first round that reads the fixer's own commit, and the band
 `max_rounds: 6` was raised to buy. Measured over this board's own 115 recorded review runs
 (`GET /reviews?days=365&limit=500`; `limit` defaults to 50, so the counts here do not
 reproduce without the params),
-of the seven PRs that reached round 3 at all rounds 1 and 2 take a **median 57%** of the PR's whole
-measured spend (n=7, 0%–89%, where the 0% is a PR whose first two rounds recorded no
-tokens at all); on the worst of them a flat total had 11% of itself left for the four
+ten PRs reached round 3 and of the seven of them that recorded any tokens at all rounds
+1 and 2 take a **median 57%** of the PR's whole measured spend (n=7, 0%–89%, where the
+0% is a PR whose first two rounds recorded no tokens at all; the other three are 0/0 and
+have no share to take); on the worst of them a flat total had 11% of itself left for the four
 rounds that followed.
 
 The check runs *before* any seat is dispatched, so the round about to start has spent
@@ -1366,8 +1367,17 @@ each stayed inside the allowance can run every round the cap allows. Rounds are 
 from the board's own rows (`pr_total.runs`, the same aggregate over the same rows as the
 tokens) and never from `--round`, which restarts under `--new-cycle` while `pr_total`
 has no time bound; the `min(…, max_rounds)` is what makes the derived total exact rather
-than conventional, since a caller re-running one round buys a row and not a further
-allowance.
+than conventional, since however many rows a PR accumulates the release stops at a whole
+cycle's worth — a caller re-running rounds buys the rows and cannot walk the ceiling up
+past the total those rounds were ever entitled to.
+
+**The epoch is the PR and not the cycle.** `pr_total` is every row this PR has ever had,
+so `--new-cycle` buys no fresh allowance: a second cycle starts against the first one's
+spend and against a multiplier the first one's rows may already have pushed to
+`max_rounds`. That is the survivable direction — a PR reviewed six times over is refused
+rather than funded again, which is what `runs_per_pr` already does over the same window
+— and an allowance that genuinely reset per cycle would need a cycle-scoped spend
+aggregate, which `GET /review/spend` does not publish.
 
 **Why it ships `null` like the rest, and where the number is.** Two reasons, and
 neither is that nobody looked. Setting *any* key in this block wakes the budget for
@@ -1388,7 +1398,7 @@ spent real money and measured no tokens, so a token-only ceiling reads an
 unmeasured spend as *no* spend. `/review/spend` reports `rows` against
 `measured_rows` and a refusal that was computed over partial coverage says
 *"measured over 6 of 20 reviewer runs — the real spend is higher"*. And
-`runs_per_pr` is the only one of the five that binds a caller which **renumbers its
+`runs_per_pr` is the only one of the six that binds a caller which **renumbers its
 rounds**: `--round N` is an argument, so a driver that always says `--round 1`
 never reaches the round ceiling at all, while a run is a row on the board whatever
 it called itself.

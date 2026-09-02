@@ -4285,7 +4285,7 @@ def dial_matches(vocabulary: dict[str, dict], typed: str,
     """The dial names worth offering for what has been typed so far.
 
     Substring rather than prefix, because the useful half of a name is in the
-    middle of it: `budget` finds the five `review_panel.budget.*` and `enabled`
+    middle of it: `budget` finds the six `review_panel.budget.*` and `enabled`
     finds the seats, and a prefix filter would answer both with nothing until the
     person had typed `review_panel.` — which is the part they know.
 

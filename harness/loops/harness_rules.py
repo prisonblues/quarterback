@@ -1989,14 +1989,15 @@ DEFAULTS: dict = {
             # latest and hardest on the round that matters most: it is spent on rounds
             # 1 and 2, which were happening anyway, and refuses round 3 — the first
             # round that reads the fixer's own commit, and the band `max_rounds: 6`
-            # was raised to buy. Measured over this board's own 115 recorded rounds
-            # (`GET /reviews?days=365&limit=500` — the params matter, `limit`
-            # defaults to 50 and the counts below do not reproduce without them; 115
-            # recorded review runs): of the seven PRs that
-            # reached round 3 at all, rounds 1 and 2 take a MEDIAN 57% of the PR's
-            # whole measured spend (n=7, 0%-89%, where the 0% is a PR whose first two
-            # rounds recorded no tokens at all), and on the worst of them a flat total
-            # had 11% of itself left for the four rounds that followed.
+            # was raised to buy. Measured over this board's own 115 recorded review
+            # runs (`GET /reviews?days=365&limit=500` — the params matter, `limit`
+            # defaults to 50 and the counts below do not reproduce without them): ten
+            # PRs reached round 3, and of the seven of them that recorded any tokens
+            # at all, rounds 1 and 2 take a MEDIAN 57% of the PR's whole measured
+            # spend (n=7, 0%-89%, where the 0% is a PR whose first two rounds recorded
+            # no tokens at all; the other three measured nothing anywhere and have no
+            # share to take), and on the worst of them a flat total had 11% of itself
+            # left for the four rounds that followed.
             #
             # HOW IT IS ENFORCED, since the check runs before any seat is dispatched
             # and the round about to start has therefore spent nothing. The allowance
@@ -2053,13 +2054,16 @@ DEFAULTS: dict = {
             # about the 2026-08-30 attempt to set this key ALONE, which is the shape
             # #483 was filed against.
             #
-            # **The shape complaint in #483 is unfixed and this does not fix it.** A
-            # per-PR ceiling binds latest and hardest on the LAST rounds of a cycle:
-            # it spends itself on rounds 1 and 2, which were happening anyway, and
+            # **The shape complaint in #483 was what made the 2026-08-30 number a
+            # stopgap, and `tokens_per_round` above is now the fix for it.** A per-PR
+            # ceiling binds latest and hardest on the LAST rounds of a cycle: it
+            # spends itself on rounds 1 and 2, which were happening anyway, and
             # refuses round 3 — which is precisely the band of rounds `max_rounds: 6`
             # was raised to buy, and precisely the rounds that read the fixer's own
             # work. The fix is a per-ROUND allowance with the per-PR total derived
-            # from it (#483's proposals 1 and 2) and it is not built.
+            # from it (#483's proposals 1 and 2), and it IS built: it is the key
+            # above, and the paragraph that follows is what the number here was
+            # chosen for while it was not.
             #
             # So the number is chosen LARGE ENOUGH NOT TO BIND while that is
             # outstanding. #483's own measurement is 1.2M-1.7M tokens per round at
