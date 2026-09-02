@@ -71,26 +71,64 @@ select = [
 ignore = [
     "B008",   # function-call-in-default-argument (FastAPI Depends pattern)
     "E501",   # line-too-long (handled by formatter)
+    # Every one of the 73 is deliberate. 54 are `＋` (FULLWIDTH PLUS) and 12 are `×`,
+    # which the dashboards use because they line up in a monospace column where `+`
+    # and `x` do not; the rest are an en dash, a curly apostrophe, and — the one that
+    # looks most like a bug and is the most deliberate of all — `٧` (ARABIC-INDIC
+    # SEVEN) as a test vector for "only a positive integer gets through". A rule that
+    # is right about homoglyph attacks in identifiers has nothing to say about a
+    # codebase whose strings and prose are typeset.
+    "RUF001", "RUF002", "RUF003",   # ambiguous-unicode-character
+    # `report, payload, seen = _round(...)` names what the tuple holds, and a test
+    # that reads two of the three is not improved by renaming the third to `_seen`.
+    # 76 of these, nearly all in tests, where the unpacking IS the documentation.
+    "RUF059", # unused-unpacked-variable
+    # This repo writes `# noqa: BLE001 — the claim is what must survive` and
+    # `# noqa: PLC0415 — see docstring`: suppressions for a STRICTER selection than
+    # the one above, carrying the reason in prose beside the code. RUF100 calls every
+    # one of them unused, and `--fix` deletes them — losing the suppression and the
+    # sentence explaining it, and re-breaking the file for anyone who does select
+    # those rules. The convention is deliberate; the rule that objects to it is not
+    # worth the convention. (Also 326 `# noqa: E402` in harness/, which ruff tolerates
+    # and pycodestyle does not — same argument, different linter.)
+    "RUF100", # unused-noqa
+
+    # ---- TEMPORARY, and tracked: prisonblues/quarterback#697 ----------------
+    # The 97 findings #47 could not fix mechanically. Every one needs a judgement a
+    # `--fix` cannot make, and several are traps: `ruff check --fix` twice deleted
+    # `import _path_sandbox`, which is imported for the side effect of building a
+    # suite's PATH and HOME, and only a guard test noticed.
+    #
+    # They are ignored BY CODE rather than left as a red baseline so the gate in
+    # `.github/workflows/tests.yml` can be a real gate today — it is live for every
+    # other rule, which is what would have caught #34's `ci_txt ={"PASS": …`. This
+    # block is a ratchet, not a clean bill: whittle it down in #697 and delete the entries
+    # as they reach zero.
+    "F401",   # unused-import — several are side-effecting; read each one
+    "E741",   # ambiguous-variable-name — `l` for "line"
+    "RUF015", # unnecessary-iterable-allocation-for-first-element
+    "RUF005", # collection-literal-concatenation
+    "SIM105", # suppressible-exception
+    "UP031",  # printf-string-formatting
+    "B905",   # zip-without-explicit-strict — real; `strict=` is a question per site
+    "B904",   # raise-without-from-inside-except
+    "E402",   # module-import-not-at-top-of-file — the 4 real ones
+    "RUF012", # mutable-class-default
+    "E702",   # multiple-statements-on-one-line-semicolon
+    "F811",   # redefined-while-unused — a bug shape, worth doing first
+    "F841",   # unused-variable
+    "RUF013", # implicit-optional
+    "RUF046", # unnecessary-cast-to-int
+    "B023",   # function-uses-loop-variable — a bug shape, worth doing first
+    "RUF017", # quadratic-list-summation
 ]
 
 # `harness/` used to be excluded wholesale (#47). It is the most-edited code in the
 # repo — `panel.py` above all — and the exclusion meant the cheapest possible class
 # of defect was being caught by the most expensive possible reviewer: `ci_txt ={…`,
 # a missing space with the continuation left at its old indent, reached review on #34
-# because no tool was looking. Two narrow ignores buy the whole directory instead.
+# because no tool was looking. One per-file entry buys the whole directory instead.
 [tool.ruff.lint.per-file-ignores]
-# The `# noqa: E402` on an import that follows a `sys.path.insert` is the reason the
-# exclusion existed, and it is NOT a dead directive — ruff simply tolerates the idiom
-# where pycodestyle does not, so RUF100 calls 326 of them unused and stripping them
-# would make the files worse under any other linter. (The exclusion's own comment said
-# these fire "because this config does not enable E402"; that premise is stale — `E` is
-# selected, E402 is on, and there are 4 real E402 findings in here. They are unused for
-# the opposite reason: ruff does not flag what they suppress.) The remaining 73 name
-# rules this config does not select at all — BLE001, PLC0415, N802, A003, S603 — and are
-# suppressions for a stricter selection, not mistakes. Both kinds are worth keeping and
-# neither is worth a rule; what is not worth having is the whole directory unlinted for
-# them. Revisit if the harness ever becomes ruff-only.
-"harness/**" = ["RUF100"]
 # The panel is split across modules that re-export each other's names by design — every
 # one of these files already carries `# noqa: F401,F403` on the star import itself. F405
 # is the same architecture seen from the other end ("may be undefined, or from a star

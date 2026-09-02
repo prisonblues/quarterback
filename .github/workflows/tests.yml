@@ -19,6 +19,38 @@ permissions:
   contents: read
 
 jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    # `ruff` has been configured in pyproject.toml since v2.13 and run by NOTHING —
+    # no job here, no hook, no flake check. A linter nobody runs is a linter nobody
+    # obeys: `harness/` was excluded outright (#47) and drifted to 1562 findings while
+    # the config sat there looking like a standard. This is the job that makes the
+    # config mean something.
+    #
+    # SAFE TO REQUIRE, and cheap — seconds, no database, no services. It cannot cry
+    # wolf either: the tree is at zero when this lands, so the only way to redden it
+    # is to add a finding. What it buys is #34's `ci_txt ={"PASS": …` — a missing
+    # space with its continuation left at the old indent, which reached a human
+    # reviewer because nothing mechanical was looking at the most-edited file in the
+    # repo.
+    #
+    # NOT a formatter. `ruff format` is deliberately absent: it would rewrite the
+    # whole tree, and this repo's layout carries meaning a formatter does not know
+    # about (the grouped `__all__` in panel_core is the clearest case). Lint only.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # `--extra dev`, where ruff is declared, for the same reason the app suite
+      # uses it: pinning the version to the one the project ships with is what
+      # stops a runner's newer ruff from failing a tree that is clean locally.
+      - name: Lint
+        run: uv run --extra dev ruff check
+
   app:
     name: app suite
     runs-on: ubuntu-latest

@@ -1,0 +1,21 @@
+# Commits that changed formatting and nothing else, so `git blame` can skip them and
+# name whoever last changed the LOGIC of a line instead of whoever last ran a linter.
+#
+# GitHub reads this file automatically in its blame view. Locally it needs
+# `git config blame.ignoreRevsFile .git-blame-ignore-revs`, which `qb-hooks install`
+# sets per checkout — a repo cannot set it for you, and a worktree does not inherit it.
+#
+# ONLY put a commit here if it changed no behaviour. Anything with a judgement in it
+# belongs in blame, and hiding it is worse than the churn: the next reader loses the
+# one thing that would have told them a decision was made here. A commit that mixes
+# the two should be split rather than listed.
+
+# style(ruff): apply the behaviour-neutral fixes (#47)
+# UP017 timezone.utc -> UTC, UP037 quoted annotations, UP033/35, RUF010/21/68,
+# F541, SIM300/905, W291/293, E401. No rule in that set can change what code does.
+10c215fb82fe34e58c57ad68cf8cbe97206b9531
+
+# style(ruff): sort imports (#47)
+# I001 only, across 59 files. Verified that nothing moved across a `sys.path.insert`
+# boundary, so the deliberately-late imports stayed late.
+60462fab695e118075f52ad7781950da56e1b16f

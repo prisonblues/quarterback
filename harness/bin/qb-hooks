@@ -142,6 +142,21 @@ do_install() {
         || die "could not set core.hooksPath (config not writable?)"
     git -C "$repo" config qb.hooksDelegate "$delegate" >/dev/null 2>&1 || true
 
+    # `blame.ignoreRevsFile` cannot be set by the repository — it is a config key, and a
+    # clone brings none. GitHub reads `.git-blame-ignore-revs` on its own; a terminal does
+    # not, so `git blame` locally names whoever last ran a linter over a line rather than
+    # whoever last changed what it does. This is the one place that runs per checkout AND
+    # per worktree, which is the granularity the key needs (#47).
+    #
+    # Only when the file exists, and never overriding a value somebody set themselves.
+    if [[ -f "$repo/.git-blame-ignore-revs" ]] \
+       && ! git -C "$repo" config --get blame.ignoreRevsFile >/dev/null 2>&1; then
+        if git -C "$repo" config blame.ignoreRevsFile .git-blame-ignore-revs 2>/dev/null; then
+            echo -e "  ${GREEN}blame.ignoreRevsFile set${NC} — 'git blame' now skips the"
+            echo "  formatting-only commits listed in .git-blame-ignore-revs."
+        fi
+    fi
+
     echo -e "  ${GREEN}stash guard installed${NC} — 'git stash' in this repo now refuses to"
     echo "  write the shared refs/stash while linked worktrees exist. Use 'qb-stash'."
     echo -e "  ${GREEN}pre-push guard installed${NC} — a push is refused when it would leave a"
