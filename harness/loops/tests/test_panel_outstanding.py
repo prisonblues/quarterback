@@ -48,7 +48,7 @@ def _finding(severity="P2", title="boom", file="a.py", line=1, verdict="confirme
                            synthesis=title, verdict=verdict, reported_by=reported)
 
 
-def _flat(series=(9, 9), limit=1):
+def _flat(series=(20, 20), limit=1):
     return panel_rounds.not_falling_state(
         [(1 + i, n) for i, n in enumerate(series)], limit)
 

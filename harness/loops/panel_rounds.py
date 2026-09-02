@@ -3110,9 +3110,9 @@ FIX_INJECTION_MIN_NEW = 4
 #: The rung compares two counts, and at the bottom of the range the comparison is
 #: arithmetic rather than divergence: one new finding then two is a rise of 100% and
 #: is a cycle that is very nearly done. What #505 is about is the shape Rich read off
-#: a real cycle — 44, then 15 new, then 18 new — where both ends of the comparison
-#: are volumes. Below four the round is not producing volume, whatever the round
-#: before it did, and another fix pass is cheap.
+#: a real cycle — quarterback#480, three rounds, 44 then 38 new then 41 new — where
+#: both ends of the comparison are volumes. Below the floor the round is not producing
+#: volume, whatever the round before it did, and another fix pass is cheap.
 #:
 #: Applied to BOTH ends of every comparison, so it fails in the direction that does
 #: not stop a cycle: a round that produced three new findings cannot end one however
@@ -3122,16 +3122,83 @@ FIX_INJECTION_MIN_NEW = 4
 #: under-read, which argues for more coverage rather than for stopping.
 #: `not_falling_state` records which existing test found that.
 #:
-#: Four rather than three for `FIX_INJECTION_MIN_NEW`'s reason and
-#: deliberately the same number — two uncalibrated floors that differ by one would be
-#: two things to defend and one of them would be defended by "it is not the other
-#: one".
+#: **SEVENTEEN, AND MEASURED — #710, Rich's decision of 2026-09-02.** It was 4, which
+#: was never calibrated: four was chosen to match `FIX_INJECTION_MIN_NEW` because two
+#: uncalibrated floors differing by one would be "two things to defend and one of them
+#: would be defended by 'it is not the other one'". #710 answered the question next
+#: door — `escalate_on.new_findings_not_falling` STAYS AT 1 — and moved this instead,
+#: so that the rung may still fire at round 2 but only on counts large enough to be a
+#: real trend. Taken over the whole board, all time:
 #:
-#: Not a dial, for its sibling's reason: #505 says in as many words that what a
-#: HEALTHY cycle looks like is uncalibrated, and the honest answer to one uncalibrated
-#: number is not to ship two of them. `new_findings_not_falling: null` is the
-#: supported way to switch this off and it is one line.
-NOT_FALLING_MIN_NEW = 4
+#:     curl -sH "Authorization: Bearer $QUARTERBACK_TOKEN" \
+#:          "$QUARTERBACK_BASE_URL/reviews?limit=500"
+#:
+#: 115 runs, 90 of them in a cycle and reviewed, 42 cycles, **37 multi-round**. A
+#: cycle is (repo, pr, cycle) and its series is each round's own `new_findings` — the
+#: same population `GET /review/convergence`'s `marginal_by_round` publishes, and no
+#: new instrument was needed to read it. Replaying this function over each series at
+#: `limit: 1`:
+#:
+#: * **FOUR HAS NEVER BOUND ANYTHING.** Of the 85 round counts recorded inside a
+#:   cycle, **0 fall below 4** — the smallest is 7. The floor that is "the only thing
+#:   between this rung and noise" has not excluded one round in the history of the
+#:   board. It was not merely uncalibrated; it was inoperative.
+#: * **Every firing whose verdict can be CHECKED came out wrong.** A firing is
+#:   checkable when the cycle has a round after the one it fired on; 19 of the 22
+#:   firings at a floor of 4 are not, so the board says nothing about them either way.
+#:   The 3 that are checkable are quarterback#161, lexray#1709 and lexray#1697, and on
+#:   every one of them the count came back DOWN before the cycle ended. Two fell on the
+#:   next round (#161 25 -> 17, #1697 13 -> 9). #1709 rose once more and then fell
+#:   15 -> 8, so at a floor of 4 it is the one firing the round after CONFIRMS — and
+#:   from 9 to 14 it merely fires a round later (14 -> 15) and is wrong there instead.
+#:   The tally by floor is 2 false positives and 1 confirmed at 1-8, 3 and 0 at 9-10,
+#:   2 and 0 at 11-14, 1 and 0 at 15-16, and 0 and 0 at 17.
+#: * **17 is the smallest floor with no false positive on record**, and it is set by
+#:   the largest of the three: quarterback#161 compares 16 and 25, so 17 silences it;
+#:   lexray#1709 needs 15 and lexray#1697 needs 11. Below 17 the count of observed
+#:   false positives is 1, 2 or 3; at 17 it is 0.
+#: * **And the founding case still fires, on the round the human stopped it on.**
+#:   quarterback#480 is 44 -> 38 -> 41: round 2 falls and buys round 3, round 3 does
+#:   not and ends the cycle. That survives every floor up to 38, so the window the two
+#:   constraints leave open is **[17, 38]** and 17 is its lower bound — the least
+#:   intervention that clears the observed noise. Going higher costs coverage with
+#:   nothing in the population to pay for it.
+#: * **17 is also a bottom-quartile round.** 20 of the 85 counts fall below it
+#:   (23.5%); the median count is 25 and the median round-1 count 27.5. "Both ends are
+#:   volumes" now means "both ends are at least a small round", which is what the
+#:   phrase was always trying to say.
+#:
+#: **WHAT THIS MEASUREMENT CANNOT DO, said plainly.** At 17 the rung fires on 13 of
+#: the 37 cycles (35%, down from 22 and 59%) and **all 13 firings land on the cycle's
+#: last recorded round** — it forgoes no round anywhere on the board, so on this
+#: population it cannot be shown to be wrong and cannot be shown to do anything. That
+#: is not a property of 17; it is #706's finding arriving here. The population was
+#: gathered under `max_rounds: 2`, where round 2 was the round the cap was ending
+#: anyway, and `converged` is TRUE on no cycle on this board, so there is no healthy
+#: cycle for a false positive to have interrupted. The one cycle started since
+#: `f53bdcd` is lexray#1813 (7 -> 13), which fired at a floor of 4 and is silent at
+#: 17 — and 17 was NOT chosen to exclude it: 8 would have done that, and n=1 is
+#: exactly the fitting #637 refused. It is excluded because 7 and 13 are below where
+#: the checkable evidence sits, which is a reason that is not that cycle.
+#:
+#: Not a dial, and #621 is explicit that this is "not a 29th dial". #505 says in as
+#: many words that what a HEALTHY cycle looks like is uncalibrated, and the honest
+#: answer to one uncalibrated number is not to ship two of them.
+#: `new_findings_not_falling: null` is the supported way to switch this off and it is
+#: one line. Nothing in the measurement above splits by repo — the three false
+#: positives are two repos and the founding case a third — so nothing observed asks
+#: for this to be repo-specific. If a later population does, that is a finding to
+#: report and not a dial to build.
+#:
+#: **It is no longer `FIX_INJECTION_MIN_NEW`'s number, and that is the point.** The
+#: two floors guard different quantities: that one is the DENOMINATOR of a rate, where
+#: below four findings a ratio is one reviewer's line number, and this one bounds a
+#: comparison of two VOLUMES, where the question is whether a count is big enough for
+#: "it did not fall" to mean anything. Matching them was a way of having one argument
+#: instead of two while neither had been measured. This one has been; that one has
+#: not (#637/PR #706 found its floor bound nothing either), so there is now a real
+#: difference to defend and it is written above.
+NOT_FALLING_MIN_NEW = 17
 
 
 def premise_repeat_limit(panel: dict, notes: list[str]) -> int | None:
@@ -5644,8 +5711,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     ``injection`` rather than instead of it, and asking a different question. That one
     asks *did the fix cause this?*; this one asks *is the new-finding count still
     falling?*, which is the rule a human stated on #480 over a cycle of this
-    codebase's own: 44 findings, then 15 new, then 18 new — stop, and triage the
-    remainder. The 18 need not be attributable to the fix at all, and
+    codebase's own: three rounds, 44 findings then 38 new then 41 new — stop, and
+    triage the remainder. The 41 need not be attributable to the fix at all, and
     :func:`panel_scope._provenance` under-counts the ones that are, so a genuinely
     diverging cycle can sit under ``injection``'s threshold for its whole life and be
     stopped only by the cap.
