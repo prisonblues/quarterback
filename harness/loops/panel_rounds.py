@@ -3436,7 +3436,19 @@ def working_head(repo_path: str = ".") -> str:
     commit yet. All of them mean "nobody recorded where the tree was", which reads
     downstream as unknown and accuses nobody. Inferring it from the PR instead would
     mint a stamp for a tree the declaration was never made in, and the ordering check
-    would then say something false rather than nothing."""
+    would then say something false rather than nothing.
+
+    **WHAT THIS IS NOT, said plainly because the first version of #560 overstated
+    it.** The directory is the one the declaring PROCESS was launched in, and that is
+    the tree the patch lands in only when the declaration was made there. Run from
+    the canonical checkout, from a sibling worktree, or outside a repository
+    altogether, this records some other tree's head or none — and the ordering check
+    then reports nothing, because a stamp matching no round's head is silence. So an
+    actor that would rather not be stamped does not have to falsify an argument; it
+    can pick a directory. That is #622 — every brake on the fix pass is measured by
+    the actor it constrains — and it is not closed here. What IS closed is the
+    accident this issue was opened on: an orchestrator-that-is-also-the-fixer
+    declaring in its own patch tree, after the pass, with no intent to deceive."""
     sha = (panel_scope._git(repo_path, "rev-parse", "HEAD") or "").strip()
     return sha if _SHA_RE.fullmatch(sha) else ""
 
@@ -3615,9 +3627,11 @@ def declare_premise(reg: dict, text: str, round_no: int,
 
     ``head`` is where the tree stood when this was declared (#560), from
     :func:`working_head`. It records nothing about the premise and everything about
-    WHEN the sentence was said, which is the property the brake rests on and the only
-    one the register did not hold: a declaration made after its own fix pass was
-    written is an annotation, and it used to be indistinguishable from a brake."""
+    WHEN the sentence was said, and it settles exactly one of the two ways the
+    ordering fails: the pass that was already COMMITTED when the premise was declared,
+    which is the shape #560 reported and which :func:`retroactive_declarations` reads.
+    The pass that was merely WRITTEN moves no head and is not settled here — see that
+    function for the three attempts at it and why the evidence does not carry it."""
     text = " ".join(str(text).split())
     answer = str(decidable or "unknown").strip().lower()
     if answer not in DECIDABILITY:
@@ -3717,25 +3731,60 @@ def undeclared_passes(reg: dict, round_no: int) -> list[int]:
 
 
 def retroactive_declarations(reg: dict, heads: Mapping[int, str] | None) -> list[dict]:
-    """Declarations the register can PROVE were made after the fix pass they explain
+    """Declarations this cycle's own records place after the fix pass they explain
     (#560), as ``[{key, text, round, head, head_round}, …]``.
 
     ``heads`` is round -> the commit that round reviewed, which the round already has:
     every earlier round's from `Baseline.head_shas`, and this round's from its own
-    `head_sha`. A declaration for round R was made in order when the tree it was
-    declared from is the tree round R reviewed. If the stamp is instead the head of
-    some LATER round, the fix pass for round R had already been written and pushed
-    when the sentence was said, and exit 4 could not have meant anything.
+    `head_sha`. A declaration for round R stamped with the head of some LATER round
+    was said after the round-R fix pass was written, committed and pushed, so exit 4
+    had no patch left to refuse. That is what this reports, and it is the shape #560
+    was opened on — the issue says the premise was declared "after the pass had been
+    written, committed and pushed", twice.
 
     **Positive identification only, and everything else is silence.** A stamp
     matching no round's head is not reported — a fixer that declared from an
-    unpushed local commit, a rebase, a stray checkout and a declaration made from
-    the wrong directory all land there, and the honest reading of all four is that
-    the ordering was not checkable. The alternative rule — "anything that is not the
-    round's own head is late" — would accuse an honest fixer for a rebase it did not
-    perform, and a check that cries wolf on ordinary history is one an orchestrator
-    learns to pass over. This one fires on a fact: the tree was carrying a commit
-    that the cycle itself recorded as arriving after the round in question.
+    unpushed local commit, an amend, a rebase, a stray checkout and a declaration
+    made from the wrong directory all land there, and the honest reading of all of
+    them is that the ordering was not checkable. The alternative rule — "anything
+    that is not the round's own head is late" — would accuse an honest fixer for a
+    rebase it did not perform, and a check that cries wolf on ordinary history is one
+    an orchestrator learns to pass over. This fires on a fact rather than on an
+    absence: the tree was carrying a commit the cycle itself recorded as arriving
+    after the round in question, and there is no innocent way for that to be true.
+
+    **WHAT THIS DELIBERATELY DOES NOT REPORT, and the three attempts it cost.** A fix
+    pass that edits the working tree and declares BEFORE committing has not moved
+    `HEAD`, so its stamp equals its own round's head and is byte-identical to the
+    honest declaration made before the first edit. Edit, then commit is the ordinary
+    shape of a fix pass, so this is not a corner. It is also **not detectable from
+    anything this loop can read**, and each attempt failed in its own way:
+
+    * *Ask whether the declaring tree is dirty.* An unrelated edit predating the
+      round, a tracked generated file, a staged unrelated change and a dirty submodule
+      all answer yes — and `review-pr.md` permits pre-existing dirt outright in
+      fix-in-place mode. It accused the honest fixer, which is worse than the
+      detection it bought: an operator switches such a check off.
+    * *Compare a porcelain fingerprint the round took against one the declaration
+      took.* Better, and still wrong twice over. A concurrent agent in a shared
+      checkout, an editor autosave or a background build moves the tree between the
+      two readings with no fix pass involved — and this fleet runs several agents in
+      shared checkouts routinely. Meanwhile a file ALREADY modified when the round ran
+      fingerprints as ` M path` both times however much the fix pass then changed it,
+      so the case the comparison existed for slipped through.
+    * *Hash contents instead of status codes.* Closes the second half and leaves the
+      first untouched, because the ambiguity is not in the digest. It is in the
+      inference: a tree change cannot be attributed to a particular actor from
+      evidence read in that actor's own environment. That is #622, and it is not
+      solvable here.
+
+    So the ordering ahead of an uncommitted patch is UNCHECKED rather than checked and
+    found clean, and this list's silence must be read that way. The alternative — an
+    entry that says "the tree differed, and I cannot tell you why" — was considered
+    and rejected: in this fleet it would fire on ordinary concurrent work, which is
+    the loud-and-wrong the `config_notes` gate on `undeclared_passes` already argues
+    against, and it would enumerate part of a category (declarations whose ordering
+    could not be confirmed) while the far larger part of it went unlisted.
 
     Ties go to the EARLIEST round holding a head, which matters when a fix pass
     pushed nothing and two rounds reviewed the same commit. Then "which round does
@@ -3786,18 +3835,30 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
     # #560's two halves, and they answer two different questions a reader of
     # `undeclared_rounds` alone cannot tell apart.
     #
-    # `wired` is whether this round was given a register AT ALL. Without it, a cycle
-    # that never wired one and a cycle whose fixer skipped a declaration produce the
-    # same `undeclared_rounds` list, and on lexray#1697 the first happened: the
-    # orchestrator handed the fixer no register path, so `panel.py --premise` was
-    # uncallable during the pass and the premise was declared afterwards. That was
-    # only visible because the fixer said so. This makes it a fact in the payload —
-    # `wired: false` with rounds listed is a cycle in which no fix pass COULD have
-    # been braked, and nobody has to be honest for it to say so.
+    # `wired` is whether THIS ROUND'S INVOCATION was given a `--premise-file` path,
+    # and that sentence is the whole of what it claims. It is worth carrying because
+    # without it a cycle that never wired a register and a cycle whose fixer skipped a
+    # declaration produce the same `undeclared_rounds` list, and on lexray#1697 the
+    # first happened: the orchestrator handed the fixer no register path, `panel.py
+    # --premise` was uncallable during the pass, and that was visible only because the
+    # fixer said so.
+    #
+    # **It does NOT establish that the fixer could reach the register**, and the first
+    # version of #560 claimed it drew that distinction. The round and the fix pass are
+    # separate invocations: a round can be handed a path the fixer was never told
+    # about, or a path the fixer could not write. What the payload does hold about the
+    # fixer's side is `declared` — a register with entries in it was reached by
+    # somebody — and `undeclared_rounds`, which names the passes that left none. The
+    # honest reading of `wired: false` with rounds listed is "the reader of this
+    # cycle was not even pointed at a register", not "the fixer had no brake".
     #
     # `stamped` is how many round-declarations carried a head, which is what makes
     # `retroactive`'s silence readable: zero stamps means the ordering was not
-    # checkable on this cycle, not that it checked out.
+    # checkable on this cycle, not that it checked out. It is a floor on
+    # checkability and not a ceiling — a stamped declaration is checkable against
+    # `retroactive`'s one shape, the pass already committed when it was said, and
+    # nothing in this payload checks the pass that was written and not yet committed.
+    # `retroactive_declarations` has the three attempts at that and why none held.
     return {"limit": limit,
             "declared": len(entries),
             "repeated": repeated,
@@ -4740,7 +4801,9 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
     # #560's stamp, read here rather than taken from the caller. The declaration is
     # made from the tree the patch is about to be written in, so that tree's HEAD is
-    # the fact — see :func:`working_head` for why it is not a flag.
+    # the fact — see :func:`working_head` for why it is not a flag, and
+    # :func:`retroactive_declarations` for the one ordering failure it settles and the
+    # one it does not.
     verdict = declare_premise(reg, premise, round_no, findings or [], limit,
                               decidable, undecidable_brake, working_head())
     if verdict["decidable"] == "no" and not undecidable_brake:
@@ -6414,9 +6477,11 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
               # kept apart from `undeclared_rounds` on exactly the terms
               # `undecidable_brake` is kept apart from `undecidable`: one is what
               # the cycle said and the other is whether it was ever in a position
-              # to say it. `retroactive` is the declarations the register can prove
-              # were written after the pass they explain — evidence about the
-              # cycle, not a rung. Nothing here stops anything, deliberately: the
+              # to say it. `retroactive` is the declarations this cycle's own
+              # records place after the pass they explain — evidence about the
+              # cycle, not a rung, and not a proof: each entry rests on a reading
+              # taken in the actor's environment. Nothing here stops anything,
+              # deliberately: the
               # brake's whole claim is that it runs before the patch, and a stop
               # taken on a round is the late half that `repeated` and
               # `undecidable` already occupy.

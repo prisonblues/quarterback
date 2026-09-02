@@ -670,10 +670,15 @@ the next pass will do, declare it, *then* make the first edit. Choose the regist
 path yourself (one file per PR, alongside the payloads) and pass the same path to
 every round's `--premise-file`, because a register the round cannot read counts
 nothing. Declaring after the pass is written is not a late brake, it is no brake:
-exit 4 means *do not write the patch*, and there is no patch left to refuse. The
-round records the tree each declaration was made from and names one that followed
-its own fix pass in `config_notes` (#560), so this is checkable rather than a
-matter of your own account of it.
+exit 4 means *do not write the patch*, and there is no patch left to refuse. Each
+declaration records the commit the tree was on, and a later round names in
+`config_notes` any premise stamped with a head that arrived after the round it answers
+(#560) — a fix pass already committed and pushed when its premise was stated. **That
+check does not cover you for the common case and is not meant to read as if it does:**
+a patch written into the working tree and not yet committed moves no `HEAD`, so a
+premise declared halfway through one is indistinguishable from a premise declared
+before the first edit, and no reading taken in your own environment tells them apart
+(#622). There the ordering is your discipline and nothing else.
 
 `--premise-decidable` is **test 4, answered where it can brake something**. Pass
 `no` when the runtime the assertion runs in cannot observe the property the fix

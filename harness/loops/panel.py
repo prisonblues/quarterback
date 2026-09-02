@@ -4964,7 +4964,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # a premise declared after its own pass produced the same
                       # entry as one declared before it. The heads this cycle
                       # already recorded — every earlier round's, plus this one's —
-                      # are enough to tell them apart, so the check costs no call.
+                      # are what it compares against, so the check costs no call.
+                      # They settle ONE of the two ways the ordering fails — the pass
+                      # already committed and pushed when the premise was declared,
+                      # which is the shape #560 reported. The pass that was merely
+                      # written moves no head and is not settled here or anywhere:
+                      # `retroactive_declarations` carries the three attempts at it
+                      # and why the evidence does not reach.
+                      # `wired` says this ROUND was handed a register path and
+                      # nothing more — see `premise_state` for why that is not the
+                      # same claim as "the fixer could reach one".
                       premises=premise_state(premises, round_no, premise_limit,
                                              premise_undecidable,
                                              heads={**prior.head_shas,
@@ -5060,13 +5069,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # #491 itself prices as "worse than stopping before the fix, better than the cap".
     # What was missing was not another way to end a cycle. It was a way for anyone
     # downstream to tell a brake from an annotation, and that is a fact in the record.
+    # One shape, and only the one the commit ids settle on their own: the pass was
+    # on the branch when the premise was declared, which no honest history produces.
+    # The pass that was written and not yet committed moves no head, and three
+    # attempts at reading it off the working tree are recorded on
+    # `retroactive_declarations` along with why none of them could be said out loud.
     for late in stop["premises"]["retroactive"]:
         notes.append(
             f"premise {late['key']} was declared against round {late['round']} — "
             f"{late['text']!r} — from a tree that was already on "
             f"{late['head'][:12]}, the commit round {late['head_round']} reviewed. The "
-            "fix pass it explains was written and pushed BEFORE the premise was "
-            "declared, so `panel.py --premise` could not have refused it: for that "
+            "fix pass it explains was written, committed and pushed BEFORE the premise "
+            "was declared, so `panel.py --premise` could not have refused it: for that "
             "pass the brake was an annotation, not a brake (#560). Where the "
             "orchestrator is also the fixer, declare the premise after reading "
             "`round_stop` and before the first edit")
