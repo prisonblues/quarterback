@@ -97,7 +97,14 @@ ignore = [
 # import"), 802 times, and silencing it here is consistent with the suppression that is
 # already on the import. Replacing the star imports is a refactor of the most-edited
 # file in the repo and is not this issue.
-"harness/loops/panel*.py" = ["F405"]
+#
+# RUF022 belongs with it. These `__all__` lists are grouped by MEANING — the imports
+# together, then the constants by theme — under a comment saying so, and the whole point
+# of the grouping is that a reader can see what kind of thing each block is. Sorting them
+# flat alphabetical is 257 lines of churn in panel_core alone, and what it buys is a list
+# nobody can skim. Alphabetical is the better default for a list nobody reads; these are
+# read.
+"harness/loops/panel*.py" = ["F405", "RUF022"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
