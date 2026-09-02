@@ -99,10 +99,14 @@ with these parallel-mode overrides:
   the patch*, and a premise declared once the pass is written and pushed is an
   annotation. So the agent makes its own `mktemp -d` register at the start, declares
   after reading each round's `round_stop` and **before** editing anything, and passes
-  the same path to every round's `--premise-file`. The round stamps each declaration
-  with the tree it was made from and reports one made after its own fix pass in
-  `config_notes` (#560) — so an agent that declares late is recorded as having done
-  so, whatever its summary says.
+  the same path to every round's `--premise-file`. `--premise` records the commit the
+  tree was on, and a later round names in `config_notes` any premise stamped with a
+  head that arrived after the round it answers (#560) — a fix pass already committed
+  and pushed when its premise was stated. **It catches nothing else, deliberately:** a
+  patch written into the working tree and not committed moves no `HEAD`, and no
+  reading taken in the fixer's own environment separates that from an honest
+  declaration (#622). Declaring before the first edit is the mechanism there, not the
+  check.
 - **Always worktree mode, never fix-in-place** — concurrent agents cannot share
   your checkout. Each opens its own throwaway worktree at the PR's head
   (`git worktree add <tmpdir> <remote>/<branch>`, detached — this works even
@@ -356,8 +360,29 @@ From its output collect:
   round clearing two P1s can spend three hundred production lines the budget never
   applied to. **Do not treat `false` as a breach and do not brief the next fixer as
   though it were.** `null` means there was nothing to measure: round 1, an unreadable fix
-  range, or no budget in force. REPORTED and gates nothing (#67), and there is no flag to
-  arm one — the epic this came from is explicit that it adds no dial.
+  range, or no budget in force. The upper bound is REPORTED and gates nothing (#67).
+
+  **`breach` is the side `within` does not have, and it is the one that gates.** It is
+  `true` only where every entry in the LAST round's To fix list could be READ and every
+  one of them sat in the 💸 band — no mandatory work in front of that pass, and nothing
+  in the list this round cannot identify — so the priced total is not an upper bound on
+  the budgeted spend, it IS the budgeted spend, and going past the limit is a fact.
+  That ends the round, files a veto line and costs the round its confidence.
+  `false` means the premise held and the pass stayed inside its budget, which is a
+  stronger statement than `within: true`. `null` is the ordinary case and means no
+  strict verdict was available; `brief` beside it says which of the reasons it was, in a
+  sentence, and carries the prior round's finding count and how many of them were
+  budgeted so you can check the claim rather than take it. One of those reasons is
+  worth knowing about: since #551 the budget is `min(dial, its pro-rata share of the
+  cycle's first round)`, so the number a round SPENDS against is not the dial — and a
+  cycle whose two rounds applied different budgets reaches no strict verdict, because
+  a breach priced against a bound the fixer was never given is an accusation about a
+  policy nobody ran. **A `null` here is evidence
+  of nothing** — do not read it as a pass and do not read it as a failure. There is
+  still no flag to arm and no new dial: the limit is one the repo already wrote, the
+  band is one its own floors carve out, and the premise is a proof rather than a
+  threshold — the epic this came from is explicit that it adds no dial, and this adds
+  none.
 - **Fix surface** — `round_stop.fix_surface` in the JSON (#619): `files`, the files the
   last fix pass touched; `new_files` and `count`, the subset no earlier round had read;
   `prior_files`, what the rounds before it had. Like Guard-to-guarded it is REPORTED and
@@ -456,7 +481,10 @@ with these overrides:
   one, and a **To fix** list pasted without them briefs the pre-#297 behaviour: every
   low-severity finding unconditional, which is the 408-line round-1 fix pass this
   budget exists to stop. Copy the note under the heading verbatim — it carries the
-  line count and the spend rule.
+  line count and the spend rule, and since #551 that count is **this round's**, scaled
+  to the size of the cycle's first round: on a small PR it is less than
+  `low_severity_fix_lines`, so never substitute the dial's value for the number the note
+  states.
 - **Selecting findings and capping churn are INDEPENDENT controls, and naming
   findings NEVER lifts the budget (#492).** A human who says "just fix the
   concurrency ones" has narrowed *which* findings this pass may touch. They have said
@@ -1365,6 +1393,7 @@ python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
     --escalated <the key the fixer's escalated ID maps to> \
     --escalated-from-board \
     --narrowed <the key each of the fixer's NARROWED IDs maps to> \
+    --declined <key>:<budget|premise|scope|refuted> \
     --baseline /tmp/tmp.AbC123/r1.json [--baseline …] \
     --json-file /tmp/tmp.AbC123/r<r>.json
 ```
@@ -1441,6 +1470,54 @@ fix, wearing the cycle instead of the brief. Three things about it that are NOT
   direction; what it does not do is announce itself, so a caller who believes it declared
   a narrowing watches the round it meant to end run anyway with nothing on screen saying
   why. The note is there. An ID or a title in place of a key is the usual cause.
+
+**`--declined` is the third register, and it is the one that stops the loop paying
+twice (#665).** A fix pass that identifies a correction and does not make it is
+already recording that in §4b — a `deferred` row under roads (1) or (2), or a
+`refuted` one. Until now that record went nowhere the loop could read: on a real
+cycle a pass declared two corrections it could not pay for under the growth
+ceiling, and the round after it spent its own budget rediscovering one of them and
+reported it as a fresh finding. Pass the same keys forward:
+
+```
+    --declined <key>:budget      # a ceiling the fix did not fit under
+    --declined <key>:premise     # an assumption the pass could not decide
+    --declined <key>:scope       # a repair that would open files this change never touched
+    --declined <key>:refuted     # the pass disagreeing with the finding on the merits
+```
+
+Same argument shape as `--escalated` — keys from §4b's `jq`, repeatable,
+deduplicated, refused outside a cycle — and it **is** inherited through
+`--baseline`, so pass a key on the round after the pass that declined it and let
+the register carry it from there. The reason word is not decoration: it is what
+the next round's reader is briefed off, and "priced out" and "I think this finding
+is wrong" call for opposite next moves. A word this loop does not recognise is
+recorded as `unstated` and named in `config_notes` — the declaration survives, the
+adjective does not.
+
+**It loosens NOTHING, which is the point of it.** The finding stays outstanding,
+stays counted at every one of `round_stop`'s four rules, stays a fix pass's work,
+and still buys another round exactly as it did — this is not a second
+`--escalated`. What it changes is what the round can CLAIM: a finding matching an
+inherited declaration is marked 🧾 and reported `new_this_round: false`, because an
+earlier round already raised it and calling it news overstates what this round
+found; and a cycle that ENDS with declarations on the record takes a veto line and
+cannot report `converged: true`. Landing with a known-unfixed defect is allowed;
+landing with one while calling the cycle clean is not.
+
+**The register does not retract, and a `refuted` declaration is an argument you
+should have.** There is no un-decline: a correction genuinely made in a later pass
+goes on costing the cycle its `converged` until the cycle ends, which is the
+conservative direction and #617's `--new-cycle` is the clean start for a PR that
+has actually had the work done. And a pass that declines everything buys itself
+nothing — every declaration is a veto against the cycle it is in, so the flag
+cannot be gamed in the direction the fixer would want.
+
+**A cycle that ends holding declarations reaches the board.** The round that ends
+it posts one `needs-human` `decision` naming the keys, their rounds and their
+reasons, so the PR lands with its known-unfixed defects named rather than with a
+`config_notes` line nobody reads. Its answers are a person's: raise the ceiling,
+widen the scope, argue with the fixer, or accept the defect.
 
 **A stop that is HOLDING an escalation is never convergence — and that is
 narrower than "the cycle can never converge with a question open".** When the
@@ -1621,6 +1698,15 @@ Then the part that is new, and is the point of running more than one round:
   been kept, which on a round that cleared a P1 says nothing about the 💸 band at all.
   Where the fixer's own summary counted a spend and this priced a different one, say both
   numbers; that disagreement is the entire reason the count moved out of the fixer.
+  `breach: true` is the one reading here that is an accusation, and it is the only one:
+  say what the pass priced, what the budget was, and that every finding in the prior
+  round's **To fix** list was budgeted — that last clause is what makes the number
+  binding, and a reader given the accusation without it has been asked to take it on
+  trust. Note also what it does NOT cover: the rung needs the round to be going again,
+  which a wholly-budgeted prior list normally prevents, so it enforces an exceptional
+  lifecycle (a Sonar hard-gate issue keeping the cycle alive, or a cycle continued by
+  hand) rather than the ordinary budgeted-fix path. Do not report a `null` here as
+  evidence that a pass stayed inside its budget.
 - **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
   answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
   fix, which finding it answered (now back on the board as reported-and-not-fixed), and

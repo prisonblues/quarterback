@@ -1600,6 +1600,103 @@ def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+#: The smallest below-floor fix that can honestly be made, in churned lines and before
+#: `unrefereed_line_weight` prices it — the quantity :meth:`Dials.budget_for` clamps the
+#: pro-rata budget at.
+#:
+#: **2, and it is arithmetic on the counting rule rather than an estimate.** `git diff
+#: --numstat` reports AGGREGATE insertions and deletions per file; it has no notion of a
+#: "changed line", and an earlier draft of this comment said it did. What is true and
+#: sufficient: a one-line replacement COMMONLY comes out as one deletion plus one
+#: insertion — checked rather than assumed — and :func:`_referee_kind_lines` counts every
+#: `-` and every `+` alike ("insertions plus deletions, which is what `git diff
+#: --numstat` reports"). So the cheapest correction to a line that already exists
+#: commonly costs two, and a budget under two can buy only an ADDED line — which is not
+#: the shape most below-floor findings have.
+#:
+#: Weighted at the point of use rather than baked in here: the commonest below-floor fix
+#: is a comment or a stale docstring, `unrefereed_line_weight` prices those at 2 apiece,
+#: and a clamp that could not pay for one wherever it landed would be a zero wearing a
+#: budget's clothes. Since #674 that is expensive rather than untidy — an unpayable fix
+#: is declared `--declined <key>:budget`, which vetoes the round, costs `stop_confident`
+#: and fails `preland --require-earned-stop`.
+MIN_HONEST_FIX_CHURN = 2
+
+
+def low_severity_full_budget_chars(panel: dict, notes: list[str]) -> int | None:
+    """`low_severity_fix_full_chars` — a positive whole number of chars, or ``None`` for
+    "the absolute binds on its own".
+
+    #551's proportional half of the low-severity budget, written as the first round's
+    SIZE: at or above this many `pr_chars` the whole `low_severity_fix_lines` budget
+    applies, and below it :meth:`Dials.budget_for` scales it pro rata.
+
+    **The MIRROR IMAGE of :func:`fix_growth_floor_chars`**, with the opposite operator.
+    There the defect is that a multiple's allowance shrinks with the PR while diff
+    framing does not, so a tiny PR cannot afford one honest fix — a floor. Here the
+    measurement is accumulation RELATIVE TO THE CHANGE (#297: PR #188's feature became
+    721 churned lines, 74% of it review-response code), so the dangerous end is the
+    SMALL PR, where a fixed 40 lines can exceed the diff it is polishing. A `max`
+    written here on the strength of the floor next door would reintroduce #188; both
+    halves are ceilings and the round spends the smaller.
+
+    **CHARS, and that is a correctness point rather than a style one.** The budget is
+    counted in churned lines and the only first-round size a baseline records is
+    `pr_chars`, so the companion had to be written in one unit or the other. Chars is
+    the unit the comparison happens in, so a size in chars states its crossing in the
+    unit the code compares and needs no chars-per-line rate AT RUN TIME. An earlier draft
+    of this key was a percentage over a `CHARS_PER_CHURNED_LINE` constant, and both are
+    gone. The CALIBRATION of the default still anchors on a churned-line count, so it is
+    less exposed to #692 rather than immune to it — `harness_rules` says exactly how
+    far that goes.
+
+    **Absent inherits the default and a written ``null`` switches it off**, the reading
+    :func:`low_severity_budget` and the three growth keys already have. ``null`` is the
+    exact pre-#551 behaviour, which is what makes the shape reversible from the board
+    rather than by a release.
+
+    ``0`` is refused rather than read as "no proportion". A size of zero is one every
+    PR is at or above, so it is the OFF position written in a spelling that does not say
+    so — `max_fix_growth_chars`' own argument about `0` — and `null` is already that
+    spelling. A bool is refused before the numeric read for :func:`resolve_max_rounds`'
+    reason (``isinstance(True, int)``), and a fractional value because half a char is
+    not a size any diff has.
+
+    Not bounded above. A very large value makes every PR proportional, which reads as
+    an inert dial and is not: it is the policy "scale the budget with the change, always",
+    and the clamp in :meth:`Dials.budget_for` keeps the result spendable."""
+    raw = panel.get("low_severity_fix_full_chars", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("low_severity_fix_full_chars", raw,
+                      f"{what} — chars the cycle's first round must reach before the "
+                      "whole low-severity budget applies, or null to let "
+                      "`low_severity_fix_lines` bind on its own")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
 def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
     """`unrefereed_line_weight` — a whole number >= 1, what one unrefereed churned
     line costs the low-severity budget against a production line's 1 (#554).
@@ -2003,6 +2100,30 @@ def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
     reading the two keys beside it already have. ``null`` here is the exact pre-#664
     behaviour, which is what makes a shape decision reversible without a release.
 
+    **The empty string is null too**, said here because the paragraph below reads as
+    though `null` were the only off spelling and a reviewer took it that way (#686).
+    It is not a quirk of this key. EVERY dial resolver in this module reads `""` as
+    null — all seventeen of them, with no exception — so it is the module's
+    convention rather than this dial's behaviour, and refusing it here alone would
+    make this the only dial in the file that answers an emptied value differently
+    from every other. Stated as "every" rather than as a bare count deliberately: a
+    count is what three earlier drafts of this paragraph each got wrong, because the
+    answer moves with what you decide to grep for, while "every resolver, no
+    exception" is checkable against the list of resolvers itself.
+
+    WHY the convention exists is not recorded anywhere and is deliberately not guessed
+    at here. Two routes DO deliver one, so it is not unreachable: a hand-written
+    `.harness-rules` with a key emptied rather than deleted, and `POST /dials`, which
+    `json.dumps`es whatever `value` it is given and stores it — the API validates the
+    dial NAME and the payload size but not the value's type, on the stated rule that
+    "the client owns the vocabulary". `POST /dials/clear` is the one route that cannot:
+    it stamps `cleared_at` and the dial then resolves as ABSENT, which is a different
+    answer from `null` here (absent inherits the default; `null` switches the floor
+    off).
+
+    That is not in tension with `0` below. `0` is a number a repo can mean and whose
+    meaning would be wrong; `""` is the absence of a value, which is what `null` is.
+
     ``0`` is refused rather than read as "no floor". A floor of zero is one every
     growth clears the moment a fix pass writes a character, so it is the OFF position
     written in a spelling that does not say so, and `null` is already that spelling —
@@ -2330,8 +2451,8 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The fifteen #165/#297/#492/#482/#554/#508/#618/#78/#664 settings as this round
-    applied them.
+    """The sixteen #165/#297/#492/#482/#554/#508/#618/#78/#664/#551 settings as this
+    round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -2344,6 +2465,16 @@ class Dials:
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
     low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
+    #: #551's proportional half of that budget, and the mirror of `min_fix_growth_chars`
+    #: below — the same sizing question, the opposite operator, because a fixed line
+    #: budget is dangerous on the SMALL PR and a fixed growth allowance on the tiny one.
+    #: The first round's `pr_chars` at or above which the whole budget applies; below it
+    #: :meth:`budget_for` scales it pro rata and spends the smaller of the two, so this
+    #: can only ever tighten. In CHARS because that is the unit the comparison happens
+    #: in and the only first-round size a baseline records. Carried on this object for
+    #: its siblings' reason: the fixer's brief, the report and the payload's measurement
+    #: have to read ONE number.
+    low_severity_fix_full_chars: int | None = DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS
     unrefereed_line_weight: int = DEFAULT_UNREFEREED_LINE_WEIGHT
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
@@ -2376,6 +2507,7 @@ class Dials:
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
                 "low_severity_fix_lines": self.low_severity_fix_lines,
+                "low_severity_fix_full_chars": self.low_severity_fix_full_chars,
                 "unrefereed_line_weight": self.unrefereed_line_weight,
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
@@ -2405,6 +2537,94 @@ class Dials:
         return (self.low_severity_fix_lines is not None
                 and not severity_at_least(self.fix_severity_floor,
                                           self.round_trigger_floor))
+
+    def budget_for(self, first_chars: int | None) -> int | None:
+        """The churned lines this round may actually spend on the 💸 band — #297's
+        absolute and #551's pro-rata share of the cycle's first round, whichever is
+        SMALLER, and never less than one honest one-line fix.
+
+        The one number the fixer's brief states and the payload measures against, so it
+        is computed here rather than at either site: two derivations of one budget is
+        how a report and a payload come to disagree about the policy a round ran under.
+
+        ``first_chars`` is the size the cycle's FIRST round read the PR at — the same
+        denominator `max_fix_growth` divides by (`Baseline.first_reviewed`), and on
+        round 1 the round's own size, because round 1 IS the first round. It is
+        measured there and not against the current diff for `max_fix_growth`'s reason: a
+        budget that grows as the PR grows pays for the growth it is supposed to bound.
+
+        **Chars in, lines out, and nothing converts between them.** The pro-rata term is
+        `written x first_chars / low_severity_fix_full_chars` — a ratio of two char
+        counts multiplied by a line count — so the units cancel and no chars-per-line
+        rate appears anywhere in this arithmetic. That is why the dial is a SIZE and not
+        a percentage: a percentage calibrated in lines would need such a rate at every
+        call. The claim is about THIS FUNCTION and not about the default's calibration,
+        which does anchor on a churned-line count (`harness_rules`).
+
+        **The outer `min` is the safety property and must stay outermost.** Both terms
+        are ceilings and the written value is the outer bound, so no setting of the size
+        and no value of the clamp can ever hand back more than the file wrote — a repo
+        at `low_severity_fix_lines: 3` gets 3 even where the clamp is 4. #664's floor
+        one dial over is a `max` and loosens; writing a `max` here on the strength of
+        that symmetry is the version that reintroduces #188, because the two dials'
+        dangerous ends are opposite.
+
+        **The clamp, and why a starved budget is not an acceptable outcome.** Pro rata
+        alone reaches 1 line at 359 chars and 3 at 1,075, and a budget of one or two
+        lines is not a small budget — it is "fix nothing" written so that it reads like
+        a budget. (Two, because `git diff --numstat` reports aggregate insertions and
+        deletions rather than edits, and a one-line replacement commonly arrives as one
+        of each — see :data:`MIN_HONEST_FIX_CHURN`.) Since #674 that costs something concrete: a fix the budget cannot pay
+        for is declared `--declined <key>:budget`, the declaration appends a veto, the
+        veto costs the round its `stop_confident`, and `preland --require-earned-stop`
+        turns that into a failed check — so a starved budget holds the PR out of a
+        strict landing for the rest of the cycle. So the floor is
+        :data:`MIN_HONEST_FIX_CHURN` times `unrefereed_line_weight`: one one-line
+        correction priced wherever it might land, 4 at the shipped weight, moving with
+        the weight because the weight is the unit the budget is counted in.
+
+        Below 1,791 chars of first round the clamp IS the budget, that being simply
+        where the pro-rata share first rises above it, at 5. It is not where a SECOND
+        such fix becomes affordable — that is 2,865. That is a concession and is written down as one: on a PR that
+        small there is no proportional answer that is also a workable one, and #674's
+        price is why it concedes toward the workable.
+
+        **Three cases hand back the written value untouched**, and each is a case where
+        a proportion would be inventing something:
+
+        * ``low_severity_fix_full_chars: null`` — the half is off, and off is the exact
+          pre-#551 behaviour.
+        * **no budget at all** (`low_severity_fix_lines: null`) — there is no ceiling
+          for a proportion to be the smaller of, and a size must not BECOME a budget on
+          a repo that wrote it off. `resolve_dials` says so in `config_notes`.
+        * **an unknown first-round size** — round 2 with an unreadable baseline, or one
+          written before `pr_chars`. `max_fix_growth` declines to run there too; a
+          guessed denominator is worse than none.
+
+        **A first round MEASURED at zero chars is not that case and gets the opposite
+        answer**: the clamp, not the whole budget. Unknown and zero are different claims
+        — the first says nothing was read, the second says something was read and it was
+        nothing — and the smallest measurement there is must not buy the largest budget
+        there is. No guard is needed for it: `written x 0 // size` is 0, which the clamp
+        lifts to one honest fix. A guard against it is what an earlier draft had, and it
+        failed open.
+
+        A written ``0`` also comes back as ``0``: that is an operator saying "fix none
+        of the band", it already moves :attr:`fix_floor` to the trigger cut, and this
+        key may lower a budget and may never raise one. The clamp does not reach it, for
+        the same reason — a floor that turned a written zero into four would be this
+        key deciding what the file meant."""
+        written = self.low_severity_fix_lines
+        # `first_chars is None` and not `<= 0`: a size of zero is a MEASUREMENT and is
+        # handled by the arithmetic below, which floors it at the clamp. Excluding it
+        # here returned the whole budget for the smallest reading there is.
+        if (written is None or written == 0
+                or self.low_severity_fix_full_chars is None
+                or first_chars is None):
+            return written
+        pro_rata = written * first_chars // self.low_severity_fix_full_chars
+        least = MIN_HONEST_FIX_CHURN * self.unrefereed_line_weight
+        return min(written, max(least, pro_rata))
 
     @property
     def fix_floor(self) -> str:
@@ -2678,8 +2898,22 @@ class Dials:
         # a dial that vanishes from the report at some settings is one a reader
         # cannot tell from a dial that was never applied. Suppressed only where the
         # budget is off, where there is nothing for it to be a unit of.
+        # #551's proportional half rides INSIDE the budget's clause rather than getting
+        # one of its own, on the floor's rule three keys down and for its reason: it is
+        # not a second thing this round bounds, it is the other half of one ceiling, and
+        # a reader who saw "40 lines" alone would take a round briefed at 6 for an
+        # arithmetic bug. This line states the POLICY and not the applied number — it
+        # has no PR size in front of it — so it says which two terms bind and leaves
+        # the arithmetic to the **To fix** header, which states what the round spent it
+        # on. Printed only where there IS an absolute for it to be the smaller of: a
+        # percentage under a null budget bounds nothing, and `config_notes` carries that
+        # case rather than a policy line that misdescribes it.
+        proportion = (f", in full at {self.low_severity_fix_full_chars:,}+ chars of "
+                      "round 1 and pro rata below"
+                      if self.low_severity_fix_lines is not None
+                      and self.low_severity_fix_full_chars is not None else "")
         budget = ("off" if self.low_severity_fix_lines is None
-                  else f"{self.low_severity_fix_lines} lines, unrefereed "
+                  else f"{self.low_severity_fix_lines} lines{proportion}, unrefereed "
                        f"x{self.unrefereed_line_weight}")
         return (f"fix at/above {self.fix_severity_floor} · below-"
                 f"{self.round_trigger_floor} fix budget {budget} · another round "
@@ -2708,7 +2942,7 @@ class Dials:
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all fourteen at once.
+    """Read, validate and report all sixteen at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2730,6 +2964,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
         low_severity_fix_lines=low_severity_budget(panel, notes),
+        low_severity_fix_full_chars=low_severity_full_budget_chars(panel, notes),
         unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
@@ -2759,6 +2994,27 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
             "another round however few seats raised them, so suppressing them would "
             "leave a finding no fix pass may touch and every stop rule still "
             "demanding. Each named band is applied at 1 seat, as it was before the key")
+    # #551's one configuration hazard, said rather than refused, and it is the mirror of
+    # #664's below. A percentage with no absolute beside it bounds NOTHING: the two are
+    # halves of one ceiling and the round spends the smaller, so with
+    # `low_severity_fix_lines: null` there is no smaller to take. The obvious
+    # alternative — let the percentage become a budget on its own — is worse and is
+    # refused rather than argued for: a repo that wrote `null` meant "no budget, every
+    # finding above the fix floor is unconditional work", and handing it one back from a
+    # key it may never have touched would make a written value mean the opposite of what
+    # it names. So the percentage goes inert and the round SAYS so, naming the key that
+    # would put it back in force (#169: a dial that reads as configured and bounds
+    # nothing is the failure worth a line). Silent on the shipped defaults, where
+    # nobody wrote anything to be surprised about.
+    if (dials.low_severity_fix_lines is None
+            and dials.low_severity_fix_full_chars is not None):
+        notes.append(
+            f"`low_severity_fix_full_chars` is written at "
+            f"{dials.low_severity_fix_full_chars:,} and bounds nothing this round — it "
+            "is the PROPORTIONAL half of the low-severity budget and the round spends "
+            "whichever half is smaller, so with `low_severity_fix_lines: null` there is "
+            "no budget for it to scale. Write a line budget beside it, or null this too "
+            "and mean it")
     # The one migration hazard #492 creates, said out loud rather than special-cased.
     # A repo that wrote `max_fix_growth: null` meant "no growth check" — that key WAS
     # the whole check — and after #492 it switches off the multiple only, leaving an
@@ -4923,13 +5179,13 @@ __all__ = [
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
     "severity_floor", "deferral_issue_gate", "reviewer_scope",
-    "low_severity_budget",
+    "low_severity_budget", "low_severity_full_budget_chars",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
     "fix_growth_floor_chars",
     "fix_guard_lines_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "REFEREE_KINDS", "_LINE_COMMENTS", "_DOCSTRING_FENCES",
-    "UNREFEREED_MIN_CHURN", "_suffix_of", "_comment_line",
+    "UNREFEREED_MIN_CHURN", "MIN_HONEST_FIX_CHURN", "_suffix_of", "_comment_line",
     "_BLOCK_COMMENTS", "_DOCSTRING_HOST_END", "_hosts_docstring",
     "_next_block",
     "_STRING_PREFIXES", "_COMMENTED_LIKE_PY", "_unescaped_find", "_fence_at_start", "_next_fence",

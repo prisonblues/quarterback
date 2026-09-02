@@ -173,7 +173,7 @@ between the two floors, counted rather than estimated and spent cheapest-first �
 second measurement on 2026-08-21, where PR #188's 185-line feature came out of two fix passes
 at 721 lines, 74% of the PR being review-response code, off a round-2 fix list that was 89%
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
-individually reasonable small fixes;
+individually reasonable small fixes, and since #551 `low_severity_fix_full_chars` (**14,325**) is the proportional half of that same budget — the first round's `pr_chars` at or above which the whole 40 lines applies, with anything smaller getting it pro rata and the round spending whichever half is smaller, so a fixed 40 lines can no longer be a bigger share of the change than the change; a **ceiling** and not the floor #664 put under `max_fix_growth`, because the two dials' dangerous ends are opposite and a `max` written here would reintroduce #188; in chars because that is the unit the comparison happens in and the only first-round size a baseline records, and measured rather than converted — the median `pr_chars` of this repo's merged PRs scaled to the ~182 churned lines at which 40 is #551's sane ~22% (n=21, range 9,538-18,604) — with the result clamped at one honest one-line fix (`2 x unrefereed_line_weight`), because since #674 a budget too small to buy anything is a declination, a veto, a lost `stop_confident` and a `preland --require-earned-stop` hold — and the run-time arithmetic is rate-free while the calibration still anchors on a churned-line count, so it is less exposed to #692 rather than immune to it;
 `unrefereed_line_weight` (**2**) is what one churned line of test or prose costs that budget
 against a production line's 1, because a production fix has an external referee in red/green,
 the suite and CI while a test fix has none — nothing tests a test — so a budget that prices
@@ -2548,6 +2548,16 @@ outside a checkout, a fleet-wide plan item, a `plan:<uuid>` claim this process h
 resolved — is kept, because no repo is not evidence of another repo and hiding it drops a
 live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fleet`) was
 the only thing that ever said so and the narrow view is exactly the view that drops it.
+**The chip bar narrows the fleet to one repo.** One line of clickable chips above the
+tables, a chip per repo the live fleet is actually in — not per repo the board knows, because
+a chip with nobody behind it filters to an empty table. The same chip sets and clears, so a
+bar clipped by a narrow pane cannot strand you with a filter and no way out; the unfiltered
+count stays on the title (`AGENTS · 3 of 16 · lexray`) so a filter reads as a filter rather
+than as the fleet having shrunk; and the bar hides itself below two repos, which makes it
+mostly a fleet-wide-scope control — the scope that needed it. It does **not** narrow WORK:
+`gh` is only ever asked about the watched repos, so filtering those rows would show all of
+them or none.
+
 The SEAT ROWS of AGENTS are not scoped: `tmux_seats()` lists every seat pane on the whole
 tmux server, so another screen's seat is a pane you can still close, and narrowing it away
 would take the `✕` with it. It returns `(seats, error)` rather than a bare list, because an

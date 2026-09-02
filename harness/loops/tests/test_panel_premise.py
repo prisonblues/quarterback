@@ -757,6 +757,82 @@ def test_the_payload_says_how_many_declarations_could_be_checked_at_all():
     assert state["stamped"] == 1 and state["retroactive"] == []
 
 
+# ------------------ #560 reopened: what the stamp settles, and what it cannot
+
+# The stamp answers "which commit was this tree on", and three reviews established
+# what that does and does not buy. It settles the pass that was written, COMMITTED and
+# pushed before the premise was declared — which is the shape #560 reports, twice, on
+# lexray#1697. It cannot settle the pass that was written and not yet committed:
+# editing does not move HEAD, so that declaration's stamp is its own round's head,
+# byte-identical to the honest declaration made before the first edit.
+#
+# Two mechanisms were built for that second case and both are gone. A dirty-tree flag
+# accused any fixer whose checkout carried an unrelated modification. A porcelain
+# fingerprint the round and the declaration each took, compared, accused any fixer
+# whose checkout a concurrent agent, an autosave or a background build touched between
+# the two readings — routine in this fleet — while a file already modified when the
+# round ran fingerprinted the same both times however much the fix pass changed it.
+# Hashing contents closes the second and not the first: the ambiguity is in the
+# inference, not the digest. Attributing a tree change to a particular actor from
+# evidence read in that actor's own environment is #622. These pin the silence.
+
+
+def test_the_uncommitted_pass_is_left_unchecked_rather_than_guessed_at():
+    """The removal, pinned. A fix pass that edits and does not commit leaves the stamp
+    on its own round's head, and NOTHING here separates that from the honest
+    declaration. Two mechanisms tried and each accused honest fixers more often than
+    it caught anything; the third would have closed one half of one of them. Silence
+    is the answer the evidence supports, and it has to be a decision somebody can
+    find rather than a gap that looks like an oversight."""
+    reg = _stamped([(1, R1_HEAD)])
+    assert panel_rounds.retroactive_declarations(reg, HEADS) == []
+    assert panel_rounds.premise_state(reg, 2, 2, True, HEADS, wired=True)[
+        "retroactive"] == []
+
+
+def test_no_entry_claims_more_than_the_commit_ids_carry():
+    """Every reported entry is `committed`-shaped and says so with a `head_round` that
+    is a LATER round than the declaration's. There is no second kind and no `shape`
+    discriminator, because a list with one member of one kind that hints at others is
+    how the last two attempts got read as more than they were."""
+    late, = panel_rounds.retroactive_declarations(_stamped([(1, R2_HEAD)]), HEADS)
+    assert set(late) == {"key", "text", "round", "head", "head_round"}
+    assert late["head_round"] > late["round"]
+
+
+def test_the_declaration_records_no_tree_state_at_all(repo, at, tmp_path):
+    """The register carries the stamp and nothing about the working tree. A field that
+    nothing reads is a field a later reader infers a mechanism from, and both removed
+    mechanisms would have left one."""
+    reg = tmp_path / "premises.json"
+    declare(reg, LANDED, 1, KEY_A)
+    entry, = register(reg)["premises"]
+    assert entry["heads"] == {"1": R1_HEAD}
+    assert not [k for k in entry if k in ("dirty", "trees", "tree")]
+
+
+def test_the_declaration_screen_records_the_stamp_and_judges_nothing(
+        repo, at, tmp_path, capsys):
+    """A declaration has no access to what any round recorded, so this screen cannot
+    say whether the ordering held and must not appear to. It says the stamp was taken,
+    which is what tells a fixer the ordering is on the record at the one moment it can
+    still act on that."""
+    assert declare(tmp_path / "premises.json", LANDED, 1, KEY_A) == 0
+    out = capsys.readouterr().out
+    assert R1_HEAD[:12] in out
+    assert "EDITED" not in out and not [
+        ln for ln in out.splitlines() if ln.startswith("tree ")]
+
+
+def test_a_round_carries_no_tree_reading_on_its_payload(
+        repo, at, monkeypatch, capsys, tmp_path):
+    """The other half of the removal. A round recorded its own checkout so a later one
+    could compare; with nothing comparing, the key is data no reader has a use for and
+    a contract the board's ingest would have to carry."""
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=1)
+    assert "tree_state" not in payload
+
+
 # --------------------------------------------------------------- the stop rule's half
 
 def _state(rounds, limit=2, round_no=3):
@@ -1038,9 +1114,10 @@ def test_a_cycle_that_never_wired_the_brake_is_not_nagged_every_round(
 def test_a_round_names_a_premise_that_followed_its_own_fix_pass(
         repo, monkeypatch, capsys, tmp_path):
     """#560 end to end. The declaration for round 2 was made from the commit THIS round
-    is reviewing, so the round-2 fix pass was written and pushed before the premise was
-    stated — the shape the collapsed orchestrator-is-fixer configuration produces, and
-    the one that used to leave a register entry indistinguishable from an honest one."""
+    is reviewing, so the round-2 fix pass was written, committed and pushed before the
+    premise was stated — the shape the collapsed orchestrator-is-fixer configuration
+    produced on lexray#1697, twice, and the one that used to leave a register entry
+    indistinguishable from an honest one."""
     reg = tmp_path / "premises.json"
     # "abc" is the head `stub` gives the PR, so this is a declaration made from the tree
     # round 3 reviews — after round 2's fix pass had already landed.
@@ -1050,8 +1127,23 @@ def test_a_round_names_a_premise_that_followed_its_own_fix_pass(
                            premise_file=str(reg))
     late, = payload["round_stop"]["premises"]["retroactive"]
     assert (late["round"], late["head_round"]) == (2, 3)
-    assert any("BEFORE the premise was declared" in n and "not a brake" in n
-               for n in payload["config_notes"])
+    assert any("written, committed and pushed BEFORE the premise" in n
+               and "not a brake" in n for n in payload["config_notes"])
+
+
+def test_the_round_says_nothing_about_a_pass_that_never_committed(
+        repo, monkeypatch, capsys, tmp_path):
+    """The same cycle where the fix pass edited and did not commit. Its stamp is round
+    2's own head, `stub` gives every round that head, and there is nothing anywhere in
+    the loop that separates it from the honest declaration — which is the conclusion
+    three attempts reached and this pins so it is not re-derived a fourth time."""
+    reg = tmp_path / "premises.json"
+    monkeypatch.setattr(panel_rounds, "working_head", lambda *a, **k: "abc")
+    declare(reg, LANDED, 3, KEY_A)
+    _, payload, _ = _round(monkeypatch, capsys, tmp_path, round_no=3,
+                           premise_file=str(reg))
+    assert payload["round_stop"]["premises"]["retroactive"] == []
+    assert not [n for n in payload["config_notes"] if "was declared against round" in n]
 
 
 def test_naming_it_does_not_end_the_cycle(repo, monkeypatch, capsys, tmp_path):
@@ -1164,6 +1256,26 @@ def test_both_briefs_place_the_declaration_where_the_fixer_is_the_orchestrator()
     # cycle's fixer was given none, so `--premise` was uncallable during the pass.
     assert "Choose the register\npath yourself" in REVIEW_PR
     assert "passes\n  the same path to every round's `--premise-file`" in PANEL_REVIEW_PR
+
+
+def test_both_briefs_say_what_the_check_does_not_cover():
+    """#560's documentation half, and the part that matters most now that one of the
+    two shapes is undetectable. A brief that says "the round records the tree each
+    declaration was made from" and stops reads as a safety net over the whole
+    ordering, and the common workflow — edit, then commit — is precisely the half it
+    does not cover. An agent that believes it is being checked declares carelessly."""
+    assert "does not cover you for the common case" in REVIEW_PR
+    assert "It catches nothing else, deliberately" in PANEL_REVIEW_PR
+    assert "(#622)" in REVIEW_PR and "(#622)" in PANEL_REVIEW_PR
+
+
+def test_neither_brief_claims_the_check_survives_an_actor_working_around_it():
+    """The claim PR #669 made and this branch withdraws. Both readings come out of the
+    actor's own environment, so what the record supports is that the ORDERING slipped,
+    not that nobody could have arranged for it not to show."""
+    assert "(#622)" in PANEL_REVIEW_PR
+    assert "whatever its summary says" not in PANEL_REVIEW_PR
+    assert "matter of your own account of it" not in REVIEW_PR
 
 
 def test_both_briefs_carry_the_limit_rather_than_implying_coverage():

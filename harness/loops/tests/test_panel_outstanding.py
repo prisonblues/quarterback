@@ -120,7 +120,7 @@ def test_a_dry_stop_says_there_is_nothing_rather_than_saying_nothing():
     got = panel_rounds.round_stop(2, 5, [], [], [])
     assert got["stop"] is True
     assert got["outstanding"] == {"fixable": [], "below_floor": [], "escalated": [],
-                                 "narrowed": [],
+                                 "narrowed": [], "declined": [],
                                  "handed_to": "nobody",
                                  "why": "nothing is outstanding — the cycle ends "
                                         "with nothing to hand on"}

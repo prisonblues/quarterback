@@ -3094,6 +3094,47 @@ def agent_rows(data: dict, scope: "Scope | None" = None,
     return rows, hidden
 
 
+#: What the chip bar offers, and what a chip does to the rows.
+#:
+#: BOTH LIVE HERE rather than in the renderer, for the reason every row model
+#: does: a filter is a decision about which rows exist, the renderer decides what
+#: they look like, and a test that has to build a Textual app to find out which
+#: repos a chip bar would show is a test nobody writes.
+
+
+def chip_repos(rows: list[dict]) -> list[str]:
+    """The repos these rows are in, folded to one spelling and in a stable order.
+
+    ONE CHIP PER REPO THE FLEET IS ACTUALLY IN, not per repo the board knows or
+    per repo this checkout watches. A chip for a repo with nobody in it filters to
+    an empty table, which is a control that can only disappoint; the chips are
+    built from the rows they filter so every one of them has something behind it.
+
+    Folded through :func:`repo_name` because three spellings reach this dashboard
+    for one repository — a lease reports a bare ``quarterback``, the plan and `gh`
+    report ``prisonblues/quarterback`` — and two chips for one repo would be two
+    filters that each hide half of it.
+
+    Alphabetical, and deliberately not by size: the chips are a place your eye
+    goes back to, and an order that reshuffles whenever an agent starts or stops
+    is one you have to re-read every tick.
+    """
+    return sorted({r for r in (repo_name(row.get("repo")) for row in rows) if r})
+
+
+def only_repo(rows: list[dict], repo: str | None) -> list[dict]:
+    """`rows`, narrowed to one repo — or all of them when nothing is filtered.
+
+    A row with NO repo is dropped by a filter rather than kept. It reads the other
+    way round at first — an unknown repo is not a known mismatch — but a row that
+    survives every filter is a row the chip bar cannot explain, and the tally
+    beside the chip would then count rows the chip does not describe.
+    """
+    if not repo:
+        return rows
+    return [row for row in rows if repo_name(row.get("repo")) == repo]
+
+
 def agent_tally(rows: list[dict]) -> str:
     """``5 live · 2 seats · 1 idle · 3 unheld`` — what the AGENTS title counts.
 
@@ -4296,10 +4337,11 @@ def tmux_seats() -> tuple[list[dict], str | None]:
     state worth showing rather than a gap: those are exactly the seats free to be
     given something to do.
 
-    Returns [] rather than raising when there is no tmux, no server, or no
-    screen: the dashboard runs inside the screen most of the time and in a bare
-    terminal the rest, and an empty SEATS panel is the honest answer to the
-    second case.
+    Returns ``([], None)`` rather than raising when there is no tmux around us
+    and no screen to list: the dashboard runs inside the screen most of the time
+    and in a bare terminal the rest, and an empty SEATS panel is the honest
+    answer to the second case. A tmux that is THERE and fails is the other half,
+    below, and is not an empty screen.
 
     THE ERROR HALF IS THE POINT. This used to return a bare [] whatever went
     wrong, so "this screen has no seats" and "tmux could not be run at all" were
