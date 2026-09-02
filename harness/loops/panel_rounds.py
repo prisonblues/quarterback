@@ -6480,7 +6480,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
               # to say it. `retroactive` is the declarations this cycle's own
               # records place after the pass they explain — evidence about the
               # cycle, not a rung, and not a proof: each entry rests on a reading
-              # taken in the actor's environment, and `shape` says which reading. Nothing here stops anything, deliberately: the
+              # taken in the actor's environment. Nothing here stops anything,
+              # deliberately: the
               # brake's whole claim is that it runs before the patch, and a stop
               # taken on a round is the late half that `repeated` and
               # `undecidable` already occupy.
