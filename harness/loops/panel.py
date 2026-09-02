@@ -1803,7 +1803,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # that cannot proceed; the board read that checks it against what has actually
     # been spent waits until this PR is known to be one the panel would review at
     # all. Dormant unless somebody has set a number.
-    budget = panel_caps.resolve_budget(panel, notes)
+    # `cap` and not the file's wish: #483's per-round allowance derives the per-PR
+    # total as `tokens_per_round × max_rounds`, so the cap this run will actually
+    # honour is the one the total has to be derived against. A `--max-rounds 2` run on
+    # a repo that wrote 6 must not be told it may spend six rounds' worth.
+    budget = panel_caps.resolve_budget(panel, notes, max_rounds=cap)
 
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
@@ -2343,6 +2347,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if again:
             mergeable, mergeable_said = mergeability({"mergeable": again})
     gate = mergeable_said if mergeable == "CONFLICTING" and require_mergeable else ""
+    # WHICH precondition is occupying `gate`, carried alongside the sentence because
+    # the refusal notice owes each one a different remedy list and could not tell them
+    # apart (#483). Three of them reach `preflight` through this one variable and
+    # `refusal_report` keyed its whole "what to do" block on the mergeability case, so
+    # a round refused on the spend ceiling told its reader to rebase the branch, to
+    # set `review_panel.require_mergeable: false`, and to pass `--force` — the last of
+    # which the same refusal says two paragraphs earlier does not work. Set at each of
+    # the three places `gate` is, so a fourth cannot inherit the wrong prose by
+    # default.
+    gate_kind = "merge" if gate else ""
     merge_gate = gate
     if mergeable == "CONFLICTING" and not merge_gate:
         notes.append(f"{mergeable_said}. Reviewed anyway because "
@@ -2433,7 +2447,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the payload, where the next round reads it.
     gate_overridable = not caps.stop
     if caps.stop:
-        gate = caps.refusal
+        gate, gate_kind = caps.refusal, "spend"
         if force:
             notes.append(
                 "--force did NOT override the spend ceiling. It overrides this "
@@ -2453,6 +2467,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # an answer to "an earlier round already ended this cycle", and letting it
         # serve as one would leave the only opt-in indistinguishable from the flag
         # people already pass to get past a size refusal.
+        gate_kind = "cycle"
         gate = (f"an earlier round already ENDED this cycle for PR #{pr_number} — "
                 f"{prior_said}. Continuing it as a fresh round would repeat "
                 "`prisonblues/lexray#1780` rounds 3-5, where three standalone "
@@ -2765,7 +2780,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # means an empty `budgets` and nothing to ask about — which is why there is no
     # test for it. It is spelled the safe way because the cost is a dunder.
     pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate,
-                    gate_overridable=gate_overridable,
+                    gate_overridable=gate_overridable, gate_kind=gate_kind,
                     # #617's record, whichever gate ended up occupying `gate`. It is
                     # carried on a `run` verdict too — a round that stepped past a
                     # terminal verdict with --new-cycle publishes what it stepped

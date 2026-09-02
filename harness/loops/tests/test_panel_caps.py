@@ -677,3 +677,307 @@ def test_every_ceiling_is_settable_from_the_board_and_none_is_settable_twice():
     for key in panel_caps.CEILINGS:
         assert f"review_panel.budget.{key}" in harness_rules.BOARD_DIALS
     assert "review_panel.budget_window_hours" in harness_rules.BOARD_DIALS
+
+
+# --------------------------------------------------------------------------
+# #483: the unit of the budget is the unit of the work.
+#
+# A flat per-PR total does not bound spend per unit of work; it bounds how many
+# units of work a PR is allowed, which is the decision the round logic is supposed
+# to make on evidence. These pin the shape that replaces it: an allowance
+# denominated in rounds, released one round at a time, with the per-PR total
+# derived from it rather than set beside it.
+# --------------------------------------------------------------------------
+
+def test_a_per_round_allowance_refuses_the_round_after_one_that_overspent(
+        monkeypatch):
+    """The refusal #483 asks for: *a round gone wrong, not a PR that has had enough
+    attention.*
+
+    The check runs before any seat is dispatched, so the round about to start has
+    spent nothing of its own to measure. What there is to measure is what the rounds
+    already recorded were entitled to — one allowance each — so a round that
+    overspent is refused at the next boundary. Under a flat total sized for the whole
+    cycle the same overspend is invisible until the total runs out, which is several
+    rounds later and on the rounds that read the fixer's own commit.
+    """
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 1, "rows": 4, "measured_rows": 4,
+                                       "tokens": 3_200_000}))
+    got = panel_caps.check(CFG, {"budget": {"tokens_per_round": 1_500_000},
+                                 "max_rounds": 6}, 77, notes := [], headless=False)
+    assert got.stop, "a round that spent twice its allowance bought a second round"
+    # Every number a reader needs to check the arithmetic that refused them: what
+    # was spent, what was released, the allowance it came from, how many rounds
+    # bought it, and the cap they are counted against.
+    assert "tokens per round: 3,200,000 of 3,000,000 tokens" in got.refusal
+    assert "1,500,000 per round × 2 released" in got.refusal
+    assert "1 round already recorded on this PR, of at most 6" in got.refusal
+    assert notes
+
+
+def test_the_later_rounds_of_a_well_behaved_cycle_stay_affordable(monkeypatch):
+    """The half a flat per-PR ceiling gets wrong, and the reason #483 was filed.
+
+    Five rounds inside their allowance have spent five allowances, so the sixth is
+    afforded — which is the band `max_rounds: 6` was raised to buy and the band that
+    reads the fixer's own commit. A flat `tokens_per_pr` of the same total size
+    (6 × 1,500,000) would be at 83% of itself here and would refuse the round after
+    one more average one, having spent most of itself on the rounds that were
+    happening anyway.
+    """
+    body = spend(pr_total={"runs": 5, "rows": 20, "measured_rows": 20,
+                           "tokens": 7_500_000})
+    monkeypatch.setenv(panel_caps.SPEND_ENV, body)
+    assert panel_caps.check(CFG, {"budget": {"tokens_per_round": 1_500_000},
+                                  "max_rounds": 6}, 77, [],
+                            headless=False).stop is False
+    # And the release schedule is what makes that true rather than a bigger number:
+    # the same spend against the same total taken up front is over the line, because
+    # rounds 1-2 are allowed to eat all of it.
+    assert panel_caps.check(CFG, {"budget": {"tokens_per_pr": 7_500_000}}, 77, [],
+                            headless=False).stop is True
+
+
+def test_a_cheap_round_cannot_bank_the_whole_cycle_for_round_one(monkeypatch):
+    """#483's third proposal. The failure a ceiling is actually for is a runaway
+    round, and a total released up front funds one: round 1 may spend every round's
+    allowance before anything has read anything twice. Released one round at a time,
+    round 1 gets one allowance and its overspend is answered at round 2."""
+    per_round, cap = 1_000_000, 6
+    fresh = spend(pr_total={"runs": 0, "rows": 0, "measured_rows": 0, "tokens": 0})
+    monkeypatch.setenv(panel_caps.SPEND_ENV, fresh)
+    panel_cfg = {"budget": {"tokens_per_round": per_round}, "max_rounds": cap}
+    assert panel_caps.check(CFG, panel_cfg, 77, [], headless=False).stop is False
+    # Round 1 spends what a flat total of `per_round × cap` would have let it, and
+    # the flat total says nothing. The allowance says it at the next boundary.
+    runaway = per_round * cap - 1
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 1, "rows": 4, "measured_rows": 4,
+                                       "tokens": runaway}))
+    assert panel_caps.check(CFG, panel_cfg, 77, [], headless=False).stop is True
+    assert panel_caps.check(CFG, {"budget": {"tokens_per_pr": per_round * cap}},
+                            77, [], headless=False).stop is False
+
+
+def test_the_allowance_is_counted_from_the_boards_rows_and_not_from_the_round_flag(
+        monkeypatch):
+    """`pr_total.runs` and `pr_total.tokens` are one aggregate over one set of rows,
+    so the multiplier and the measurement cannot disagree about which rounds they
+    describe. `--round` could: it restarts at 1 under `--new-cycle` while `pr_total`
+    has no time bound at all, so a per-cycle count over a per-PR sum would refuse the
+    first round of every second cycle on a PR that had behaved perfectly.
+
+    It is also `runs_per_pr`' reason — a caller that renumbers its rounds still costs
+    a row — applied to the multiplier rather than to the ceiling.
+    """
+    panel_cfg = {"budget": {"tokens_per_round": 1_000_000}, "max_rounds": 6}
+    # The same spend, twice, differing only in how many rows the BOARD holds. Three
+    # well-behaved rounds release four allowances and the next round is afforded;
+    # the identical spend with no rows behind it releases one and is refused. So the
+    # multiplier is the board's count and nothing else — `check` is not passed a
+    # round number at all, which is what makes a `--round 1` driver unable to move it
+    # in either direction.
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 3, "rows": 12, "measured_rows": 12,
+                                       "tokens": 2_500_000}))
+    assert panel_caps.check(CFG, panel_cfg, 77, [], headless=False).stop is False
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 0, "rows": 0, "measured_rows": 0,
+                                       "tokens": 2_500_000}))
+    got = panel_caps.check(CFG, panel_cfg, 77, [], headless=False)
+    assert got.stop and "0 rounds already recorded on this PR" in got.refusal
+
+
+def test_the_release_never_exceeds_a_whole_cycles_worth(monkeypatch):
+    """`min(recorded + 1, max_rounds)` is what makes the derived total EXACT rather
+    than conventional. Without it a caller re-running one round buys a row and
+    thereby buys a further allowance, so the per-PR total is whatever the caller
+    chose to dispatch — which is the property `tokens_per_pr` existed to have."""
+    panel_cfg = {"budget": {"tokens_per_round": 1_000_000}, "max_rounds": 3}
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 9, "rows": 36, "measured_rows": 36,
+                                       "tokens": 3_000_000}))
+    got = panel_caps.check(CFG, panel_cfg, 77, [], headless=False)
+    assert got.stop, "nine rows bought nine allowances on a cap of three"
+    assert "of 3,000,000 tokens" in got.refusal
+    assert "1,000,000 per round × 3 released" in got.refusal
+
+
+def test_the_per_pr_total_is_derived_and_said_out_loud(monkeypatch):
+    """#483's proposal 2. An operator who wrote one number has two in force, and the
+    second decides whether the cycle's later rounds are affordable. Leaving a reader
+    to multiply it out is how a per-round allowance comes to be read as a per-PR
+    one — #52's "never silent" applied to the number nobody typed."""
+    budget = panel_caps.resolve_budget({"budget": {"tokens_per_round": 1_500_000}},
+                                       notes := [], max_rounds=6)
+    assert budget.derived_tokens_per_pr == 9_000_000
+    assert budget.rounds_allowed(0) == 1 and budget.rounds_allowed(4) == 5
+    assert budget.rounds_allowed(99) == 6, "the release outran the round cap"
+    assert any("per-PR total of 9,000,000 over at most 6 rounds" in n for n in notes)
+    # No allowance, no derived total — and no sentence inventing one.
+    plain = panel_caps.resolve_budget({"budget": {"tokens_per_pr": 9_000_000}},
+                                      notes := [], max_rounds=6)
+    assert plain.derived_tokens_per_pr is None
+    assert not any("per-PR total" in n for n in notes)
+
+
+def test_the_cap_the_total_is_derived_against_is_the_one_in_force():
+    """`panel.run` passes `resolve_dials`' answer, after `--max-rounds` and the
+    board's ceiling, because `max_rounds` has four layers and this module can see one
+    of them. A run capped at two rounds must not be told it may spend six rounds'
+    worth."""
+    written = {"budget": {"tokens_per_round": 1_000_000}, "max_rounds": 6}
+    assert panel_caps.resolve_budget(written, [], max_rounds=2
+                                     ).derived_tokens_per_pr == 2_000_000
+    # Left out, the repo's own file answers, and then the built-in.
+    assert panel_caps.resolve_budget(written, []).max_rounds == 6
+    assert (panel_caps.resolve_budget({"budget": {"tokens_per_round": 1}}, [])
+            .max_rounds == panel_caps.DEFAULT_MAX_ROUNDS)
+
+
+@pytest.mark.parametrize("junk", ["six", 0, -1, True, 2.5])
+def test_an_unreadable_max_rounds_is_not_a_second_refusal_for_the_same_key(junk):
+    """A malformed `max_rounds` is a refusal `resolve_dials` already owns, and two
+    refusals for one key would differ only in which module's wording the operator
+    got. So the fallback read here is LENIENT and lands on the built-in."""
+    got = panel_caps.resolve_budget(
+        {"budget": {"tokens_per_round": 1}, "max_rounds": junk}, [])
+    assert got.max_rounds == panel_caps.DEFAULT_MAX_ROUNDS
+
+
+def test_a_per_pr_total_below_the_one_its_allowance_implies_is_refused_by_name():
+    """The contradiction #483 says is invisible until a late round is refused, made
+    loud at the moment it is fixable — beside the other bad-value refusals, before any
+    board call, naming both keys and the arithmetic.
+
+    A repo asking for six rounds and paying for two is exactly the arrangement the
+    issue was filed against, and until now the two dials could say it without
+    anything noticing.
+    """
+    with pytest.raises(SystemExit) as raised:
+        panel_caps.resolve_budget(
+            {"budget": {"tokens_per_round": 1_500_000,
+                        "tokens_per_pr": 3_000_000}}, [], max_rounds=6)
+    said = str(raised.value)
+    assert "`review_panel.budget.tokens_per_pr` (3,000,000)" in said
+    assert "`tokens_per_round` 1,500,000 × `max_rounds` 6 = 9,000,000" in said
+    assert "asks for 6 rounds and pays for 2" in said
+
+
+def test_a_per_pr_total_at_or_above_the_derived_one_is_left_alone(monkeypatch):
+    """The narrowness of that refusal. A runaway backstop over the top of a per-round
+    allowance is a coherent thing to want — it is what `tokens_per_pr: 20,000,000`
+    was for on #621 — and the tighter of the two then binds on its own, which is what
+    two ceilings over one measurement already do."""
+    both = {"budget": {"tokens_per_round": 1_500_000,
+                       "tokens_per_pr": 20_000_000}}
+    budget = panel_caps.resolve_budget(both, [], max_rounds=6)
+    assert budget.derived_tokens_per_pr == 9_000_000
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 1, "rows": 4, "measured_rows": 4,
+                                       "tokens": 4_000_000}))
+    got = panel_caps.check(CFG, both, 77, [], headless=False)
+    assert got.stop and "tokens per round" in got.refusal
+    assert "tokens per pr" not in got.refusal, "the looser ceiling was blamed"
+
+
+def test_an_uninstrumented_round_names_the_run_ceiling_that_still_binds(monkeypatch):
+    """The allowance measures the same rows as `tokens_per_pr`, so it stops binding
+    on exactly the seats nobody instrumented — and of the 72 four-seat rounds this
+    board has recorded, not one measured all four. `runs_per_pr` is the ceiling that still
+    binds a row nobody priced, and the refusal has to SAY so rather than leave a
+    reader believing a token ceiling covered it."""
+    monkeypatch.setenv(panel_caps.SPEND_ENV,
+                       spend(pr_total={"runs": 3, "rows": 12, "measured_rows": 0,
+                                       "tokens": None}))
+    got = panel_caps.check(CFG, {"budget": {"tokens_per_round": 1_000_000}}, 77,
+                           [], headless=True)
+    assert got.stop
+    assert "`budget.tokens_per_round`" in got.refusal
+    assert "`budget.runs_per_pr` is the ceiling that still binds" in got.refusal
+
+
+def test_a_spend_refusal_stops_telling_its_reader_to_rebase_the_branch(
+        monkeypatch, tmp_path):
+    """The adjacent defect #483 reports, and it is one shared remedy renderer keyed
+    to the wrong precondition.
+
+    THREE preconditions reach `preflight` through one `gate` parameter — a branch
+    that cannot merge (#271), the spend ceiling (#55), and a cycle an earlier round
+    already ended (#617) — and the notice keyed its whole "what to do" block on the
+    first. So a round refused on the ceiling was told to rebase its branch, to set
+    `review_panel.require_mergeable: false`, and to pass `--force`: none of the three
+    applies, and the same refusal says two paragraphs earlier that the ceiling is
+    fleet policy which `--force` does not override. A remedy list a reader cannot act
+    on is how a gate becomes advice, which is #628's complaint about the CI line.
+
+    Driven by `runs_per_day` rather than by #483's own allowance, deliberately: the
+    defect is in the RENDERER's wiring and predates the new dial, so a test that
+    needed the new dial to reach it would be testing two things and proving the
+    weaker one.
+    """
+    said: list[str] = []
+
+    def capture(*a, **k):
+        text = panel_preflight.refusal_report(*a, **k)
+        said.append(text)
+        return text
+
+    # The real run and the real renderer — the notice a reader actually gets, on the
+    # verdict `panel.run` actually built. A hand-assembled `Preflight` would pin the
+    # renderer and leave the wiring that decides which prose it prints untested,
+    # which is precisely where the defect was.
+    monkeypatch.setattr(panel, "refusal_report", capture)
+    payload, ran, _ = _run(
+        monkeypatch, tmp_path,
+        panel_cfg={"budget": {"runs_per_day": 1}},
+        spend_body=spend(repo_window={"runs": 3, "rows": 12, "measured_rows": 12,
+                                      "tokens": 5}))
+    assert ran == []
+    assert payload["preflight"]["verdict"] == "refuse"
+    assert said, "the refusal printed no notice"
+    text = said[0]
+    for wrong in ("Rebase the branch onto its base",
+                  "`review_panel.require_mergeable: false`",
+                  "`--force` to review this one anyway"):
+        assert wrong not in text, wrong
+    assert "refused on the repo's SPEND ceiling" in text
+    assert "`review_panel.budget`" in text
+    assert "`--force` does NOT move this gate" in text
+
+
+def test_the_other_two_gates_keep_the_prose_they_already_had():
+    """The narrowness of the branch above. A discriminator that sent every gate to
+    the new prose would pass that test and lose the two remedy lists that were
+    right — and the mergeability one is the reason `gate` exists at all (#271)."""
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,0 +1,1 @@\n+x\n"
+    merge = panel_preflight.preflight(diff, {"claude": 10_000}, {}, [],
+                                      gate="the branch cannot merge",
+                                      gate_kind="merge")
+    assert merge.refused and merge.gate_kind == "merge"
+    said = panel_preflight.refusal_report("board", 77, "a title", "main", merge)
+    assert "Rebase the branch onto its base" in said
+    assert "SPEND ceiling" not in said
+    # #617's, which keys on the record rather than on the kind and must stay that way.
+    ended = panel_preflight.preflight(
+        diff, {"claude": 10_000}, {}, [], gate="an earlier round ended this cycle",
+        gate_overridable=False, gate_kind="cycle",
+        prior_cycle={"refused": True, "round": 3, "cycle": "abc", "ago": "an hour ago",
+                     "reason": "a premise nobody could settle", "confident": False,
+                     "head_sha": "deadbeefcafe"})
+    said = panel_preflight.refusal_report("board", 77, "a title", "main", ended)
+    assert "--new-cycle" in said and "SPEND ceiling" not in said
+
+
+def test_a_gate_that_names_no_kind_still_gets_a_remedy_list():
+    """`gate_kind` is the caller's answer and defaults to empty, so an existing
+    caller that names none must not fall off the end of the branches into a notice
+    with no "what to do" block at all. It lands on the mergeability prose, which is
+    the pre-#483 behaviour for every gate and is what makes this change additive."""
+    diff = "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1,0 +1,1 @@\n+x\n"
+    got = panel_preflight.preflight(diff, {"claude": 10_000}, {}, [],
+                                    gate="something failed")
+    assert got.refused and got.gate_kind == ""
+    said = panel_preflight.refusal_report("board", 77, "a title", "main", got)
+    assert "**What to do,**" in said

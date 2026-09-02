@@ -4280,7 +4280,8 @@ def dial_scope_refusal(dial: str, repo: str | None, script: str | None = None) -
         return ""
 
 
-def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> list[str]:
+def dial_matches(vocabulary: dict[str, dict], typed: str,
+                 limit: int | None = None) -> list[str]:
     """The dial names worth offering for what has been typed so far.
 
     Substring rather than prefix, because the useful half of a name is in the
@@ -4295,15 +4296,23 @@ def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> li
     decides, and sorting the names alphabetically would open the list on `enabled`,
     the one dial that switches this repo's reviews off and nobody's answer to "what
     did I come here to change".
+
+    `limit` is OPT-IN, and it used to default to 40 — which was the number of dials
+    there were. So the picker's first answer to "which dials are there" was all of
+    them by coincidence, and the 41st dial (`review_panel.budget.tokens_per_round`,
+    #483) silently dropped `spawn.max_sessions_fleet` off the end of a list whose
+    whole claim is completeness. The one caller that wants a bound asks for one
+    (`limit=2`, disambiguating a name typed on the command line); the picker wants
+    every match and puts them in a list that scrolls.
     """
     want = (typed or "").strip().lower()
     names = list(vocabulary)
     if not want:
-        return names[:limit]
+        return names if limit is None else names[:limit]
     rank = {name: i for i, name in enumerate(names)}
     hit = [n for n in names if want in n.lower()]
     hit.sort(key=lambda n: (not n.lower().startswith(want), rank[n]))
-    return hit[:limit]
+    return hit if limit is None else hit[:limit]
 
 
 # ---- the tmux screen ---------------------------------------------------------
