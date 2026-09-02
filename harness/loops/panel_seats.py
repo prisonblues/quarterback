@@ -13,11 +13,14 @@ keeps working for it.
 
 from __future__ import annotations
 
-from panel_core import *          # noqa: F401,F403
-import panel_core                 # noqa: F401  — for anything wanting the module
+# Named directly and BELOW the star imports, on `panel_rounds`' rule and for its
+# reason: `Iterator` has to still mean `collections.abc.Iterator` the day a module
+# above re-exports the name, and the last import wins.
+from collections.abc import Iterator  # noqa: E402
+
+import panel_core  # noqa: F401  — for anything wanting the module
 
 # ----------------------------------------------------------------------------- reviewers
-
 # Reasoning levels each CLI accepts for the shared `effort` config key — codex
 # spells it `model_reasoning_effort`, pi spells it `--thinking`, grok spells it
 # `--reasoning-effort`, and the sets genuinely differ (pi has off/minimal, codex
@@ -33,13 +36,14 @@ import panel_core                 # noqa: F401  — for anything wanting the mod
 # recognising a level this CLI accepts, or accept one it does not, the first time a
 # vendor adds one. `run_seat` below is the other reader, and both now read the one
 # tuple. Import direction is fixed by panel_core already importing harness_rules.
-from harness_rules import (            # noqa: F401  — re-exported, see __all__
-    AGY_EFFORTS, CODEX_EFFORTS, EFFORTS, GROK_EFFORTS, PI_EFFORTS)
-
-# Named directly and BELOW the star imports, on `panel_rounds`' rule and for its
-# reason: `Iterator` has to still mean `collections.abc.Iterator` the day a module
-# above re-exports the name, and the last import wins.
-from collections.abc import Iterator   # noqa: E402
+from harness_rules import (  # noqa: F401  — re-exported, see __all__
+    AGY_EFFORTS,
+    CODEX_EFFORTS,
+    EFFORTS,
+    GROK_EFFORTS,
+    PI_EFFORTS,
+)
+from panel_core import *  # noqa: F401,F403
 
 # How long a seat may ALREADY have spent and still be allowed to lower an
 # unsatisfiable pin and go again (#215). A count of attempts is not a bound on
@@ -5157,9 +5161,8 @@ def _diff_files_cut(diff: str, budget: int | None) -> set[str]:
 
 # The range/provenance/scope readers and the CI + Sonar signals moved to
 # panel_scope (#129) — this module was the last one over the argv cap.
-from panel_scope import *        # noqa: F401,F403
-import panel_scope               # noqa: F401
-
+import panel_scope  # noqa: F401
+from panel_scope import *  # noqa: F401,F403
 
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop

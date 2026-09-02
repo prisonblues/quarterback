@@ -103,7 +103,7 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import qbdata as qd                                             # noqa: E402
+import qbdata as qd  # noqa: E402
 
 
 def sibling(name: str) -> str:
@@ -135,7 +135,7 @@ def env_columns(name: str, fallback: int) -> int:
     return int(raw)
 
 
-def spawn_answer(name: str, done: "subprocess.CompletedProcess") -> str:
+def spawn_answer(name: str, done: subprocess.CompletedProcess) -> str:
     """The detail line after `qb-start` has answered, in `qb-start`'s own words.
 
     Module level, and not a method, because it is the one part of the ⚒ that is
@@ -1088,7 +1088,7 @@ class Dash(App):
     VERB_COLUMN = 1
 
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
-                 plan_interval: float = 15.0, scope: "qd.Scope | None" = None,
+                 plan_interval: float = 15.0, scope: qd.Scope | None = None,
                  repo: str | None = None) -> None:
         super().__init__()
         # Which project's rows this is about, and whether the repo column is worth
@@ -1153,7 +1153,7 @@ class Dash(App):
         #: The credential the writes go out on, or None until `on_mount` has a
         #: config to build it from. See `qd.HumanClient` — and #479 for what it
         #: costs, which is not this file's to re-argue but is this file's to say.
-        self.human: "qd.HumanClient | None" = None
+        self.human: qd.HumanClient | None = None
         self.plan: dict = {}                      # the whole /plan envelope
         self.plan_err: str | None = None
         self.plan_sig: tuple | None = None

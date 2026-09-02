@@ -93,7 +93,12 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from harness_rules import (  # noqa: E402
-    DEFAULTS, RULES_FILENAME, RepoNotFound, describe, resolve_repo, unattended,
+    DEFAULTS,
+    RULES_FILENAME,
+    RepoNotFound,
+    describe,
+    resolve_repo,
+    unattended,
 )
 
 # Shared with epic.py's run state, for the same reason it exists there: a CLI

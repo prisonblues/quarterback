@@ -14,9 +14,9 @@ The three properties worth defending, in the order they get broken:
    spent to reach a wall.
 """
 
+import inspect
 import json
 import subprocess
-import inspect
 import sys
 from pathlib import Path
 
@@ -211,7 +211,7 @@ def test_untracked_files_only_warn(monkeypatch):
 #: `harness/package.nix` on why that is the one library there. The loops suite does
 #: not otherwise import it, so the path goes on here rather than in conftest.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bin"))
-import qbdata as qd                                       # noqa: E402
+import qbdata as qd  # noqa: E402
 
 
 @pytest.fixture

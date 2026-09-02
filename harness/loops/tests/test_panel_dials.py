@@ -48,11 +48,11 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402  — DEFAULTS, the documented half
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` and the dial constants live here
 import panel_scope  # noqa: E402  — the two compare calls a scoped round makes
 import panel_seats  # noqa: E402  — the resolvers live here
-import harness_rules  # noqa: E402  — DEFAULTS, the documented half
 from conftest import gh_stub  # noqa: E402
 
 #: The repo root, for the two briefs. Four levels up: tests -> loops -> harness -> repo.

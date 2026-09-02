@@ -70,9 +70,8 @@ import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
-import pytest
-
 import _flake_sandbox
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 

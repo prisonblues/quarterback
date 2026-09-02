@@ -81,8 +81,8 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
-from panel_core import (ARGV_PROMPT_MAX_BYTES, CLI_BIN, seat_installed,
-                        _diff_file_path)
+from panel_core import ARGV_PROMPT_MAX_BYTES, CLI_BIN, _diff_file_path, seat_installed
+
 # `_ci_line` renders #548's states, so it names them rather than spelling the three
 # strings a second time — a state named in two places is a state the two places can
 # come to disagree about, and this one is compared for equality in four modules. The

@@ -126,7 +126,11 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from harness_rules import (
-    BOARD_TIMEOUT, RULES_FILENAME, board_config, ssl_context, unattended,
+    BOARD_TIMEOUT,
+    RULES_FILENAME,
+    board_config,
+    ssl_context,
+    unattended,
 )
 
 #: The five spend ceilings, mapped to the window each is measured over. The key is

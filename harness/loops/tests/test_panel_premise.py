@@ -38,10 +38,10 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402
 import panel  # noqa: E402
 import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
-import harness_rules  # noqa: E402
 from test_panel_dials import PANEL_CFG, stub  # noqa: E402
 
 #: The premise #299 circled for three rounds, in the words a fixer would have used.

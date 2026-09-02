@@ -3559,7 +3559,7 @@ def test_list_says_the_seats_and_the_repo(screen):
     screen("-n", "2")
     line = qb(screen, "list").stdout
     assert "2 seats" in line, line
-    assert str(screen.repo) in line or f"~{str(screen.repo)}" in line, line
+    assert str(screen.repo) in line or f"~{screen.repo!s}" in line, line
 
 
 def test_list_finds_a_screen_whatever_it_is_called(screen):

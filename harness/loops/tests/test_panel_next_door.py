@@ -56,7 +56,6 @@ import panel_core  # noqa: E402
 import panel_seats  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
-
 #: The real fetch, captured at import — BEFORE any fixture has run, so this is the
 #: function itself and not the conftest's stub.
 #:

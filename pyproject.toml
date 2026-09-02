@@ -57,14 +57,6 @@ asyncio_default_test_loop_scope = "session"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-# harness/ arrived verbatim from the repo that used to own it, and lints under
-# different conventions — 13 of its 32 findings here are RUF100 "unused noqa",
-# fired only because this config does not enable E402. "Fixing" those would strip
-# suppressions that are correct wherever E402 IS enabled, i.e. make the files
-# worse to satisfy a linter they were not written against. Excluded so this stays
-# a faithful move rather than a move plus 32 unrelated edits; reconciling the
-# harness onto its own ruff config is tracked separately.
-extend-exclude = ["harness"]
 
 [tool.ruff.lint]
 select = [
@@ -79,7 +71,78 @@ select = [
 ignore = [
     "B008",   # function-call-in-default-argument (FastAPI Depends pattern)
     "E501",   # line-too-long (handled by formatter)
+    # Every one of the 73 is deliberate. 54 are `＋` (FULLWIDTH PLUS) and 12 are `×`,
+    # which the dashboards use because they line up in a monospace column where `+`
+    # and `x` do not; the rest are an en dash, a curly apostrophe, and — the one that
+    # looks most like a bug and is the most deliberate of all — `٧` (ARABIC-INDIC
+    # SEVEN) as a test vector for "only a positive integer gets through". A rule that
+    # is right about homoglyph attacks in identifiers has nothing to say about a
+    # codebase whose strings and prose are typeset.
+    "RUF001", "RUF002", "RUF003",   # ambiguous-unicode-character
+    # `report, payload, seen = _round(...)` names what the tuple holds, and a test
+    # that reads two of the three is not improved by renaming the third to `_seen`.
+    # 76 of these, nearly all in tests, where the unpacking IS the documentation.
+    "RUF059", # unused-unpacked-variable
+    # This repo writes `# noqa: BLE001 — the claim is what must survive` and
+    # `# noqa: PLC0415 — see docstring`: suppressions for a STRICTER selection than
+    # the one above, carrying the reason in prose beside the code. RUF100 calls every
+    # one of them unused, and `--fix` deletes them — losing the suppression and the
+    # sentence explaining it, and re-breaking the file for anyone who does select
+    # those rules. The convention is deliberate; the rule that objects to it is not
+    # worth the convention. (Also 326 `# noqa: E402` in harness/, which ruff tolerates
+    # and pycodestyle does not — same argument, different linter.)
+    "RUF100", # unused-noqa
+
+    # ---- TEMPORARY, and tracked: prisonblues/quarterback#697 ----------------
+    # The 97 findings #47 could not fix mechanically. Every one needs a judgement a
+    # `--fix` cannot make, and several are traps: `ruff check --fix` twice deleted
+    # `import _path_sandbox`, which is imported for the side effect of building a
+    # suite's PATH and HOME, and only a guard test noticed.
+    #
+    # They are ignored BY CODE rather than left as a red baseline so the gate in
+    # `.github/workflows/tests.yml` can be a real gate today — it is live for every
+    # other rule, which is what would have caught #34's `ci_txt ={"PASS": …`. This
+    # block is a ratchet, not a clean bill: whittle it down in #697 and delete the entries
+    # as they reach zero.
+    "F401",   # unused-import — several are side-effecting; read each one
+    "E741",   # ambiguous-variable-name — `l` for "line"
+    "RUF015", # unnecessary-iterable-allocation-for-first-element
+    "RUF005", # collection-literal-concatenation
+    "SIM105", # suppressible-exception
+    "UP031",  # printf-string-formatting
+    "B905",   # zip-without-explicit-strict — real; `strict=` is a question per site
+    "B904",   # raise-without-from-inside-except
+    "E402",   # module-import-not-at-top-of-file — the 4 real ones
+    "RUF012", # mutable-class-default
+    "E702",   # multiple-statements-on-one-line-semicolon
+    "F811",   # redefined-while-unused — a bug shape, worth doing first
+    "F841",   # unused-variable
+    "RUF013", # implicit-optional
+    "RUF046", # unnecessary-cast-to-int
+    "B023",   # function-uses-loop-variable — a bug shape, worth doing first
+    "RUF017", # quadratic-list-summation
 ]
+
+# `harness/` used to be excluded wholesale (#47). It is the most-edited code in the
+# repo — `panel.py` above all — and the exclusion meant the cheapest possible class
+# of defect was being caught by the most expensive possible reviewer: `ci_txt ={…`,
+# a missing space with the continuation left at its old indent, reached review on #34
+# because no tool was looking. One per-file entry buys the whole directory instead.
+[tool.ruff.lint.per-file-ignores]
+# The panel is split across modules that re-export each other's names by design — every
+# one of these files already carries `# noqa: F401,F403` on the star import itself. F405
+# is the same architecture seen from the other end ("may be undefined, or from a star
+# import"), 802 times, and silencing it here is consistent with the suppression that is
+# already on the import. Replacing the star imports is a refactor of the most-edited
+# file in the repo and is not this issue.
+#
+# RUF022 belongs with it. These `__all__` lists are grouped by MEANING — the imports
+# together, then the constants by theme — under a comment saying so, and the whole point
+# of the grouping is that a reader can see what kind of thing each block is. Sorting them
+# flat alphabetical is 257 lines of churn in panel_core alone, and what it buys is a list
+# nobody can skim. Alphabetical is the better default for a list nobody reads; these are
+# read.
+"harness/loops/panel*.py" = ["F405", "RUF022"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

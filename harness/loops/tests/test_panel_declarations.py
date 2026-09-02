@@ -25,13 +25,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
-import panel_seats  # noqa: E402  — run_cli lives here since #129
-import panel_scope  # noqa: E402  — CI_STATE_WORDS, the vocabulary #546 must cover
 import panel_rounds  # noqa: E402  — patched by name where a test forces a collision
+import panel_scope  # noqa: E402  — CI_STATE_WORDS, the vocabulary #546 must cover
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
-
-
-
 
 
 def _reports(title, file="a.py", reviewer="codex", line=1, flagged=False):

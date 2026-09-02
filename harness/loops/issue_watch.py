@@ -108,8 +108,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from appetite import (  # noqa: E402
-    Verdict, author_verdict, events_needed, gh_json, label_events, label_names,
-    pickup_verdict, refusal_verdict, unattended_writes_allowed,
+    Verdict,
+    author_verdict,
+    events_needed,
+    gh_json,
+    label_events,
+    label_names,
+    pickup_verdict,
+    refusal_verdict,
+    unattended_writes_allowed,
 )
 from epic import DEP_RE, IssueWork, resolve_ceiling, triage  # noqa: E402
 from harness_rules import RepoNotFound, describe, resolve_repo, unattended  # noqa: E402

@@ -32,7 +32,6 @@ import panel_core  # noqa: E402
 import preland  # noqa: E402
 from conftest import UNSET, gh_stub, pr_meta  # noqa: E402
 
-
 PR_DIFF = ("diff --git a/a.py b/a.py\n"
            "--- a/a.py\n"
            "+++ b/a.py\n"

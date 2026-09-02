@@ -12,31 +12,34 @@ why that distinction is not optional.
 
 from __future__ import annotations
 
-from panel_core import *            # noqa: F401,F403
-import panel_core                   # noqa: F401
-from panel_seats import *           # noqa: F401,F403
-import panel_seats                  # noqa: F401
-from panel_scope import *        # noqa: F401,F403  — re-exported for callers
-import panel_scope               # noqa: F401
+# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
+# is what lets :class:`CoverageRuling` default to an empty mapping without the
+# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
+import hashlib  # noqa: E402
+
+# #555: asked of the `needs_human` this box actually has, because a harness on PATH
+# can be older than this file and an unexpected keyword would cost the escalation.
+import inspect  # noqa: E402
+
+# Named here for the same reason, and used by exactly one check: a baseline's
+# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
+import math  # noqa: E402
 
 # Named directly, and BELOW the star imports on purpose: `escalated: Iterable[str]`
 # has to still mean `collections.abc.Iterable` the day one of those modules
 # re-exports the name, and the last import wins. Placed above, the guarantee would
 # have been a claim about another module's current contents rather than a property
 # of this file.
-from collections.abc import Iterable, Mapping # noqa: E402
-# Named here for the same reason, and used by exactly one check: a baseline's
-# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
-import math                                   # noqa: E402
-# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
-# is what lets :class:`CoverageRuling` default to an empty mapping without the
-# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
-import hashlib                                # noqa: E402
-# #555: asked of the `needs_human` this box actually has, because a harness on PATH
-# can be older than this file and an unexpected keyword would cost the escalation.
-import inspect                                # noqa: E402
-from types import MappingProxyType            # noqa: E402
-from typing import NamedTuple                 # noqa: E402
+from collections.abc import Iterable, Mapping  # noqa: E402
+from types import MappingProxyType  # noqa: E402
+from typing import NamedTuple  # noqa: E402
+
+import panel_core  # noqa: F401
+import panel_scope  # noqa: F401
+import panel_seats  # noqa: F401
+from panel_core import *  # noqa: F401,F403
+from panel_scope import *  # noqa: F401,F403  — re-exported for callers
+from panel_seats import *  # noqa: F401,F403
 
 # ----------------------------------------------------------------------------- synthesis
 
@@ -1135,7 +1138,7 @@ REWORD_RATIO = 0.85
 #: words are what this list must leave alone: "not" and "never" are deliberately
 #: absent, since "is closed" and "is never closed" are two different defects.
 _TITLE_NOISE = frozenset(
-    "a an the of in on at to by is it its as be or and for with this that".split())
+    ["a", "an", "the", "of", "in", "on", "at", "to", "by", "is", "it", "its", "as", "be", "or", "and", "for", "with", "this", "that"])
 
 
 def _stem(word: str) -> str:
@@ -4280,7 +4283,7 @@ NO_PRIOR_BRIEF = {"round": None, "findings": None, "budgeted": None,
                   "why": "no earlier round's To fix list reached this round"}
 
 
-def budgeted_brief(prior: "Baseline | None", round_no: int, limit: int | None,
+def budgeted_brief(prior: Baseline | None, round_no: int, limit: int | None,
                    weight: int) -> dict:
     """Was the WHOLE of the prior round's To fix list budgeted? — #622's strict half,
     and the only premise under which a priced overspend is a breach rather than an

@@ -47,7 +47,6 @@ import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 from conftest import UNSET, gh_stub, pr_meta  # noqa: E402
 
-
 REF_BODY = json.dumps({"ref": "refs/heads/main",
                        "object": {"sha": "beef0001", "type": "commit"}})
 

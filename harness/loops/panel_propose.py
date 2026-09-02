@@ -41,18 +41,18 @@ the reply shape and — crucially — the ABSENCE of a tally are not. See
 
 from __future__ import annotations
 
-from panel_core import *            # noqa: F401,F403
-import panel_core                   # noqa: F401
-from panel_seats import *           # noqa: F401,F403
-import panel_seats                  # noqa: F401
-from panel_rounds import *          # noqa: F401,F403
-import panel_rounds                 # noqa: F401
-
 # Named directly, and BELOW the star imports for `panel_rounds`' reason: a star
 # import brings only what the exporting module lists, and a name that arrives by
 # accident today is one a tidy-up upstream removes tomorrow with no error here
 # until the branch that uses it runs.
-from collections.abc import Iterable   # noqa: E402
+from collections.abc import Iterable  # noqa: E402
+
+import panel_core  # noqa: F401
+import panel_rounds  # noqa: F401
+import panel_seats  # noqa: F401
+from panel_core import *  # noqa: F401,F403
+from panel_rounds import *  # noqa: F401,F403
+from panel_seats import *  # noqa: F401,F403
 
 # ------------------------------------------------------------------- when it fires
 

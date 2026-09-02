@@ -43,9 +43,6 @@ import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_seats  # noqa: E402  — these seats moved here in #129
 from conftest import gh_stub  # noqa: E402
 
-
-
-
 REPO = "/tmp/acme-board"
 
 # Two seats, so a lost one is a DEGRADED panel rather than the whole panel. A

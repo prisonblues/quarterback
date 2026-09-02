@@ -17,7 +17,7 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -25,11 +25,11 @@ import pytest
 BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
-import qbdata as qd                                       # noqa: E402
+import qbdata as qd  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import _path_sandbox                                      # noqa: E402
+import _path_sandbox  # noqa: E402
 
 # ---- reading a seat off the board: deleted with the seat name (#540) --------
 #
@@ -84,7 +84,7 @@ def test_the_first_claim_on_an_issue_is_the_one_shown():
 
 def _in(seconds: int) -> str:
     """An ISO timestamp `seconds` from now, for a claim that has not lapsed."""
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    return (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat()
 
 
 def item(title: str = "do the thing", repo: str | None = qd.REPO, ref: int | None = None,
@@ -1016,7 +1016,7 @@ def test_outside_tmux_is_not_reported_as_a_failure(monkeypatch):
 def agent(state: str | None, age_s: int | None = 0) -> dict:
     a: dict = {"holder": "zeus/seat-1", "state": state}
     if age_s is not None and state is not None:
-        when = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+        when = datetime.now(UTC) - timedelta(seconds=age_s)
         a["state_at"] = when.isoformat()
     return a
 
@@ -1187,7 +1187,7 @@ def test_a_weekly_reset_is_days_rather_than_a_three_digit_hour_count():
     from datetime import datetime, timedelta, timezone
 
     def ahead(**kw):
-        return (datetime.now(timezone.utc) + timedelta(**kw)).isoformat()
+        return (datetime.now(UTC) + timedelta(**kw)).isoformat()
 
     assert qd.limit_reset(ahead(days=5, hours=8, minutes=1)) == "5d8h"
     assert qd.limit_reset(ahead(hours=3, minutes=57, seconds=30)) == "3h57m"
@@ -1391,7 +1391,7 @@ def test_no_token_is_go_and_says_why():
 def test_a_cap_near_exhaustion_holds_and_carries_when_it_comes_back():
     """`hold` is a WAIT, not a stop. The resumption time is the fact that makes it
     survivable, so it travels with the verdict rather than being looked up again."""
-    soon = (datetime.now(timezone.utc) + timedelta(minutes=47)).isoformat()
+    soon = (datetime.now(UTC) + timedelta(minutes=47)).isoformat()
     got = qd.pace(([_cap(percent=96, resets=soon)], None))
     assert got["verdict"] == "hold"
     assert got["cap"] == "5h" and got["percent"] == 96
@@ -1455,7 +1455,7 @@ def test_pacing_asks_the_endpoint_no_more_often_than_the_dashboard_does(alone, m
 def test_the_line_names_the_verdict_and_the_reset_it_carries():
     # Half a minute of slack: the countdown floors to whole minutes, so a bare 47
     # renders as 46 the instant the clock has moved at all.
-    soon = (datetime.now(timezone.utc) + timedelta(minutes=47, seconds=30)).isoformat()
+    soon = (datetime.now(UTC) + timedelta(minutes=47, seconds=30)).isoformat()
     line = qd.pace_line(qd.pace(([_cap(percent=96, resets=soon)], None)))
     assert line.startswith("pace: HOLD — 5h at 96%")
     assert "resets in 47m" in line

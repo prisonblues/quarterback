@@ -35,12 +35,10 @@ import re
 import shutil
 import subprocess
 import sys
-
 from pathlib import Path
 
-import pytest
-
 import _flake_sandbox
+import pytest
 
 HARNESS = Path(__file__).resolve().parents[1]
 REPO_ROOT = HARNESS.parent

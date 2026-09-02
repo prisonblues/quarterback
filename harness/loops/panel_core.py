@@ -48,18 +48,27 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
+
 # stderr_gist and cli_outcome live with the shared plumbing — how headless CLIs
 # fail is not a panel question, and the loops that run headless agents with no
 # panel in sight need the same reading of a CLI's complaint (#31). They are
 # re-exported here because they read as part of run_cli's contract at every call
 # site in this file.
-from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
-                           RULES_FILENAME, SAMPLE_FILENAME,
-                           RepoNotFound, cli_outcome, describe,
-                           resolve_repo, stderr_gist)
+from harness_rules import (  # noqa: E402
+    DENIAL_MARKERS,
+    REJECTION_MARKERS,
+    RULES_FILENAME,
+    SAMPLE_FILENAME,
+    RepoNotFound,
+    cli_outcome,
+    describe,
+    resolve_repo,
+    stderr_gist,
+)
+
 # #279's vocabulary, through the one module that knows where it is defined.
-from needs_human import (class_or_none as needs_human_class_or_none,  # noqa: E402
-                         reason_or_none as needs_human_reason_or_none)
+from needs_human import class_or_none as needs_human_class_or_none  # noqa: E402
+from needs_human import reason_or_none as needs_human_reason_or_none
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
 # NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
@@ -3117,7 +3126,6 @@ __all__ = [
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
     "DEFAULT_MIN_FIX_GROWTH_CHARS",
-    "DEFAULT_MAX_FIX_GUARD_LINES",
     "DEFAULT_MAX_FIX_GUARD_LINES",
     "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",

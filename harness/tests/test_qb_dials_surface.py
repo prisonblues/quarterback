@@ -37,7 +37,7 @@ import pytest
 BIN = Path(__file__).resolve().parent.parent / "bin"
 sys.path.insert(0, str(BIN))
 
-import qbdata as qd                                       # noqa: E402
+import qbdata as qd  # noqa: E402
 
 REPO = "prisonblues/quarterback"
 OTHER = "prisonblues/lexray"
@@ -150,7 +150,7 @@ def test_the_indefinite_one_is_the_loud_cell():
 def test_no_end_is_not_the_glyph_every_other_panel_uses_for_unknown():
     """`—` means "nobody reported this" on every other panel here. An expiry that
     was never set is a decision somebody made, and the opposite of an unknown."""
-    assert qd.DIAL_NO_END != qd.until(None)
+    assert qd.until(None) != qd.DIAL_NO_END
 
 
 # ---- the value, rendered without claiming to know what it means ---------------

@@ -39,10 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import panel  # noqa: E402
 import panel_scope  # noqa: E402
 import panel_seats  # noqa: E402
-
-from test_panel_reconstruct import _new_repo  # noqa: E402
 from test_panel_provenance import CFG, _compare, _panel_round, _round  # noqa: E402
-
+from test_panel_reconstruct import _new_repo  # noqa: E402
 
 #: The block a fix pass reverts and then puts back. Five lines, which is exactly
 #: :data:`panel_scope.RESTORED_RUN_MIN` — so a test that drops one of them is

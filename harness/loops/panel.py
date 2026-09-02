@@ -94,32 +94,16 @@ away from writing the payload somewhere else, and world-readable meanwhile.)
 
 from __future__ import annotations
 
-# The imports, tunables, prompts and helpers this file used to carry live in
-# panel_core (#129). Star-imported so every name this module already used stays
-# a plain global here — which is also what keeps `monkeypatch.setattr(panel, …)`
-# working for anything CALLED from this file. A helper called from inside
-# panel_core resolves there instead, so tests driving one of those patch
-# `panel_core` directly; the module docstring there says so.
-from panel_core import *          # noqa: F401,F403
-import panel_core                 # noqa: F401
-from panel_core import (          # noqa: F401  — explicit, so a reader can grep
-    sh, load_repo_cfg)            #   the two with the widest blast radius
+from datetime import UTC
 
-# The seats moved to panel_seats (#129) — that section alone was over
-# antigravity's argv cap, so the one seat whose prompt travels in argv could
-# never read the file reviewing it. Imported back so `run()` below still calls
-# `review_llm(...)` as a plain global, which is what keeps the suites' 
-# `setattr(panel, "review_llm", …)` doubles working.
-from panel_seats import *        # noqa: F401,F403
-import panel_seats               # noqa: F401
-from panel_scope import *        # noqa: F401,F403  — re-exported for callers
-import panel_scope               # noqa: F401
-
-# Synthesis and rounds moved to panel_rounds (#129). Imported back so run()
-# below still calls them as plain globals, which is what keeps the suites'
-# `setattr(panel, "adjudicate", …)` doubles working.
-from panel_rounds import *       # noqa: F401,F403
-import panel_rounds              # noqa: F401
+# The caps (#55) — the board's round ceiling and the spend ceiling, and what an
+# unverifiable ceiling means. Deliberately NOT star-imported, for `panel_timing`'s
+# reason with more force: a cap is policy, `panel_caps.` on every call site is what
+# makes "where is the ceiling checked" answerable with one grep, and a bare
+# `check(...)` in this file would read like one of the dozen local helpers.
+import panel_caps  # noqa: F401
+import panel_core  # noqa: F401
+import panel_preflight  # noqa: F401
 
 # The constructive pass (#507) — on an escalation, one question to the seats that
 # still have outstanding findings: what is the smallest change that resolves them?
@@ -127,36 +111,58 @@ import panel_rounds              # noqa: F401
 # this file that spends a fan-out on a round the verdict has already ended, so
 # `panel_propose.` on every call site is what makes "where does the extra spend
 # happen" answerable with one grep.
-import panel_propose              # noqa: F401
-
-# The pre-flight verdict (#138) — whether a round is worth running at all, and
-# whether it should read the diff or a manifest of it. Its own module for the
-# reason the four above are: this file is what #129 split because one of its
-# sections was over the cap of the seat that has to read it.
-from panel_preflight import *     # noqa: F401,F403
-import panel_preflight            # noqa: F401
-
-# The caps (#55) — the board's round ceiling and the spend ceiling, and what an
-# unverifiable ceiling means. Deliberately NOT star-imported, for `panel_timing`'s
-# reason with more force: a cap is policy, `panel_caps.` on every call site is what
-# makes "where is the ceiling checked" answerable with one grep, and a bare
-# `check(...)` in this file would read like one of the dozen local helpers.
-import panel_caps                 # noqa: F401
+import panel_propose  # noqa: F401
+import panel_rounds  # noqa: F401
+import panel_scope  # noqa: F401
+import panel_seats  # noqa: F401
 
 # Where the round's wall clock went (#192). Its own module, and deliberately NOT
 # star-imported: nothing here calls it as a bare global, so an explicit import
 # keeps `panel_timing.` on every call site and makes the instrumentation greppable
 # as one thing — this file is edited by several changes at once and a timing call
 # that reads like a panel helper is the kind of line a merge loses.
-import panel_timing               # noqa: F401
+import panel_timing  # noqa: F401
+
+# #274's one door, and #279's escalation list read back through it.
+from needs_human import announce  # noqa: E402
+from needs_human import digest as nh_digest
+
+# The imports, tunables, prompts and helpers this file used to carry live in
+# panel_core (#129). Star-imported so every name this module already used stays
+# a plain global here — which is also what keeps `monkeypatch.setattr(panel, …)`
+# working for anything CALLED from this file. A helper called from inside
+# panel_core resolves there instead, so tests driving one of those patch
+# `panel_core` directly; the module docstring there says so.
+from panel_core import *  # noqa: F401,F403
+from panel_core import (  # noqa: F401  — explicit, so a reader can grep
+    load_repo_cfg,
+    sh,  #   the two with the widest blast radius
+)
+
+# The pre-flight verdict (#138) — whether a round is worth running at all, and
+# whether it should read the diff or a manifest of it. Its own module for the
+# reason the four above are: this file is what #129 split because one of its
+# sections was over the cap of the seat that has to read it.
+from panel_preflight import *  # noqa: F401,F403
+
+# Synthesis and rounds moved to panel_rounds (#129). Imported back so run()
+# below still calls them as plain globals, which is what keeps the suites'
+# `setattr(panel, "adjudicate", …)` doubles working.
+from panel_rounds import *  # noqa: F401,F403
+from panel_scope import *  # noqa: F401,F403  — re-exported for callers
+
+# The seats moved to panel_seats (#129) — that section alone was over
+# antigravity's argv cap, so the one seat whose prompt travels in argv could
+# never read the file reviewing it. Imported back so `run()` below still calls
+# `review_llm(...)` as a plain global, which is what keeps the suites'
+# `setattr(panel, "review_llm", …)` doubles working.
+from panel_seats import *  # noqa: F401,F403
 
 # The mergeability sentence, from the merge gate that already owns it (#271). One
 # import rather than a second copy: `preland.check_pr_state` refuses a CONFLICTING
 # branch at merge time, this refuses a round on the same branch hours earlier, and
 # the two saying it differently is how the three checks in #96 came to disagree.
-from preland import board_config, board_get, board_request, mergeability   # noqa: E402
-# #274's one door, and #279's escalation list read back through it.
-from needs_human import announce, digest as nh_digest   # noqa: E402
+from preland import board_config, board_get, board_request, mergeability  # noqa: E402
 
 #: What `GET /review/findings` calls the escalation list (#279). Named because
 #: two things read it: the fetch below, and the note it writes when a board is
@@ -361,7 +367,7 @@ def _age_of(ts: object) -> str:
     timestamp is missing or unparseable. Never raises and never guesses a
     duration: an unreadable timestamp downgrades the sentence, it does not
     invalidate the verdict the sentence is about."""
-    from datetime import datetime, timezone            # noqa: PLC0415
+    from datetime import datetime, timezone  # noqa: PLC0415
     try:
         when = datetime.fromisoformat(str(ts))
     except (TypeError, ValueError):
@@ -370,8 +376,8 @@ def _age_of(ts: object) -> str:
         # The board stores UTC and `isoformat()` on a naive column drops the
         # offset. Reading it as local time is how a verdict from an hour ago comes
         # out as "1 hour ago" on one machine and "2 hours ago" on the next.
-        when = when.replace(tzinfo=timezone.utc)
-    return _ago(max(0.0, (datetime.now(timezone.utc) - when).total_seconds()))
+        when = when.replace(tzinfo=UTC)
+    return _ago(max(0.0, (datetime.now(UTC) - when).total_seconds()))
 
 
 #: What `GET /review/next-door` calls the hint list (#508). Named for the reason
@@ -6965,8 +6971,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
 # The --ask path moved to panel_ask (#129). Imported back so the CLI below
 # still dispatches to `ask(...)` as a plain global.
-from panel_ask import *          # noqa: F401,F403
-import panel_ask                 # noqa: F401
+import panel_ask  # noqa: F401
+from panel_ask import *  # noqa: F401,F403
 
 
 def main() -> int:
