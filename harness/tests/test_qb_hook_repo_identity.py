@@ -196,6 +196,34 @@ def test_the_slug_does_not_keep_the_dot_git_suffix(hook):
     assert ".git" not in hook.lease().split('"repo":')[1][:60]
 
 
+@pytest.mark.parametrize("url", [
+    "https://GitHub.com/prisonblues/quarterback.git",
+    "HTTPS://github.com/prisonblues/quarterback.git",
+    "git@GITHUB.COM:prisonblues/quarterback.git",
+    "ssh://git@GitHub.Com:22/prisonblues/quarterback.git",
+])
+def test_the_scheme_and_host_are_matched_whatever_their_case(hook, url):
+    """A URI scheme and a DNS hostname are case-insensitive by their own specs (RFC
+    3986, RFC 4343) and git clones `https://GitHub.com/...` happily, so a
+    lowercase-only pattern reads a GitHub remote as a foreign one. It fails the way
+    this whole change is about: not with an error but with the bare name `quarterback`
+    — a legitimate answer for a non-GitHub remote, and therefore one nothing
+    downstream can tell from the real thing. Found by an independent review."""
+    hook.origin(url)
+    hook.start()
+    assert '"repo":"prisonblues/quarterback"' in hook.lease().replace(" ", "")
+
+
+def test_the_owner_and_name_keep_the_case_they_were_cloned_under(hook):
+    """Only the scheme and the host are folded here. GitHub preserves repository-name
+    case, the hook is not the thing that gets to decide it, and the board folds a
+    qualified slug on the way in (`app.repomatch.fold_repo`) — so folding it twice,
+    in two languages, is two rules that can come to disagree."""
+    hook.origin("https://GitHub.com/PrisonBlues/Quarterback.git")
+    hook.start()
+    assert '"repo":"PrisonBlues/Quarterback"' in hook.lease().replace(" ", "")
+
+
 # --------------------------------------------------- no origin: no repo, not a guess
 
 

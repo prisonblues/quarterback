@@ -366,8 +366,20 @@ if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
     # `(:[0-9]+)?` cannot eat the scp-style separator even for an all-digit owner
     # (`github.com:123/repo`): ERE backtracks, and the only parse where the tail is
     # an `owner/name` is the one where the port group matched nothing.
+    #
+    # The scheme and the host are matched CASE-INSENSITIVELY, spelled out as
+    # character classes because POSIX ERE has no `(?i)`. Both are case-insensitive
+    # by their own specs — URI schemes by RFC 3986, DNS hostnames by RFC 4343 — and
+    # git clones `https://GitHub.com/Acme/Widget` happily. A lowercase-only host
+    # dropped such a remote through to the bare-name fallback and published
+    # `Widget`, which is not wrong enough to notice and not an identity: the one
+    # spelling the write path exists to converge on is the one it would silently
+    # fail to produce. The owner and name keep whatever case they were cloned
+    # under; `app.repomatch.fold_repo` folds that on the way in, which is where a
+    # case rule belongs — GitHub preserves repository-name case and this hook is
+    # not the thing that gets to decide it.
     repo=$(printf '%s' "$_url" | sed -nE \
-      's#^([a-z+]+://)?([^@/]+@)?github\.com(:[0-9]+)?[:/]+([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*)$#\4#p')
+      's#^([A-Za-z0-9+.-]+://)?([^@/]+@)?[Gg][Ii][Tt][Hh][Uu][Bb]\.[Cc][Oo][Mm](:[0-9]+)?[:/]+([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*)$#\4#p')
     # Not a GitHub remote: the bare name is genuinely all this checkout has, and the
     # board's reads accept it. Only the *identity* is unavailable, not the grouping.
     [ -n "$repo" ] || repo=$(printf '%s' "$_url" | sed -E 's#.*[:/]##')
