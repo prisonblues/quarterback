@@ -270,6 +270,48 @@ def test_a_round_claims_its_pr_and_hands_it_back(monkeypatch, capsys, pr_claims)
                     ("release", "/tmp/acme-board", 1780)]
 
 
+def test_a_round_that_did_not_get_the_claim_does_not_hand_one_back(
+        monkeypatch, capsys):
+    """Found by an independent Codex review of this PR.
+
+    `hold_pr` never gates — a round told the PR is held by a peer runs anyway — and
+    the release was gated on `record` rather than on having taken anything. So the
+    shorter of two overlapping rounds ended the longer one's claim on its way out,
+    and `POST /claim/release` authorises at MACHINE granularity for a claim that
+    names no session, which is exactly the co-tenant case. The fleet then read a
+    review still in flight as finished: the claim's one job, undone by the
+    mechanism that took it.
+
+    red/green: fails with a `release` call recorded against a round that was told
+    the PR belonged to somebody else.
+    """
+    _round(monkeypatch)
+    seen: list[tuple] = []
+    monkeypatch.setattr(panel, "hold_pr",
+                        lambda *a, **k: "PR #1780 is claimed by somebody else")
+    monkeypatch.setattr(panel, "release_pr",
+                        lambda p, n: seen.append(("release", p, n)) or "")
+    assert panel.run("board", 1780, post=False, json_out=True) == 0
+    capsys.readouterr()
+    assert seen == [], "a round handed back a claim it never held"
+
+
+def test_a_claim_the_board_refused_is_not_released_either(monkeypatch, capsys):
+    """The other half of the same gate, and it is not the same case. A board that
+    could not be reached leaves the PR genuinely unclaimed, so there is nothing to
+    release — and a `qb-release` fired at it is a second failed round trip whose
+    only output is a second note saying the same thing."""
+    _round(monkeypatch)
+    seen: list[tuple] = []
+    monkeypatch.setattr(panel, "hold_pr",
+                        lambda *a, **k: "the board has no claim on PR #1780")
+    monkeypatch.setattr(panel, "release_pr",
+                        lambda p, n: seen.append(("release", p, n)) or "")
+    assert panel.run("board", 1780, post=False, json_out=True) == 0
+    capsys.readouterr()
+    assert seen == []
+
+
 def test_the_claim_is_taken_before_a_single_seat_is_dispatched(monkeypatch, capsys):
     """#253's event is the round STARTING, and a claim taken after the seats have
     run would be a record of work that is already over — which is what the board

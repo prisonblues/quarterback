@@ -3547,8 +3547,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `--no-record` is a caller saying this run does not go on the board, and a
     # claim is a board write like any other. `hold_pr` never gates a round — its
     # refusals are notes — so nothing here can stop a review that was going to run.
+    #: Did THIS round take the claim? The release below is gated on it, and
+    #: nothing else is: a round that was told the PR is held by somebody else runs
+    #: anyway (the claim is a record, not a gate) and must not then hand back the
+    #: claim that peer is still holding. Without this, the shorter of two
+    #: overlapping rounds frees the longer one's PR on its way out and the fleet
+    #: reads the live review as finished — the claim's one job, undone by the
+    #: mechanism that took it (PR #715 review).
+    holding_pr = False
     if record:
         claimed = hold_pr(cfg["path"], pr_number, round_no, title)
+        holding_pr = not claimed
         if claimed:
             notes.append(claimed)
     tasks = {}
@@ -6194,6 +6203,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # A cycle's next round takes its own claim at its own dispatch, which is what
     # makes the note on each one say which round is holding it.
     #
+    # ONLY WHAT THIS ROUND TOOK. `holding_pr` is false when the claim was refused,
+    # and the HELD case is the one that matters: that round is still reviewing this
+    # PR, and a release is authorised by the board at machine granularity when the
+    # claim names no session — so an unconditional hand-back is a round ending
+    # somebody else's record of work still in flight.
+    #
     # NO `try/finally`, and that is a decision rather than an oversight (PR #715
     # review). There is no early return between the claim and here — the skip and
     # refusal exits are all ABOVE the dispatch — so the only paths that reach this
@@ -6204,7 +6219,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # round that dies holding one frees it within `PR_HOLD_TTL` with nobody
     # intervening — the same failure mode as the lease of the agent that died with
     # it. The cost of the choice is stated where the fuse is set.
-    if record:
+    if holding_pr:
         handed_back = release_pr(cfg["path"], pr_number)
         if handed_back:
             notes.append(handed_back)
