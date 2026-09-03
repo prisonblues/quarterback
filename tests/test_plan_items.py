@@ -47,6 +47,7 @@ from sqlalchemy import select, update
 import app.api.plan as plan_api
 from app.api.claims import ClaimRequest, acquire
 from app.api.plan import (
+    _DONE_SEP,
     CLAIM_KIND,
     MAX_NOTE,
     STALE_DAYS,
@@ -1124,6 +1125,98 @@ async def test_a_receipt_that_merely_reads_like_another_is_still_recorded(client
                                   json={"item_id": item["item_id"], "note": repeat},
                                   headers=LAPTOP)
         assert again.json()["note"] == note, f"{repeat!r} was appended a second time"
+
+
+async def test_two_hosts_with_different_words_both_land_them(client, monkeypatch):
+    """The guarantee the SQL append exists for, raced rather than described.
+
+    The identical-receipt race above would still pass if a losing caller simply
+    threw its note away — which is the behaviour the SQL append was introduced to
+    make unnecessary, so that test cannot be the one holding it up. This one
+    sends two DIFFERENT notes through the same seam and requires both to survive:
+    the loser's append is derived from the note as the winner left it, not from
+    the copy it read a round trip earlier.
+
+    **The interleave is forced, not hoped for.** `live_claim` is awaited after the
+    row is read and before anything is written, so releasing both requests from a
+    barrier there puts them in exactly the read-read-write-write order the
+    read-modify-write lost a note in. Unsynchronised, that ordering is likely and
+    not certain, and a race test that only usually races is a test that only
+    usually holds.
+
+    red/green: the `changed` assertion fires first, as it does everywhere on this
+    branch. With it removed, the property this test is FOR goes red on its own:
+    `assert 'and the revert is on main' in 'landed in PR #143'` — the note holding
+    one caller's words and not the other's, because whichever committed second
+    wrote its copy of the row over the first. Measured, not assumed.
+    """
+    repo = "acme/twovoicesraced"
+    item = await issue(client, repo, 727)
+    barrier = asyncio.Barrier(2)
+    real_live_claim = plan_api.live_claim
+
+    async def in_step(*args, **kwargs):
+        got = await real_live_claim(*args, **kwargs)
+        # Both requests have read the row and neither has written. A deadline
+        # rather than a bare wait: if one of them fails before it arrives, the
+        # other must fail the test loudly instead of hanging the suite.
+        await asyncio.wait_for(barrier.wait(), timeout=10)
+        return got
+
+    monkeypatch.setattr(plan_api, "live_claim", in_step)
+    mine, theirs = "landed in PR #143", "and the revert is on main"
+    laptop, desktop = await asyncio.gather(
+        client.post("/plan/item/done",
+                    json={"item_id": item["item_id"], "note": mine}, headers=LAPTOP),
+        client.post("/plan/item/done",
+                    json={"item_id": item["item_id"], "note": theirs}, headers=DESKTOP),
+    )
+    # Before any further request: the barrier still wants two parties, and a read
+    # that reached it alone would sit there until the deadline.
+    monkeypatch.undo()
+
+    assert [laptop.status_code, desktop.status_code] == [200, 200], [
+        laptop.text, desktop.text]
+    assert {laptop.json().get("changed"), desktop.json().get("changed")} == {True, False}
+    note = (await _row(client, repo, item["item_id"]))["note"]
+    assert mine in note, note
+    assert theirs in note, note
+
+
+async def test_a_multi_line_note_is_never_read_as_a_repeated_receipt(client):
+    """`_note_already_says` reads a note as lines, so it must not be asked about a
+    caller that sends several.
+
+    A row carrying the receipts `foo` and `bar` stores `foo\n— done: bar`, and the
+    padded single-line test matches that against a caller sending exactly those two
+    lines as one note — a different note, suppressed. Found by an independent review
+    of this branch, and it is the same failure the substring rule had before it: only
+    the same sentence is the same sentence.
+
+    Nothing that arrives with a newline in it is the duplicate being dropped here.
+    `qb-reconcile`'s receipt is one line, which is what makes it byte-identical
+    across hosts; a multi-line note is somebody typing.
+
+    red/green: fails against this branch's own previous commit on
+    `assert note.endswith(...)` — the note came back unchanged, the second write
+    silently discarded. (Against `main` there is no dedup at all, so the assertion
+    that goes red there is `changed`.)
+    """
+    repo = "acme/multiline"
+    item = await issue(client, repo, 728)
+    for said in ("foo", "bar"):
+        await client.post("/plan/item/done",
+                          json={"item_id": item["item_id"], "note": said}, headers=LAPTOP)
+    both = f"foo{_DONE_SEP}bar"
+    assert (await _row(client, repo, item["item_id"]))["note"] == both
+
+    echoed = await client.post("/plan/item/done",
+                               json={"item_id": item["item_id"], "note": both},
+                               headers=DESKTOP)
+
+    assert echoed.json().get("changed") is False
+    note = echoed.json()["note"]
+    assert note == f"{both}{_DONE_SEP}{both}", note
 
 
 async def test_a_drop_that_lands_mid_write_is_not_finished_over(client, monkeypatch):

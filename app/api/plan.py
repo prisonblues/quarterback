@@ -59,6 +59,7 @@ from sqlalchemy import (
     Text,
     case,
     delete,
+    false,
     func,
     literal,
     or_,
@@ -2754,12 +2755,12 @@ async def complete_item(
     # inferring it from timestamps, and `done_by` beside it names who won.
     #
     # It says nothing about what the row IS — `state` in the view does, refreshed
-    # after the write. The two come apart in one race, and the pairing is what
-    # keeps it legible: a person reopening the item between the failed transition
-    # and the read gets `changed: false` with `state: "open"` and no `done_by`,
-    # because reopening clears it. Nobody is named for a completion that was
-    # undone, which is what a caller inferring "somebody else recorded it" from
-    # `changed` alone would have done.
+    # after the write, and the two answer different questions: `changed` is about
+    # this call, `state` is about the row it left behind. A 200 carrying
+    # `changed: false` always describes a done row, because the re-read above
+    # answers its other two findings as errors rather than as a body: a missing
+    # row is a 404 and a dropped one a 409. So a caller may read `done_by` beside
+    # a `false` and know it names whoever transitioned it.
     return {**view, "claim_left": left, "changed": changed}
 
 
@@ -2780,20 +2781,33 @@ def _dropped(item: PlanItem) -> HTTPException:
 def _note_already_says(said: str) -> ColumnElement[bool]:
     """Is this exact receipt already a LINE of the item's note?
 
-    The rule the no-op append is documented to keep — "the same sentence twice" —
-    stated as the predicate it actually needs. A plain substring test was wider
-    than the argument for it (found by Codex on this change's own diff): a note
-    reading `— done: landed in PR #143 after the schema change` would have
-    swallowed a later caller's `landed in PR #143`, which is a different sentence
-    somebody wanted on the record. Dropping a distinct one is the failure this
-    whole no-op path was written to avoid, one clause narrower.
-
-    A note is `\n`-joined and every element after the first carries
+    **It assumes ``said`` is a single line, and refuses to answer when it is
+    not.** A note is `\n`-joined and every element after the first carries
     :data:`_DONE_SEP`, so a receipt is present exactly when the padded text holds
     ``\n<said>\n`` (it was the first thing written) or ``\n— done: <said>\n``
     (it was appended). Padding both ends is what lets one `contains` answer for
-    the head, the middle and the tail at once, instead of four anchored LIKEs.
+    the head, the middle and the tail at once, instead of four anchored LIKEs —
+    and it is also precisely what stops being sound once ``said`` may itself
+    contain a newline. A note holding the receipts `foo` and `bar` reads
+    ``\nfoo\n— done: bar\n``, which those two clauses match against a caller
+    sending the two-line string ``"foo\n— done: bar"``: a different note,
+    suppressed, which is the failure this path exists to avoid rather than an
+    instance of the one it fixes.
+
+    So a multi-line ``said`` is never recognised and always appended.
+    ``DoneIn.note`` permits newlines, and nothing that would arrive with one is
+    the duplicate being dropped here: the fleet's receipt is
+    ``qb-reconcile``'s one-line :func:`apply_note` rendering, byte-identical
+    across hosts because it carries no host and no timestamp. A multi-line note
+    is somebody typing, and the answer to somebody typing is to write it down.
+
+    The single-line predicate is narrow on purpose too — a plain substring test
+    was the first cut, and it swallowed `landed in PR #143` because the row
+    already read `landed in PR #143 after the schema change`. Both narrowings are
+    the same rule: only the same sentence is the same sentence.
     """
+    if "\n" in said:
+        return false()
     padded = func.concat(literal("\n", Text), func.coalesce(PlanItem.note, ""),
                          literal("\n", Text), type_=Text)
     return or_(padded.contains(f"\n{said}\n", autoescape=True),
