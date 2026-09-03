@@ -540,6 +540,45 @@ def pr_claim_wanted(panel: dict, no_pr_claim: bool, notes: list[str]) -> bool:
     return False
 
 
+def history_wanted(panel: dict, no_history: bool, notes: list[str]) -> bool:
+    """Whether this round shows its seats the changed files' git history (#716).
+
+    On by default, because the block exists to close a gap that was MEASURED: three
+    of eight declared coverage gaps on the instrumented cycle were questions a single
+    `git log` answers, and every one of them cost the round its confident stop.
+
+    An off switch all the same, and for two reasons that are not symmetry with
+    :func:`pr_claim_wanted`. The first is cost: this block is charged to the seat's
+    diff budget, and a repo that would rather spend every character on the diff is
+    making a defensible call rather than a mistake. The second is #550's, arriving
+    one section over — the honest limit on #716 is `n=1`, a single history-heavy
+    migration PR, and the way that stops being `n=1` is by running the same PRs with
+    the block and without it and counting the declared gaps. `history_brief: false`
+    in the repo's rules and `panel.py --no-history-brief` for one run are what make
+    that comparison producible at all; the flag is the instrument, because the dial
+    lives in the repo under review and flipping it there would change the diff whose
+    gaps are being counted.
+
+    **A value this cannot read as a boolean falls CLOSED**, on
+    :func:`code_access_wanted`'s reasoning rather than a new one: `bool("false")` is
+    True, so the intuitive read turns a hand-written `"history_brief": "false"` into
+    the setting's opposite. The closed posture here is also the cheap one and the one
+    that ran for the whole life of the panel before this."""
+    if no_history:
+        return False
+    raw = panel.get("history_brief", True)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None or raw == "":
+        # Unset means unset, the reading `code_access_wanted` gives an absent
+        # setting: silent, and the default applies.
+        return True
+    notes.append(f"`history_brief`={raw!r} is not true or false — the seats were NOT "
+                 "shown the changed files' git history this round (#716). A setting "
+                 "that decides what evidence a seat is given is not guessed at")
+    return False
+
+
 def strip_convention_files(root: Path) -> list[str]:
     """Remove every vendor instruction file and config directory under `root`,
     returning what was removed, repo-relative and sorted.
@@ -5382,7 +5421,7 @@ __all__ = [
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
-    "code_access_wanted", "pr_claim_wanted",
+    "code_access_wanted", "pr_claim_wanted", "history_wanted",
     "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
