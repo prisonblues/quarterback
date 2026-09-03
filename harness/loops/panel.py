@@ -4979,6 +4979,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     revert_shape = (fix_pass_commits(gh_repo, prior.head_sha, head_sha)
                     if attributable and range_kind == FIX_RANGE_OK and injecting["over"]
                     else {})
+    # The findings this round attributed to the fix pass, built ONCE and read by both
+    # of the things downstream of the attribution: #506's `removes` column and #627's
+    # excision. Two list comprehensions over `placed` would be two derivations of one
+    # answer, and the failure they permit is a revert proposal and an excision that
+    # disagree about which findings the pass caused.
+    introduced_by_pass = [{"key": c.key, "severity": c.severity, "file": c.file,
+                           "line": c.line, "title": c.synthesis}
+                          for c, bucket in placed if bucket == "introduced"]
     revert = revert_state(
         range_kind if attributable else REVERT_NOT_ASKED,
         why=no_range_why, base_sha=prior.head_sha if attributable else None,
@@ -4993,10 +5001,108 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # pass was sent to fix was not looked at again, so "no longer raised" is a
         # ceiling on the cost rather than a measurement of it.
         scope=review.scope,
-        removes=[{"key": c.key, "severity": c.severity, "file": c.file,
-                  "line": c.line, "title": c.synthesis}
-                 for c, bucket in placed if bucket == "introduced"],
+        removes=introduced_by_pass,
         costs=revert_cleared, still_open=revert_open, shape=revert_shape)
+
+    # ---- #627: the one backtrack this loop takes on its own, and the only one.
+    #
+    # The proposal above is a decision for a human because a fix PASS is mixed. A
+    # single fix that answered a finding below `round_trigger_floor` is not: it
+    # answered one complaint that was, by definition, not blocking the close, so
+    # removing it costs exactly one P3 or P4 going back on the board unfixed — the
+    # state every unpaid budget item is already in. Rich's decision on #621, in his
+    # words: "a sub-floor fix that causes findings is excised, not repaired".
+    #
+    # ALWAYS built, on `revert`'s rule — the payload records what the round KNEW, and a
+    # consumer inferring "there was nothing to excise" from a missing key would be
+    # reading the payload's age — and gated on `attributable` for the same reason
+    # `revert` is: a round with no earlier round has no fix pass to have a seam in.
+    #
+    # THE READS ARE LOCAL GIT AND THEY ARE PAID ON EVERY ATTRIBUTABLE ROUND, which is
+    # the one place this differs from `revert_shape` above. That call is a `gh api`
+    # round trip and is bought only on a round whose rate crossed the threshold; these
+    # are reads of an object store already on the disk, and #627's rule is not
+    # conditioned on the rate at all — a sub-floor fix that caused one finding is
+    # excised on the round that found it whether or not the cycle is ending. They are
+    # bounded by construction: the commit log is one call, and `excision_state` asks
+    # for a blame or a numstat only for the files and commits a seam actually reaches.
+    excision = excision_state(
+        range_kind if attributable else REVERT_NOT_ASKED,
+        why=no_range_why,
+        # `anchor`, not `prior.head_sha`, and it is the same correction `restored_lines`
+        # already carries: an explicit `--since` is what THIS round attributed from, so
+        # `_fix_range_diff` was called with it and `introduced` is a claim about that
+        # span. Reading the baseline's commit here would look for the seam in a range
+        # no diff of this round was taken against — a commit outside the span the
+        # attribution ran over, or a later commit inside it left outside the window the
+        # cascade test checks (found by a Codex second opinion). #506's proposal one
+        # block up still names `prior.head_sha`; that inconsistency is its own and is
+        # not widened here.
+        commits=(panel_scope.fix_commit_seams(cfg.get("path") or "", anchor, head_sha)
+                 if attributable and range_kind == FIX_RANGE_OK else None),
+        # The anchor round's brief, the floors it was banded under and its own id map,
+        # all off ONE payload (`load_baseline`) on `budgeted_brief`'s rule: which of
+        # those findings were sub-floor is a question about that round's policy, and
+        # pairing a brief with another round's floors would reclassify what the pass
+        # was paying for.
+        brief=prior.fixed_findings, dials=prior.fixed_dials, ids=prior.fixed_ids,
+        # …and which of that brief was a Sonar hard-gate issue, which is never
+        # sub-floor whatever severity it carries. The pair with the `caused` filter
+        # below: one keeps a gate issue out of the list an excision drops, the other
+        # keeps a gate issue's own fix from being the thing excised.
+        gate=prior.fixed_gate,
+        # Panel findings only. A Sonar hard-gate issue is exempt from both severity
+        # floors at every rule in `round_stop`, because it is an external gate's
+        # verdict rather than a judged opinion — and #627's whole argument is that
+        # nothing above the floor was owed in the first place. That argument cannot be
+        # made about a finding no floor applies to, so an excision never takes one out
+        # of a fixer's list. The gate itself is the other half: the issue goes away
+        # when the code does, and Sonar is what says so, not this.
+        caused=[f for f in introduced_by_pass
+                if f["key"] not in {c.key for c in sonar}],
+        # The two readers, on `excision_state`'s contract. `head_sha` is this round's
+        # own commit, so the blame is of the tree the findings were raised against —
+        # the same tree `_provenance` placed them in.
+        blame=lambda file: panel_scope.blame_owners(cfg.get("path") or "", head_sha,
+                                                    file),
+        added=lambda sha: panel_scope.commit_insertions(cfg.get("path") or "", sha))
+    # The findings an excision takes away with it. #627: "the finding it caused
+    # disappears with it and is not handed to a fixer, because there is no longer
+    # anything for a fixer to be briefed about." The report lists them under their own
+    # heading and the payload flags them, exactly as a below-floor finding is handled
+    # (#165) and for the same reason: an orchestrator pasting "the To fix list" into a
+    # brief must not be able to sweep them up with it.
+    #
+    # Every rule in `round_stop` still counts them, and that is deliberate rather than
+    # an oversight — see `round_stop`'s own docstring. Excising the fix removes the
+    # cause; it is the NEXT round that gets to observe that it did, and a round which
+    # dropped the finding from its own arithmetic would be recording a repair it had
+    # not seen.
+    excised_keys = {str(f.get("key") or "")
+                    for entry in excision["excise"] for f in entry["caused"]}
+    excised = [c for c in for_fix if c.key in excised_keys]
+    for_fix = [c for c in for_fix if c.key not in excised_keys]
+    if excision["count"]:
+        notes.append(
+            f"{excision['count']} sub-floor fix(es) are being EXCISED rather than "
+            "repaired (#627): "
+            + "; ".join(
+                f"`{e['commit'][:8]}` ({e['subject']}) answered "
+                f"{e['answered']['severity']} {e['answered']['title']!r}, which goes "
+                f"back on the board unfixed, and caused "
+                f"{_by_severity(e['caused'])} which go away with it — "
+                f"`{e['command']}`"
+                for e in excision["excise"])
+            + f". Each removes {sum(e['destroys']['lines'] for e in excision['excise'])} "
+              "line(s) the fix wrote, and what those lines were WORTH is not priced "
+              "here (#558) — a sub-floor fix is very often the only test over the path "
+              "it was written for")
+    for refused in excision["declined"]:
+        notes.append(
+            "a sub-floor fix was NOT excised (#627): " + refused["why"]
+            + (f" — {_by_severity(refused['caused'])} attributed to it stay in the "
+               "cycle and are handed to a fixer like any other finding"
+               if refused.get("caused") else ""))
 
     # ---- #624: the pass itself, as one addressable artifact.
     #
@@ -5117,6 +5223,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # gate ended, naming the commit range that is still on the
                       # branch and pricing what undoing it would cost.
                       revert=revert,
+                      # #627's excision, assembled above. It decides nothing here
+                      # either — it cannot stop the cycle and cannot buy one another
+                      # round — and the reason is not `revert`'s: this one is a
+                      # CORRECTION rather than a decision, so the round that names it
+                      # carries on exactly as it would have.
+                      excision=excision,
                       # #505's volume rung beside it. The series is the trend block's
                       # own `new_findings` column — every round's count of findings no
                       # earlier round raised, this one included — so the block a reader
@@ -5910,6 +6022,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                     "declined": c.key in live_declined,
                     "below_fix_floor": below_floor(c),
                     "below_threshold": below_threshold(c),
+                    # #627. On the finding for `escalated`'s reason: this is the flag
+                    # that says a row is NOT this round's work because the fix that
+                    # caused it is being taken out, and an orchestrator building the
+                    # next brief has to see it without joining against
+                    # `round_stop.excision`. False on every round that named no
+                    # excision, which is every round of every repo whose fix passes
+                    # leave no seam.
+                    "excised": c.key in excised_keys,
                     "seats_required": dials.threshold_for(c.severity),
                     "budgeted_fix": budgeted(c)} for c in to_fix],
         "sonar_findings": [{**c.as_dict(), "new_this_round": is_new(c),
@@ -5920,6 +6040,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             "declined": c.key in live_declined,
                             "below_fix_floor": below_floor(c),
                             "below_threshold": False,
+                            # FALSE on a hard-gate issue, by construction rather than
+                            # by this line: #627's excision is handed only the panel's
+                            # own findings, because its argument — nothing above the
+                            # trigger floor was owed — cannot be made about a finding
+                            # no floor applies to. Written out for the reason
+                            # `escalated: False` is written out one bucket down: the
+                            # three buckets are deliberately ONE shape, and a key
+                            # missing here is a consumer finding a different row in the
+                            # next bucket.
+                            "excised": False,
                             "seats_required": 1,
                             "budgeted_fix": False} for c in sonar],
         "dismissed": [{**c.as_dict(), "new_this_round": is_new(c),
@@ -5936,6 +6066,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                        "declined": False,
                        "below_fix_floor": False,
                        "below_threshold": False,
+                       # False for `escalated`'s reason again: the master ruled it not
+                       # real, so no fixer was sent to it and no fix answered it. An
+                       # excision is about a fix that was made.
+                       "excised": False,
                        "seats_required": 1,
                        "budgeted_fix": False} for c in dismissed],
         # The eight #165/#297 dials AS APPLIED, not as written: a repo whose
@@ -6878,6 +7012,59 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             lines += accounts(c)
     else:
         lines.append("- none")
+
+    # #627, and a section of its own for #165's reason rather than a mark inside the
+    # list above: the two are read by different readers for different purposes, and an
+    # orchestrator that pastes "the To fix list" into a fixer's brief must not be able
+    # to sweep these up with it. There is nothing here for a fixer to do — the fix that
+    # caused them is coming out, and repairing it instead is the round this whole rule
+    # exists to skip.
+    # Gated on the BLOCK and not on `excised`, which is the subtraction from the
+    # fixer's list and can be empty while an excision exists: a caused finding that
+    # was also below the fix floor, or below the corroboration threshold, was never
+    # in **To fix** to be taken out of. Those stay under their own heading as well,
+    # where "not this round's work" is true for a second reason — the record of the
+    # decision is this section either way, and it is the section an orchestrator acts
+    # on.
+    if excision["excise"]:
+        lines.append("\n### Excised, not fixed "
+                     f"({sum(len(e['caused']) for e in excision['excise'])}) — the "
+                     "sub-floor fix that caused them is being removed (#627)")
+        lines.append(
+            "_A round attributed each of these to a fix that answered a finding below "
+            # The ANCHOR round's floor, off the block that applied it — this report is
+            # written under THIS round's dials, and a floor moved between the two would
+            # otherwise have the sentence name a cut the classification did not use
+            # (found by a Codex second opinion).
+            f"the `{excision['floor']}` cut. The response is to **revert that "
+            "fix**, not to repair it: the sub-floor finding it answered goes back on "
+            "the board as reported-and-not-fixed, exactly as an unpaid budget item "
+            "does, and the finding it caused goes away with it. This is not an "
+            "escalation, not a stop and not a decision to take to a human — the cycle "
+            "carries on. Run the command, record the finding it answered `deferred` "
+            "with its one-line note (§4b), and hand a fixer NONE of the findings "
+            "below._")
+        for entry in excision["excise"]:
+            back = entry["answered"]
+            lines.append(
+                f"- ✂️ `{entry['commit'][:8]}` — {entry['subject']} — answered "
+                f"**{back['severity']}** {back['title']!r}, which returns to the board "
+                f"unfixed. `{entry['command']}`")
+            # `caused` and not `c`: a `for` binding leaks into the enclosing
+            # function, and `c` is the name the finding loops around this one use.
+            for caused in entry["caused"]:
+                lines.append(f"    - **{caused['severity']}** `{caused['file']}"
+                             + (f":{caused['line']}" if caused.get("line") else "")
+                             + f"` — {caused['title']}")
+            destroys = entry["destroys"]
+            lines.append(
+                f"    - _removes {destroys['lines']} line(s) across "
+                f"{len(destroys['files'])} file(s)"
+                + (f", {destroys['guard_lines']} of them in test or documentation "
+                   "paths" if destroys["guard_lines"] else "")
+                + ". What those lines were WORTH is not priced here (#558): a "
+                  "sub-floor fix is very often the only test over the path it was "
+                  "written for, and the finding that returns says nothing about that._")
 
     # The other half of the fix floor (#165), and it has to be a section of its own
     # rather than a mark inside **To fix**: the two lists are read by different

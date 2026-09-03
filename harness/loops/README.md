@@ -1774,6 +1774,123 @@ losing a declared defect over its adjective would be this issue's own bug commit
 by its fix. A value with no finding key in it is refused outright, for
 `--escalated`'s reason.
 
+### A sub-floor fix that caused findings is excised, not repaired (#627)
+
+`escalate_on.fix_injection` ends a cycle whose fix pass generated more than half of the
+round's work, and `round_stop.revert` prices undoing that pass and hands the decision to
+a human. That refusal to act is deliberate and stands: a fix pass is **mixed**, so
+reverting one that cleared three P2s to remove five P3s puts the P2s back, and nothing in
+the loop can tell which half is which without asking.
+
+**A single fix that answered a finding below `round_trigger_floor` is not a mixed pass.**
+It answered one complaint that was, by definition, not blocking the close, so the whole
+cost of removing it is one P3 or P4 going back on the board unfixed — the state every
+unpaid budget item is already in, which the repo's own policy calls reportable and
+non-blocking. There is nothing to weigh, so there is no decision to take upstairs. This
+is the one backtrack the loop takes on its own, and it is decided rather than proposed:
+excise the fix, hand the sub-floor finding back to the board, drop the finding it caused,
+and carry on with the round.
+
+Recorded every round as **`round_stop.excision`**:
+
+| key | what it says |
+| --- | --- |
+| `kind` | the fix range's own verdict — `ok`, `no-fix`, `blind`, `rewritten`, `not-asked` — #500's vocabulary, not a second one |
+| `count` | how many excisions this round names. **`null` is "nobody looked"** — round 1, a rebased range, an anchor payload whose trigger floor cannot be read, a checkout that could not list the pass — and `0` is a measured none. `why` says which |
+| `sub_floor` / `seams` | how many findings below the floor the pass was sent to, against how many of its commits named exactly one of them. `seams: 0` with `sub_floor` above zero is a pass that left nothing to excise |
+| `floor` | the trigger floor the classification used, which is the **anchor** round's and not this one's — a floor moved between rounds must not reclassify what the last pass was paying for, and the report is written under this round's dials |
+| `excise[]` | per fix: the `commit`, its `subject`, the `command` (`git revert --no-commit <sha>`), `answered` (the sub-floor finding that comes back unfixed) and `caused` (the findings that go away with it) |
+| `declined[]` | a seam refused, with the sentence saying why: a later commit built on the fix, the commit answered more than one finding, it is a merge, or the checkout could not be read |
+| `excise[].destroys` | the files, lines and guard lines the excision removes — a count, not a valuation (see below) |
+
+**How the fix is identified, and why it is blame rather than a diff.** `_provenance`
+attributes a finding to the fix **pass**: its added-line set is the whole range's, so a
+finding standing on one commit's line is indistinguishable from one standing on another's.
+`git blame` of the finding's own line at this round's head answers the finer question, and
+it answers it in the head's line numbers — which a per-commit diff cannot, because every
+later commit in the pass renumbers its post-image. The fixer's side of it is one line in
+`review-pr.md`: land each budgeted fix as its own commit and put the finding's id
+(`[1609-F03]`, as the **To fix** list prints it) in the body. A pass that left no seam is
+reported as such and nothing is aimed approximately.
+
+**The revert cannot cascade, and that is tested rather than assumed.** A sub-floor fix
+whose lines a later blocking fix built on is not a clean excision — taking it out takes
+part of a P1's fix with it, which is the mixed revert this rule is careful not to be. The
+test is that **every line the commit added is still the commit's own at the head**: fewer
+means a later commit rewrote or removed part of it, more means blame credits it with lines
+its own diff did not count (a rename), and either way the excision is declined with the
+two numbers in the sentence.
+
+**It moves no verdict.** The caused finding is still outstanding to every rule in
+`round_stop`, so a round that names an excision goes again exactly as it would have
+without one — which is #627's "the cycle continues", and why there is no `fired` or
+`offered` beside `count`. Excising the fix removes the cause; it is the **next** round
+that gets to observe that it did. A Sonar hard-gate issue is never excised: it is exempt
+from both severity floors at every rule, and this rule's whole argument is that nothing
+above the floor was owed.
+
+**Its own restoration is CHURN, it is counted, and #559 is why that is not a
+contradiction.** Two questions get confused here and this mechanism answers them
+differently on purpose.
+
+*How much surface was disturbed* — #692's decided unit, churned lines, cumulative across
+passes rather than the size of the surviving diff. An excision is a pass that touches
+lines: it deletes what the sub-floor fix wrote and restores what that fix replaced.
+**None of it is exempted.** The excision commit lands inside the next round's fix range,
+so the churn split (#554), the guard ceiling (#618), the budget pricing (#622) and the
+surface count (#619) all see it like any other commit. The branch was touched, and a
+correction that touched code is still a touch.
+
+*Who wrote this line* — #559, the mirror case, which established that restoring
+already-reviewed code counts as WRITING it to a line diff, so a naive revert inflates
+`escalate_on.fix_injection` and the remedy for the gate reads to the gate as the disease.
+The lines an excision puts back sat at an earlier round's head **by construction** — the
+sub-floor fix landed after it — so `restored_lines` is looking for exactly them and takes
+them out of `introduced`. The honest limit is `RESTORED_RUN_MIN`: runs shorter than five
+lines are not filtered, deliberately, because a blank line and a `return None` are
+byte-identical to lines in almost any file. An excision smaller than that is not
+distinguished from authorship, and the exposure is one round's `introduced` count leaning
+high by a handful of lines.
+
+**`low_severity_fix_lines` is one of those readings, and the excision IS charged to it.**
+`fix_budget_state` prices the referee's split; the revert commit is in that split; its
+churn is priced at insertions plus deletions exactly as the fix it removes was. An
+earlier draft of this section claimed the exemption and no code implemented it — a
+different-vendor review of PR #708 found the contradiction with the paragraph above.
+There is an argument for the exemption (a round should not be priced for undoing work it
+was told not to have done, and that bites hardest where the budget is tightest, which is
+where this fires most), but taking it would mean finding the revert commit inside the
+next round's fix range and subtracting its churn from a total the fixer's own brief
+prices the same way — and #692 settled the unit as churned lines so that no correction
+gets to be free. **The exposure is stated rather than closed:** where the rest of the
+anchor round's brief was wholly budgeted, `budgeted_brief` supplies the strict premise
+and a large excision can fire an overspend against a pass that only did what the rule
+ordered.
+
+**Where this joins the fix-pass record (#624).** That record is an *assembly* of the
+five rungs a round already derives, at the grain of the **pass**; this is the one thing
+in the loop derived at the grain of the **fix**, and it derives it from commits and blame
+that nothing else reads. So there is no second derivation of anything #624 holds, and the
+right shape once it lands is for the record to carry this the way it already carries
+`revert`: one more sibling, read off the block that computed it.
+
+**What it does NOT price is what the excision destroys, and #558 is open on exactly
+that.** `destroys` names the files, the line count and how many of those lines sit in test
+or documentation paths; it does not say what they were worth. A sub-floor fix is very
+often the only test over the path it was written for — on `lexray#1697` two "P3 findings
+return" entries were the sole coverage of the mechanism the PR existed to build, and round
+3 raised both at P2 — and `answered` says nothing about that. The rule is not conditioned
+on a pricing that does not exist: #621's decision is that a sub-floor fix causing findings
+is excised, and the cost side of it is one non-blocking finding returning. What this
+does instead of inheriting the broken half is name the gap in the payload, in the report
+and in the orchestrator's brief, so nobody reads `answered` as the whole cost.
+
+**Selective replacement of a MIXED pass still needs #623.** "Keep the repairs that
+answered a regression and drop the ones that answered an observation" is not a
+distinction `git` can make, and findings carry no type today. This rule stays inside the
+case that is decidable without one: a fix whose finding was below the floor, aimed by a
+seam the fixer named, refused wherever anything later touched it.
+
 ### What the cycle leaves behind — `round_stop.outstanding` (#42)
 
 `stop` answers **one** question: *should another panel run?* It is a question about

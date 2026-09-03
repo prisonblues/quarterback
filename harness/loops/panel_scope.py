@@ -549,6 +549,241 @@ def reconstruct_fix_range(repo_path: str, gh_repo: str, base_ref: str,
     return out
 
 
+# ------------------------------------------------------------------ #627: the three
+# local reads an EXCISION needs, which the compare endpoint cannot answer.
+#
+# `fix_pass_commits` below names a pass's commits for a proposal a human reads. #627
+# is the one backtrack the loop takes on its own, and it needs three things that
+# compare does not carry: the commit MESSAGE (which is where a fixer names the finding
+# a hunk answers, and a compare `--jq` gives only the subject line), the commit's own
+# INSERTION COUNT per file, and — for each finding this round raised — WHICH commit
+# last wrote the line it sits on.
+#
+# All three are local git, and that is deliberate rather than incidental. The one API
+# call #506 makes is paid only on a round whose injection rate crossed the threshold,
+# because a network round trip on every round is a cost this repo refuses. These are
+# reads of an object store already on the disk, so they are affordable on the rounds
+# where an excision is actually possible — and a checkout that cannot answer them is
+# #500's honest blindness, reported and never guessed at.
+
+
+#: How many commits of one fix pass :func:`fix_commit_seams` will read (#627).
+#:
+#: A fix pass is a handful of commits — the shape #506 documents is four — and a
+#: range holding more than this is not a pass anybody is taking one hunk out of. The
+#: reader DECLINES past the ceiling rather than reading the first fifty, on
+#: :func:`_patch_ids`' rule: a seam set computed over part of a range would let a
+#: later commit that built on the seam sit outside the window this checked, which is
+#: precisely the cascade the rule exists to refuse.
+EXCISION_MAX_COMMITS = 50
+
+#: The separators :func:`fix_commit_seams` reads its `git log` back with. A commit
+#: message is arbitrary text — a fixer pastes a finding's own line out of a report
+#: into it — so the record and field separators have to be bytes a message cannot
+#: plausibly hold. ASCII 30 and 31 are the ones git will write literally out of a
+#: `--format` string, and a message carrying either is treated as unreadable rather
+#: than mis-split (see the function).
+_LOG_RS, _LOG_FS = "\x1e", "\x1f"
+
+#: One line of `git blame --porcelain`'s per-line header: the commit, the line's
+#: number in that commit, its number in the file being blamed, and — on the first
+#: line of a group — how many lines the group runs for. Every line gets a header,
+#: which is what makes this a complete map rather than a sample.
+_BLAME_HEADER = re.compile(r"^([0-9a-f]{40}) (\d+) (\d+)(?: (\d+))?$")
+
+
+def fix_commit_seams(repo_path: str, base_sha: str | None, head_sha: str | None
+                     ) -> dict:
+    """The commits of one fix pass with the MESSAGE each landed under, as
+    ``{"commits": [...], "why": None}`` — #627's seam reader.
+
+    A commit is ``{"sha", "subject", "message", "merge"}``. ``message`` is the whole
+    body, because that is where the fixer names the finding the commit answers
+    (`review-pr.md` step 3: "each one stays its own hunk or its own commit, named in
+    the commit body by the finding it answers"), and a subject line is not it.
+
+    ``why`` is a SENTENCE and the only thing a caller may read when ``commits`` is
+    empty, on :func:`restored_lines`' rule: "this checkout could not tell me" and
+    "this pass landed as one commit with no seam in it" are different news, and a
+    consumer that inferred the first from an empty list would report a fixer as having
+    left no seam whenever the panel ran outside a clone.
+
+    Never raises and never half-answers. :func:`_git` returns one ``None`` for every
+    failure — no git, no checkout, a commit this clone does not carry, a hung call —
+    and each of them lands here as a ``why`` with no commits, because a seam set
+    computed from a range that was only partly read is a set whose later commits were
+    never checked for having built on the seam.
+
+    ``merge`` is carried per commit rather than counted for the range, which is the
+    difference between this and :func:`fix_pass_commits`. There the question is
+    whether a WHOLE range may be handed to `git revert`, and one merge anywhere
+    refuses it; here the question is asked of one commit at a time, so a merge
+    elsewhere in the pass does not disqualify a seam that is not one.
+    """
+    out: dict = {"commits": [], "why": None}
+    if not (base_sha and head_sha):
+        return {**out, "why": "there is no fix range to read commits out of"}
+    if base_sha == head_sha:
+        return {**out, "why": "nothing landed between the rounds, so there is no fix "
+                              "to excise"}
+    span = f"{base_sha}..{head_sha}"
+    count = _git(repo_path, "rev-list", "--count", span)
+    if count is None:
+        return {**out, "why": f"this checkout could not list the commits in {span} — "
+                              "it may not carry them"}
+    try:
+        total = int(count.strip())
+    except ValueError:
+        return {**out, "why": f"the commit count for {span} came back unreadable"}
+    if not total:
+        # Read, and empty. `base_sha == head_sha` above catches the commonest shape and
+        # not every one: an explicit `--since` naming a REF rather than a sha compares
+        # unequal to the head and still resolves to it, and a caller must not read that
+        # as "the commits could not be read" — the answer is that there is no fix to
+        # excise, which is a fact about the cycle rather than a gap in this reader.
+        return {**out, "why": "nothing landed between the rounds, so there is no fix "
+                              "to excise"}
+    if total > EXCISION_MAX_COMMITS:
+        return {**out, "why": f"the fix range holds {total} commits, past the "
+                              f"{EXCISION_MAX_COMMITS} this reads — a pass that size is "
+                              "not one a single hunk can be taken out of, and reading "
+                              "part of it would leave the commits that may have built "
+                              "on a seam outside the window"}
+    log = _git(repo_path, "log", "--reverse", "--no-color",
+               f"--format={_LOG_RS}%H{_LOG_FS}%P{_LOG_FS}%B", span)
+    if log is None or len(log) > FIX_RANGE_MAX_CHARS:
+        return {**out, "why": f"the commit messages in {span} could not be read"}
+    # ONE FRAGMENT PER COMMIT, COUNTED AGAINST `rev-list` BEFORE ANY OF IT IS BELIEVED.
+    # `--format` writes the record separator BEFORE each entry, so the stream opens with
+    # an empty fragment and holds exactly `total` after it. A message carrying the RECORD
+    # separator splits its own entry in two, and the tail is then parsed as a commit of
+    # its own: a body ending `\x1e<some other sha>\x1f<anything>\x1fAnswers 77-F01`
+    # yields a fully-formed record naming a commit whose real message never named that
+    # finding — and `excision_seams` keys seams by sha, so the excision is then aimed at
+    # THAT commit, which may be the blocking fix this rule exists to leave alone. A
+    # separator that only truncates rather than forging still loses the tail of a
+    # message, which is where the finding is named.
+    #
+    # The count is the whole guard and it is complete: every mis-split ADDS a fragment
+    # (the real entries each still begin with their own `%H`), so a stream that does not
+    # hold exactly one fragment per commit is one this cannot read. Refused for the whole
+    # range rather than per record, on the rule below — a commit this cannot read is a
+    # commit that cannot be checked for having built on a seam. Found by a Codex second
+    # opinion; the docstring already claimed this and the code did not do it.
+    records = log.split(_LOG_RS)
+    if len(records) != total + 1 or records[0].strip():
+        return {**out, "why": f"a commit message in {span} carries the record separator "
+                              "this reads the log back with, so the pass cannot be "
+                              "split into its commits"}
+    commits = []
+    for record in records[1:]:
+        parts = record.split(_LOG_FS)
+        if len(parts) != 3:
+            # A message carrying the FIELD separator, which splits a record into more
+            # pieces than it has fields. Same refusal and for the same reason.
+            return {**out, "why": f"a commit message in {span} could not be split "
+                                  "into its fields, so this pass cannot be read"}
+        sha, parents, message = parts
+        sha = sha.strip()
+        if not _SHA_TEXT.fullmatch(sha):
+            return {**out, "why": f"a commit id in {span} came back unreadable"}
+        commits.append({"sha": sha,
+                        "subject": message.strip().splitlines()[0].strip()
+                        if message.strip() else "",
+                        "message": message,
+                        "merge": len(parents.split()) > 1})
+    out["commits"] = commits
+    return out
+
+
+def commit_insertions(repo_path: str, sha: str) -> dict[str, int] | None:
+    """``{path: insertions}`` for ONE commit, or None if it could not be read.
+
+    The denominator of #627's cascade test: how many lines the commit added, against
+    how many of them :func:`blame_owners` still attributes to it at the head. Equal
+    means nothing later in the pass has touched the fix's own lines and taking it out
+    is a clean excision; fewer means a later commit rewrote part of it, and a revert
+    of the commit is then no longer the removal of one fix.
+
+    Insertions only. A commit's deletions are what a revert PUTS BACK, and what
+    comes back is priced by the finding that returns to the board rather than by a
+    line count; the lines that must still be the commit's own are the ones it wrote.
+
+    None, not ``{}``, for every failure, on :func:`_patch_ids`' rule: an empty map is
+    "this commit added no line" — true of a pure deletion, and a commit no finding can
+    be standing on — while a failure means the test cannot be made, and a caller that
+    read them alike would call an unreadable commit cleanly excisable.
+
+    ``--no-renames``, and it is about the PATHS rather than about the counts. With
+    rename detection on, `--numstat` prints one row spelled `src/{a => b}.py` — a
+    string that is not a path either side of the rename, so the caller's blame of it
+    fails and the excision declines for the wrong stated reason. Off, a rename is an
+    add and a delete, the paths are literal, and the delete's zero-insertion row makes
+    the same commit decline through :func:`blame_owners` returning ``None`` for a file
+    the head no longer carries — the right answer with the right sentence.
+    """
+    if not _SHA_TEXT.fullmatch((sha or "").strip()):
+        return None
+    out = _git(repo_path, "show", "--numstat", "--format=", "--no-color",
+               "--no-renames", sha.strip())
+    if out is None or len(out) > FIX_RANGE_MAX_CHARS:
+        return None
+    counts: dict[str, int] = {}
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            return None
+        added, path = parts[0].strip(), parts[-1]
+        if added == "-":
+            # A binary file. Nothing here can be a finding's line and nothing can be
+            # blamed, so a commit touching one cannot be shown to be cleanly
+            # excisable — the caller reads a path it cannot count as a decline.
+            return None
+        try:
+            counts[path] = int(added)
+        except ValueError:
+            return None
+    return counts
+
+
+def blame_owners(repo_path: str, head_sha: str, file: str) -> dict[int, str] | None:
+    """``{line: commit}`` for one file at one commit — which commit last WROTE each
+    line — or None if it could not be read.
+
+    #627 needs attribution at the grain of the individual fix, and
+    :func:`_provenance` works at the grain of the pass: its ``added`` set is the whole
+    range's, so a finding standing on a line one commit of the pass wrote is
+    indistinguishable from one standing on a line another commit wrote. Blame answers
+    exactly that question, and it answers it in the head's OWN line numbers — which is
+    what a per-commit diff cannot do, because its numbers are its own post-image and
+    every later commit in the pass renumbers them.
+
+    It is one tool doing both of the jobs #627 lists, and that is the reason it is
+    blame rather than a walk over per-commit patches. The attribution is "which commit
+    owns this finding's line"; the cascade test is "does that commit still own all the
+    lines it wrote". A later commit that rewrote a seam's lines fails the second and
+    also, by construction, moves the finding off the seam in the first — so the two
+    answers cannot disagree about whether a fix is still there to be taken out.
+
+    Rename detection is deliberately OFF (`-C`/`-M` are not passed). A seam whose file
+    a later commit renamed is a seam whose lines a later commit moved, and following
+    them would report a clean excision of a commit whose paths no longer exist.
+    """
+    if not (_SHA_TEXT.fullmatch((head_sha or "").strip()) and file):
+        return None
+    out = _git(repo_path, "blame", "--porcelain", head_sha.strip(), "--", file)
+    if out is None or len(out) > FIX_RANGE_MAX_CHARS:
+        return None
+    owners: dict[int, str] = {}
+    for line in out.splitlines():
+        got = _BLAME_HEADER.match(line)
+        if got:
+            owners[int(got.group(3))] = got.group(1)
+    return owners
+
+
 #: How many of a fix pass's commits a proposal will list by name (#506). A revert
 #: proposal is read by a human deciding whether to undo a pass, and a pass of four
 #: commits is the shape that decision is usually about; beyond this the list stops
@@ -3694,6 +3929,8 @@ __all__ = [
     "FIX_RANGE_OK", "FIX_RANGE_NO_FIX", "FIX_RANGE_BLIND", "FIX_RANGE_REWRITTEN",
     "RECONSTRUCT_TIMEOUT_S", "RECONSTRUCT_MAX_COMMITS",
     "_git", "_patch_ids", "reconstruct_fix_range",
+    "EXCISION_MAX_COMMITS", "_LOG_RS", "_LOG_FS", "_BLAME_HEADER",
+    "fix_commit_seams", "commit_insertions", "blame_owners",
     "_mergeable_now",
     "_merge_base_now", "_MERGE_BASE_JQ", "_SHA_TEXT",
     "_base_tip_now",
