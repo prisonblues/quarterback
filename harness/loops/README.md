@@ -2747,7 +2747,7 @@ that had written up that exact confusion an hour earlier.
 | `pr_state` | Not OPEN, a draft, or `CONFLICTING`. Uncomputed mergeability warns. |
 | `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
 | `ci` | Anything but `green`. Six states since [#324](https://github.com/prisonblues/quarterback/issues/324) — `green`, `red`, `pending`, `blocked` (a run exists and is waiting on a human to approve it, so it has executed nothing), `none` (no run was created for this head) and `unknown` (the state could not be read). A push restarts CI, so an earlier green is stale; and the last three are silence, which is never green. A `blocked` HOLD names the newest run on the branch that actually executed. |
-| `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
+| `review` | The board's newest round for this PR read another commit, did not `stop`, still owes work on its own disposal (`outstanding.fixable + outstanding.escalated`, or `confirmed > 0` where no disposal was recorded), or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
 | `merge_claim` | Another agent holds `kind=merge` on `<repo>:<base>` — it is landing onto this PR's base right now. Keyed on the base rather than the head since [#318](https://github.com/prisonblues/quarterback/issues/318): two agents landing two *different* PRs into `main` is the collision worth serialising, and under head keys they never see each other. |
 | `queue` | This PR is not at the head of the merge queue for its base, or is not in the line at all while others are ([#227](https://github.com/prisonblues/quarterback/issues/227)). The reason names the position and who holds the place ahead. An empty line passes silently; a board with no `/merge-queue` reports `skipped-absent`. |
 | `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
@@ -2756,9 +2756,26 @@ that had written up that exact confusion an hour earlier.
 The last two also HOLD when `origin/<base>` could not be refreshed — they are answers about the gap between this branch and the base, and a base last fetched yesterday produces a confident NOOP about a head that moved this morning. `--no-fetch` makes that the caller's choice instead, noted once on the run.
 
 The `review` clauses are the round's **own statements** — `head_sha`, `stopped`,
-`confirmed`, `sonar_gate` — read back rather than re-derived. #62 spent three rounds
-discovering that merge gates trust proxies (the exit code, then the push, then the
+`confirmed`, `outstanding`, `sonar_gate` — read back rather than re-derived. #62 spent three
+rounds discovering that merge gates trust proxies (the exit code, then the push, then the
 existence of a payload file), and this must not become the fourth.
+
+**Severity, and where it comes from** ([#717](https://github.com/prisonblues/quarterback/issues/717)).
+This gate had none: any nonzero `confirmed` was a HOLD, and the file did not contain the
+word. That contradicts `review_panel.fix_severity_floor`, whose entire content is that
+findings below it are *reported and not fixed here* (#165) — so a repo running a raised
+floor could essentially never reach READY, because a round asked to find problems almost
+always finds a P3. It now rules on the round's own disposal, which `round_stop` has
+published since #42 and the board has stored since #717: HOLD on `fixable + escalated`,
+**warn** on `below_floor`. Three things it deliberately does not do. It does not subtract
+anything from `confirmed` — that count is over a larger population (findings an outcome has
+already cleared are gone from the disposal), so a difference between them is a number about
+neither. It does not compare a severity against a floor itself; the floors are repo dials
+the board holds opaquely, and a second reading of them here would be free to disagree with
+the round it is ruling on. And it does not soften on silence: escalated findings block at
+any severity (#221), a round that recorded no disposal is held on the raw `confirmed` count
+exactly as before, and a round that recorded no count at all is still held — unknown is not
+zero, in either clause.
 
 `stop_confident: false` is a **warning, not a hold** by default, deliberately: two
 permanently-absent reviewer seats on a headless box would otherwise make a green verdict

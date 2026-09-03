@@ -432,9 +432,13 @@ commands and the files they touch), or `HOLD` (exit 2, with what is unresolved a
 to resolve it). `--json` for a loop, plain text for a person.
 
 It is not a new gate. It is the gates the harness already had — CI green *now*, the panel's
-newest round read *this* commit and stopped with nothing confirmed, one migration head,
+newest round read *this* commit and stopped owing nothing, one migration head,
 no failing Sonar gate, nobody else landing the same branch — read in one place instead of
-described in two. `/fix-and-land` used to hold about fifty lines of prose about them and
+described in two. "Owing nothing" is the round's own disposal of what it found (#42, #717):
+`fixable + escalated` holds the merge, and findings under the repo's `fix_severity_floor`
+are warned about, because that dial's whole content is that they are reported and not fixed
+here (#165). A round that recorded no disposal is held on its raw confirmed count, as
+before. `/fix-and-land` used to hold about fifty lines of prose about them and
 `/panel-review-pr` held none, which is how they came to disagree; both now call this and
 act on the verdict.
 
