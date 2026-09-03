@@ -1050,9 +1050,9 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     # that, and dismissing a false positive is its stated job.
     with tempfile.TemporaryDirectory(prefix="panel-judge-") as tmp:
         if code_tree is not None:
-            sandbox, reads_code = panel_seats.seat_checkout(code_tree, Path(tmp) / "cwd")
+            sandbox, reads_code = panel_seats.seat_checkout(code_tree, Path(tmp) / "seat")
         else:
-            sandbox, reads_code = member_sandbox(Path(tmp) / "cwd"), False
+            sandbox, reads_code = member_sandbox(Path(tmp) / "seat"), False
         if reads_code:
             # Told, and pinned, exactly as a reviewer seat is — the brief is what
             # stops it treating the diff as the whole record, and the pin is what

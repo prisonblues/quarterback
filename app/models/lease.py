@@ -25,7 +25,13 @@ class Lease(Base):
     device: Mapped[str] = mapped_column(Text, nullable=False)
     holder: Mapped[str] = mapped_column(Text, nullable=False)  # token name (see auth.identify)
     cwd: Mapped[str | None] = mapped_column(Text)              # project dir (for revive)
-    repo: Mapped[str | None] = mapped_column(Text)             # git repo name (topic-overlap match)
+    #: The repo this session is standing in, as the holder reports it — the origin
+    #: remote's ``owner/name``, or a bare repository name from a checkout with no
+    #: GitHub remote (and from every lifecycle hook older than #714). The one repo
+    #: column on this board that is a *report* rather than a key, so it holds either
+    #: shape and the reads match it by repository name: see :mod:`app.repomatch`,
+    #: which carries the argument and the false-clean that made it.
+    repo: Mapped[str | None] = mapped_column(Text)
     branch: Mapped[str | None] = mapped_column(Text)           # git branch (finer overlap signal)
     title: Mapped[str | None] = mapped_column(Text)            # CC ai-title
     recap: Mapped[str | None] = mapped_column(Text)            # compact-summary head / last prompt
@@ -98,5 +104,17 @@ class Lease(Base):
 
     __table_args__ = (
         Index("ix_leases_session", "session"),
+        #: NOT what the collision reads use any more, and it is worth saying so
+        #: before somebody assumes otherwise. Since #714 ``/active`` and
+        #: ``/overlap`` match this column through ``lower(substring(rtrim(...)))``
+        #: (:func:`app.repomatch.name_clause`), which no plain b-tree can serve —
+        #: the fold is the point, because the column holds ``owner/name`` and a
+        #: bare name and only their common half can be compared. Left in place
+        #: rather than replaced: both reads are already bounded by
+        #: ``released_at IS NULL AND expires_at > now``, which no index serves
+        #: either, so the repo predicate has never been the selective one. If this
+        #: table ever grows enough to matter, the answer is an index on the LIVE
+        #: set — the predicate every one of these queries starts with — and a
+        #: functional index on the fold beside it, not the exact match back.
         Index("ix_leases_repo", "repo"),
     )

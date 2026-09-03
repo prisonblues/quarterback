@@ -318,10 +318,12 @@ SCOPE_WIDE = ("all", "fleet", "wide")
 def repo_name(value: str | None) -> str | None:
     """A repo in the one form these panels can be compared in, or None.
 
-    THREE spellings reach this dashboard for one repository. A lease reports a
-    bare ``quarterback``, because what it saw was the checkout's directory; the
-    plan and `gh` both report ``prisonblues/quarterback``; and a hand-written plan
-    item reports whichever the human typed. Folded to the bare name, lowercased,
+    THREE spellings reach this dashboard for one repository. A lease reports
+    ``prisonblues/quarterback`` off its origin remote — or, from a checkout with no
+    GitHub remote and from any lifecycle hook older than #714, the bare
+    ``quarterback`` it saw as the checkout's directory; the plan and `gh` both
+    report the slug; and a hand-written plan item reports whichever the human
+    typed. Folded to the bare name, lowercased,
     so what gets compared is repositories rather than spellings — comparing the
     slugs would put a seat's own FLEET row out of its own scope.
     """
@@ -3111,9 +3113,9 @@ def chip_repos(rows: list[dict]) -> list[str]:
     built from the rows they filter so every one of them has something behind it.
 
     Folded through :func:`repo_name` because three spellings reach this dashboard
-    for one repository — a lease reports a bare ``quarterback``, the plan and `gh`
-    report ``prisonblues/quarterback`` — and two chips for one repo would be two
-    filters that each hide half of it.
+    for one repository — the plan and `gh` report ``prisonblues/quarterback``, and
+    so does a lease since #714 unless its checkout has no GitHub remote — and two
+    chips for one repo would be two filters that each hide half of it.
 
     Alphabetical, and deliberately not by size: the chips are a place your eye
     goes back to, and an order that reshuffles whenever an agent starts or stops
