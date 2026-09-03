@@ -337,13 +337,47 @@ tp=$(printf '%s'  "$IN" | jq -r '.transcript_path // empty' 2>/dev/null)
 
 repo=""; branch=""
 if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
-  # Repo identity is the origin remote's name, not the directory's: a checkout
-  # cloned to a different local name is still the same repo to everyone else, and
-  # /sync has to agree with what the MCP tools (which read origin) call it. Falls
-  # back to the directory basename when there's no origin.
+  # Repo identity is the origin remote's, not the directory's: a checkout cloned
+  # to a different local name is still the same repo to everyone else, and /sync
+  # has to agree with what the MCP tools (which read origin) call it.
+  #
+  # `owner/name`, not the basename. The basename is what every board surface that
+  # KEYS on a repo refuses (`app/claimkey.py`, #148), so a lease reporting one made
+  # `/active?repo=prisonblues/lexray` — the spelling `plan_read` had just taught the
+  # agent, and the only one it accepts — answer that the coast was clear while three
+  # agents worked the repo (#714). The reads fold both shapes now, so this is not
+  # what fixes that; it is what stops the fleet's own heartbeat being the thing that
+  # needs folding.
   _origin=$(git -C "$cwd" config --get remote.origin.url 2>/dev/null)
-  repo=$(printf '%s' "${_origin:-$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)}" \
-         | sed -E 's#/+$##; s#\.git$##; s#.*[:/]##')
+  if [ -n "$_origin" ]; then
+    # Trailing slashes and one `.git` off the end first, so the slug pattern below
+    # need not also decide where the repository name stops. `sed -E` is POSIX ERE
+    # and has no lazy quantifier, so a name class that can match `.git` and an
+    # optional `(\.git)?` after it hands the suffix to the NAME: the first cut of
+    # this reported `prisonblues/quarterback.git`, which `canonical_repo` refuses
+    # for exactly the reason it is stripped here — GitHub allows no repository name
+    # ending in `.git`, so that spelling can only ever be a clone URL's suffix.
+    _url=$(printf '%s' "$_origin" | sed -E 's#/+$##; s#\.git$##')
+    # A GitHub remote in any of its spellings (https, ssh://, scp-style, with or
+    # without an explicit port), anchored on the host so a *path* remote cannot be
+    # read as `owner/name`: `/home/rich/source` would otherwise become `rich/source`,
+    # which is the open-domain guessing PR #152 was closed for.
+    #
+    # `(:[0-9]+)?` cannot eat the scp-style separator even for an all-digit owner
+    # (`github.com:123/repo`): ERE backtracks, and the only parse where the tail is
+    # an `owner/name` is the one where the port group matched nothing.
+    repo=$(printf '%s' "$_url" | sed -nE \
+      's#^([a-z+]+://)?([^@/]+@)?github\.com(:[0-9]+)?[:/]+([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*)$#\4#p')
+    # Not a GitHub remote: the bare name is genuinely all this checkout has, and the
+    # board's reads accept it. Only the *identity* is unavailable, not the grouping.
+    [ -n "$repo" ] || repo=$(printf '%s' "$_url" | sed -E 's#.*[:/]##')
+  fi
+  # No origin at all => NO repo. It used to fall back to the directory basename,
+  # which is why the panel's per-seat sandbox — a `git init` in a temp directory
+  # named `cwd` — put `repo: "cwd"` and `branch: "master"` on the board and read as
+  # an unexpanded variable. A throwaway repo nobody else can name is not a repo the
+  # fleet shares, and reporting one is worse than reporting none: it is a repo name
+  # a peer can ask about and be answered about.
   branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
 fi
 

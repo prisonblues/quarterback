@@ -414,6 +414,26 @@ async def test_the_landing_graph_read_refuses_a_spelling_that_is_neither(client,
     assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
 
 
+@pytest.mark.parametrize("repo", NOT_A_REPO_NOR_A_NAME + NOT_A_NAME_EITHER)
+async def test_the_collision_index_refuses_a_spelling_that_is_neither(client, repo):
+    """`GET /active` is the third read that takes a bare name, and the one where an
+    empty answer is most expensive: it is the pre-flight collision check, and its
+    own tool docstring says an empty result means the coast is clear. It accepted
+    ANY string and answered `[]` for it until #714 — see
+    `tests/test_collision_repo_scope.py` for the whole of that defect."""
+    r = await client.get("/active", params={"repo": repo}, headers=LAPTOP)
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
+@pytest.mark.parametrize("repo", NOT_A_REPO_NOR_A_NAME + NOT_A_NAME_EITHER)
+async def test_peer_discovery_refuses_a_spelling_that_is_neither(client, repo):
+    """`GET /overlap` is the fourth, and it is the call the fleet's CLAUDE.md tells
+    an agent to make on starting a piece of work."""
+    r = await client.get("/overlap", params={"mine": "s-spelling", "repo": repo},
+                         headers=LAPTOP)
+    assert r.status_code == 422, f"accepted {repo!r}: {r.text}"
+
+
 @pytest.mark.parametrize("repo", NOT_A_REPO)
 async def test_a_landing_EDGE_cannot_be_WRITTEN_under_any_of_them(client, repo):
     """The write is strict where the read is not, and here the asymmetry matters

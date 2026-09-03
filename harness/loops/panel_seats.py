@@ -880,6 +880,17 @@ def member_sandbox(where: Path) -> str:
     stop (:attr:`ReviewerRun.code_blind`), which is the mitigation available to a repo
     that keeps this function.
 
+    **This repo has no origin, and the board depends on that staying true** (#714).
+    A seat's cwd is a throwaway `git init`, so `qb-hook` — which runs in it, because
+    a hooked `claude -p` is how a seat is invoked — can read no origin remote and
+    therefore reports no repo for the session. It used to fall back to the directory
+    basename, which is how the board came to hold live agents in a repository called
+    `cwd` on a branch called `master`, indistinguishable from an unexpanded variable.
+    The directory is named `seat` for the same reason. Neither the fallback nor the
+    old name should come back: a name only this process can resolve is not a repo the
+    fleet shares, and putting one on a collision index gives peers something to ask
+    about and be answered about.
+
     A `git init` that fails is reported and then degraded past, never raised. **Every
     way it can fail, not just a non-zero exit** — `git` absent from PATH raises
     `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
@@ -4038,7 +4049,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # and through it the coverage veto and the payload — has to follow it
             # down. Believing the intent here is how a blind seat gets recorded as
             # a sighted one and has its declarations counted against the round.
-            sandbox, reads_code = seat_checkout(code_tree, tmpdir / "cwd")
+            sandbox, reads_code = seat_checkout(code_tree, tmpdir / "seat")
             if not reads_code:
                 # The prompt was composed BEFORE this staging could be attempted —
                 # `run` decides the brief when it builds the text, and only this
@@ -4053,7 +4064,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # will otherwise go looking for a checkout it was promised.
                 prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF)
         else:
-            sandbox = member_sandbox(tmpdir / "cwd")
+            sandbox = member_sandbox(tmpdir / "seat")
         #: What that sandbox COSTS the seat, recorded at the line that causes it.
         #: An empty repo and no file tools means the diff in the prompt is the
         #: seat's entire evidence, so anything it declares about code outside the

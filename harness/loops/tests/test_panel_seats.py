@@ -175,7 +175,7 @@ def test_the_sandbox_directory_exists_even_when_git_init_fails(monkeypatch, tmp_
     the actual cause. Degrading to the DOCUMENTED failure is the point."""
     monkeypatch.setattr(panel.subprocess, "run", lambda *a, **k: type(
         "P", (), {"returncode": 1, "stdout": "", "stderr": "fatal: nope"})())
-    made = panel.member_sandbox(tmp_path / "cwd")
+    made = panel.member_sandbox(tmp_path / "seat")
     assert Path(made).is_dir()
 
 
@@ -183,7 +183,7 @@ def test_a_real_sandbox_is_a_real_repo(tmp_path):
     """The one test here that runs git rather than mocking it — the mocked tests
     above all assert plumbing, and plumbing that produces a directory git does not
     recognise would satisfy every one of them while losing the codex seat."""
-    made = panel.member_sandbox(tmp_path / "cwd")
+    made = panel.member_sandbox(tmp_path / "seat")
     assert (Path(made) / ".git").exists()
     inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
                             cwd=made, capture_output=True, text=True)

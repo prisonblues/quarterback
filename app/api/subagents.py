@@ -9,6 +9,16 @@ Two coordination gaps this closes:
 - **No "who's live in this dir?" query.** ``GET /active`` folds active leases
   (top-level agents) and live sub-agents into one answer, filterable by ``cwd``,
   so an agent can check a worktree for occupants before diving in.
+
+Both reads here take a ``repo`` filter and both got it wrong in a way that reads
+as an all-clear (#714). ``Lease.repo == repo`` is raw equality over a column the
+lifecycle hook fills with the checkout **basename**, so the qualified
+``owner/name`` spelling every keyed surface on this board teaches — and refuses
+anything else — matched nothing and reported an empty board while three agents
+worked the repo. The sub-agent half of ``/active`` was worse: ``repo`` never
+filtered it at all, so the payload a caller reads as "who is in my repo" carried
+every live sub-agent on the fleet. :mod:`app.repomatch` holds the rule both halves
+now use, and the argument for its shape.
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ from app.models.lease import Lease
 from app.models.post import Post
 from app.models.subagent import Subagent
 from app.overlap import overlap_score
+from app.repomatch import AskedRepo, asked_repo, name_clause, name_matches
 from app.schemas import CWD_MAX, SESSION_MUTED_TYPES
 
 router = APIRouter(tags=["coordination"])
@@ -72,6 +83,63 @@ async def active_subagents(
     if cwd is not None:
         stmt = stmt.where(Subagent.cwd == cwd)
     return list((await session.scalars(stmt)).all())
+
+
+async def _subagents_in_repo(
+    session: AsyncSession, subs: list[dict], asked: AskedRepo, now: datetime
+) -> list[dict]:
+    """``subs``, narrowed to the ones whose PARENT is live in ``asked``.
+
+    A sub-agent has no repo of its own. The Task tool fires no lifecycle hook, so
+    the row carries a cwd, a label and a parent — nothing that names a repository —
+    and its repo is therefore its parent's, which is a second query rather than a
+    column. That is why ``repo=`` never narrowed this half of the answer at all
+    until #714: ``/active?repo=quarterback`` returned every live sub-agent on the
+    fleet, in every repo, inside the payload a caller reads as "who is in my repo".
+    The lease half's bug reported a clean board where there were peers; this half's
+    reported peers that were somewhere else entirely.
+
+    **A parent whose repo cannot be established keeps its sub-agents** — no live
+    lease, or no live lease that ever sent a repo. That is *unknown*, not "not in
+    your repo", and on the one endpoint whose job is that absence must not be
+    representable as a clean answer, unknown has to fall on the side that is still
+    visible. The row carries its ``cwd`` and its ``parent_session``, so a caller
+    that wants to resolve it can.
+
+    One query for the whole page rather than one per sub-agent: the live sub-agent
+    set is small, but it is unbounded in principle and a per-row lookup on the
+    endpoint agents are told to call *before every piece of work* is the wrong shape
+    to leave lying around.
+    """
+    parents = {s["parent_session"] for s in subs}
+    if not parents:
+        return subs
+    rows = await session.execute(
+        select(Lease.session, Lease.repo).where(
+            Lease.released_at.is_(None),
+            Lease.expires_at > now,
+            Lease.session.in_(parents),
+        )
+    )
+    # ANY live lease, not "the" live lease. `POST /lease` refuses a second device
+    # on one session, so two live rows for one parent should not arise — but they
+    # are not forbidden by a constraint, and picking one of them to answer for the
+    # session would decide a sub-agent's fate by row order. Asked this way the
+    # question has no order to depend on: matched if any live lease matches;
+    # attributed if any live lease names a repo at all.
+    matched: set[str] = set()
+    attributed: set[str] = set()
+    for sess_key, lease_repo in rows:
+        if lease_repo is None:
+            continue
+        attributed.add(sess_key)
+        if name_matches(lease_repo, asked):
+            matched.add(sess_key)
+    return [
+        s
+        for s in subs
+        if s["parent_session"] in matched or s["parent_session"] not in attributed
+    ]
 
 
 async def active_subagents_by_session(
@@ -174,7 +242,12 @@ async def list_active(
     _reader: str = Depends(reader),
     session: AsyncSession = Depends(get_session),
     cwd: str | None = Query(None, description="only agents live in this working dir"),
-    repo: str | None = Query(None, description="only agents live in this git repo"),
+    repo: str | None = Query(
+        None,
+        description="only agents live in this git repo, spelled `owner/name` or as "
+        "the bare repository name; a spelling that is neither is refused rather "
+        "than answered with an empty board",
+    ),
     device: str | None = Query(None, description="only agents on this device"),
     holder: str | None = Query(
         None,
@@ -201,8 +274,21 @@ async def list_active(
     Pass ``mine=<your session>`` to tag your own entries ``own=true`` (so a
     reader can signpost "yours" rather than mistaking its own sub-agents for
     peers); add ``peers_only=true`` to drop them from the result altogether.
+
+    **An empty answer here is read as "the coast is clear", so it has to mean
+    that.** ``repo`` accepts ``owner/name`` or a bare repository name and matches a
+    lease by repository name either way (:mod:`app.repomatch` — the column holds
+    both shapes, in any case), narrows the sub-agents through their parents' leases,
+    and refuses a spelling that is neither with a 422. Before #714 the first three
+    of those were routes to an all-clear made of nothing having matched, and the
+    fourth was the opposite mistake: the fan-out of the whole fleet, reported as
+    company in your repo.
     """
     now = _utcnow()
+    # Parsed once, before either half of the answer is built: `repo` has to mean the
+    # same thing to the leases and to the sub-agents, and the refusal has to happen
+    # before any of it rather than per-half.
+    asked = asked_repo(repo) if repo is not None else None
     # Both spellings of an agent select the same leases, so a peer holding only
     # the permanent key form doesn't have to know the name it maps to today.
     aliases: tuple[str, ...] = ()
@@ -211,8 +297,8 @@ async def list_active(
     lstmt = select(Lease).where(Lease.released_at.is_(None), Lease.expires_at > now)
     if cwd is not None:
         lstmt = lstmt.where(Lease.cwd == cwd)
-    if repo is not None:
-        lstmt = lstmt.where(Lease.repo == repo)
+    if asked is not None:
+        lstmt = lstmt.where(name_clause(Lease.repo, asked))
     if device is not None:
         lstmt = lstmt.where(Lease.device == device)
     if holder is not None:
@@ -249,6 +335,8 @@ async def list_active(
         for lease in leases
     ]
     subs = [_subagent_view(s) for s in await active_subagents(session, now, cwd=cwd)]
+    if asked is not None:
+        subs = await _subagents_in_repo(session, subs, asked, now)
     if device is not None:
         subs = [s for s in subs if s["device"] == device]
     if holder is not None:
@@ -265,7 +353,12 @@ async def find_overlap(
     _reader: str = Depends(reader),
     session: AsyncSession = Depends(get_session),
     mine: str = Query(..., description="the caller's own session id (always excluded)"),
-    repo: str | None = Query(None, description="restrict to peers live in this git repo"),
+    repo: str | None = Query(
+        None,
+        description="restrict to peers live in this git repo, spelled `owner/name` "
+        "or as the bare repository name; a spelling that is neither is refused "
+        "rather than answered with no peers",
+    ),
     subject: str | None = Query(
         None, description="the caller's title+recap; ranks peers by textual overlap with it"
     ),
@@ -283,6 +376,13 @@ async def find_overlap(
     ``subject`` present ⇒ rank by overlap and drop peers below ``min_score``.
     ``subject`` absent ⇒ every same-repo peer is returned (repo alone is the
     signal), score null.
+
+    **Same repo is matched by repository name, either spelling** — see
+    :mod:`app.repomatch`. This is the call the fleet's CLAUDE.md tells an agent to
+    make at the start of a piece of work, and with raw equality on the basename the
+    board stores it answered "no peers" to the qualified spelling every other tool
+    here insists on (#714). No peers is the answer that ends the conversation the
+    endpoint exists to start.
 
     **Same repo is not the same working tree, and the difference is the advice.**
     A peer in its own worktree shares nothing with you but a branch name; a peer
@@ -320,11 +420,12 @@ async def find_overlap(
       — must quote it, and must not let a leading ``-`` be read as a flag.
     """
     now = _utcnow()
+    asked = asked_repo(repo) if repo is not None else None
     lstmt = select(Lease).where(
         Lease.released_at.is_(None), Lease.expires_at > now, Lease.session != mine
     )
-    if repo is not None:
-        lstmt = lstmt.where(Lease.repo == repo)
+    if asked is not None:
+        lstmt = lstmt.where(name_clause(Lease.repo, asked))
     leases = (await session.scalars(lstmt)).all()
 
     scored: list[tuple[float | None, Lease]] = []

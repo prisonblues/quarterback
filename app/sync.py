@@ -21,9 +21,18 @@ def repo_key(value: str | None) -> str | None:
     """Loose repo identity: the bare name, lowercased.
 
     Repo names reach the board in two shapes — ``report_git`` registers worktrees
-    under the origin slug ("owner/name") while the lifecycle hook tags posts with
-    the checkout's basename ("name"). Matching on the last segment lets the two
-    agree without forcing either side to change.
+    under the origin slug ("owner/name") while the lifecycle hook tagged posts and
+    leases with the checkout's basename ("name"). Matching on the last segment lets
+    the two agree without forcing either side to change.
+
+    #714 changed the hook to report ``owner/name`` too, and this stayed the rule
+    rather than becoming redundant: a checkout whose remote is not a GitHub one has
+    no other name, every post and lease already on the board carries the old one,
+    and a hook rolls out across a fleet rather than at an instant. It is also the
+    matching rule :mod:`app.repomatch` renders in SQL for the reads over
+    ``leases.repo``, which is the one column that legitimately holds either shape —
+    so this function and that SQL are two renderings of one sentence and must stay
+    that way.
     """
     if not value:
         return None
