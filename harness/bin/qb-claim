@@ -25,6 +25,14 @@ and a false pickup, and it left the PR sitting at rank 1 of the plan after the
 round released it, so the next agent was offered a review that had already
 happened (#722). Use it when you are holding a key rather than starting the work.
 
+**`--no-plan-item` is checked against the answer, because an older board ignores
+it.** `ClaimIn` takes pydantic's default `extra="ignore"`, and this harness and
+the board are deployed separately — so a new tool against an old board is the
+ordinary state of a rollout, not an edge case. The board answers with the item it
+wrote; if one comes back when none was asked for, that is said loudly and the
+claim still stands, since nothing out here can un-write the row and the claim is
+the half that prevents duplicated work. Roll the BOARD out first.
+
 **1 and 2 are different exits for the reason `qb-claimed` gives.** "Somebody has
 it" is the board saying something definite and a caller should stop. "Cannot tell"
 covers a board outage, and a checkout that refuses on one makes the board a single
@@ -234,7 +242,32 @@ def main() -> int:
     # The half a caller cannot see from the claim id: the board put this on the
     # plan (#427), and saying so is what stops the next agent adding it by hand.
     item = answer.get("plan_item")
-    if item:
+    if item and args.no_plan_item:
+        # **The flag went up and the item came back anyway: this board predates
+        # `plan_item` (#722).** `ClaimIn` takes pydantic's default `extra="ignore"`,
+        # so an older board discards the field in silence and writes the rank-1 row
+        # the flag exists to prevent — and the harness and the board are deployed
+        # separately here, so during any rollout that combination is not exotic, it
+        # is the default for as long as the two halves disagree.
+        #
+        # Said and never failed. The claim is real, it is exclusive, and it is the
+        # half that prevents duplicated work; refusing it because the plan write
+        # could not be suppressed would trade the coordination record for a tidy
+        # plan, which is the trade `_plan_item_for` refuses in the other direction.
+        # What the fleet gets instead is the evidence, because nothing out here can
+        # un-write the row: the answer carried it all along and nobody read it.
+        # Worded deliberately unlike the ordinary pickup line below it. That line
+        # ("on the plan at rank N of …") is the reassurance a caller who WANTED an
+        # item gets, and it is the sentence a reader skims past; printing it here
+        # would report the defect as the feature working.
+        say(f"  WARNING: --no-plan-item was IGNORED — this board is older than the "
+            f"flag and wrote a plan item for "
+            f"{answer.get('key') or args.value} anyway, at rank {item.get('rank')} "
+            f"of {item.get('repo') or 'the fleet'}: {item.get('title')}")
+        say(f"  the claim is yours and stands. The plan row is not: it will sit "
+            f"open at that rank once this claim is released, which is #722. Upgrade "
+            f"the board, or retire the row by hand.")
+    elif item:
         say(f"  on the plan at rank {item.get('rank')} of "
             f"{item.get('repo') or 'the fleet'}: {item.get('title')}")
     elif answer.get("plan_item_error"):

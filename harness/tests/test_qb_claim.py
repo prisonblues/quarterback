@@ -497,3 +497,66 @@ def test_an_explicit_title_is_still_dropped_when_no_item_will_hold_it(tmp_path):
     assert got.returncode == 0, got.stderr
     assert sent(tmp_path)["plan_item"] is False
     assert "title" not in sent(tmp_path)
+
+
+# ------------------------------------------- an older board ignores it (#722)
+
+#: What a board OLDER than `plan_item` answers a `--no-plan-item` claim: `ClaimIn`
+#: takes pydantic's default `extra="ignore"`, so the field is discarded in silence
+#: and the rank-1 row is written anyway. The answer is the only place that says so.
+IGNORED = {**TAKEN, "key": "acme/widget!715",
+           "plan_item": {"item_id": "d1", "rank": 1, "rank_source": "picked-up",
+                         "title": "panel review round 1", "repo": "acme/widget"}}
+
+
+def test_a_board_that_ignored_the_flag_is_reported_loudly(tmp_path):
+    """The compatibility hole, and it is the ordinary state of a rollout: this
+    harness and the board deploy separately, so for as long as the two halves
+    disagree a new `qb-claim` is talking to an old board.
+
+    The board answered with the item it wrote. Nothing read it — the claim exited 0
+    and printed the cheerful "on the plan at rank 1" line, which is what a caller
+    that WANTED an item gets, over the exact defect the flag exists to prevent.
+
+    red/green: fails on the WARNING missing from stderr — the pre-fix tool printed
+    the ordinary success line instead.
+    """
+    got = run(CLAIM, "pr", "715", "--no-plan-item", board="http://b",
+              tmp_path=tmp_path, answer=IGNORED)
+    assert got.returncode == 0, "the claim is real and must stand"
+    assert "WARNING: --no-plan-item was IGNORED" in got.stderr
+    assert "older than the flag" in got.stderr
+    assert "rank 1" in got.stderr and "acme/widget!715" in got.stderr
+    assert "#722" in got.stderr
+
+
+def test_the_ignored_flag_does_not_read_like_a_successful_pickup(tmp_path):
+    """The line a claim gets when it ASKED for the item says "on the plan at rank
+    1", and it is the sentence a reader skims past. Printing it here would report
+    the defect as the feature working."""
+    got = run(CLAIM, "pr", "715", "--no-plan-item", board="http://b",
+              tmp_path=tmp_path, answer=IGNORED)
+    assert "on the plan at rank" not in got.stderr
+
+
+def test_a_board_that_honoured_the_flag_says_nothing_about_the_plan(tmp_path):
+    """The alarm must not fire on the ordinary case, or it is noise on every claim
+    the flag is used for — which, once the fleet is upgraded, is all of them."""
+    got = run(CLAIM, "pr", "715", "--no-plan-item", board="http://b",
+              tmp_path=tmp_path, answer={**TAKEN, "plan_item": None})
+    assert got.returncode == 0, got.stderr
+    assert "WARNING" not in got.stderr
+    assert "on the plan at rank" not in got.stderr
+
+
+def test_an_ordinary_claim_still_reports_its_item_the_way_it_always_did(tmp_path):
+    """The other side of the same branch. `--no-plan-item` must not be the change
+    that turned the pickup line off for everybody — saying so is what stops the next
+    agent adding the row by hand."""
+    got = run(CLAIM, "issue", "172", board="http://b", tmp_path=tmp_path,
+              answer={**TAKEN, "plan_item": {"item_id": "d1", "rank": 1,
+                                             "rank_source": "picked-up",
+                                             "title": "a thing", "repo": "acme/widget"}})
+    assert got.returncode == 0, got.stderr
+    assert "on the plan at rank 1 of acme/widget" in got.stderr
+    assert "WARNING" not in got.stderr

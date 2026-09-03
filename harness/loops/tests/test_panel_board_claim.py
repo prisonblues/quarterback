@@ -72,20 +72,55 @@ def _the_real_pair(monkeypatch, pr_claims):
 
 
 def _cli(monkeypatch, *, present=True, returncode=0, stdout="", stderr="",
-         raises=None):
-    """Stub `qb-claim`/`qb-release`. Returns the dict the call is recorded into."""
+         raises=None, results=None):
+    """Stub `qb-claim`/`qb-release`. Returns the dict the calls are recorded into.
+
+    `results` scripts CONSECUTIVE answers — `[(returncode, stdout, stderr), …]` —
+    for the one path that runs `qb-claim` twice: a host whose `qb-claim` predates
+    `--no-plan-item` refuses the flag, and the round asks again without it. The last
+    entry repeats, so a single `returncode`/`stdout`/`stderr` still describes a tool
+    that keeps saying the same thing however often it is asked.
+
+    `seen["args"]` is the LAST argv, as it always was; `seen["argvs"]` is every one
+    of them, which is what the retry test needs — the assertion there is that the
+    second call dropped the flag rather than repeating it into the same refusal.
+    """
     monkeypatch.setattr(panel_seats.shutil, "which",
                         lambda name: f"/usr/bin/{name}" if present else None)
-    seen: dict = {}
+    seen: dict = {"argvs": []}
+    scripted = list(results or [(returncode, stdout, stderr)])
 
     def fake(args, **kw):
         seen["args"] = args
+        seen["argvs"].append(args)
         if raises:
             raise raises
-        return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+        rc, out, err = scripted[min(len(seen["argvs"]) - 1, len(scripted) - 1)]
+        return subprocess.CompletedProcess(args, rc, out, err)
 
     monkeypatch.setattr(panel_seats.subprocess, "run", fake)
     return seen
+
+
+#: What an old `qb-claim` prints when it meets the flag: argparse's own wording,
+#: which is what `_rejected_the_flag` matches on. Reproduced rather than
+#: paraphrased — the whole detection rests on this being the real sentence.
+STALE_TOOL = ("usage: qb-claim [-h] [--repo-path REPO_PATH] [--ttl TTL] [--note NOTE]\n"
+              "qb-claim: error: unrecognized arguments: --no-plan-item\n")
+
+#: What a board OLDER than `plan_item` answers: it discarded the field
+#: (`extra="ignore"`) and wrote the rank-1 row anyway. `--json` is what puts this on
+#: stdout where `_wrote_a_plan_item` can read it.
+OLD_BOARD = json.dumps({
+    "claim_id": "abc-123", "kind": "work", "key": "acme/widget!1780",
+    "expires": "2026-09-04T18:00:00Z", "renewed": False,
+    "plan_item": {"item_id": "d1", "rank": 1, "rank_source": "picked-up",
+                  "title": "fix: a thing", "repo": "acme/widget"}})
+
+#: A board that HONOURS the flag: same answer, no item.
+NEW_BOARD = json.dumps({
+    "claim_id": "abc-123", "kind": "work", "key": "acme/widget!1780",
+    "expires": "2026-09-04T18:00:00Z", "renewed": False, "plan_item": None})
 
 
 # ------------------------------------------------------------------ hold_pr itself
@@ -99,7 +134,7 @@ def test_a_taken_claim_adds_no_note_and_names_the_resource_not_a_key(monkeypatch
     third spelling would be the same defect with a new party.
     """
     seen = _cli(monkeypatch)
-    assert panel_seats.hold_pr("/tmp/acme", 1780, 2) == ""
+    assert panel_seats.hold_pr("/tmp/acme", 1780, 2) == ("", True)
     argv = seen["args"]
     assert argv[:3] == ["qb-claim", "pr", "1780"]
     assert "--repo-path" in argv and argv[argv.index("--repo-path") + 1] == "/tmp/acme"
@@ -149,12 +184,119 @@ def test_a_round_holds_the_pr_without_claiming_to_have_picked_it_up(monkeypatch)
     assert "--no-gh-title" not in seen["args"], "implied by --no-plan-item"
 
 
+# ------------------------------------------------- mixed versions (#722 follow-up)
+
+def test_an_old_board_that_ignored_the_flag_is_said_rather_than_hidden(monkeypatch, capsys):
+    """New harness, old board — and it is the ordinary state of a rollout here,
+    because this harness and the board deploy separately.
+
+    `ClaimIn` takes pydantic's default `extra="ignore"`, so a board older than
+    `plan_item` discards the field in silence and writes the rank-1 row the flag
+    exists to prevent. The answer carries the evidence — a `plan_item` on a request
+    that asked for none — and before this nothing read it: `qb-claim` exited 0, this
+    returned "", and the round reported a clean claim over the exact defect #722 is
+    about.
+
+    Noted and never failed. The claim is real and it is the half that prevents
+    duplicated work; nothing out here can un-write the row, so the only thing left
+    to do with it is say so where a reader will meet it.
+
+    red/green: fails on `assert note`, which was "" — the item came back and the
+    round said nothing about it.
+    """
+    _cli(monkeypatch, returncode=0, stdout=OLD_BOARD)
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert holding is True, "the claim IS ours — losing the release would be worse"
+    assert note, "an ignored flag that nothing reports is the silent half of #722"
+    assert "older than" in note and "rank 1" in note
+    assert "#722" in note
+    assert note in capsys.readouterr().err
+
+
+def test_a_board_that_honoured_the_flag_says_nothing_at_all(monkeypatch):
+    """The alarm must not fire on the ordinary case, or it is noise on every round —
+    and `--json` returning `plan_item: null` is what the fixed board answers."""
+    _cli(monkeypatch, returncode=0, stdout=NEW_BOARD)
+    assert panel_seats.hold_pr("/tmp/acme", 1780, 1) == ("", True)
+
+
+def test_an_unreadable_answer_is_not_an_alarm(monkeypatch):
+    """`--quiet`, a truncated pipe, a `qb-claim` old enough to print the bare id:
+    none of those is evidence that a row was written, and an alarm that fires when
+    it cannot tell is one people learn to filter out. The cost of the miss is the
+    behaviour the fleet had yesterday."""
+    _cli(monkeypatch, returncode=0, stdout="abc-123\n")
+    assert panel_seats.hold_pr("/tmp/acme", 1780, 1) == ("", True)
+
+
+def test_an_old_qb_claim_that_rejects_the_flag_is_asked_again_without_it(
+        monkeypatch, capsys):
+    """New harness, old `qb-claim` — the reverse direction, and the one that used to
+    fail worst.
+
+    argparse refuses the unknown flag and exits 2, which this filed as "the board did
+    not take it". So a host part-way through an upgrade ran every round UNCLAIMED and
+    said only that the board had declined — silently undoing #715 a few hours after
+    it shipped, on the evidence of a flag added to fix something else.
+
+    The retry writes a plan item, which is the #722 defect. That is the right trade:
+    an imperfect record somebody can see beats no record at all, which is the failure
+    #715 was written to remove.
+
+    red/green: fails on `holding is True` — the refusal was read as a board's, no
+    retry happened, and the round ran with no claim.
+    """
+    seen = _cli(monkeypatch, results=[(2, "", STALE_TOOL), (0, NEW_BOARD, "")])
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert holding is True, "the round must end up holding the PR"
+    assert len(seen["argvs"]) == 2, "asked once with the flag, once without"
+    assert "--no-plan-item" in seen["argvs"][0]
+    assert "--no-plan-item" not in seen["argvs"][1], \
+        "repeating the flag walks into the identical refusal"
+    assert "predates" in note and "#722" in note
+    assert note in capsys.readouterr().err
+
+
+def test_a_different_unknown_argument_is_not_retried_into_the_same_refusal(monkeypatch):
+    """The detection names the flag as well as argparse's wording, and that half is
+    load-bearing: dropping `--no-plan-item` cannot help a host that refused
+    something else, so the retry would be a second identical failure at twice the
+    latency — the rule `qb-claim` states about its own retry."""
+    stale = ("usage: qb-claim [-h]\n"
+             "qb-claim: error: unrecognized arguments: --some-later-flag\n")
+    seen = _cli(monkeypatch, returncode=2, stderr=stale)
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert len(seen["argvs"]) == 1, "nothing here is retryable"
+    assert holding is False
+    assert "did not take it" in note
+
+
+def test_a_board_refusal_is_still_not_a_stale_tool(monkeypatch):
+    """Exit 2 covers an outage, a rotated token and a ref the board will not key.
+    None of those is answered by dropping a flag, and reading them as a stale tool
+    would hide a real misconfiguration behind a successful retry."""
+    seen = _cli(monkeypatch, returncode=2, stderr="qb-claim: board answered HTTP 401\n")
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert len(seen["argvs"]) == 1
+    assert holding is False and "401" in note
+
+
+def test_the_round_asks_for_json_because_that_is_where_the_evidence_is(monkeypatch):
+    """The old-board case is detected from the board's own answer, not from
+    `qb-claim`'s prose — `create-worktree` says why that matters, and the flag is
+    what puts the answer on stdout."""
+    seen = _cli(monkeypatch, returncode=0, stdout=NEW_BOARD)
+    panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert "--json" in seen["args"]
+
+
 def test_a_pr_somebody_else_holds_is_a_note_and_never_a_refusal(monkeypatch, capsys):
     """The claim is a record, not a gate. A review that would not run because a
     board could not be reached is a worse failure than a review nobody can see —
     and two panels on one PR is spend twice, which is worth a line."""
-    _cli(monkeypatch, returncode=1, stdout=QB_HELD)
-    note = panel_seats.hold_pr("/tmp/acme", 1780, 2)
+    _cli(monkeypatch, returncode=1, stderr=QB_HELD)
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 2)
+    assert holding is False, "a peer holds it, so this round has nothing to release"
     assert "claimed by somebody else" in note
     assert "marble-bronze" in note, "the holder is the point of the note"
     assert "ran anyway" in note
@@ -164,7 +306,8 @@ def test_a_pr_somebody_else_holds_is_a_note_and_never_a_refusal(monkeypatch, cap
 def test_a_host_without_qb_claim_says_what_is_lost_and_it_is_not_the_review(
         monkeypatch, capsys):
     _cli(monkeypatch, present=False)
-    note = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert holding is False
     assert "no `qb-claim` on this host" in note
     assert "complete and unaffected" in note
     assert "which PR this agent is on" in note
@@ -177,21 +320,22 @@ def test_a_board_that_would_not_take_it_is_told_apart_from_a_holder(monkeypatch)
     misconfiguration reported as a collision sends somebody looking for an agent
     that does not exist."""
     _cli(monkeypatch, returncode=2, stderr="qb-claim: board answered HTTP 401\n")
-    note = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    note, holding = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    assert holding is False
     assert "claimed by somebody else" not in note
     assert "did not take it" in note and "401" in note
 
 
 def test_claiming_never_raises_and_still_says_so(monkeypatch):
     _cli(monkeypatch, raises=subprocess.TimeoutExpired("qb-claim", 20))
-    note = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    note, _ = panel_seats.hold_pr("/tmp/acme", 1780, 1)
     assert "TimeoutExpired" in note and "no claim on PR #1780" in note
 
 
 def test_a_shouting_board_cannot_push_a_page_of_markup_into_a_pr_comment(monkeypatch):
     """The note goes into `config_notes`, which `--post` publishes."""
     _cli(monkeypatch, returncode=2, stderr="<html>" + "x" * 5000)
-    note = panel_seats.hold_pr("/tmp/acme", 1780, 1)
+    note, _ = panel_seats.hold_pr("/tmp/acme", 1780, 1)
     assert len(note) < 600 and "xxx" in note
 
 
@@ -270,7 +414,7 @@ def test_a_round_claims_its_pr_and_hands_it_back(monkeypatch, capsys, pr_claims)
     # ORDER of the two calls rather than about what either one says to `qb-claim`.
     seen: list[tuple] = []
     monkeypatch.setattr(panel, "hold_pr",
-                        lambda p, n, r: seen.append(("hold", p, n, r)) or "")
+                        lambda p, n, r: (seen.append(("hold", p, n, r)), ("", True))[1])
     monkeypatch.setattr(panel, "release_pr",
                         lambda p, n: seen.append(("release", p, n)) or "")
     assert panel.run("board", 1780, post=False, json_out=True) == 0
@@ -297,7 +441,7 @@ def test_a_round_that_did_not_get_the_claim_does_not_hand_one_back(
     _round(monkeypatch)
     seen: list[tuple] = []
     monkeypatch.setattr(panel, "hold_pr",
-                        lambda *a, **k: "PR #1780 is claimed by somebody else")
+                        lambda *a, **k: ("PR #1780 is claimed by somebody else", False))
     monkeypatch.setattr(panel, "release_pr",
                         lambda p, n: seen.append(("release", p, n)) or "")
     assert panel.run("board", 1780, post=False, json_out=True) == 0
@@ -313,7 +457,7 @@ def test_a_claim_the_board_refused_is_not_released_either(monkeypatch, capsys):
     _round(monkeypatch)
     seen: list[tuple] = []
     monkeypatch.setattr(panel, "hold_pr",
-                        lambda *a, **k: "the board has no claim on PR #1780")
+                        lambda *a, **k: ("the board has no claim on PR #1780", False))
     monkeypatch.setattr(panel, "release_pr",
                         lambda p, n: seen.append(("release", p, n)) or "")
     assert panel.run("board", 1780, post=False, json_out=True) == 0
@@ -328,7 +472,7 @@ def test_the_claim_is_taken_before_a_single_seat_is_dispatched(monkeypatch, caps
     _round(monkeypatch)
     order: list[str] = []
     monkeypatch.setattr(panel, "hold_pr",
-                        lambda *a, **k: order.append("claim") or "")
+                        lambda *a, **k: (order.append("claim"), ("", True))[1])
     monkeypatch.setattr(panel, "review_llm",
                         lambda *a, **k: (order.append("seat")
                                          or panel.ReviewerRun([], None, 5)))
@@ -343,7 +487,8 @@ def test_no_record_takes_no_claim_at_all(monkeypatch, capsys):
     would refuse somebody on the strength of a run nobody asked to be recorded."""
     _round(monkeypatch)
     seen: list[tuple] = []
-    monkeypatch.setattr(panel, "hold_pr", lambda *a, **k: seen.append(a) or "")
+    monkeypatch.setattr(panel, "hold_pr",
+                        lambda *a, **k: (seen.append(a), ("", True))[1])
     monkeypatch.setattr(panel, "release_pr", lambda *a, **k: seen.append(a) or "")
     assert panel.run("board", 1780, post=False, json_out=True, record=False) == 0
     capsys.readouterr()
@@ -354,8 +499,9 @@ def test_a_claim_that_could_not_be_taken_reaches_the_pr_comment(monkeypatch, cap
     """`config_notes` is the channel that already exists for a board write that
     did not land, and it is what `--post` publishes."""
     _round(monkeypatch)
-    monkeypatch.setattr(panel, "hold_pr",
-                        lambda *a, **k: "the board has no claim on PR #1780 — no `qb-claim`")
+    monkeypatch.setattr(
+        panel, "hold_pr",
+        lambda *a, **k: ("the board has no claim on PR #1780 — no `qb-claim`", False))
     assert panel.run("board", 1780, post=False, json_out=True) == 0
     notes = json.loads(capsys.readouterr().out)["config_notes"]
     assert any("no claim on PR #1780" in n for n in notes)

@@ -3645,8 +3645,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #: mechanism that took it (PR #715 review).
     holding_pr = False
     if record:
-        claimed = hold_pr(cfg["path"], pr_number, round_no)
-        holding_pr = not claimed
+        # Two facts, not one. A note used to imply "and we do not hold it", which
+        # stopped being true with #722's mixed-version notes: a round can hold the
+        # PR *and* have something to say about how (an old board that ignored
+        # `--no-plan-item`, an old `qb-claim` that had to be asked again without
+        # it). Inferring the release from the note would have skipped it on exactly
+        # those runs and left the PR held for PR_HOLD_TTL.
+        claimed, holding_pr = hold_pr(cfg["path"], pr_number, round_no)
         if claimed:
             notes.append(claimed)
     tasks = {}

@@ -1361,23 +1361,71 @@ def hold_pr(repo_path: str, pr_number: int, round_no: int) -> str:
     `--no-plan-item` as implying `--no-gh-title`, which is where the saved `gh`
     call went.
 
-    Returns "" when the claim is ours, or the one line saying why it is not.
+    **Mixed versions are the ordinary state here, and both directions are handled.**
+    This harness and the board deploy separately, so during any rollout one of them
+    is older than the other and neither can be assumed. Each direction fails in its
+    own way and neither may fail silently:
+
+    * *New harness, old board.* `ClaimIn` takes pydantic's default `extra="ignore"`,
+      so an old board discards `plan_item` and writes the rank-1 row anyway. The
+      answer says so — a non-null `plan_item` on a request that asked for none — and
+      `--json` is what lets this read it rather than grep prose. Noted, never
+      failed: the claim is real and it is the half that prevents duplicated work.
+    * *New harness, old `qb-claim`.* argparse refuses the unknown flag and exits 2,
+      which this used to file as "the board did not take it" — so a host part-way
+      through an upgrade would run every round UNCLAIMED, silently undoing #715 a
+      few hours after it shipped. That refusal is now told apart from a board's
+      (argparse's own wording, plus the flag's name) and the claim is retried once
+      without the flag. The round then holds the PR *and* writes a plan item, which
+      is the #722 defect — and it is the better of the two, because an imperfect
+      record somebody can see beats no record at all.
+
+    Returns ``(note, holding)``. **Two facts, not one**, and they used to be one
+    string: "" meant both "nothing to report" and "the claim is ours", because every
+    note this raised also meant the claim was not. The two combinations above break
+    that — a note beside a claim we do hold — and a caller that inferred one from the
+    other would skip the release and leave the PR held for :data:`PR_HOLD_TTL`.
     """
     if not shutil.which("qb-claim"):
-        return _unclaimed(pr_number, "there is no `qb-claim` on this host")
-    argv = ["qb-claim", "pr", str(pr_number), "--repo-path", repo_path,
+        return _unclaimed(pr_number, "there is no `qb-claim` on this host"), False
+    # `--json` puts the board's whole answer on stdout, which is how the old-board
+    # case below is detected: the evidence is structured, and reading it out of
+    # `qb-claim`'s prose would be the coupling `create-worktree` warns about.
+    base = ["qb-claim", "pr", str(pr_number), "--repo-path", repo_path,
             "--ttl", str(PR_HOLD_TTL),
-            "--note", f"panel review round {round_no}",
-            # Exclusivity, not a pickup — see the docstring. The note is what a
-            # reader gets instead of a plan row, and it says which round.
-            "--no-plan-item"]
-    try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
-    except (OSError, subprocess.SubprocessError) as e:
-        return _unclaimed(pr_number, f"`qb-claim` failed ({e.__class__.__name__})")
+            "--note", f"panel review round {round_no}", "--json"]
+    # Exclusivity, not a pickup — see the docstring. The note is what a reader gets
+    # instead of a plan row, and it says which round.
+    proc = _qb_claim(base + ["--no-plan-item"])
+    if isinstance(proc, Exception):
+        return _unclaimed(pr_number, f"`qb-claim` failed ({proc.__class__.__name__})"), False
+    stale_tool = _rejected_the_flag(proc)
+    if stale_tool:
+        proc = _qb_claim(base)
+        if isinstance(proc, Exception):
+            return _unclaimed(
+                pr_number, f"`qb-claim` failed ({proc.__class__.__name__})"), False
+
     if proc.returncode == CLAIM_TAKEN:
-        return ""
-    said = (proc.stdout or proc.stderr or "").strip().splitlines()
+        if stale_tool:
+            return _note(
+                f"the claim on PR #{pr_number} was taken WITH a plan item: this "
+                f"host's `qb-claim` predates `--no-plan-item`, so the round is on "
+                f"the board and the PR is now on the plan at rank 1 too (#722). "
+                f"Upgrade the harness on this host; until then the row has to be "
+                f"retired by hand once this round releases the claim"), True
+        if _wrote_a_plan_item(proc.stdout):
+            return _note(
+                f"the claim on PR #{pr_number} is ours, but this BOARD is older "
+                f"than `--no-plan-item` and ignored it, so the PR is on the plan at "
+                f"rank 1 (#722). The review is unaffected; the plan row will sit "
+                f"open at that rank once this round releases the claim, and only a "
+                f"board upgrade or a hand edit removes it"), True
+        return "", True
+    # stderr first: with `--json`, stdout is the board's answer on the paths that
+    # have one, and quoting a line of JSON at a human tells them nothing. Every
+    # message worth quoting here has always been on stderr.
+    said = (proc.stderr or proc.stdout or "").strip().splitlines()
     quoted = f" — `qb-claim` said: {said[-1][:QB_SAID_MAX]}" if said else ""
     if proc.returncode == CLAIM_HELD:
         # Through `_note` like the other two, because this is the one of the three
@@ -1386,8 +1434,55 @@ def hold_pr(repo_path: str, pr_number: int, round_no: int) -> str:
         return _note(f"PR #{pr_number} is claimed by somebody else{quoted}. This "
                      "round ran anyway — the claim is a record and not a gate — but "
                      "two panels on one PR is spend twice, so it is worth knowing "
-                     "which")
-    return _unclaimed(pr_number, f"the board did not take it{quoted}")
+                     "which"), False
+    return _unclaimed(pr_number, f"the board did not take it{quoted}"), False
+
+
+def _qb_claim(argv: list[str]):
+    """One `qb-claim` run, or the exception that stopped it. Never raises.
+
+    Returning the exception rather than None because the caller says its class name
+    out loud, and because there are two call sites now — the flagged attempt and the
+    retry — and a helper that reported the failure itself would say it twice.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return e
+
+
+def _rejected_the_flag(proc) -> bool:
+    """Did THIS `qb-claim` refuse `--no-plan-item` as an unknown argument?
+
+    Told apart from every other exit 2 — an outage, a rotated token, a ref the board
+    will not key — because the remedy is different and only this one has one: drop
+    the flag and ask again. Retrying any of the others is a second wrong answer at
+    twice the latency, which is the rule `qb-claim` itself states about its retry.
+
+    Matched on argparse's own wording rather than on `qb-claim`'s: the string
+    belongs to the standard library, has been that sentence for the life of the
+    module, and is what the tool prints without choosing to. The flag's own name is
+    required beside it so that a DIFFERENT unknown argument — a future flag this
+    file grows, sent to a host older still — is not answered by dropping this one
+    and retrying into the identical refusal.
+    """
+    return (proc.returncode not in (CLAIM_TAKEN, CLAIM_HELD)
+            and "unrecognized arguments" in (proc.stderr or "")
+            and "--no-plan-item" in (proc.stderr or ""))
+
+
+def _wrote_a_plan_item(stdout: str) -> bool:
+    """Did the board write a plan item for a claim that asked for none? Never raises.
+
+    Reads `--json`'s own payload. A board that cannot be parsed, or one whose answer
+    carries no `plan_item` at all, is a "no": the note this feeds is an alarm, and an
+    alarm that fires on an unreadable answer is one people learn to ignore. The cost
+    of a miss is the pre-#722 behaviour, which is what the fleet had yesterday.
+    """
+    try:
+        return bool(json.loads(stdout or "{}").get("plan_item"))
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def _unclaimed(pr_number: int, why: str) -> str:
