@@ -363,11 +363,11 @@ def test_review_pr_asks_the_reviewer_to_read_tests_as_tests(briefs):
 
 
 def test_review_pr_asks_the_reviewer_to_read_comments_as_claims(briefs):
-    """The single-reviewer brief carries the same dimension, for the reason `FIX_BRIEFS` exists.
+    """The review half again, and the sibling of the tests question above it.
 
-    `/review-pr` and the panel apply the same bar by design — `panel.md` says so in its first
-    paragraph — so a dimension in one and not the other means which reviewer you spent decides
-    whether the comments in the diff were read at all."""
+    `/review-pr` and the panel apply the same bar by design — `panel.md`'s opening paragraph
+    says "the same exhaustive bar as `/review-pr`" — so a dimension in one and not the other
+    means which reviewer you spent decides whether the comments in the diff were read at all."""
     text = briefs["review-pr.md"]
     assert re.search(r"comments?\b[^.]*\bclaims?\b", text, re.IGNORECASE), (
         "review-pr.md asks for stale docs but never asks whether a comment the diff WROTE is "
@@ -380,10 +380,11 @@ def _dimensions(prompt: str) -> str:
     """The `Review for:` checklist, delimited from the severity paragraph that follows it.
 
     A helper rather than a fourth inline slice: several tests here ask about the list and one
-    asks about the paragraph AFTER it, and a search over the whole prompt lets text anywhere in
-    the brief answer a question about the checklist — which is how a dimension could be deleted
-    from the list while the words survive in the envelope below and every grep here stayed
-    green."""
+    asks about the severity paragraph after it, and bounding the search is what keeps those
+    questions distinct from the rest of the brief. Two of them would otherwise be answered by
+    text no reviewer works through as a dimension — `_FINDINGS_ENVELOPE` names
+    `could_not_assess` and spells severities `"P1|P2|P3|P4"`, so a whole-prompt grep for either
+    passes with the dimension that was supposed to carry it deleted."""
     for marker in ("Review for:", "Severity:"):
         assert marker in prompt, (
             f"REVIEW_PROMPT no longer contains `{marker}`, so its dimension list "
@@ -398,8 +399,9 @@ def _bullets(block: str) -> list[str]:
     `- ` opens a dimension and an indented line continues it, which is the shape
     `test_the_review_prompt_is_still_one_bullet_per_dimension` pins. Folding is what makes the
     assertions below about a NAMED dimension rather than about the list: every argument a
-    dimension makes is on its continuation lines, so an unfolded search for "claim" beside
-    "comment" is answered by two adjacent bullets that each say one of them."""
+    dimension makes is on its continuation lines — the comments bullet's "claim" is on its
+    third and its severity floor on its last — so an unfolded, line-wise search finds neither,
+    and the obvious repair, searching the whole block, is answered by any bullet in it."""
     out: list[str] = []
     for line in block.splitlines():
         if line.startswith("- "):
@@ -412,9 +414,10 @@ def _bullets(block: str) -> list[str]:
 def _dimension(prompt: str, name: str) -> str:
     """The one dimension whose NAME — the text before its first colon — matches `name`.
 
-    Matched on the name rather than anywhere in the bullet, because the bodies quote each
-    other: the comments dimension talks about tests and the tests dimension about assertions,
-    so a body match would find whichever came first and report on the wrong bullet."""
+    Matched on the NAME rather than anywhere in the bullet, because dimension bodies contain
+    each other's subject words — `Test coverage`'s body says "a test" and `Load-bearing tests`'s
+    says "no test" — so a body match for a word this file greps on returns whichever came first
+    and then reports confidently about the wrong bullet."""
     hits = [b for b in _bullets(_dimensions(prompt))
             if re.search(name, b.split(":", 1)[0], re.IGNORECASE)]
     assert len(hits) == 1, (
