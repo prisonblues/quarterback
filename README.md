@@ -239,7 +239,8 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           population) and confirmed_defects, never outcomes_recorded
 GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by_repo, by_size,
                                                                      by_kind, by_shape, by_rounds,
-                                                                     marginal_by_round}
+                                                                     marginal_by_round,
+                                                                     injection_by_round}
                           the share of review CYCLES that ended in a confident dry round
                           (#626) — the number the convergence epic is judged on. One cycle
                           is one (repo, pr, cycle), its ending is its TERMINAL round's, and
@@ -256,7 +257,26 @@ GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by
                           that way. A caps refusal is NOT among them: it ends the cycle and
                           counts `unconverged`, as `preland` and the review queue already
                           call it. `by_rounds` is keyed `final_round`, the terminal round's
-                          NUMBER rather than a count of rounds recorded. **`days` defaults
+                          NUMBER rather than a count of rounds recorded.
+                          `injection_by_round` (#637) is the OTHER population: per round
+                          number, the distribution of `provenance_counts.introduced` over
+                          every bucket — the quantity `escalate_on.fix_injection` divides,
+                          at the grain it divides it, which `marginal_by_round` (counts) and
+                          `/review/stats` (a ratio of sums across a window) both miss. Read
+                          `rate_min`/`rate_p25`/`rate_median`/`rate_p75`/`rate_max` and not
+                          `pooled_rate`: the rule weights a 4-finding round like a
+                          44-finding one and a pooled ratio does not. Every SUM and RATE is
+                          over `rated_runs` (a non-zero denominator existed), which is
+                          smaller than `attributed_runs` (the panel sent a tally) and
+                          smaller again than `rounds`; those three are the markers, not
+                          figures over it. `dial_runs` counts the RATED rounds carrying a
+                          `rules` record — the only field that says what the threshold WAS
+                          while the round ran — and it read 1 of 38 on 2026-09-02; it
+                          shares `rated_runs`' population deliberately, a marker over any
+                          other being worse than none. **No threshold
+                          and no minimum denominator is applied**: the dial is a repo's and
+                          `FIX_INJECTION_MIN_NEW` is the harness's, so the board publishes
+                          the population and never the verdict. **`days` defaults
                           to 90** where the rest of `/review/*` defaults to all time: this
                           one classifies a row per cycle in Python rather than aggregating
                           in SQL, and the applied boundary is always in `window.since`
