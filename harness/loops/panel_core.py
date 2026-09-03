@@ -697,11 +697,23 @@ master judge filters false positives; your job is breadth, not triage.
   cannot fail, a mock that satisfies itself. Absence of a test is the easy half; a passing
   assertion that the bug is gone is worse than no test, because it keeps passing when it returns
 - Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
+- Load-bearing comments: a comment or docstring the diff WRITES that states a checkable property of
+  the code — "this is the only caller", "nothing between here and there returns", "this re-reads X
+  rather than trusting the earlier read", "this cannot be reached" — is a claim, and a claim in the
+  diff is reviewable. Staleness above is the easy half: nothing ever EXECUTES a comment, so a wrong
+  one survives every round, every CI run and every rebase. Price it by what RESTS on it — a claim
+  the change's own correctness argument leans on (a guard's justification, an ordering or
+  concurrency property, the reason no `try/finally` was needed) is P2 when false, because the next
+  change is made on the strength of it; a claim nothing depends on is P3, priced like any other
+  documentation defect. Checking is usually LABORIOUS rather than impossible — grep the
+  callers, read the enclosing scopes — so do that first: `could_not_assess` is for a claim the
+  material cannot settle, after you have looked, and never for one you did not open a file about
 - Related code: <<<RELATED_CODE>>>
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
 
 Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
-logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
+logic flaws, a false comment claim the correctness argument rests on) · P3 should fix (style,
+naming, simplifications, a false comment claim nothing rests on) · P4 polish (minor consistency).
 Report all of them.
 
 """ + _FINDINGS_ENVELOPE
