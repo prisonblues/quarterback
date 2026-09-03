@@ -1602,6 +1602,27 @@ class StopIn(BaseModel):
     #: ``GET /review/convergence`` counts it under ``unmeasured``.
     converged: bool | None = None
     veto: list[str] = Field(default_factory=list)
+    #: WHAT THE CYCLE LEFT BEHIND and who it went to (#42, stored by #717): the
+    #: ``fixable`` / ``below_floor`` / ``escalated`` / ``narrowed`` / ``declined``
+    #: key lists and the ``handed_to`` verdict over them.
+    #:
+    #: Taken raw and reduced by :func:`_outstanding_or_none` and
+    #: :func:`_handed_to_or_none` rather than modelled field by field, because
+    #: what is stored is five lengths and one word and a per-field model would
+    #: publish an opinion about the keys themselves — which are the panel's and
+    #: belong to the findings, not to this row.
+    #:
+    #: ``None`` when the caller nested a ``round_stop`` and sent no disposal,
+    #: which is every producer older than #42. The consumer that matters — the
+    #: merge gate in ``preland`` — falls back to holding on the raw confirmed
+    #: count there, so silence costs a strict verdict and never a lax one.
+    #:
+    #: Typed ``Any`` and not ``dict``, on this module's standing rule that a
+    #: payload is never refused over one field: ``outstanding: []`` from a
+    #: hand-rolled caller would be a 422 under a dict annotation, taking the
+    #: findings, the scorecards and the accounts down with it. The coercers below
+    #: turn it into NULL and the response names the drop.
+    outstanding: Any = None
 
     @field_validator("veto", mode="before")
     @classmethod
@@ -1697,6 +1718,129 @@ MAX_FIX_PASS_CHARS = 65536
 FIX_PASS_COUNTS = ("briefed", "placed", "cleared", "still_open",
                    "production", "test", "prose", "churn",
                    "files", "new_files", "introduced")
+
+#: The disposal buckets ``round_stop.outstanding`` publishes, each as a list of
+#: finding keys (#42). This board stores their LENGTHS — see
+#: :func:`_outstanding_or_none` — and never asks which finding is in which.
+#:
+#: ``panel_rounds.round_stop`` is the producer and this is the same list, written
+#: out here for :data:`FIX_PASS_COUNTS`' reason: the two halves cannot import each
+#: other, and ``tests/test_review_outstanding.py`` is where both are readable at
+#: once, which is where the drift check lives.
+OUTSTANDING_COUNTS = ("fixable", "below_floor", "escalated", "narrowed", "declined")
+#: The three of those a merge gate rules on, and therefore the three a stored
+#: disposal must carry to be stored at all (#717).
+#:
+#: ``fixable + escalated`` is what a round is owed and ``below_floor`` is what its
+#: repository has already said it is not; a block missing one of them cannot answer
+#: either question. It is refused whole rather than stored short, on
+#: :func:`_opaque_or_none`'s rule and with the sharpest version of it: a disposal
+#: with ``escalated`` dropped does not read as a smaller remainder, it reads as a
+#: round with no escalations — the one class of finding no fix pass may touch, gone
+#: in the flattering direction on the field that decides whether a PR may merge.
+#:
+#: ``narrowed`` and ``declined`` are counted when they arrive and not required.
+#: They are #615's and #665's, they postdate the block, and neither is read by a
+#: gate — so requiring them would refuse a #42-era producer's whole disposal over
+#: two numbers nothing consults.
+OUTSTANDING_REQUIRED = ("fixable", "below_floor", "escalated")
+#: Who a round that ENDED a cycle handed its remainder to (#42). Null on a round
+#: that went again, which is a different fact and not a fourth word.
+HANDED_TO = ("fixer", "human", "nobody")
+
+
+def _outstanding_or_none(v: object) -> tuple[dict[str, int] | None, str]:
+    """``round_stop.outstanding`` as this board will store it, and why it did not.
+
+    **A COUNT, NOT A SPLIT** — the distinction is the whole of #717's design.
+    ``panel_rounds.round_stop`` decides which finding is fixable, which is under
+    the repository's ``cleared_floor`` and which is escalated; this reads the
+    length of each list it published. Nothing here compares a severity against a
+    floor, and nothing may: the floors are repo dials this board holds as opaque
+    JSON and does not interpret (``app/api/dials.py`` argues that at length), so a
+    board-side split would be a second reading of the policy that produced the
+    verdict stored beside it — what ``m6bc45ff1`` refuses for ``converged``.
+
+    **Lengths rather than a ``counts`` block the panel sends beside the lists**,
+    which was the other way to get the same numbers. ``len()`` of a list cannot
+    disagree with that list; a sibling tally in the same payload can, and a
+    consumer holding a count against the keys it is supposed to describe has no
+    way to tell which of the two is wrong. The keys themselves stay off the row on
+    ``unread_files``' rule — one round's worth is a fair payload and
+    ``GET /reviews?limit=500`` would serialise five hundred finding lists — and
+    they are already on the round's own findings.
+
+    Refused whole where any of :data:`OUTSTANDING_REQUIRED` is missing or is not a
+    list. A number that is *absent* leaves the consumer knowing it does not know;
+    a disposal short one bucket looks complete and reads as a zero in it.
+
+    **The second return value names what was not stored, and that is not the same
+    question as whether anything was.** An unreadable OPTIONAL bucket —
+    ``narrowed: 5`` from a producer sending a count where the contract is keys —
+    leaves the other four stored and still earns a sentence, because the stored
+    disposal is then missing a key, and a missing key here means "the producer
+    sent none". Silently omitting it would file a value this board refused under
+    the shape a #42-era producer legitimately sends, which is the
+    absent-versus-refused collapse this module argues at length one field over. So
+    a caller reads ``(counts, "")`` as stored whole, ``(counts, why)`` as stored
+    without the buckets ``why`` names, and ``(None, why)`` as refused entire.
+
+    ``{}`` never survives as ``{}`` here, unlike :func:`_tally_or_none`'s three
+    tallies, and the asymmetry is deliberate: those have a state that means "the
+    question does not arise", and a round always has a disposal — ``round_stop``
+    sends all five lists empty for a dry stop, which lands here as five honest
+    zeros. An empty object is a producer that sent no disposal at all.
+    """
+    if not isinstance(v, Mapping):
+        return None, ("" if v is None else
+                      "round_stop.outstanding was not an object, so what the round "
+                      "left behind could not be read")
+    out: dict[str, int] = {}
+    unusable: list[str] = []
+    for bucket in OUTSTANDING_COUNTS:
+        keys = v.get(bucket)
+        if isinstance(keys, list):
+            out[bucket] = len(keys)
+        elif bucket in OUTSTANDING_REQUIRED:
+            return None, (f"round_stop.outstanding carried no list of {bucket!r} "
+                          "keys — the disposal is refused whole rather than stored "
+                          "short, because a missing bucket reads as an empty one")
+        elif keys is not None:
+            unusable.append(bucket)
+    if unusable:
+        return out, ("round_stop.outstanding carried no list of keys for "
+                     f"{', '.join(unusable)} — the disposal is stored without "
+                     "them, and an absent bucket here means the producer sent "
+                     "none rather than that it counted zero")
+    return out, ""
+
+
+def _handed_to_or_none(v: object) -> str | None:
+    """Who the round handed its remainder to, out of :data:`HANDED_TO`, or None.
+
+    **Against a vocabulary, where** :func:`_word_or_none` **deliberately is not**,
+    and the two arguments do not conflict. That helper refuses a closed set
+    because its fields name things whose spellings grow — ``fix_range_source``
+    gained ``reconstructed`` a release after it shipped — and an unknown value
+    there reclassifies nothing, because a consumer grouping by it gets an extra
+    group it can see.
+
+    This one is a three-valued verdict computed in one function, in one branch
+    each, and its consumers branch on the three. A fourth word stored verbatim
+    would not appear as a fourth group; it would fall through every branch and be
+    read as whichever the ``else`` is. So an unrecognised disposal becomes NULL —
+    "the panel did not say", which is a state this column already has and which no
+    reader may take for an answer.
+
+    NULL is also what a round that is going again sends, and that is not a defect
+    to be coerced away: the counts are true of a round either way and the verdict
+    belongs only to a round that is ending a cycle (#42). The row's own ``stopped``
+    is what tells the two silences apart.
+    """
+    if not isinstance(v, Mapping):
+        return None
+    word = v.get("handed_to")
+    return word if isinstance(word, str) and word in HANDED_TO else None
 
 
 def _has_nul(node: object) -> bool:
@@ -2577,6 +2721,12 @@ class ReviewIn(BaseModel):
     #: nowhere else. See :func:`_word_or_none`.
     rules_dropped: str = ""
     provenance_restored_dropped: str = ""
+    #: Why a ``round_stop.outstanding`` that arrived was not stored, or ``""``
+    #: (#717). Its own signal for ``review_panel_dropped``'s reason and one more:
+    #: a disposal refused in silence lands on the NULL that means "this producer
+    #: is older than #42", so a panel that measured its remainder and sent it
+    #: would be told nothing while the row said it had none to send.
+    outstanding_dropped: str = ""
     #: Why a fix-pass record arrived and was not stored (#624). Its own key beside
     #: the three above rather than folded into them, on `rules_dropped`'s rule: they
     #: are bounded differently and a producer told only "something you sent was too
@@ -2706,6 +2856,12 @@ class ReviewIn(BaseModel):
         # not because it is an end of any range on this row.
         h_rev, h_dirty = v.get("harness_rev"), v.get("harness_dirty")
         h_digest, h_path = v.get("harness_digest"), v.get("harness_path")
+        # #717's disposal lives inside the nested stop record, so the drop signal
+        # has to reach in for it. Read here with the rest rather than in `StopIn`,
+        # because that model is the shape of a verdict and this is a report about
+        # what the sender's payload lost — which every other field's drop signal is
+        # gathered in this one place.
+        stop = v.get("round_stop")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -2776,6 +2932,13 @@ class ReviewIn(BaseModel):
                 # the wrong field.
                 "rules_dropped": _rules_or_none(rules)[1],
                 "provenance_restored_dropped": _restored_or_none(restored)[1],
+                # #717, on that rule and read out of the NESTED block rather than
+                # the top level, because that is where the panel puts it. A
+                # disposal refused in silence is indistinguishable from a producer
+                # that predates #42 — and the field it lands on is the one a merge
+                # gate reads, so the sender is the party that has to hear about it.
+                "outstanding_dropped": _outstanding_or_none(
+                    stop.get("outstanding") if isinstance(stop, Mapping) else None)[1],
                 # #624, on that same rule. A fix-pass record refused for its size
                 # would otherwise land on the NULL that means "there was no pass",
                 # which is a true statement about round 1 and a false one about a
@@ -3733,6 +3896,19 @@ async def record_review(
         # happen to `could_not_assess`, one field over — and `_run_view` passes
         # it through unmasked, so a reader of the API sees the distinction too.
         stop_veto=body.round_stop.veto if body.round_stop else None,
+        # #717. The round's own disposal, counted — five lengths and the verdict
+        # over them. NULL by the same three routes `converged` above lists, plus a
+        # fourth: a block that arrived without one of `OUTSTANDING_REQUIRED` and
+        # was refused whole. All four mean "how much this round is owed is not
+        # recorded", which is what `preland` falls back to holding on the raw
+        # confirmed count for — the strict reading, never the lax one.
+        outstanding_counts=(_outstanding_or_none(body.round_stop.outstanding)[0]
+                            if body.round_stop else None),
+        # Beside the counts and not folded into them: it is a verdict about a
+        # remainder and not a measurement of one, and it is null on a round that is
+        # going again while the counts are still true of it (#42).
+        handed_to=(_handed_to_or_none(body.round_stop.outstanding)
+                   if body.round_stop else None),
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
         reviewers_selected=body.reviewers_selected or None,
@@ -3934,6 +4110,11 @@ async def record_review(
         dropped["rules_dropped"] = body.rules_dropped
     if body.provenance_restored_dropped:
         dropped["provenance_restored_dropped"] = body.provenance_restored_dropped
+    # #717, on the same argument and with its own version of the sharp end: a
+    # disposal refused in silence reads as "this producer predates #42", which is
+    # a statement about a payload's age, on the one field a merge gate rules on.
+    if body.outstanding_dropped:
+        dropped["outstanding_dropped"] = body.outstanding_dropped
     # #624, on the same argument again and with the sharpest version of it: a
     # fix-pass record refused in silence reads as "there was no pass to record",
     # which is what round 1 and every skip legitimately send — so a producer that
@@ -4919,6 +5100,18 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # panel ever said" (NULL) stay apart, and masking it on read handed every
         # consumer exactly the collapse the storage side argues against.
         "stop_veto": r.stop_veto,
+        # #717: what the round left behind, counted, and who it went to. On every
+        # view rather than detail-only, because the reader this exists for is
+        # `preland`, and `preland` fetches the run LIST for a PR and rules on the
+        # newest row — the same cut `provenance_counts` is on and for its reason.
+        #
+        # Unmasked, both. NULL on the counts is "how much is owed is not recorded"
+        # — every round predating the column, and every block this board refused
+        # whole — and a consumer that read it as zero would wave through exactly
+        # the PRs this gate exists to stop. NULL on `handed_to` is either that or a
+        # round that went again and made no disposal, told apart by `stopped`.
+        "outstanding": r.outstanding_counts,
+        "handed_to": r.handed_to,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],

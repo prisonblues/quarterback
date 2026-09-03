@@ -19,7 +19,7 @@ board reconnects them.**
   ways of working a repo uses — `⌂ CLEANROOM` or `~ JUNGLE` — and exits 3 when the
   tree you are standing in contradicts it, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
-  on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
+  on any host with ssh; see the repo README), `qb-reconcile`, the pass
   that asks whether the board's plan still describes the present, `qb-pace`, which
   says how the shared subscription's five-hour and weekly windows stand and what a
   job of N seats would cost against them, `qb-doctor`, the one command that answers
@@ -432,9 +432,13 @@ commands and the files they touch), or `HOLD` (exit 2, with what is unresolved a
 to resolve it). `--json` for a loop, plain text for a person.
 
 It is not a new gate. It is the gates the harness already had — CI green *now*, the panel's
-newest round read *this* commit and stopped with nothing confirmed, one migration head,
+newest round read *this* commit and stopped owing nothing, one migration head,
 no failing Sonar gate, nobody else landing the same branch — read in one place instead of
-described in two. `/fix-and-land` used to hold about fifty lines of prose about them and
+described in two. "Owing nothing" is the round's own disposal of what it found (#42, #717):
+`fixable + escalated` holds the merge, and findings under the repo's `fix_severity_floor`
+are warned about, because that dial's whole content is that they are reported and not fixed
+here (#165). A round that recorded no disposal is held on its raw confirmed count, as
+before. `/fix-and-land` used to hold about fifty lines of prose about them and
 `/panel-review-pr` held none, which is how they came to disagree; both now call this and
 act on the verdict.
 
@@ -3139,6 +3143,7 @@ qb-reconcile                     # every repo the board's plan names
 qb-reconcile --repo owner/name   # just that one
 qb-reconcile --json              # the whole report, unknowns beside the findings
 qb-reconcile --post              # put the report on the board — when it CHANGED, or aged out
+qb-reconcile --apply             # complete items whose own PR is merged (#552)
 qb-reconcile --include-drafts    # count draft PRs as untracked work too
 qb-reconcile --quiet             # say nothing when there is nothing to say
 ```
@@ -3200,11 +3205,80 @@ disagreements:
 | `note_contradicted` | the item's note asserts a readiness `/review/findings` denies |
 | `untracked_pr` | an open PR no open plan item accounts for |
 
-**No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. It never
-edits the plan: "this item looks done" is a candidate for a human or a `plan_done` call, not
-a state transition to make behind their back — and `dropped` in particular is a *decision*,
-which is why the plan's model keeps it apart from `done`. The only write it can make is one
-board post, and only when asked.
+**No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. The writes
+it can make are one board post (`--post`) and one plan transition (`--apply`), both opt-in.
+
+**It never *judges* — which is a narrowing of "it never edits the plan", and #552 is why.**
+That was the rule, and it was measured: ranks 1, 2 and 3 of this repo's plan were closed
+work, flagged `done_candidate` and re-confirmed every fifteen minutes for days, while on
+lexray **thirteen finished items sat on top of a thirty-one-item human-ordered plan** with
+every one of their claims already expired. Picking work up writes a plan item (#427) and
+nothing writes it back, and the two halves decay differently: a claim expires on its TTL and
+needs nobody, an item has no TTL at all. So the residue is permanent, and it lands at the
+*top*, because picked-up items rank first. The detector had been right and unheard the whole
+time; what was missing was an actor. `dropped` stays a decision the plan's model keeps apart
+from `done`, and nothing here infers one.
+
+#### `--apply` — the one transition it may make (#552)
+
+It completes an item whose **own ref is a pull request GitHub reports `MERGED`**, and nothing
+else. That the work merged is a fact about the code; recording it is bookkeeping.
+
+**Only that leg, and the `test`-branch flow is the reason.** #552's predicate is three-legged
+— an item is done when its PR merges, or its issue is closed, or the agent releases it — and
+`MERGED` is the only leg that is base-branch agnostic. GitHub says `MERGED` whatever the base,
+so a PR that landed on `test`, or on an `fca` integration branch two merges below it, completes
+its item with no change at all. A closing keyword only fires on a merge into the repository's
+*default* branch, and an item whose ref is an **issue** cannot see the pull request that
+implemented it — the item→PR edge is computed on every pass and stored nowhere (#396). So an
+issue-ref `done_candidate` is **declined by name, in the report, on every tick** rather than
+acted on or quietly skipped: the residue that limb would clear stays readable until #396 makes
+it answerable.
+
+Everything it will not do, it says:
+
+| the report says | what it means |
+|---|---|
+| `COMPLETED` | the item's own PR is merged and the board accepted the write |
+| `NOT COMPLETED` | the pass decided to complete it and the write failed — exit code 1 |
+| `LEFT ALONE` | a `done_candidate` this pass does not complete, with the reason |
+
+Three properties hold it to that. **The merge is re-read from GitHub at the point of the
+write**, not inferred from the condition: `CONDITIONS` is a vocabulary five checks share and
+any of them may widen, and an actor trusting the label would one day complete an item on a
+fact nobody checked, on a fifteen-minute timer. **A run that could not reach GitHub writes
+nothing**, which falls out rather than being special-cased — an unresolved ref is an `unknown`
+and raises no finding, so there is nothing to read as a merge. And **a refused write is
+reported and raises the exit code**: a 409 is the board holding a rule this pass must not route
+around ("a human dropped this item" is the one state `done` refuses), and a rule enforced into
+a silence is a rule nobody learns.
+
+**A claim the board leaves is named.** `POST /plan/item/done` releases the item's claim only
+when it is the caller's, and this pass calls with a machine token and no session — so an item a
+live agent is still holding is recorded done with that claim standing, and the endpoint says so
+in `claim_left`. That is the endpoint's own rule, and the residue this is about is the other
+case entirely: every one of lexray's thirteen claims had already expired. The holder is carried
+into the report anyway, because a row that went done under somebody's hand is the one row a
+reader may want to ask about.
+
+**`qb-next` retires a finished row too, and the two agree on the word.** Walking the plan for
+something to claim, it asks the forge about each candidate and records a row whose ref has
+already closed — `MERGED` for a PR, `CLOSED` for an issue, the same per-kind rule for the same
+reason. That is not a duplicate of this and neither replaces the other. `qb-next` needs an
+agent to be *there*, arriving through `/get-involved` and walking down from the top; the
+residue is precisely what escapes it — lexray's thirteen items were worked through
+`/fix-issue`-shaped routes, so nothing ever walked that plan. And where `qb-next` does retire
+an issue-ref row, it is a row it has just claimed and is about to work, with an agent present
+to read the answer; `--apply` acts across every plan unattended on a timer, which is why it
+takes the narrower leg. A guard holds `APPLY_STATE` against `qb-next`'s `TERMINAL["pr"]`: two
+tools that retire a plan item on the same fact must not disagree about what the fact is.
+
+**An item it completed is withdrawn from the `/plan/reconcile` hand-off**, and only that. Those
+rows exist to tell a reader of the plan that an *open* item looks finished; reported for an item
+this pass just completed, `plan_read` would hang "looks done" off a row that is done, and
+re-assert it every tick — `run` reads open rows only, so it would never find it again to
+withdraw it. A write that *failed* keeps its finding: there the item is still open and the
+disagreement still stands.
 
 **Ref kind is not one of the conditions.** The first two are "the item outlived its work"
 and "the work was abandoned"; whether that work is spelled as a PR or an issue is only how
@@ -3243,13 +3317,18 @@ anyway. The exit code carries the same distinction:
 
 ```
 0   ran, every check completed (a disagreement is the report, not an error)
-1   ran, but at least one check could not be made
+1   ran, but at least one check could not be made — or, under `--apply`, a write it
+    decided on could not be made either
 2   could not run at all: no board, no `gh`, or bad arguments
 ```
 
 Run it on a timer with
 [`loops/systemd/qb-reconcile.{service,timer}`](loops/systemd/) — reference units, like the
-lander's. There is no `--execute` to graduate to, because there is nothing for it to do.
+lander's. The shipped unit runs `--apply --post --quiet`: the timer is what carries the actor,
+because it covers every route work is picked up through and every abnormal ending, including a
+session that died mid-work. **The live units on this fleet come from nix-fleet's
+`home/rich-workstation.nix`** (#695's row is about exactly that split), so a flag added here
+reaches a host only once that config carries it too.
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.

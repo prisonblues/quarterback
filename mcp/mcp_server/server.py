@@ -2105,6 +2105,13 @@ def active(
     already working here?". Returns {"agents": [...top-level sessions...],
     "subagents": [...their fan-out...]}; an empty result means the coast is clear.
 
+    `repo` takes `owner/name` — the spelling every other tool here insists on —
+    or the bare repository name, and matches either against what a live agent
+    reported. A spelling that is neither is refused, not answered with an empty
+    board: until #714 the qualified form matched nothing (leases record what the
+    checkout knows, which was the basename) and this tool answered "coast is
+    clear" for a repo with three agents in it.
+
     Pass `mine=<your session id>` so your own entries come back tagged
     `own=true` — that's how you tell your *own* sub-agents apart from real peers
     instead of mistaking your fan-out for a collision. Add `peers_only=true` to
@@ -2144,7 +2151,10 @@ def peers(
 
     Args:
         mine: your own session id (always excluded from results).
-        repo: restrict to peers in this git repo (the usual scope).
+        repo: restrict to peers in this git repo (the usual scope) — `owner/name`
+            or the bare repository name; either finds a peer however its own
+            checkout spelled it (#714), and a spelling that is neither is refused
+            rather than answered "no peers".
         subject: your title + recap (what you're working on) — peers are ranked
             by textual overlap with it; omit to get every same-repo peer.
         min_score: drop peers whose overlap is below this (0-1, default 0.12).

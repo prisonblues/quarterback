@@ -24,9 +24,10 @@ posts the board already holds.
 ## The one rule that keeps that safe
 
 **A merge announcement counts only when the post names its repository as
-``owner/name``.** The lifecycle hook tags posts with the checkout's *basename*
-(``quarterback``), and a bare name is exactly the ambiguity
-:data:`app.claimkey.REPO_RE` refuses — ``nix-fleet#40`` and ``quarterback#40``
+``owner/name``.** The lifecycle hook tagged posts with the checkout's *basename*
+(``quarterback``) until #714 — it reports the origin remote's ``owner/name`` now,
+where the remote is a GitHub one — and a bare name is exactly the ambiguity
+:data:`app.claimkey.REPO_RE` refuses: ``nix-fleet#40`` and ``quarterback#40``
 are different nodes and there is no honest way to tell which one a bare
 ``Merge pull request #40`` meant. Under-resolving is a stale edge somebody
 clears by hand; over-resolving silently tells an agent that its blocker has

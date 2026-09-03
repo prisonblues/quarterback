@@ -2906,6 +2906,32 @@ def test_the_clickable_fleet_shows_how_far_along_each_agent_is():
     assert stages == ["R2", _load_app().qd.STAGE_UNREPORTED]
 
 
+def test_a_qualified_repo_does_not_fill_the_repo_cell_with_its_owner():
+    """#714 made a lease report `owner/name`, and this cell is eleven columns.
+
+    The width is deliberate — `qbdata.short_repo`'s docstring is "the owner never
+    distinguishes", on a fleet whose repos share one — so an unfolded slug clips to
+    the half that distinguishes nothing and every AGENTS row reads `prisonblue…`.
+    The plan table folded before calling and AGENTS did not, because until #714 a
+    lease reported the checkout basename and had nothing to fold; the fold lives in
+    `repo_cell` now so no caller can be the one that forgets.
+
+    The colour is keyed on the same fold, so a PR row and the agent working it stay
+    the same colour whichever spelling each of them arrived in.
+    """
+    app_module = _load_app()
+    app = app_module.Dash.__new__(app_module.Dash)          # no screen, no board
+    app.scope = SimpleNamespace(column=True)
+
+    cell = app.repo_cell("prisonblues/quarterback")
+    assert [str(t) for t in cell] == ["quarterback"]
+    assert cell[0].style == app_module.qd.repo_colour("quarterback")
+
+    app.scope = SimpleNamespace(column=False)
+    assert app.repo_cell("prisonblues/quarterback") == [], \
+        "a narrowed pane spends no columns saying the same word on every row"
+
+
 def test_the_scope_narrows_the_rows_and_drops_the_column_together():
     """#261: one keypress, both halves.
 

@@ -95,6 +95,14 @@ DROPPED_BY_DESIGN = frozenset({
     # lifted it.
     "retracted",            # key -> the round a human retracted a declination in
     "unresolved_claims",    # #547's ledger, per claim
+    # #718's pair, dropped for the reason every register above it is: they are the
+    # next ROUND's input rather than this round's outcome. What the board keeps is
+    # the consequence — a declaration somebody answered stops appearing in
+    # `stop_veto` and stops costing the stop its `confident`, and both of those ARE
+    # stored — so the row already says whether the hold is lifted without carrying
+    # the register that lifted it.
+    "assessed",             # key -> {round, note, set_by, attested} of an answer
+    "coverage_declarations",  # #718's ledger, per declaration
     "new_finding_keys",     # the keys behind `new_findings`, which IS stored
     "prior_rounds",         # derivable from this board's own rows for the cycle
     "prior_findings",       # likewise

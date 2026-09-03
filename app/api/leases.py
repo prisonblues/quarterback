@@ -5,7 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,7 @@ from app.models.blob import Blob
 from app.models.lease import Lease
 from app.models.post import Post
 from app.models.session import SessionRecord
+from app.repomatch import fold_repo
 from app.schemas import CWD_MAX
 
 router = APIRouter(tags=["lease"])
@@ -158,7 +159,12 @@ class LeaseIn(BaseModel):
     device: str = Field(min_length=1)
     ttl: int = Field(default=300, ge=1, le=86400)
     cwd: str | None = Field(default=None, max_length=CWD_MAX)  # project dir (peer `--resume`)
-    repo: str | None = None     # git repo name (topic-overlap match)
+    #: The repository this session is standing in — ``owner/name`` off the origin
+    #: remote, or the bare repository name from a checkout that has no GitHub one
+    #: (and from every lifecycle hook older than #714). Both shapes are matched by
+    #: repository name at the reads; see :mod:`app.repomatch` for why the column is
+    #: the one repo field on this board that is not a key.
+    repo: str | None = None
     branch: str | None = None   # git branch (finer overlap signal)
     title: str | None = None    # CC ai-title
     recap: str | None = None    # compact-summary head / last prompt
@@ -173,6 +179,19 @@ class LeaseIn(BaseModel):
     #: reader's conclusion from `state_at` — and accepting it would let a holder
     #: assert a state it cannot know it is in.
     state: Literal["working", "waiting", "input"] | None = None
+
+    @field_validator("repo")
+    @classmethod
+    def _fold_repo(cls, value: str | None) -> str | None:
+        """One repository, one stored spelling — #326's rule, on the reporting column.
+
+        A qualified ``owner/name`` is folded; a bare name (or a blank, which becomes
+        NULL) passes through. :func:`app.repomatch.fold_repo` carries the argument
+        for why this is a fold and not a refusal: the alternative to accepting the
+        un-qualified half is taking a heartbeat's whole lease away over a field that
+        is optional in the first place.
+        """
+        return fold_repo(value)
 
 
 class StageIn(BaseModel):

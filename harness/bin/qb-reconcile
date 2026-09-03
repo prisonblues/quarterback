@@ -14,11 +14,37 @@ reports every disagreement it can establish. It is the deterministic half of
 cannot order a plan that does not describe the present.
 
 WHAT IT IS NOT. No agent, no claims, no hook wiring. It resolves refs, compares,
-prints, and exits; the only write it can make is one board post, and only when
-asked (`--post`). It NEVER edits the plan: "this item looks done" is a candidate
-for a human or a `plan_done` call, not a state transition to make behind their
-back. `dropped` in particular is a decision — the plan's own model says so — and
-a tool that inferred it would erase the distinction the model exists to keep.
+prints, and exits; the writes it can make are one board post (`--post`) and, since
+#552, one plan transition (`--apply`).
+
+THE RULE THAT CHANGED, AND HOW FAR (#552). This paragraph used to read "it NEVER
+edits the plan: 'this item looks done' is a candidate for a human or a `plan_done`
+call, not a state transition to make behind their back". The detector was right and
+unheard. Ranks 1-3 of this repo's own plan were closed work, flagged
+`done_candidate` and re-confirmed every fifteen minutes for days; on lexray
+thirteen finished items sat on top of a thirty-one-item ordered plan with every one
+of their claims already expired. Picking work up writes an item (#427) and nothing
+writes it back, and the two halves decay differently — a claim expires on its TTL
+and needs nobody, an item has no TTL at all — so the residue is permanent and it
+lands at the TOP, because picked-up items rank first.
+
+So the rule is NARROWED, not dropped: it never **judges**. `--apply` completes an
+item whose own ref is a pull request GitHub reports `MERGED`, and nothing else.
+That the work merged is a fact about the code, and recording it is bookkeeping.
+`dropped` stays a decision — the plan's own model says so — and a tool that
+inferred it would erase the distinction the model exists to keep.
+
+AND ONLY THAT LEG, DELIBERATELY. #552's predicate is three-legged: an item is done
+when its PR merges, or its issue is closed, or the agent releases it. Only the
+first is acted on here, and the `test`-branch flow is why. `MERGED` is
+base-branch agnostic — GitHub says it whatever the base — so that leg reads the
+same in a repo whose PRs land on `test` as in one where they land on the default
+branch. The issue leg does not: a closing keyword only fires on a merge into the
+DEFAULT branch, and an issue-ref item cannot see the pull request that implemented
+it, because the item→PR edge is computed on every pass and stored nowhere (#396).
+So an issue-ref `done_candidate` is declined by name, in the report, on every tick.
+The residue stays visible rather than being cleared on a signal that does not mean
+the same thing in every repo.
 
 THE FIVE CONDITIONS (#255's table):
 
@@ -47,7 +73,8 @@ is v2.48 and `/review/findings` there returns no `cycles` field at all, so its
 Exit codes:
     0   ran, every check completed (findings or not — a disagreement is the
         report, not an error)
-    1   ran, but at least one check could not be made
+    1   ran, but at least one check could not be made — or, under `--apply`, a
+        write the pass decided on could not be made either
     2   could not run at all: no board, no `gh`, or bad arguments
 
 Usage:
@@ -55,6 +82,7 @@ Usage:
     qb-reconcile --repo owner/name   just that one
     qb-reconcile --json              the whole report as JSON (what #232 reads)
     qb-reconcile --post              post one `finding` — only when it CHANGED
+    qb-reconcile --apply             complete items whose own PR is merged (#552)
     qb-reconcile --include-drafts    count draft PRs as untracked work too
     qb-reconcile --quiet             say nothing when there is nothing to say
 """
@@ -302,11 +330,32 @@ class Report:
     #: reason `prs_skipped` does neither: nothing went unchecked. Said once per
     #: tick, in one line, so it is not silent either.
     scopes_skipped: list[dict] = field(default_factory=list)
+    #: Items `--apply` completed: one entry per write the board accepted.
+    applied: list[dict] = field(default_factory=list)
+    #: Writes `--apply` decided on and could not make. Never folded in with
+    #: :attr:`applied`, and the reason is this file's own thesis pointed at its own
+    #: new limb: "I completed three items" and "I completed two and a third refused"
+    #: are different sentences, and on a fifteen-minute timer the second one told as
+    #: the first is a plan a reader believes is being maintained.
+    apply_failed: list[dict] = field(default_factory=list)
+    #: `done_candidate` findings `--apply` will not act on, each with the reason.
+    #: Said out loud on every tick rather than left implicit, because this is where
+    #: the limb that was NOT shipped lives (#396's issue-ref items) and a residue
+    #: nobody names is a residue nobody clears.
+    apply_declined: list[dict] = field(default_factory=list)
 
     @property
     def exit_code(self) -> int:
-        """0 clean, 1 partial. Findings do not raise it — they are the output."""
-        return 1 if self.unknowns else 0
+        """0 clean, 1 partial. Findings do not raise it — they are the output.
+
+        A refused WRITE does raise it. `--apply` is not a check, so a failure there
+        is not an unknown and must not be filed as one; but "ran, and part of what
+        it decided to do did not happen" is exactly what exit 1 means to the shipped
+        unit (`SuccessExitStatus=0 1`, retried on the next tick), and an actor whose
+        writes can fail silently under exit 0 is the report-that-never-ran collapse
+        this file exists to prevent, arriving through the half that acts.
+        """
+        return 1 if self.unknowns or self.apply_failed else 0
 
     def as_dict(self) -> dict:
         return {
@@ -321,6 +370,14 @@ class Report:
             "unknowns": [asdict(u) for u in self.unknowns],
             "prs_skipped": list(self.prs_skipped),
             "scopes_skipped": list(self.scopes_skipped),
+            "applied": list(self.applied),
+            "apply_failed": list(self.apply_failed),
+            "apply_declined": list(self.apply_declined),
+            # Still about the CHECKS, and deliberately not about the writes. #232's
+            # orderer reads this to decide whether the report describes the whole
+            # plan; a write that was refused leaves every comparison in it exactly as
+            # good as it was. `apply_failed` is what says a write did not happen, and
+            # `exit_code` is what makes a caller notice.
             "complete": not self.unknowns,
         }
 
@@ -1242,6 +1299,224 @@ def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
     return report
 
 
+# ---- the actor: the one transition this pass may make (#552) ----------------
+
+
+#: What `--apply` acts on, spelled as three separate facts rather than one label.
+#:
+#: The condition alone is not enough and the ref kind alone is not enough, so the
+#: write re-reads both off the finding's own evidence rather than trusting the
+#: LABEL — even though :func:`ref_verdict` gives a pull request `done_candidate`
+#: for `MERGED` and for nothing else today. `CONDITIONS` is a vocabulary five
+#: checks share and any of them may legitimately widen; the day a `done_candidate`
+#: is raised for a PR GitHub reports some other way, an actor that trusted the
+#: label would complete a plan item on a fact nobody checked, silently, on a
+#: fifteen-minute timer. So the write reads the state GitHub actually reported, and
+#: one it does not recognise is declined and named rather than acted on.
+#:
+#: **It is not a second call to GitHub, and the guard is not claiming to be one**
+#: (PR #719 review). `github_state` is what this pass already fetched, minutes
+#: earlier at most, and re-fetching it would buy nothing here: `MERGED` is terminal
+#: on GitHub, so the one state acted on cannot have stopped being true in between.
+#: What the re-read defends against is this file drifting away from itself — a
+#: condition widening upstream of an actor that reads only the condition — which is
+#: a change to the code and not a change on the forge.
+APPLY_CONDITION = "done_candidate"
+APPLY_REF_KIND = "pr"
+APPLY_STATE = "MERGED"
+
+#: Why an issue-ref `done_candidate` is left for a human — the limb #552 splits off.
+#:
+#: A closed issue IS one of that issue's three completion signals, so this is a
+#: scoping decision and not a claim that the signal is wrong. What makes the two
+#: legs unequal is the `test`-branch flow: `MERGED` is base-branch agnostic, a
+#: closing keyword only fires on a merge into the repository's DEFAULT branch, and
+#: an item whose ref is an issue cannot see the pull request that implemented it
+#: (#396). So in a repo that lands work on an integration branch, "the issue closed"
+#: arrives one or two merges after the work did — and an actor keyed on it would be
+#: correct on this repo and inert on lexray, which is worse than not shipping,
+#: because the plan would then carry something that claims to be handling
+#: completion. Declined out loud instead, every tick, with somewhere to read why.
+ISSUE_LIMB = ("this pass completes the PR leg only (#552): an item whose ref is an "
+              "issue cannot see the PR that implemented it (#396), and a closing "
+              "keyword only fires on a merge into the default branch — so a closed "
+              "issue is not the same fact as landed work in every repo. Left for a "
+              "human or a `plan_done` call")
+
+
+def apply_note(finding: Finding) -> str:
+    """What the completed item's note will say — the fact and where to read it.
+
+    `POST /plan/item/done` appends this to the item's own note rather than
+    replacing it, so it is a receipt and says only what a receipt says. The URL is
+    in it because "where did this land" is the first question a reader of a done row
+    asks, and the pass has GitHub's answer in hand.
+    """
+    url = (finding.evidence or {}).get("url")
+    return (f"{finding.ref} is merged — recorded by qb-reconcile"
+            + (f" ({url})" if url else ""))
+
+
+def _attempt(finding: Finding, **extra) -> dict:
+    """The identifying half of an applied / failed / declined entry.
+
+    One shape for all three, so a reader (and the digest) sees the same fields
+    whichever list a row is in.
+    """
+    return {"item_id": finding.item_id, "repo": finding.repo, "ref": finding.ref,
+            "rank": finding.rank, "subject": finding.subject, **extra}
+
+
+def apply_candidates(report: Report) -> tuple[list[Finding], list[dict]]:
+    """``(the findings --apply completes, the done candidates it will not)``.
+
+    Pure, and separate from the writing, so the predicate is testable without a
+    board — the same reason :func:`reconcile` does no I/O.
+
+    Every `done_candidate` reaches one list or the other. A finding that is neither
+    completed nor accounted for is the failure mode this whole issue is about, one
+    level in: a pass that quietly acts on some rows and says nothing about the rest
+    leaves a residue whose size nobody can read off the report.
+    """
+    doing: list[Finding] = []
+    declined: list[dict] = []
+    for finding in report.findings:
+        if finding.condition != APPLY_CONDITION:
+            continue
+        kind, _, _value = (finding.ref or "").partition("#")
+        state = str((finding.evidence or {}).get("github_state") or "").strip().upper()
+        if kind != APPLY_REF_KIND:
+            declined.append(_attempt(finding, reason=(
+                ISSUE_LIMB if kind == "issue" else
+                f"the ref kind is {kind or 'unstated'!r}, and this pass completes "
+                f"{APPLY_REF_KIND!r} refs only")))
+        elif state != APPLY_STATE:
+            # See APPLY_STATE: the condition said done, GitHub's own word did not
+            # say merged, and the two disagreeing is a reason to stop rather than a
+            # detail to round off.
+            declined.append(_attempt(finding, reason=(
+                f"the finding is a {APPLY_CONDITION} but GitHub reports "
+                f"{state or 'nothing'} rather than {APPLY_STATE}, so the one fact "
+                "this pass acts on was not established")))
+        elif not finding.item_id:
+            # `untracked_pr` carries no item and never reaches here; a
+            # `done_candidate` without one would be a plan row this pass cannot
+            # address, and inventing an id is not the answer.
+            declined.append(_attempt(finding, reason=(
+                "the finding carries no item_id, so there is no plan row to complete")))
+        else:
+            doing.append(finding)
+    return doing, declined
+
+
+def _already_done(view: dict, before: str) -> str | None:
+    """Who had recorded this item done before THIS WRITE went out, if anybody.
+
+    **Two observers of one merge is the endpoint's design, not a race this caller
+    invented.** `POST /plan/item/done` says any agent may record a completion —
+    "whoever observes it may write it down" — and it appends the note rather than
+    replacing it, precisely so two receipts can coexist. `complete_item` only stamps
+    `done_by` when the row was not already done, so a second record leaves the first
+    holder's name and timestamp in place and adds a note line under it.
+
+    What that leaves is not a wrong state — the row is done either way, which is the
+    answer both observers wanted — but a duplicated receipt, and this file's rule is
+    that nothing it does is silent. So the pass reads the timestamp it got back and
+    compares it against the moment it sent the write: a `done` older than that means
+    somebody finished the row while this pass was working (an agent's own
+    `plan_done`, or a sibling host's tick), and the report says so and names them.
+
+    **`before` is the write, and it cannot be the report's `generated`** (PR #719
+    review). `generated` is stamped before the plan is even read, and `run` reads
+    OPEN rows only — so a row this pass saw as open was still open at `generated`,
+    and `done < generated` is a comparison that cannot come out true in the race it
+    was written to catch. It went the other way instead: every sibling's completion
+    landed after `generated`, was read as ours, and the duplicated receipt the whole
+    function exists to name was the one case it stayed silent about.
+
+    The residual is clock skew between this host and the board, and it is bounded by
+    the one round trip rather than by the length of the pass. Both directions cost
+    one sentence in a report and neither costs a state: a fast local clock names a
+    peer for a receipt that was ours, a slow one stays quiet about one that was not.
+
+    `None` on anything unparseable, and `None` when the row was ours to record.
+    Guessing either way round would put a sentence in the report that no comparison
+    supports, which costs more than the line it would explain.
+    """
+    stamp, holder = view.get("done"), view.get("done_by")
+    if not stamp or not holder:
+        return None
+    try:
+        done, ours = datetime.fromisoformat(str(stamp)), datetime.fromisoformat(before)
+    except (TypeError, ValueError):
+        return None
+    if done.tzinfo is None:
+        done = done.replace(tzinfo=UTC)
+    if ours.tzinfo is None:
+        ours = ours.replace(tzinfo=UTC)
+    return str(holder) if done < ours else None
+
+
+def apply_done(report: Report) -> None:
+    """Complete every item whose own pull request GitHub reports merged.
+
+    Fills :attr:`Report.applied`, :attr:`Report.apply_failed` and
+    :attr:`Report.apply_declined` in place; makes no decision the report does not
+    already carry.
+
+    **A claim the board leaves is reported, not silenced.** `POST /plan/item/done`
+    releases the item's claim only when it is the caller's, and this pass calls with
+    a machine token and no session — so an item still held by a live agent is
+    recorded done with that agent's claim left standing, and the endpoint says so in
+    `claim_left`. That is the endpoint's own rule ("an item another agent is holding
+    might be finished by a third, but taking their claim away is not this
+    endpoint's business") and the residue this issue is about is the other case
+    entirely: every one of lexray's thirteen claims had already expired. So the
+    holder is carried into the report rather than dropped, because a plan row that
+    went done while somebody was holding it is the one row a reader may want to ask
+    about.
+
+    **A run that could not reach GitHub writes nothing, and that falls out rather
+    than being special-cased.** A ref `gh` would not resolve produces an `Unknown`
+    and no finding at all, so there is nothing here to act on — the same property
+    that makes an unmade check unable to read as a clean one makes it unable to read
+    as a merge.
+    """
+    doing, declined = apply_candidates(report)
+    report.apply_declined.extend(declined)
+    if not doing:
+        return
+    try:
+        client, _cfg = client_once()
+    except Exception as exc:                                # noqa: BLE001
+        report.apply_failed.extend(
+            _attempt(f, reason=f"the board could not be reached: {exc}") for f in doing)
+        return
+    for finding in doing:
+        note = apply_note(finding)
+        # Stamped per write and not once for the batch: it is the reference
+        # `_already_done` compares the board's `done` against, and a batch-wide one
+        # would widen the window by however long the writes before this took.
+        before = _utcnow().isoformat()
+        try:
+            got = client.post("/plan/item/done",
+                              {"item_id": finding.item_id, "note": note})
+        except Exception as exc:                            # noqa: BLE001
+            # NAMED, never swallowed. A 409 is the board holding a rule this pass
+            # must not route around — "a human dropped this item" is the one state
+            # `done` refuses — and a rule enforced into a silence is a rule nobody
+            # learns.
+            report.apply_failed.append(
+                _attempt(finding, reason=f"the board refused the write: {exc}"))
+            continue
+        view = got if isinstance(got, dict) else {}
+        left = view.get("claim_left")
+        report.applied.append(_attempt(
+            finding, note=note,
+            claim_left=(left or {}).get("holder") if isinstance(left, dict) else None,
+            already=_already_done(view, before)))
+
+
 # ---- reporting --------------------------------------------------------------
 
 _HEADINGS = {
@@ -1253,8 +1528,32 @@ _HEADINGS = {
 }
 
 
+def _acted(rows: list[dict], heading: str) -> list[str]:
+    """One rendered block for a list the actor filled, or nothing at all."""
+    if not rows:
+        return []
+    lines = ["", heading]
+    for row in rows:
+        where = f" [{short_repo(row.get('repo'))}]" if row.get("repo") else ""
+        said = row.get("reason") or row.get("note") or ""
+        held, first = row.get("claim_left"), row.get("already")
+        lines.append(f"  {row.get('subject')}{where}: {said}"
+                     + (f" — a live claim held by {held} was left" if held else "")
+                     + (f" — {first} had already recorded it, so this receipt is a "
+                        "second one on a row that was already done" if first else ""))
+    return lines
+
+
 def render(report: Report) -> str:
-    """The report a cron log carries. Findings, then what could not be checked."""
+    """The report a cron log carries: what it did, what it found, what it could not check.
+
+    What was APPLIED is printed above the findings and not instead of them. The
+    finding is the evidence the write was made on, and a report that showed only the
+    action would leave a reader unable to check the reasoning — which is the same
+    argument :class:`Finding`'s own `evidence` field is annotated with, one level
+    out. So a completed item appears twice, once as the disagreement and once as the
+    thing done about it.
+    """
     lines = [f"qb-reconcile {report.generated}",
              f"  {report.items_checked} open plan item(s), {report.prs_checked} open PR(s), "
              f"repos: {', '.join(short_repo(r) for r in report.repos) or 'none'}"]
@@ -1280,6 +1579,12 @@ def render(report: Report) -> str:
         lines.append(f"  {len(report.prs_skipped)} open PR(s) not compared: "
                      + "; ".join(f"{', '.join(numbers)} — {reason}"
                                  for reason, numbers in by_reason.items()))
+
+    lines += _acted(report.applied, "COMPLETED — items whose own PR GitHub reports merged")
+    lines += _acted(report.apply_failed,
+                    f"NOT COMPLETED ({len(report.apply_failed)}) — the write could not be made")
+    lines += _acted(report.apply_declined,
+                    "LEFT ALONE — done candidates this pass does not complete")
 
     for condition in CONDITIONS:
         hits = [f for f in report.findings if f.condition == condition]
@@ -1340,9 +1645,19 @@ def report_findings(report: Report) -> None:
     than none.
     """
     by_repo: dict[str, list[dict]] = {repo: [] for repo in report.repos}
+    # An item `--apply` completed is left out, and only that: the row exists to tell
+    # a reader of the PLAN that an open item looks finished, and that item is not open
+    # any more. Reported anyway, `plan_read` would hang "looks done" off a row that IS
+    # done — a disagreement with nothing left to disagree with — and it would be
+    # re-asserted every tick until the pass stopped finding it, which for a completed
+    # item is never, because `run` reads open rows only. A write that FAILED keeps its
+    # finding: there the item is still open and the disagreement still stands.
+    applied = {row["item_id"] for row in report.applied if row.get("item_id")}
     for finding in report.findings:
         kind, _, value = (finding.ref or "").partition("#")
         if kind not in ("pr", "issue") or not value or not finding.repo:
+            continue
+        if finding.item_id and finding.item_id in applied:
             continue
         by_repo.setdefault(finding.repo, []).append({
             "ref_kind": kind, "ref_value": value,
@@ -1388,9 +1703,22 @@ def post_refs(report: Report) -> list[dict]:
 
 def post_summary(report: Report) -> tuple[str, str]:
     """``(summary, detail)`` for the one board post ``--post`` makes."""
-    counts = {c: sum(1 for f in report.findings if f.condition == c) for c in CONDITIONS}
+    # NET OF WHAT WAS COMPLETED, which is the whole reason this is not a one-liner
+    # over `report.findings`. `render` lists an applied item under DONE CANDIDATES on
+    # purpose — the finding is the evidence the write was made on — but the headline
+    # is a count of what is OUTSTANDING, and it is the whole of this post for every
+    # reader who does not open it. "9 done candidate; 4 completed" describes a plan
+    # that no longer exists and reads as thirteen problems where there are five.
+    settled = {row["item_id"] for row in report.applied if row.get("item_id")}
+    outstanding = [f for f in report.findings
+                   if not (f.item_id and f.item_id in settled)]
+    counts = {c: sum(1 for f in outstanding if f.condition == c) for c in CONDITIONS}
     parts = [f"{n} {c.replace('_', ' ')}" for c, n in counts.items() if n]
     head = ", ".join(parts) if parts else "no disagreement"
+    if report.applied:
+        head += f"; {len(report.applied)} completed"
+    if report.apply_failed:
+        head += f"; {len(report.apply_failed)} could not be completed"
     if report.unknowns:
         head += f"; {len(report.unknowns)} could not be checked"
     return f"plan reconcile: {head}", render(report)
@@ -1436,6 +1764,20 @@ def post_digest(report: Report) -> str:
                   for f in report.findings)
     body += sorted([u.condition, u.repo or "", u.ref or "", u.subject, u.reason]
                    for u in report.unknowns)
+    # What the actor did belongs to what the report SAYS, and the rule above applies
+    # to it unchanged: these rows carry an item id, a ref and a sentence, and no
+    # timestamp. Without them a tick that completed three items hashes the same as
+    # the tick before it — the findings were identical, they are what the write was
+    # made on — and the one post saying the plan was repaired is the one the digest
+    # suppresses.
+    body += sorted(["applied", str(row.get("item_id") or ""), str(row.get("ref") or ""),
+                    str(row.get("subject") or ""), str(row.get("note") or "")]
+                   for row in report.applied)
+    body += sorted([kind, str(row.get("item_id") or ""), str(row.get("ref") or ""),
+                    str(row.get("subject") or ""), str(row.get("reason") or "")]
+                   for kind, rows in (("apply_failed", report.apply_failed),
+                                      ("apply_declined", report.apply_declined))
+                   for row in rows)
     return hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
 
 
@@ -1524,6 +1866,11 @@ def main(argv: list[str] | None = None) -> int:
                              "report differs from the last one posted or that post has "
                              "aged past its re-post interval (off by default: this pass "
                              "reports, it does not write)")
+    parser.add_argument("--apply", action="store_true",
+                        help="complete every open item whose OWN ref is a pull request "
+                             "GitHub reports merged, and say what it left alone and why "
+                             "(off by default: this pass reports, and #552 narrowed that "
+                             "rule to \"it never judges\" rather than dropping it)")
     parser.add_argument("--include-drafts", action="store_true", dest="include_drafts",
                         help="compare draft PRs against the plan too (off by default: a "
                              "draft is not yet work the plan owes an item)")
@@ -1536,6 +1883,13 @@ def main(argv: list[str] | None = None) -> int:
     except Unavailable as exc:
         print(f"qb-reconcile: {exc}", file=sys.stderr)
         return 2
+
+    # BEFORE anything is rendered, posted or gated. The report is what says what
+    # this pass did, so the writes have to be in it by the time it is written out —
+    # a `--json` payload or a board post that predated the actor would describe a
+    # plan the same process had already changed.
+    if args.apply:
+        apply_done(report)
 
     # What counts as "something to report", for both gates below. `prs_skipped` is
     # in it: it is neither a finding nor an unknown, but it is the report's answer
@@ -1552,7 +1906,14 @@ def main(argv: list[str] | None = None) -> int:
     # `--quiet` print and `--post` post on every fifteen-minute tick forever, which
     # is the noise this issue is about, arriving through the gate rather than
     # through the report.
-    has_content = bool(report.findings or report.unknowns or report.prs_skipped)
+    #
+    # `applied` and `apply_failed` are in it for the same reason, and they cannot
+    # presently be non-empty without a finding beside them — a write is only ever
+    # made on one. Named anyway rather than left to that coincidence: the gate should
+    # say what it means, and "the pass repaired the plan" is the one line of a tick
+    # under `--quiet --apply` that a reader most needs to see.
+    has_content = bool(report.findings or report.unknowns or report.prs_skipped
+                       or report.applied or report.apply_failed)
 
     if args.as_json:
         print(json.dumps(report.as_dict(), indent=2))

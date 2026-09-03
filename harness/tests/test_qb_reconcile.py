@@ -22,8 +22,9 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import json
+import re
 import sys
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -2026,3 +2027,648 @@ def test_a_board_that_refuses_the_endpoint_says_so_and_does_not_stop_the_pass(mo
 
     assert board.posts == []
     assert "acme/old" in capsys.readouterr().err
+
+
+# ---------------------------------------------- the actor `--apply` is (#552)
+#
+# The pass's own rule used to be "it NEVER edits the plan", and #552 is the day that
+# rule was measured: ranks 1-3 of this repo's plan were closed work, flagged
+# `done_candidate` and re-confirmed every fifteen minutes for days, and on lexray
+# thirteen finished items sat above a thirty-one-item ordered plan with every claim
+# already expired. The rule is narrowed to "it never JUDGES" — so the two properties
+# these tests pin are the narrowing itself:
+#
+#   1. **A merged pull request under an open item is completed**, whatever branch it
+#      merged to, without anybody touching it.
+#   2. **Nothing else is.** A dropped candidate is a judgement; an issue-ref done
+#      candidate is the limb #552 splits off and #396 is the dependency of; a ref
+#      GitHub would not resolve is not a merge; and a write that could not be made
+#      never reads like one that was.
+
+
+class ApplyingBoard(FakeBoard):
+    """A board that records the completions, and can refuse them or leave a claim."""
+
+    def __init__(self, *a, refuse=None, claim_left=None, **kw):
+        super().__init__(*a, **kw)
+        self.posts: list[tuple[str, dict]] = []
+        self.refuse, self.claim_left = refuse, claim_left
+
+    @property
+    def completed(self) -> list[dict]:
+        return [body for path, body in self.posts if path == "/plan/item/done"]
+
+    def post(self, path, body):
+        if path == "/plan/item/done" and self.refuse:
+            raise RuntimeError(self.refuse)
+        self.posts.append((path, body))
+        if path == "/plan/item/done":
+            return {"item_id": body["item_id"], "state": "done",
+                    "claim_left": self.claim_left}
+        return {}
+
+
+def _applied(report, board, monkeypatch):
+    """Run the actor over an already-computed report against `board`."""
+    monkeypatch.setattr(qr, "_CLIENT", None)
+    monkeypatch.setattr(qr, "board_client", lambda: (board, None))
+    qr.apply_done(report)
+    return report
+
+
+def test_a_merged_pr_under_an_open_item_is_completed(monkeypatch):
+    """The whole point: rank 2's PR merged, so rank 2 stops being offered as work.
+
+    red/green: N-A (new code path) — `--apply` and everything it calls arrived with
+    this change, so there is no pre-fix behaviour for it to fail against. What CAN
+    fail against the old tree is the shipped timer unit, and
+    `test_the_shipped_timer_unit_runs_the_actor` below is that test.
+    """
+    board = ApplyingBoard({"items": []})
+    report = _applied(full_report(), board, monkeypatch)
+
+    assert [b["item_id"] for b in board.completed] == [item()["item_id"]]
+    assert [row["ref"] for row in report.applied] == ["pr#182"]
+    assert report.apply_failed == []
+    assert report.exit_code == 0
+
+
+def test_a_pr_merged_to_a_non_default_branch_is_completed_too(monkeypatch):
+    """The lexray case, and the reason this is the leg that shipped.
+
+    GitHub reports `state: MERGED` whatever the base, so a PR that landed on `test`
+    or on an `fca` integration branch completes its item with no change at all —
+    which is the property the issue leg does NOT have, since a closing keyword only
+    fires on a merge into the default branch.
+    """
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=1, ref={"kind": "pr", "value": "1770"})],
+                    ref_states={(REPO, "pr", "1770"): {"state": "MERGED"}},
+                    open_prs=[]),
+        board, monkeypatch)
+
+    assert [row["ref"] for row in report.applied] == ["pr#1770"]
+    assert report.apply_declined == []
+
+
+def test_the_base_branch_is_never_even_asked_about(monkeypatch):
+    """Base-agnostic by construction and not by luck: nothing the pass fetches
+    carries a base ref, so no future reading of the state can start gating on one."""
+    called: list[list[str]] = []
+
+    class Answered:
+        returncode, stdout, stderr = 0, '{"state": "MERGED"}', ""
+
+    def gh(args, **_k):
+        called.append(list(args))
+        return Answered()
+
+    monkeypatch.setattr(qr.subprocess, "run", gh)
+    state, problem = qr.fetch_ref_state(REPO, "pr", "1770")
+
+    assert problem is None and state["state"] == "MERGED"
+    asked = " ".join(called[0]).lower()
+    assert "base" not in asked
+
+
+def test_an_issue_ref_done_candidate_is_left_alone_and_says_why(monkeypatch):
+    """#552's other limb, declined by name rather than acted on or silently dropped.
+
+    A closed issue is one of the three signals the issue decides on, so this is a
+    scope decision: an item whose ref is an issue cannot see the PR that implemented
+    it (#396), and in a repo that lands work on an integration branch the issue
+    closes one or two merges after the work did. Named on every tick, so the residue
+    stays readable.
+    """
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=1, ref={"kind": "issue", "value": "540"},
+                                title="Something finished")],
+                    ref_states={(REPO, "issue", "540"): {"state": "CLOSED",
+                                                         "state_reason": "COMPLETED"}},
+                    open_prs=[]),
+        board, monkeypatch)
+
+    assert board.completed == []
+    assert report.applied == []
+    assert [row["ref"] for row in report.apply_declined] == ["issue#540"]
+    assert "#396" in report.apply_declined[0]["reason"]
+    # Still a finding: the pass reports what it found and declines to act, which are
+    # two separate answers and both are owed.
+    assert [f.condition for f in report.findings] == ["done_candidate"]
+
+
+def test_a_dropped_candidate_is_never_completed_and_is_not_a_decision_deferred(
+        monkeypatch):
+    """`dropped` is a decision the plan's model keeps apart from `done`, and this
+    actor has no business anywhere near it — not acting on it, and not filing it
+    under "done candidates I declined" either, which would put abandoned work in the
+    same list as work waiting on #396."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=1, ref={"kind": "pr", "value": "190"}),
+                           item(rank=2, ref={"kind": "issue", "value": "191"},
+                                item_id="b" * 8)],
+                    ref_states={(REPO, "pr", "190"): {"state": "CLOSED"},
+                                (REPO, "issue", "191"): {"state": "CLOSED",
+                                                         "state_reason": "NOT_PLANNED"}},
+                    open_prs=[]),
+        board, monkeypatch)
+
+    assert {f.condition for f in report.findings} == {"dropped_candidate"}
+    assert board.completed == []
+    assert report.applied == report.apply_failed == report.apply_declined == []
+
+
+def test_a_ref_github_could_not_resolve_completes_nothing(monkeypatch):
+    """A run that could not reach GitHub changes nothing, and it falls out rather
+    than being special-cased: an unresolved ref is an `Unknown` and raises no
+    finding, so there is nothing for the actor to read as a merge."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=1)],
+                    ref_states={(REPO, "pr", "182"): None},
+                    open_prs=[]),
+        board, monkeypatch)
+
+    assert board.completed == []
+    assert report.applied == [] and report.apply_declined == []
+    assert [u.condition for u in report.unknowns] == ["ref_unresolved"]
+    assert report.exit_code == 1
+
+
+def test_a_stale_claim_is_not_a_completion(monkeypatch):
+    """The claim not describing the present says nothing about whether the work
+    landed — and `stale_claim` is the condition with the most rows on this board."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=13, ref={"kind": "issue", "value": "255"},
+                                claim=dict(ORPHANED))],
+                    ref_states={(REPO, "issue", "255"): {"state": "OPEN"}},
+                    open_prs=[]),
+        board, monkeypatch)
+
+    assert [f.condition for f in report.findings] == ["stale_claim"]
+    assert board.completed == [] and report.applied == []
+
+
+def test_the_completion_names_the_pr_and_where_it_landed(monkeypatch):
+    """`POST /plan/item/done` appends this to the item's note rather than replacing
+    it, so it is a receipt: the fact, and the URL a reader of a done row wants."""
+    board = ApplyingBoard({"items": []})
+    _applied(
+        full_report(items=[item(rank=1)],
+                   ref_states={(REPO, "pr", "182"): {
+                       "state": "MERGED",
+                       "url": "https://github.com/prisonblues/quarterback/pull/182"}},
+                   open_prs=[]),
+        board, monkeypatch)
+
+    note = board.completed[0]["note"]
+    assert "pr#182 is merged" in note
+    assert "qb-reconcile" in note
+    assert "/pull/182" in note
+    # The receipt must never carry the one marker an agent is forbidden to write:
+    # `POST /plan/item/done` refuses a note that exempts a PR from review (#335).
+    assert "review: exempt" not in note
+
+
+def test_a_refused_write_is_reported_and_raises_the_exit_code(monkeypatch, capsys):
+    """A 409 is the board holding a rule this pass must not route around — "a human
+    dropped this item" is the one state `done` refuses — and a rule enforced into a
+    silence is a rule nobody learns. It is not an `unknown` either: nothing went
+    unchecked, something went undone."""
+    board = ApplyingBoard({"items": []}, refuse="409 a human dropped this item")
+    report = _applied(full_report(), board, monkeypatch)
+
+    assert board.completed == []
+    assert report.applied == []
+    assert [row["ref"] for row in report.apply_failed] == ["pr#182"]
+    assert "409" in report.apply_failed[0]["reason"]
+    assert report.exit_code == 1
+    # And it is not smuggled into the half that means "a check could not be made".
+    assert [u.condition for u in report.unknowns] == []
+    assert report.as_dict()["complete"] is True
+    assert "NOT COMPLETED" in qr.render(report)
+    capsys.readouterr()
+
+
+def test_a_board_that_cannot_be_built_fails_every_write_it_decided_on(monkeypatch):
+    """The decision was made and none of it happened, which is one thing to say and
+    not two: every candidate lands in `apply_failed` with the reason."""
+    monkeypatch.setattr(qr, "_CLIENT", None)
+
+    def dead():
+        raise RuntimeError("no token")
+
+    monkeypatch.setattr(qr, "board_client", dead)
+    report = full_report()
+    qr.apply_done(report)
+
+    assert report.applied == []
+    assert [row["ref"] for row in report.apply_failed] == ["pr#182"]
+    assert "no token" in report.apply_failed[0]["reason"]
+
+
+def test_a_claim_the_board_left_standing_is_named(monkeypatch):
+    """`done` releases the item's claim only when it is the CALLER's, and this pass
+    calls with a machine token and no session — so an item a live agent is holding is
+    recorded done with that claim left, and the endpoint says so in `claim_left`. A
+    plan row that went done under somebody's hand is the one row a reader may want to
+    ask about, so it is carried rather than dropped."""
+    board = ApplyingBoard({"items": []},
+                          claim_left={"holder": "zeus/f5ca7491", "session": "abcd"})
+    report = _applied(full_report(), board, monkeypatch)
+
+    assert report.applied[0]["claim_left"] == "zeus/f5ca7491"
+    assert "zeus/f5ca7491" in qr.render(report)
+
+
+def test_a_completion_with_no_claim_behind_it_says_nothing_about_claims(monkeypatch):
+    """The residue case, and the common one: every one of lexray's thirteen claims
+    had already expired, so there is nothing to report and nothing is reported."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(full_report(), board, monkeypatch)
+
+    assert report.applied[0]["claim_left"] is None
+    assert "claim held by" not in qr.render(report)
+
+
+def test_a_finding_that_says_done_but_not_merged_is_never_completed(monkeypatch):
+    """The guard against a widening nobody noticed. `CONDITIONS` is a vocabulary
+    five checks share; the day a `done_candidate` is raised for a PR GitHub reports
+    some other way, an actor trusting the label would complete a plan item on a fact
+    nobody checked, on a fifteen-minute timer."""
+    report = qr.Report(generated="now", repos=[REPO], findings=[
+        qr.Finding(condition="done_candidate", subject="rank 2 pr#182", repo=REPO,
+                   ref="pr#182", item_id="a" * 8, rank=2, summary="says done",
+                   evidence={"github_state": "OPEN"})])
+    board = ApplyingBoard({"items": []})
+    _applied(report, board, monkeypatch)
+
+    assert board.completed == []
+    assert report.applied == []
+    assert "MERGED" in report.apply_declined[0]["reason"]
+
+
+def test_a_done_candidate_with_no_item_id_is_left_alone(monkeypatch):
+    """There is no plan row to complete, and inventing an id is not the answer."""
+    report = qr.Report(generated="now", repos=[REPO], findings=[
+        qr.Finding(condition="done_candidate", subject="rank 2 pr#182", repo=REPO,
+                   ref="pr#182", rank=2, summary="merged",
+                   evidence={"github_state": "MERGED"})])
+    board = ApplyingBoard({"items": []})
+    _applied(report, board, monkeypatch)
+
+    assert board.completed == []
+    assert "item_id" in report.apply_declined[0]["reason"]
+
+
+def test_every_done_candidate_reaches_one_list_or_the_other():
+    """A pass that acts on some rows and says nothing about the rest leaves a residue
+    whose size nobody can read off the report — which is this issue, one level in."""
+    report = full_report(
+        items=[item(rank=1, ref={"kind": "pr", "value": "182"}),
+               item(rank=2, ref={"kind": "issue", "value": "540"}, item_id="b" * 8),
+               item(rank=3, ref={"kind": "pr", "value": "190"}, item_id="c" * 8)],
+        ref_states={(REPO, "pr", "182"): {"state": "MERGED"},
+                    (REPO, "issue", "540"): {"state": "CLOSED",
+                                             "state_reason": "COMPLETED"},
+                    (REPO, "pr", "190"): {"state": "CLOSED"}},
+        open_prs=[])
+    doing, declined = qr.apply_candidates(report)
+
+    candidates = [f for f in report.findings if f.condition == "done_candidate"]
+    assert len(candidates) == 2
+    assert len(doing) + len(declined) == len(candidates)
+    assert [f.ref for f in doing] == ["pr#182"]
+    assert [row["ref"] for row in declined] == ["issue#540"]
+
+
+def test_the_report_says_what_it_completed(monkeypatch):
+    """In the rendered report, in the post's headline, and in the JSON — a repair
+    nobody can read is the shape of the problem this actor was built for."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(full_report(), board, monkeypatch)
+
+    text = qr.render(report)
+    assert "COMPLETED — items whose own PR GitHub reports merged" in text
+    assert "rank 2 pr#182" in text
+    summary, detail = qr.post_summary(report)
+    assert "1 completed" in summary
+    payload = report.as_dict()
+    assert [row["ref"] for row in payload["applied"]] == ["pr#182"]
+    assert payload["apply_failed"] == []
+    json.dumps(payload)
+
+
+def test_a_report_that_completed_something_is_not_the_same_report(monkeypatch):
+    """The digest hashes what the report SAYS, and until #552 that was findings and
+    unknowns only. The findings a completion is made on are identical before and
+    after the write — they are what it was made on — so a tick that repaired the
+    plan would hash the same as the tick that merely complained about it, and the
+    one post worth reading is the one suppression drops."""
+    before = qr.post_digest(full_report())
+    board = ApplyingBoard({"items": []})
+    after = qr.post_digest(_applied(full_report(), board, monkeypatch))
+
+    assert before != after
+
+
+def test_a_completed_item_is_not_also_handed_to_the_plan_as_a_done_candidate(
+        monkeypatch):
+    """`/plan/reconcile` rows exist to tell a reader of the plan that an OPEN item
+    looks finished. Reported for an item this pass just completed, `plan_read` would
+    hang "looks done" off a row that is done — and it would be re-asserted every
+    tick, because `run` reads open rows only and so will never find it again to
+    withdraw it."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(full_report(), board, monkeypatch)
+    qr.report_findings(report)
+
+    sent = [f for path, body in board.posts if path == "/plan/reconcile"
+            for f in body["findings"]]
+    assert "182" not in [f["ref_value"] for f in sent if f["ref_kind"] == "pr"]
+    # The rest of the report still reaches the plan.
+    assert {f["condition"] for f in sent} == {"stale_claim", "untracked_pr"}
+
+
+def test_a_write_that_failed_keeps_its_finding_on_the_plan(monkeypatch):
+    """The other side: the item is still open and the disagreement still stands, so
+    withdrawing the row would resolve a finding nothing resolved."""
+    board = ApplyingBoard({"items": []}, refuse="502 bad gateway")
+    report = _applied(full_report(), board, monkeypatch)
+    qr.report_findings(report)
+
+    sent = [f for path, body in board.posts if path == "/plan/reconcile"
+            for f in body["findings"]]
+    assert ("pr", "182", "done_candidate") in [
+        (f["ref_kind"], f["ref_value"], f["condition"]) for f in sent]
+
+
+def test_nothing_is_written_unless_apply_is_asked_for(capsys):
+    """Opt-in, like `--post`. The rule #552 narrowed is still a rule: a pass nobody
+    asked to act must not touch the plan, and the report is the same either way."""
+    posts = []
+
+    class Recording:
+        def post(self, path, body):
+            posts.append((path, body))
+
+    saved_run, qr.run = qr.run, lambda _repo=None, **_k: full_report()
+    saved_client, qr.board_client = qr.board_client, lambda: (Recording(), None)
+    try:
+        qr._CLIENT = None
+        assert qr.main([]) == 0
+        assert posts == []
+        qr._CLIENT = None
+        assert qr.main(["--apply"]) == 0
+        assert [p for p, _ in posts] == ["/plan/item/done"]
+    finally:
+        qr.run, qr.board_client, qr._CLIENT = saved_run, saved_client, None
+    capsys.readouterr()
+
+
+def test_a_completion_is_content_for_quiet_and_for_post(capsys):
+    """The gate says what it means. `applied` cannot presently be non-empty without a
+    finding beside it — a write is only ever made on one — but the shipped unit runs
+    `--quiet`, and "the pass repaired the plan" is the line a reader most needs; a
+    gate that let it through only by coincidence is the failure `prs_skipped` already
+    had once."""
+    report = full_report()
+    report.findings = []
+    report.applied = [{"item_id": "a" * 8, "repo": REPO, "ref": "pr#182", "rank": 2,
+                       "subject": "rank 2 pr#182", "note": "pr#182 is merged",
+                       "claim_left": None}]
+    report.unknowns = []
+    report.prs_skipped = []
+    posts = []
+    saved_run, qr.run = qr.run, lambda _repo=None, **_k: report
+    saved_client, qr.board_client = qr.board_client, lambda: (
+        board_post_recorder(posts), None)
+    try:
+        qr._CLIENT = None
+        assert qr.main(["--post", "--quiet"]) == 0
+        assert "COMPLETED" in capsys.readouterr().out
+        assert len(posts) == 1
+    finally:
+        qr.run, qr.board_client, qr._CLIENT = saved_run, saved_client, None
+
+
+def test_the_shipped_timer_unit_runs_the_actor():
+    """RED/GREEN: red before this change — the unit ran `--post --quiet` and its own
+    comment said "REPORT-ONLY, and unlike the lander there is no --execute to
+    graduate to".
+
+    This is the coupling that #552 is actually about. The predicate has been computed
+    correctly on a fifteen-minute timer the whole time; what was missing was an actor,
+    and an actor absent from the invocation the timer runs is an actor that does not
+    exist — #695's own story, one mechanism along.
+
+    (The unit is in this sandbox because `worktree-tests` copies `harness/loops` as a
+    tree for `test_runtime_stub_shebangs.py`; this read rides along on that line.)
+    """
+    unit = (Path(__file__).resolve().parent.parent
+            / "loops" / "systemd" / "qb-reconcile.service").read_text(encoding="utf-8")
+    exec_start = [ln for ln in unit.splitlines() if ln.startswith("ExecStart=")]
+    assert len(exec_start) == 1
+    assert "--apply" in exec_start[0]
+    assert "REPORT-ONLY" not in unit
+
+
+def test_every_flag_the_pass_accepts_is_documented_in_the_harness_readme():
+    """A flag shipped and undocumented is a feature nobody turns on — which is the
+    whole of #552 in the other direction, and of #695 before it. Read off the parser's
+    own `add_argument` calls rather than a list in a test, so a sixth flag cannot
+    arrive undocumented and green.
+
+    (`harness/README.md` is installed into `worktree-tests` for `test_qb_doctor.py`'s
+    shipping guards; this read rides along on that line.)
+    """
+    source = (Path(__file__).resolve().parent.parent
+              / "bin" / "qb-reconcile").read_text(encoding="utf-8")
+    flags = set(re.findall(r'add_argument\("(--[a-z-]+)"', source))
+    assert "--apply" in flags and len(flags) >= 6
+    readme = (Path(__file__).resolve().parent.parent
+              / "README.md").read_text(encoding="utf-8")
+    block = readme.split("### `qb-reconcile`")[1].split("```")[1]
+    assert {f for f in flags if f not in block} == set()
+
+
+def test_the_two_tools_that_retire_a_plan_item_agree_on_what_merged_means():
+    """`qb-next` retires a finished row it walks past while claiming — `MERGED` for a
+    PR, `CLOSED` for an issue — and this pass retires one on a timer. Two tools acting
+    on the same fact must not disagree about what the fact is: GitHub reports an
+    UNMERGED pull request as `CLOSED`, so a tool that drifted onto that state set
+    would quietly complete abandoned work as finished.
+
+    red/green: N-A (new code path) — `APPLY_STATE` arrived with this change, so there
+    is no earlier value for this to disagree with.
+    """
+    loader = importlib.machinery.SourceFileLoader("qb_next", str(BIN / "qb-next"))
+    spec = importlib.util.spec_from_loader("qb_next", loader)
+    qb_next = importlib.util.module_from_spec(spec)
+    sys.modules["qb_next"] = qb_next
+    loader.exec_module(qb_next)
+
+    assert qb_next.TERMINAL["pr"] == qr.APPLY_STATE
+    assert qb_next.TERMINAL["pr"] != "CLOSED"
+
+
+def test_the_headline_counts_what_is_outstanding_and_not_what_it_just_fixed(monkeypatch):
+    """Found by Codex on this change's own diff.
+
+    `render` lists an applied item under DONE CANDIDATES on purpose — the finding is
+    the evidence the write was made on. The headline is a different question, and it
+    is the whole of the post for every reader who does not open it: "1 done
+    candidate; 1 completed" describes a plan that no longer exists and reads as two
+    problems where there are none.
+    """
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=1, ref={"kind": "pr", "value": "182"}),
+                           item(rank=2, ref={"kind": "issue", "value": "540"},
+                                item_id="b" * 8)],
+                    ref_states={(REPO, "pr", "182"): {"state": "MERGED"},
+                                (REPO, "issue", "540"): {"state": "CLOSED",
+                                                         "state_reason": "COMPLETED"}},
+                    open_prs=[]),
+        board, monkeypatch)
+    summary, detail = qr.post_summary(report)
+
+    # Two done candidates were found; one was completed, so one is outstanding.
+    assert len([f for f in report.findings if f.condition == "done_candidate"]) == 2
+    assert "1 done candidate" in summary
+    assert "1 completed" in summary
+    # And the evidence is still in the detail, where a reader can check the write.
+    assert "pr#182" in detail and "issue#540" in detail
+
+
+def test_a_pass_that_completed_everything_it_found_says_no_disagreement(monkeypatch):
+    """The other end of the same count: nothing is left, so nothing is claimed."""
+    board = ApplyingBoard({"items": []})
+    report = _applied(
+        full_report(items=[item(rank=1, ref={"kind": "pr", "value": "182"})],
+                    ref_states={(REPO, "pr", "182"): {"state": "MERGED"}},
+                    open_prs=[]),
+        board, monkeypatch)
+    summary, _detail = qr.post_summary(report)
+
+    assert summary == "plan reconcile: no disagreement; 1 completed"
+
+
+#: The pass's own timeline, in the order the code makes it: the report is stamped,
+#: THEN the plan is read, THEN the writes go out. Every test below that talks about
+#: who got there first has to sit inside it, because a row this pass is writing to
+#: was read as OPEN — so nothing that finished it can have happened before the read,
+#: and a test that says otherwise is describing a sequence the pass cannot produce.
+GENERATED = "2026-08-20T12:00:00+00:00"
+WRITTEN_AT = datetime(2026, 8, 20, 12, 30, tzinfo=UTC)
+
+
+def test_a_second_receipt_on_a_row_somebody_else_finished_is_said_out_loud(
+        monkeypatch):
+    """Found by Codex on this change's own diff, and its interleaving corrected by a
+    second pass over the fix (PR #719 review).
+
+    Two observers of one merge is the endpoint's design — any agent may record a
+    completion, and the note is appended rather than replaced so two receipts can
+    coexist. What it leaves is not a wrong state but a duplicated receipt, in the
+    window between the plan read and the write: an agent's own `plan_done`, or a
+    sibling host's tick. `done_by` and `done` keep the FIRST holder's name and time,
+    so the pass can tell, and this file's rule is that nothing it does is silent.
+
+    The sibling finishes the row at 12:29:59 — after this pass was stamped at 12:00
+    and read the row open, one second before this write went out at 12:30. That is
+    the ONLY shape the race has, and it is why the comparison cannot be against
+    `report.generated`: measured from there, a peer's completion is always in the
+    future and always reads as ours.
+
+    red/green: fails on the `generated` comparison with `already is None` and no
+    line in the report — silent about the one thing it was written to say.
+    """
+    board = ApplyingBoard({"items": []})
+    board.post = lambda path, body: {
+        "item_id": body["item_id"], "state": "done", "claim_left": None,
+        "done": "2026-08-20T12:29:59+00:00", "done_by": "zeus/f5ca7491"}
+    report = full_report()
+    report.generated = GENERATED
+    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
+    _applied(report, board, monkeypatch)
+
+    # The rendered line first: it is the assertion that names the defect, and a
+    # missing key would otherwise raise before this pass could be shown to be silent.
+    assert "already recorded it" in qr.render(report)
+    assert report.applied[0]["already"] == "zeus/f5ca7491"
+
+
+def test_a_row_this_pass_finished_itself_claims_no_second_receipt(monkeypatch):
+    """The other way round, and it has to be the other way round: a `done` stamped
+    by our own write is not evidence somebody beat us to it, and reporting it as one
+    would put a peer's name on every completion this pass ever makes.
+
+    The board stamps the row as it handles the request, so our own receipt's `done`
+    lands just AFTER the moment the write left — which is the whole of the test.
+
+    red/green: N-A (the negative companion). It passed before the fix too, for the
+    wrong reason: nothing was ever named, so nothing was ever named wrongly.
+    """
+    board = ApplyingBoard({"items": []})
+    board.post = lambda path, body: {
+        "item_id": body["item_id"], "state": "done", "claim_left": None,
+        "done": "2026-08-20T12:30:01+00:00", "done_by": "daedalus"}
+    report = full_report()
+    report.generated = GENERATED
+    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
+    _applied(report, board, monkeypatch)
+
+    assert "already recorded it" not in qr.render(report)
+    assert report.applied[0]["already"] is None
+
+
+def test_the_reference_for_who_got_there_first_is_the_write_not_the_report(
+        monkeypatch):
+    """The defect stated as a property rather than as one interleaving.
+
+    `report.generated` is stamped before the plan is read and `run` reads OPEN rows
+    only, so every completion this comparison exists to catch necessarily lands
+    after it. Pinned here so that a later change cannot quietly move the reference
+    back to the report and leave the two tests above passing on a coincidence of
+    their fixtures.
+    """
+    board = ApplyingBoard({"items": []})
+    board.post = lambda path, body: {
+        "item_id": body["item_id"], "state": "done", "claim_left": None,
+        # Later than `generated` — as any real second observer must be — and
+        # earlier than the write.
+        "done": "2026-08-20T12:15:00+00:00", "done_by": "hermes/seat-1"}
+    report = full_report()
+    report.generated = GENERATED
+    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
+    _applied(report, board, monkeypatch)
+
+    assert report.applied[0]["already"] == "hermes/seat-1"
+
+
+@pytest.mark.parametrize("view", [
+    {},
+    {"done": None, "done_by": "zeus"},
+    {"done": "not a timestamp", "done_by": "zeus"},
+    {"done": "2026-08-20T09:00:00+00:00"},
+])
+def test_a_response_that_cannot_answer_who_got_there_first_says_nothing(view):
+    """Guessing either way round would put a sentence in the report that no
+    comparison supports — which costs more than the line it would explain. A board
+    too old to return the field is exactly this case."""
+    assert qr._already_done(view, "2026-08-20T12:00:00+00:00") is None
+
+
+def test_a_naive_timestamp_either_side_does_not_take_the_tick_down():
+    """`fromisoformat` yields a naive datetime for a stamp with no offset, and
+    comparing naive with aware raises — inside a loop that is mid-way through a set
+    of writes, which would lose the report for the ones already made."""
+    assert qr._already_done({"done": "2026-08-20T09:00:00", "done_by": "zeus"},
+                            "2026-08-20T12:00:00+00:00") == "zeus"
+    assert qr._already_done({"done": "2026-08-20T09:00:00+00:00", "done_by": "zeus"},
+                            "2026-08-20T12:00:00") == "zeus"

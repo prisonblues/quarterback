@@ -1374,9 +1374,18 @@ class Dash(App):
         A list rather than an optional value because that is how it is spliced into
         a row: an empty one contributes nothing, and a row built by concatenation
         cannot get the cell count wrong the way a row built by `if` can.
+
+        **Folded to the bare name here, not by each caller** (#714). The cell is
+        eleven columns because `prisonblues/` separates nothing on a fleet whose
+        repos share one owner — `qd.short_repo`'s own docstring — so a slug clips
+        to the half that distinguishes nothing and every row reads `prisonblue…`.
+        The plan table already folded before calling; AGENTS did not have to,
+        because a lease reported the checkout basename until #714 made it report
+        the origin slug. One caller not needing it is exactly how the other one
+        came to be wrong, so the fold is here where all four tables get it.
         """
         return [] if not self.scope.column else [
-            Text(qd.clip(repo, 11), style=qd.repo_colour(repo))]
+            Text(qd.clip(qd.short_repo(repo), 11), style=qd.repo_colour(repo))]
 
     # ---- data (threads, so a slow board never freezes the ui) -----------
 
@@ -2219,7 +2228,7 @@ class Dash(App):
                 Text(glyph, style=colour),
                 Text(icon, style="bold cyan" if verb else "grey30"),
                 Text(qd.work_kind(row), style="grey50"),
-                *self.repo_cell(qd.short_repo(row["repo"] or "fleet")),
+                *self.repo_cell(row["repo"] or "fleet"),
                 # THE MARK GOES ON THE RANK CELL, which is the column marking is
                 # about: a row is marked so that the next move takes it, and the
                 # rank is where a move shows up. It costs the cell one of its four

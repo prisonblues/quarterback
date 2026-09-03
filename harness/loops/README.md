@@ -1052,7 +1052,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   host and the sandbox did; a ruling is a model's opinion about a model's sentence,
   and an exemption resting on one alone would be a confidence gate the panel could
   open by writing about itself. So a `resolvable_in_harness: false` *converts* the
-  declaration into a named obligation with a key (`uc-` + 8 hex), which goes on
+  declaration into a named obligation with a key (`uc-` + 12 hex), which goes on
   vetoing until a human passes that key to `--acknowledge` — recorded state of the
   plainest kind, inherited across a cycle's rounds through `--baseline` exactly as
   `--escalated` is. Only a literal JSON `false` counts; a missing key, a malformed
@@ -1069,6 +1069,35 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   filing a task. There is no board row: `qb record-outcome` keys on a finding key and
   an obligation is not a finding, so the payload and the issue are the record, and
   giving it a row would need a schema change this deliberately does not take.
+- **A declaration somebody went and ANSWERED can be retired** (#718). #547 gave the
+  declarations nothing here could ever settle a way out; the ones that simply *were
+  not* settled still had none, so a `could_not_assess` line was permanent for the life
+  of that round's record whatever anybody subsequently learned — and `preland`'s
+  `review` check lists the round's vetoes verbatim, so an answered question went on
+  holding the landing as hard as an unanswered one. Measured on lexray#1631 round 2:
+  two of its three vetoes were the claude seat's, which cannot execute anything (#92),
+  and both were closed from a worktree at the PR head inside ten minutes.
+  Every vetoing declaration now carries a key (`ca-` + 12 hex, content-addressed over
+  the declaration's own text the way an obligation's is over the claim's) and is
+  printed with it, and `--assessed ca-xxxxxxxx:'<what you measured>'` records that
+  somebody answered it — inherited through `--baseline` exactly as `--acknowledge` is,
+  so it is done once per cycle. **Per declaration, never in bulk**: there is no flag
+  that answers them all, for #547's reason.
+  The two key spaces are disjoint and so are the registers. A declaration the judge
+  ruled unresolvable is an obligation and is answered at `--acknowledge`; everything
+  else is a declaration and is answered here, and each door refuses the other's keys
+  loudly rather than accepting one and matching nothing. It exempts the declaration
+  lines and nothing else — not a truncation, an absent seat, CI, or a judge skip — so
+  it cannot empty a veto list except by answering it one line at a time.
+  **The answer is recorded, not trusted.** `--assessed` takes the caller's word, the
+  way `--escalated` does, and stores the round, the note and `--assessed-by`'s claimed
+  assessor in the payload's `assessed` register beside a `coverage_declarations`
+  ledger. Without `--assessed-by` the row is marked **unattested** rather than refused
+  (#40, and `record-outcome`'s `refuted` treatment), the report renders the split, and
+  the name is published as a claim and never as a signature. That is strictly stronger
+  than the status quo it replaces, where the answer was recorded nowhere at all.
+  `preland` needs no change: the declaration stops appearing in `stop_veto`, which is
+  the only thing that check reads.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause
@@ -2748,7 +2777,7 @@ that had written up that exact confusion an hour earlier.
 | `pr_state` | Not OPEN, a draft, or `CONFLICTING`. Uncomputed mergeability warns. |
 | `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
 | `ci` | Anything but `green`. Six states since [#324](https://github.com/prisonblues/quarterback/issues/324) — `green`, `red`, `pending`, `blocked` (a run exists and is waiting on a human to approve it, so it has executed nothing), `none` (no run was created for this head) and `unknown` (the state could not be read). A push restarts CI, so an earlier green is stale; and the last three are silence, which is never green. A `blocked` HOLD names the newest run on the branch that actually executed. |
-| `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
+| `review` | The board's newest round for this PR read another commit, did not `stop`, still owes work on its own disposal (`outstanding.fixable + outstanding.escalated`, or `confirmed > 0` where no disposal was recorded), or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
 | `merge_claim` | Another agent holds `kind=merge` on `<repo>:<base>` — it is landing onto this PR's base right now. Keyed on the base rather than the head since [#318](https://github.com/prisonblues/quarterback/issues/318): two agents landing two *different* PRs into `main` is the collision worth serialising, and under head keys they never see each other. |
 | `queue` | This PR is not at the head of the merge queue for its base, or is not in the line at all while others are ([#227](https://github.com/prisonblues/quarterback/issues/227)). The reason names the position and who holds the place ahead. An empty line passes silently; a board with no `/merge-queue` reports `skipped-absent`. |
 | `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
@@ -2757,9 +2786,26 @@ that had written up that exact confusion an hour earlier.
 The last two also HOLD when `origin/<base>` could not be refreshed — they are answers about the gap between this branch and the base, and a base last fetched yesterday produces a confident NOOP about a head that moved this morning. `--no-fetch` makes that the caller's choice instead, noted once on the run.
 
 The `review` clauses are the round's **own statements** — `head_sha`, `stopped`,
-`confirmed`, `sonar_gate` — read back rather than re-derived. #62 spent three rounds
-discovering that merge gates trust proxies (the exit code, then the push, then the
+`confirmed`, `outstanding`, `sonar_gate` — read back rather than re-derived. #62 spent three
+rounds discovering that merge gates trust proxies (the exit code, then the push, then the
 existence of a payload file), and this must not become the fourth.
+
+**Severity, and where it comes from** ([#717](https://github.com/prisonblues/quarterback/issues/717)).
+This gate had none: any nonzero `confirmed` was a HOLD, and the file did not contain the
+word. That contradicts `review_panel.fix_severity_floor`, whose entire content is that
+findings below it are *reported and not fixed here* (#165) — so a repo running a raised
+floor could essentially never reach READY, because a round asked to find problems almost
+always finds a P3. It now rules on the round's own disposal, which `round_stop` has
+published since #42 and the board has stored since #717: HOLD on `fixable + escalated`,
+**warn** on `below_floor`. Three things it deliberately does not do. It does not subtract
+anything from `confirmed` — that count is over a larger population (findings an outcome has
+already cleared are gone from the disposal), so a difference between them is a number about
+neither. It does not compare a severity against a floor itself; the floors are repo dials
+the board holds opaquely, and a second reading of them here would be free to disagree with
+the round it is ruling on. And it does not soften on silence: escalated findings block at
+any severity (#221), a round that recorded no disposal is held on the raw `confirmed` count
+exactly as before, and a round that recorded no count at all is still held — unknown is not
+zero, in either clause.
 
 `stop_confident: false` is a **warning, not a hold** by default, deliberately: two
 permanently-absent reviewer seats on a headless box would otherwise make a green verdict
@@ -2841,9 +2887,16 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
 - **`systemd/qb-reconcile.{service,timer}`** — reference spec too, and the odd one out in
   this directory: the program it runs is `qb-reconcile` from `bin/`, not a loop. It is here
   because this is where the harness's reference units live and one place for them beats two.
-  Report-only with **no `--execute` to graduate to** — the pass never edits the plan — so the
-  only cutover decision is whether to keep `--post`, which posts only when the report's
-  content has changed since the last post. Like the lander's, the service carries no
+  It runs `--apply --post --quiet`. `--apply` is this pass's equivalent of the lander's
+  `--execute` and it arrived with #552: the timer is what carries the actor, because it covers
+  every route work is picked up through and every abnormal ending. It completes an item whose
+  **own ref is a pull request GitHub reports `MERGED`** and nothing else — `MERGED` is
+  base-branch agnostic, so it reads the same in a repo landing on `test`; an issue-ref
+  `done_candidate` is declined by name every tick, because a closing keyword only fires on a
+  merge into the default branch and an issue-ref item cannot see its PR (#396). `dropped` stays
+  a decision nobody may infer. Drop the flag to go back to reporting; the report is identical
+  either way, and `--post` posts only when the report's content has changed since the last
+  post. Like the lander's, the service carries no
   `[Install]`: the timer is what starts it, and enabling the oneshot would also run it at
   every login. `OnUnitActiveSec=15min`,
   `SuccessExitStatus=0 1` so a partial run (rate-limited `gh`, a board mid-deploy) stays out
@@ -2852,6 +2905,13 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
 
 **Cutover to acting:** keep the timer report-only, watch a few daily logs, hand-run one
 `lander.py --execute` on a single PR, *then* set `LOOPS_EXECUTE=1` in the service env.
+
+`qb-reconcile --apply` took the same route and it is worth saying why the caution ended
+differently: run it by hand first (`qb-reconcile --apply --repo owner/name`), read the
+`COMPLETED` and `LEFT ALONE` blocks, and only then leave it on the timer. What made it safe to
+leave on is that the fact it acts on is GitHub's own word for a merge, re-read at the point of
+the write — where the lander's `--execute` presses a merge button, this records something that
+already happened.
 
 ## Gate model (recap from #117)
 

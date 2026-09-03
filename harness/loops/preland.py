@@ -67,7 +67,13 @@ CAPABILITY DETECTION, AND THE ONE PLACE ABSENT DOES NOT MEAN SKIP
 WHAT IT MUST NOT BECOME
     Never gate on a proxy. Not "a payload exists", not "the job exited 0" — on
     the round's own statements: ``stopped``, ``confirmed``, ``head_sha``,
-    ``sonar_gate``. #62 spent three rounds discovering that merge gates trust
+    ``sonar_gate``, and since #717 the round's own disposal of what it found
+    (``outstanding.fixable`` + ``outstanding.escalated``, with ``below_floor``
+    warned about rather than held on, because the repo has already said those are
+    reported and not fixed here). That last one is the same rule applied to a
+    clause that was breaking it in the other direction: a bare confirmed count is
+    a proxy for "is anything owed", and the round publishes the answer.
+    #62 spent three rounds discovering that merge gates trust
     proxies, replacing the exit code with the push and the push with the payload
     artefact. And ``stop_confident: false`` is a WARN by default, not a HOLD: two
     permanently-absent reviewer seats on a headless box would otherwise make a
@@ -755,7 +761,12 @@ def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False,
     """The clause list, against the newest round the board holds for this PR."""
     c.detail = {k: latest.get(k) for k in
                 ("id", "ts", "round", "cycle", "head_sha", "stopped", "stop_reason",
-                 "stop_confident", "confirmed", "unjudged", "sonar_gate", "judge_skip")}
+                 "stop_confident", "confirmed", "unjudged", "sonar_gate", "judge_skip",
+                 # #717's two. In the audit trail whether or not they were readable:
+                 # a payload that reads READY has to show WHICH reading of the
+                 # findings produced it, and a null `outstanding` beside a HOLD on
+                 # the raw count is the whole explanation of that HOLD.
+                 "outstanding", "handed_to")}
     # Which mode ran, in the audit trail. A payload that reads READY has to say
     # whether the strict clause was even asked, or a caller cannot tell a stop
     # that was earned from one nobody put the question to.
@@ -779,8 +790,8 @@ def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False,
         # this file that could wave a defective PR through.
         c.reasons.append("the round recorded no confirmed-finding count, so how much "
                          "it found is unknown — and unknown is not zero")
-    elif confirmed:
-        c.reasons.append(f"{confirmed} judge-confirmed finding(s) are unresolved")
+    else:
+        _outstanding(c, latest, confirmed)
     gate = (latest.get("sonar_gate") or "").upper()
     if gate == "ERROR":
         c.reasons.append("the SonarCloud quality gate is failing — it is a hard gate")
@@ -791,6 +802,109 @@ def _judge_round(c: Check, latest: dict, pr: dict, earned_stop: bool = False,
     _round_warnings(c, latest)
     c.status = "failed" if c.reasons else "passed"
     return c
+
+
+#: The three buckets of ``round_stop.outstanding`` this clause rules on, and the
+#: only ones it will rule on a partial answer with — which is none of them (#717).
+#: ``narrowed`` and ``declined`` ride the same block and are not read here: a
+#: narrowed finding was answered where it was raised, and a declined one the cycle
+#: still holds is already in one of the three, so neither is a fourth number to add.
+OUTSTANDING = ("fixable", "below_floor", "escalated")
+
+
+def _split(latest: dict) -> dict[str, int] | None:
+    """The round's own disposal of its findings, or None if it did not record one.
+
+    Three non-negative integers or nothing. A block missing one of them, or
+    carrying a value that is not a count, is refused whole rather than read with
+    the gap treated as zero — the same rule as the ``confirmed`` clause above and
+    for the same reason, one level in: a disposal short one bucket looks complete
+    and reads as "nothing there".
+
+    ``bool`` is excluded explicitly because it is an ``int`` in Python, and
+    ``escalated: true`` from a hand-rolled producer would otherwise count as one
+    escalation. It is not one; it is a producer this gate has not met.
+    """
+    block = latest.get("outstanding")
+    if not isinstance(block, dict):
+        return None
+    split = {}
+    for bucket in OUTSTANDING:
+        n = block.get(bucket)
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            return None
+        split[bucket] = n
+    return split
+
+
+def _outstanding(c: Check, latest: dict, confirmed: int) -> None:
+    """What the round is still owed — on its own severity split where it recorded
+    one, and on the raw confirmed count where it did not (#717).
+
+    THE DEFECT THIS REPLACES. This clause was ``elif confirmed:`` — any nonzero
+    judge-confirmed count is a HOLD — and the file had no notion of severity at
+    all. That contradicts ``review_panel.fix_severity_floor``, which exists to say
+    that findings below it are *reported and not fixed here* (#165): the panel
+    prints them under their own heading and hands them to nobody, and this gate
+    then held the merge on them anyway. A repository running a raised floor could
+    essentially never reach READY, because a round asked to find problems almost
+    always finds a P3 — P4 has no bottom, which is the observation the floor was
+    built on. Measured on lexray#1631: a round that stopped with
+    ``handed_to: "nobody"`` and eleven below-floor findings, every one recorded
+    ``deferred``, against "11 judge-confirmed finding(s) are unresolved".
+
+    IT IS NOT A LAXER GATE, and the three ways it could have become one are each
+    closed:
+
+    * **an unknown count is still unknown.** The clause above this one is
+      untouched: a round that recorded no confirmed count HOLDs, and never reaches
+      here. A round that recorded no disposal HOLDs on that count exactly as it
+      always did. Silence buys nothing.
+    * **escalated findings still block at any severity.** They are open questions a
+      human owes an answer on (#221), so they are added to ``fixable`` rather than
+      compared against a floor. The sum is sound because ``round_stop`` takes the
+      escalated and narrowed keys out before splitting the rest at the floor, so
+      the three sets are disjoint by construction.
+    * **nothing is subtracted from anything.** ``confirmed`` counts every confirmed
+      finding on the round; the disposal is computed over a smaller population
+      (the keys an outcome has already cleared are gone from it). A difference
+      between the two would be a number about neither, and it is the shape in which
+      an escalated P3 would quietly stop counting.
+
+    Below-floor findings are WARNED about and not dropped. The repo's policy is
+    that they are not this round's work; it is not that they do not exist, and a
+    payload that read clean by saying nothing about eleven of them would be the
+    same silence one direction over.
+    """
+    split = _split(latest)
+    if split is None:
+        # No disposal on the row: a producer older than #42, or a block the board
+        # refused. The old reading, unchanged — which is the strict one.
+        if confirmed:
+            c.reasons.append(f"{confirmed} judge-confirmed finding(s) are unresolved")
+        return
+    owed = split["fixable"] + split["escalated"]
+    if owed:
+        c.reasons.append(
+            f"{owed} judge-confirmed finding(s) are unresolved — {split['fixable']} "
+            f"a fix pass could clear and {split['escalated']} escalated to a human"
+            + (f" (the round handed them to {latest['handed_to']})"
+               if latest.get("handed_to") else ""))
+    if split["below_floor"]:
+        c.warnings.append(
+            f"{split['below_floor']} finding(s) are outstanding and below this "
+            "repo's cleared severity floor — reported and not fixed here, which is "
+            "the repo's own policy (#165)")
+    if confirmed and not owed and not split["below_floor"]:
+        # The round confirmed findings and its disposal holds none of them: every
+        # one was answered — an outcome recorded, or a fix pass narrowing it where
+        # it was raised. Said out loud rather than passed in silence, because a
+        # reader comparing this payload's `confirmed` against its verdict is owed
+        # the sentence that reconciles them.
+        c.warnings.append(
+            f"{confirmed} judge-confirmed finding(s) were raised and the round's own "
+            "disposal leaves none of them outstanding — they were cleared, narrowed "
+            "or answered")
 
 
 def _round_stop_earned(c: Check, latest: dict, earned_stop: bool) -> None:

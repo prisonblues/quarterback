@@ -83,8 +83,8 @@ resolution anybody disputes can be traced to the post that caused it.
 *Narrow, not broad.* Resolving an edge is the narrow reading: the graph stops
 saying #188 waits on #293. Nothing is resumed, nobody is woken, no work starts.
 
-*Qualified repositories only.* The lifecycle hook tags posts with a checkout's
-**basename**, and ``Merge pull request #40`` under a bare ``nix-fleet`` is
+*Qualified repositories only.* The lifecycle hook tagged posts with a checkout's
+**basename** until #714, and ``Merge pull request #40`` under a bare ``nix-fleet`` is
 indistinguishable from the same number in ``quarterback``. Under-resolving leaves
 a stale edge somebody clears in one call; over-resolving tells an agent its
 blocker landed when it did not, across precisely the repository boundary this
@@ -136,8 +136,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.claims import clean_session, is_unique_violation
 from app.auth import identify, optional_identity, reader
 from app.claimkey import (
-    REPO_NAME_RE,
-    REPO_SHAPE,
     WORK,
     BadRef,
     canonical_repo,
@@ -157,7 +155,7 @@ from app.models.landing import RESOLUTIONS, LandingEdge, LandingWatch
 from app.models.lease import Lease
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
-from app.sync import repo_key
+from app.repomatch import asked_repo, canonical_predicate
 
 router = APIRouter(tags=["landing"])
 
@@ -326,18 +324,12 @@ def _repo_match(repo: str):
 
     A predicate rather than a SQL ``WHERE`` because the scope of this read is a
     graph closure rather than a row filter — see :func:`read_graph`. One
-    implementation either way, so the two tiers cannot come to disagree.
+    implementation either way, so the two tiers cannot come to disagree: both
+    renderings live in :mod:`app.repomatch`, which is where this rule moved when
+    ``GET /active`` turned out to be a fourth read that needed it and had none
+    (#714). This wrapper stays because the name is what the call site reads.
     """
-    try:
-        want = canonical_repo(repo)
-        return lambda stored: stored == want
-    except BadRef:
-        pass
-    asked = repo.strip()
-    if not REPO_NAME_RE.match(asked):
-        raise HTTPException(422, detail={"error": REPO_SHAPE, "repo": repo})
-    bare = repo_key(asked)
-    return lambda stored: repo_key(stored) == bare
+    return canonical_predicate(asked_repo(repo))
 
 
 async def _live_edges(session: AsyncSession) -> list[LandingEdge]:
