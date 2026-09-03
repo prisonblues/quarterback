@@ -28,6 +28,19 @@ Three things, each of which failed differently before #114:
    correctly. Reading the tests as tests is the cheap lever; mutation testing on a
    diff is the expensive one.
 
+A fourth subject arrived later and is the same lever pointed at the other artefact (#724).
+`REVIEW_PROMPT` grew a dimension for load-bearing *prose*: a comment or docstring the diff
+WRITES that states a checkable property of the code beside it is a claim, and a claim in a
+diff is reviewable. It sits in this file rather than one of its own because the two
+dimensions are one idea — a test that cannot fail and a comment that is not true are both an
+assertion nobody checked — and because the `/panel` and `/review-pr` drift guards those
+dimensions need were already here. Measured on the three PRs landed 2026-09-03: of the three
+defects a final adversarial pass found across #720, #719 and #715, two were in the prose and
+the third was a prose claim that happened to be true. A wrong comment is worse than a wrong
+test in one specific way, and it is what the bullet has to say: a wrong test can at least go
+red, whereas nothing ever EXECUTES a comment, so a wrong one survives every round, every CI
+run and every rebase.
+
 Asserted on the shipped text, because the shipped text is the whole artefact — these
 files ARE the behaviour, there is no implementation behind them to test instead.
 Patterns rather than literal paragraphs, so a rewrite that keeps the meaning keeps
@@ -349,7 +362,78 @@ def test_review_pr_asks_the_reviewer_to_read_tests_as_tests(briefs):
         "still pass with the bug restored is not a missing test")
 
 
+def test_review_pr_asks_the_reviewer_to_read_comments_as_claims(briefs):
+    """The single-reviewer brief carries the same dimension, for the reason `FIX_BRIEFS` exists.
+
+    `/review-pr` and the panel apply the same bar by design — `panel.md` says so in its first
+    paragraph — so a dimension in one and not the other means which reviewer you spent decides
+    whether the comments in the diff were read at all."""
+    text = briefs["review-pr.md"]
+    assert re.search(r"comments?\b[^.]*\bclaims?\b", text, re.IGNORECASE), (
+        "review-pr.md asks for stale docs but never asks whether a comment the diff WROTE is "
+        "true of the code beside it, which REVIEW_PROMPT has asked since #724")
+
+
 # ---- the panel's prompt ----------------------------------------------------
+
+def _dimensions(prompt: str) -> str:
+    """The `Review for:` checklist, delimited from the severity paragraph that follows it.
+
+    A helper rather than a fourth inline slice: several tests here ask about the list and one
+    asks about the paragraph AFTER it, and a search over the whole prompt lets text anywhere in
+    the brief answer a question about the checklist — which is how a dimension could be deleted
+    from the list while the words survive in the envelope below and every grep here stayed
+    green."""
+    for marker in ("Review for:", "Severity:"):
+        assert marker in prompt, (
+            f"REVIEW_PROMPT no longer contains `{marker}`, so its dimension list "
+            f"cannot be delimited — this test cannot report on a shape that moved")
+    block = prompt[prompt.index("Review for:"):]
+    return block[:block.index("Severity:")]
+
+
+def _bullets(block: str) -> list[str]:
+    """The dimension list as whole bullets, continuation lines folded onto their opener.
+
+    `- ` opens a dimension and an indented line continues it, which is the shape
+    `test_the_review_prompt_is_still_one_bullet_per_dimension` pins. Folding is what makes the
+    assertions below about a NAMED dimension rather than about the list: every argument a
+    dimension makes is on its continuation lines, so an unfolded search for "claim" beside
+    "comment" is answered by two adjacent bullets that each say one of them."""
+    out: list[str] = []
+    for line in block.splitlines():
+        if line.startswith("- "):
+            out.append(line[2:])
+        elif out and line.startswith("  ") and line.strip():
+            out[-1] += " " + line.strip()
+    return out
+
+
+def _dimension(prompt: str, name: str) -> str:
+    """The one dimension whose NAME — the text before its first colon — matches `name`.
+
+    Matched on the name rather than anywhere in the bullet, because the bodies quote each
+    other: the comments dimension talks about tests and the tests dimension about assertions,
+    so a body match would find whichever came first and report on the wrong bullet."""
+    hits = [b for b in _bullets(_dimensions(prompt))
+            if re.search(name, b.split(":", 1)[0], re.IGNORECASE)]
+    assert len(hits) == 1, (
+        f"expected exactly one dimension whose name matches /{name}/, found {len(hits)}: "
+        f"{[b.split(':', 1)[0] for b in hits]}")
+    return hits[0]
+
+
+def _severity_tier(prompt: str, tier: str) -> str:
+    """What the severity paragraph offers as examples of one tier, and nothing from the next.
+
+    Sliced at the `·` separators rather than searched whole, so "is a comment claim listed
+    under P2?" cannot be answered by it being listed under P3 — which is the question, since
+    the default reading of a comment defect is that it is polish."""
+    para = prompt[prompt.index("Severity:"):]
+    para = para[:para.index("\n\n")]
+    rest = para[para.index(f"{tier} "):]
+    return rest.split("\u00b7", 1)[0]
+
 
 def test_the_review_prompt_asks_whether_a_present_test_is_load_bearing(review_prompt):
     """The cheaper lever than mutation testing, and the one #114 recommends starting from.
@@ -383,18 +467,112 @@ def test_the_review_prompt_is_still_one_bullet_per_dimension(review_prompt):
     The new lines are a `- ` bullet with wrapped continuations, matching every
     dimension around them. A block that broke that shape would still contain the
     words this file greps for while no longer reading as an item to work through."""
-    for marker in ("Review for:", "Severity:"):
-        assert marker in review_prompt, (
-            f"REVIEW_PROMPT no longer contains `{marker}`, so its dimension list "
-            f"cannot be delimited — this test cannot report on a shape that moved")
-    review_block = review_prompt[review_prompt.index("Review for:"):]
-    review_block = review_block[:review_block.index("Severity:")]
-    bullets = [ln for ln in review_block.splitlines() if ln.startswith("- ")]
-    assert len(bullets) >= 9, f"expected the full dimension list, found {len(bullets)} bullets"
-    load_bearing = [ln for ln in bullets if "Load-bearing" in ln]
-    assert len(load_bearing) == 1, (
-        f"the load-bearing dimension is not a single top-level bullet in the "
-        f"dimension list ({len(load_bearing)} found)")
+    review_block = _dimensions(review_prompt)
+    bullets = [f"- {b}" for b in _bullets(review_block)]
+    assert len(bullets) >= 10, f"expected the full dimension list, found {len(bullets)} bullets"
+    # Counted per NAMED dimension rather than per occurrence of "Load-bearing". There are two of
+    # them now — tests (#114) and comments (#724) — so a bare substring count asserts they have not
+    # both arrived, which is the opposite of what this test is for.
+    for name in ("Load-bearing tests", "Load-bearing comments"):
+        opened = [ln for ln in bullets if ln.startswith(f"- {name}")]
+        assert len(opened) == 1, (
+            f"`{name}` is not a single top-level bullet in the dimension list "
+            f"({len(opened)} found)")
+
+
+def test_the_review_prompt_asks_whether_a_comment_the_diff_writes_is_true(review_prompt):
+    """#724: the dimension the tests one has had since #114, pointed at the other artefact.
+
+    The Documentation bullet beside it catches a comment the diff LEFT BEHIND — behaviour
+    changed, the docstring did not. It has nothing to say about one the diff WROTE, and that is
+    where the defects were: of the three a final adversarial pass found across #720, #719 and
+    #715, two were comments asserting a property the code did not have (`qb-reconcile`'s
+    `APPLY_STATE` describing a fresh read that never happens, `panel_seats.PR_HOLD_TTL`
+    comparing against the wrong default) and the third was a load-bearing claim that happened
+    to be true.
+
+    Asserted on the concrete shapes as well as the word "claim", for the reason the tests
+    dimension names its own: a bullet that says "check the comments" without saying what a
+    checkable claim looks like is read as the staleness bullet restated."""
+    bullet = _dimension(review_prompt, r"comment")
+    assert re.search(r"\bclaim", bullet, re.IGNORECASE), (
+        "REVIEW_PROMPT's comment dimension never says a comment is a CLAIM, which is the "
+        "whole move — a claim in the diff is reviewable and a description of it is not")
+    shapes = [pat for pat in (r"only caller", r"return", r"re-read", r"reach")
+              if re.search(pat, bullet, re.IGNORECASE)]
+    assert len(shapes) >= 3, (
+        f"REVIEW_PROMPT's comment dimension names {len(shapes)} of the concrete claim shapes "
+        f"(only caller / nothing returns / re-reads / cannot be reached); without them it "
+        f"reads as the Documentation bullet asking for staleness a second time")
+
+
+def test_the_review_prompt_says_why_a_wrong_comment_outlives_a_wrong_test(review_prompt):
+    """The argument, not just the instruction — and it is the reason this is not a nit.
+
+    A reviewer that reads "check the comments" prices it as polish, because in most codebases
+    it is. What makes it P2 here is that a wrong test can at least go red, and nothing ever
+    executes a comment: it survives every round, every CI run and every rebase, and the next
+    change is made on the strength of it. Dropping that sentence leaves a dimension whose
+    findings the master judge has no reason to keep."""
+    bullet = _dimension(review_prompt, r"comment")
+    assert re.search(r"execut", bullet, re.IGNORECASE), (
+        "REVIEW_PROMPT's comment dimension asks for the check but never says why a wrong "
+        "comment outlives a wrong test — that nothing ever executes it")
+    assert re.search(r"surviv|round|rebase", bullet, re.IGNORECASE), (
+        "REVIEW_PROMPT's comment dimension does not say what that costs: a wrong comment "
+        "survives every round, CI run and rebase, and is then built on")
+
+
+def test_an_unverifiable_comment_claim_has_somewhere_to_go(review_prompt):
+    """The #715 case, and the half that is deliberately NOT a mechanism.
+
+    `panel.run`'s "there is no early return between the claim and here" is TRUE, and it took an
+    AST walk over 2,600 lines to establish — a seat with Read, Grep and Glob and no shell
+    cannot settle it. A dimension that asks for a check no seat can perform, with no channel
+    for saying so, is answered by silence that reads as a pass. `could_not_assess` is the
+    channel the envelope already has, and routing structural claims into it is also the
+    measurement #724 gates its expensive half on: how many of these are questions a script
+    would settle."""
+    bullet = _dimension(review_prompt, r"comment")
+    assert "could_not_assess" in bullet, (
+        "REVIEW_PROMPT's comment dimension asks a seat to check claims it may have no way to "
+        "check — an unverifiable claim with no channel is reported as nothing at all, which "
+        "is indistinguishable from a claim that was checked and held")
+
+
+def test_a_false_comment_claim_is_not_priced_as_polish(review_prompt):
+    """A floor, asserted where severities are actually chosen.
+
+    The dimension list says what to look for and the severity paragraph says what it is worth,
+    and a seat reaching for a P-number reads the second. Its P3 tier is "style, naming,
+    simplifications", which is where a comment defect lands by default in any other repo. Both
+    ends are asserted: the bullet's own floor, and the tier the paragraph files it under —
+    and that the tiers BELOW it do not also offer it, since an example listed twice is not a
+    floor."""
+    assert re.search(r"at least P2|P2 at least", _dimension(review_prompt, r"comment"),
+                     re.IGNORECASE), (
+        "REVIEW_PROMPT's comment dimension states no severity floor, so a false load-bearing "
+        "claim is filed as the P4 polish a stale comment would be")
+    assert re.search(r"comment", _severity_tier(review_prompt, "P2"), re.IGNORECASE), (
+        "REVIEW_PROMPT's severity paragraph does not name a false comment claim under P2 — "
+        "the bullet's floor and the scale a seat picks from disagree, and the scale wins")
+    for tier in ("P3", "P4"):
+        assert not re.search(r"comment", _severity_tier(review_prompt, tier), re.IGNORECASE), (
+            f"REVIEW_PROMPT offers a comment defect as an example of {tier} as well as P2, so "
+            f"the floor is not a floor — a seat picks whichever tier it reads first")
+
+
+def test_the_review_prompt_keeps_asking_about_stale_docs_too(review_prompt):
+    """Added to, not swapped for — the same guard the absent-tests question has.
+
+    Staleness is the common case and the claim is the rare one; a change that folded the two
+    into a single "documentation" bullet would trade the frequent catch for the sharp one and
+    every other assertion in this file would still pass."""
+    stale = _dimension(review_prompt, r"documentation")
+    assert re.search(r"stale", stale, re.IGNORECASE), (
+        "REVIEW_PROMPT no longer asks whether a behaviour change left CLAUDE.md, docs, README "
+        "or docstrings stale — the comment-claims dimension was added beside that question, "
+        "not in place of it")
 
 
 def test_the_panel_command_describes_the_dimensions_it_actually_sends(briefs):
@@ -407,6 +585,10 @@ def test_the_panel_command_describes_the_dimensions_it_actually_sends(briefs):
     assert re.search(r"load-bearing", text, re.IGNORECASE), (
         "panel.md's dimension list does not mention load-bearing tests, which "
         "REVIEW_PROMPT now asks every reviewer for")
+    assert re.search(r"comment[^.]*\b(true|claim)", text, re.IGNORECASE), (
+        "panel.md's dimension list does not mention the comments the diff writes, which "
+        "REVIEW_PROMPT has asked every reviewer about since #724 — a reader deciding whether "
+        "to spend a panel is told it reviews less than it does")
 
 
 def test_the_reads_are_declared_rather_than_summarised():

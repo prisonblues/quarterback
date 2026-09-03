@@ -236,7 +236,11 @@ assertion that the defect is gone, and it will keep passing when the defect retu
 On PR #90 a deliberate, docstring'd regression test passed because its fixture
 happened to list two baselines in the working order, and the defect it was written
 for had to be found a round later in code that was already "covered". Docs that describe changed behaviour
-(CLAUDE.md, docs/, README, docstrings) get updated. Related code — callers,
+(CLAUDE.md, docs/, README, docstrings) get updated. And the comments the diff WRITES are
+read as claims, not as scenery: "this is the only caller", "nothing between here and
+there returns", "this re-reads X" are checkable properties of the code beside them, and
+a wrong one is at least P2 — nothing ever executes a comment, so it survives every round,
+every CI run and every rebase, and the next change is made on the strength of it. Related code — callers,
 siblings, parallel implementations — is governed by **`reviewer_scope`**: under
 `repo` it gets made consistent (search the codebase, don't just review the diff);
 under `diff`, the default, you read it to judge the change and file work only where

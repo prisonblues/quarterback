@@ -393,6 +393,54 @@ itself reviewed**. Its regression tests are the only thing standing behind it. A
 whose tests pass vacuously has no backstop at all — and that is precisely the pass this
 repo has decided not to review.
 
+### Load-bearing comments — a claim in the diff is reviewable
+
+The same lever, pointed at the other artefact. `REVIEW_PROMPT`'s Documentation dimension asks
+whether a behaviour change left CLAUDE.md, docs, README or docstrings **stale** — a comment the
+diff LEFT BEHIND. Nothing asked about one the diff **wrote**: a comment or docstring stating a
+checkable property of the code beside it — *"this is the only caller"*, *"nothing between here
+and there returns"*, *"this re-reads X rather than trusting the earlier read"*, *"this cannot be
+reached"*. That is a claim, and a claim in a diff is reviewable.
+
+The measurement is 2026-09-03, on the three PRs landed that day. Each had already been through a
+review pass, each was green, and each got one more independent adversarial pass before landing.
+**Two of the three defects that pass found were in the prose**, and the third was a prose claim
+that happened to be true. #719's `qb-reconcile` comment said both facts "are re-asked at the point
+of the WRITE rather than inferred from the finding" — read plainly, a fresh `gh` call immediately
+before mutating the plan, a second safety boundary. There is none; `apply_candidates` reads
+evidence gathered in the earlier pass. Nothing was unsafe, and the comment described a guard that
+does not exist, in the file whose entire thesis is that a check nobody made must not read as a
+check that passed. #715's `panel_seats.PR_HOLD_TTL` comment had its comparison backwards and was
+corrected by an earlier round of its own review.
+
+In most codebases that is a nit, and here it is not, for two reasons. The comments **are** the
+design record — a fifty-line docstring carrying the argument, the measurement and the rejected
+alternative is the normal unit — so a wrong one propagates: the next agent reads it, believes it,
+and builds on it. And it is worse than a wrong test in one specific way. A wrong test can at least
+go red. Nothing ever *executes* a comment, so a wrong one survives every round, every CI run and
+every rebase, indefinitely. Hence the floor: at least **P2**, stated in the dimension and again in
+the severity paragraph, where the tier a seat would otherwise reach for is P3 "style, naming,
+simplifications".
+
+**The claim a seat cannot check goes in `could_not_assess`, and that is deliberate.** #715's
+`panel.run` carried *"there is no early return between the claim and here — the skip and refusal
+exits are all ABOVE the dispatch"*. It is true, and it is what justifies shipping without a
+`try/finally`; the span is ~2,600 lines and confirming it took an AST walk enumerating every
+`return` and checking each was inside a nested `def`. `CODE_ACCESS_BRIEF` gives a code-reading seat
+Read, Grep and Glob and **no shell**, deliberately (#458, #459), so structural claims of that shape
+are not settleable from the seat's checkout. A dimension that asks for a check no seat can perform,
+with nowhere to say so, is answered by a silence that reads as a pass — a load-bearing claim nobody
+can check is not better than a false one, just quieter.
+
+So the bullet routes those into the coverage channel the envelope already has. That is also the
+**measurement** the expensive half is gated on: #724's second proposal is to give the seat a shell
+or a canned set of structural queries, and it is the same shape as #716 (a code-reading seat has
+the files and no history) one step further on. It is not built here, and the reason is that the
+count that would decide between a shell, a fixed query set and nothing does not exist yet — the
+`could_not_assess` entries this bullet produces are how it gets taken, the same way #716's was.
+Quietly undoing "you have NO shell" ahead of that measurement would spend the constraint's own
+argument to buy an answer nobody has yet.
+
 ### `/fix-and-review` and `/fix-and-land` — an issue, end to end
 
 Both take an issue number and come back with a reviewed PR. They differ in exactly one place, and

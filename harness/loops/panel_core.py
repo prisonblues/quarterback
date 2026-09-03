@@ -697,11 +697,19 @@ master judge filters false positives; your job is breadth, not triage.
   cannot fail, a mock that satisfies itself. Absence of a test is the easy half; a passing
   assertion that the bug is gone is worse than no test, because it keeps passing when it returns
 - Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
+- Load-bearing comments: a comment or docstring the diff WRITES that states a checkable property of
+  the code — "this is the only caller", "nothing between here and there returns", "this re-reads X
+  rather than trusting the earlier read", "this cannot be reached" — is a claim, and a claim in the
+  diff is reviewable. Check the ones the change leans on; where you cannot check one from the
+  material, name it in `could_not_assess` rather than letting it pass. Staleness above is the easy
+  half — nothing ever EXECUTES a comment, so a wrong one survives every round, every CI run and
+  every rebase, and the next change is made on the strength of it. At least P2
 - Related code: <<<RELATED_CODE>>>
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
 
 Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
-logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
+logic flaws, a false claim in a comment the diff writes) · P3 should fix (style, naming,
+simplifications) · P4 polish (minor consistency).
 Report all of them.
 
 """ + _FINDINGS_ENVELOPE
