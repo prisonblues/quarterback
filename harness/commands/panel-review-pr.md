@@ -843,6 +843,54 @@ the same claim. It does not compare the two wordings and never re-acknowledges f
 read both in the Unverifiable claims block, and if they are the same claim, pass the new
 key on the next round's `--acknowledge`.
 
+## 4d. The round's coverage declarations — the veto you close by going and looking
+
+The report's **Coverage declared by the reviewers** block is what each seat said it
+could not judge from what it was given, and every line there that a running,
+code-reading seat wrote costs the round its confidence. Each carries a key (`ca-` and
+twelve hex), derived from the declaration's own text the way an obligation's is
+derived from the claim's.
+
+**These are not §4c's claims and the difference decides what you do about one.** An
+unverifiable claim is one the judge ruled *nothing here could ever settle* — it needs a
+deployed system, a browser, data this checkout does not carry — and you discharge it by
+accepting the risk. A coverage declaration is one that simply *was not* settled, and it
+is very often the cheapest veto on the whole round to close, because it names its own
+instrument: the seat says what it could not do, and somebody with a shell does it. The
+claude seat cannot execute anything (#92, and reviewers stay non-executing), so its
+declarations are frequently a suite nobody ran and a question ten minutes at a prompt
+answers outright.
+
+So, per declaration:
+
+1. **Read it and decide whether it is worth closing.** Some are — run the suite, read
+   the file, grep the caller. Some are not, and then the honest outcome is that the
+   round does not stop confidently, which is what the veto is for.
+2. **Go and close it**, and keep what you measured. The measurement is the artefact,
+   not the fact that you looked.
+3. **Then pass the key back** to the next round with what you measured:
+   `--assessed ca-0123456789ab:'ran the DB suite at this head — 2165 passed, the seed
+   produces exactly 10 rows'`, repeatable, and the report prints the exact command. It
+   is inherited through `--baseline`, so you do it once per cycle and not once per
+   round. Add `--assessed-by NAME` when somebody other than this run did the measuring.
+4. **Say who, in the relay.** Without `--assessed-by` the answer is recorded and marked
+   **unattested** — the round that answered the declaration is also the round it was
+   answered for, which is the actor attesting to its own work. It is recorded rather
+   than refused (#40's rule, and `record-outcome`'s `refuted` treatment exactly), the
+   report shows the split, and `attested_by` is a claim you are making and not a
+   signature anything checked.
+
+**Per declaration, never in bulk, and there is no flag that answers them all** — §4c's
+rule, for §4c's reason. A key comes back under a new one when the seat reworded its
+declaration, and the run says so in `config_notes` rather than silently ignoring the
+stale key.
+
+**Do not `--assessed` a declaration you have not actually closed.** It is the one
+exemption in `coverage_veto` the round's own caller can grant, and the thing keeping it
+honest is that the answer is on the record with your name beside it. An assessment with
+no note, or with a note that does not say what was measured, is a veto deleted and
+nothing put in its place.
+
 ## 5. Re-review the fix commit — the round that used to be skipped
 
 Once the fixer has **pushed**, run the panel again over the new commit:
@@ -870,6 +918,11 @@ Add `--acknowledge uc-xxxxxxxx` for each unverifiable claim you accepted in §4c
 once, on the first round after you accepted it; the register is inherited through
 `--baseline` from there. Omit them and the round holds on a question you have already
 answered.
+
+Add `--assessed ca-xxxxxxxx:'<what you measured>'` for each coverage declaration you
+closed in §4d, on the same terms and for the same reason — once, inherited from there,
+and omitting it holds the PR on a question somebody has already answered. Add
+`--assessed-by NAME` when the measuring was somebody else's.
 
 ### Do not rewrite the branch between rounds, and know the cost if you must (#500)
 
