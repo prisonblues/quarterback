@@ -2729,11 +2729,18 @@ async def complete_item(
             # callers appending different words cannot overwrite one another the
             # way the read-modify-write did.
             #
-            # `state == "done"` for the same reason again, and it is not
-            # belt-and-braces: a person may reopen a done item, and the SELECT
-            # above is a read this transaction did not lock either. Without the
-            # predicate, a reopen landing in that gap gets a completion receipt
-            # written onto live work.
+            # `state == "done"` guards a state change the API does not currently
+            # permit. There are exactly two writers of `PlanItem.state` in `app/`:
+            # this endpoint's UPDATE above, and `update_item`'s assignment, which
+            # sits below a 409 refusing `done -> anything` ("finished work is a
+            # record, not a plan item"). A done row is frozen, so nothing can put
+            # this one back to `open` underneath us today.
+            #
+            # It is kept because the SELECT above genuinely is unlocked and the
+            # clause is free: add a reopen path later and this write is already
+            # unable to land a completion receipt on a row that came back to life.
+            # A guard correct in advance of the transition it catches costs one
+            # predicate; discovering it was needed costs a receipt on live work.
             await session.execute(
                 update(PlanItem)
                 .where(PlanItem.id == item.id, PlanItem.state == "done",
