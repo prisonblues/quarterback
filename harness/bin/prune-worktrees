@@ -22,8 +22,12 @@ set -uo pipefail
 #
 # Each category has FOUR states, not three: "none", a list, and `NOT CHECKED` for
 # a sweep that could not run at all — an unreachable board, a Postgres container
-# that answered nothing. A category with no answer is never reported as empty,
-# and "Nothing to prune. Clean." is printed only when all six were looked at.
+# that answered nothing, a docker daemon that is not up, a config file nothing
+# can read. A category with no answer is never reported as empty, and "Nothing to
+# prune. Clean." is printed only when all six were looked at. Every external read
+# here captures its exit status before parsing what it produced, because through
+# a pipe or a process substitution that status goes nowhere and "the command
+# failed" arrives as "the command found nothing".
 #
 # Usage: prune-worktrees [options]
 #   (no flags)         Dry-run: report orphan DBs, ports, dirs, containers,
@@ -183,6 +187,19 @@ else
     CONFIG_JSON=""
 fi
 
+# Refused rather than degraded. Every `cfg` call drops jq's error and falls back
+# to its default, so one stray comma silently erases the database engine, the
+# nginx path, the worker prefix and the protect patterns — and the categories
+# those configure then report "none" for a reason that has nothing to do with the
+# repo. That is #735's shape arriving through the config file: a check that could
+# not be set up, reported as a check that found nothing.
+if [[ -n "$CONFIG_JSON" ]] && command -v jq >/dev/null 2>&1; then
+    jq -e . >/dev/null 2>&1 <<<"$CONFIG_JSON" \
+        || die "config file is not valid JSON: ${CONFIG_FILE:-$MAIN_REPO/.worktree.json}
+Refusing to run: every setting in it would silently fall back to a default, and
+the categories it configures would report \"none\" for the wrong reason."
+fi
+
 PROJECT="${PROJECT_OVERRIDE:-$(cfg '.project' "$(detect_project_name "$MAIN_REPO")")}"
 DB_ENGINE=$(cfg '.database.engine' "")
 DB_CONTAINER=$(cfg '.database.container' "auto")
@@ -223,6 +240,18 @@ declare -A LIVE_DB=()
 declare -A LIVE_DIR=()
 LIVE_SUFFIXES=()
 LIVE_LIST_OK=false
+# Captured whole, WITH its status, before anything parses it. Piped straight into
+# the loop through process substitution, neither `git`'s status nor `awk`'s ever
+# reached this shell — so a listing that failed halfway, after emitting the main
+# checkout, satisfied the guard below and left every other live worktree looking
+# dead. That is #735's discarded exit status again, on the one input every sweep
+# in this file derives "is this live?" from, and the consequence of getting it
+# wrong here is `rm -rf` rather than a misleading line.
+if ! WORKTREE_LIST=$(git worktree list --porcelain 2>/dev/null); then
+    die "\`git worktree list\` failed (is this a git repository?).
+Refusing to classify anything as orphaned: with no live list, every worktree
+directory, database and container looks dead."
+fi
 while IFS= read -r p; do
     [[ -z "$p" ]] && continue
     LIVE_LIST_OK=true
@@ -232,7 +261,7 @@ while IFS= read -r p; do
     suffix="${b#${PROJECT}-}"
     LIVE_SUFFIXES+=("$suffix")
     LIVE_DB["${PROJECT}_$(echo "$suffix" | tr '-' '_')"]=1
-done < <(git worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}')
+done < <(printf '%s\n' "$WORKTREE_LIST" | awk '/^worktree /{print substr($0,10)}')
 
 # Everything downstream decides what to DELETE by asking "is this live?", so an
 # empty or truncated worktree list does not mean "nothing is live" — it means we
@@ -450,12 +479,21 @@ fi
 PORT_FILE="$MAIN_REPO/.worktree-ports"
 STALE_PORTS=()
 KEPT_PORTS=()
+PORTS_UNKNOWN=""
 if [[ -f "$PORT_FILE" ]]; then
-    while IFS= read -r line; do
-        [[ -z "${line//[[:space:]]/}" ]] && continue
-        name="${line#*:}"
-        if is_live_suffix "$name"; then KEPT_PORTS+=("$line"); else STALE_PORTS+=("$line"); fi
-    done < "$PORT_FILE"
+    # A redirect that cannot open the file leaves the loop unentered and both
+    # arrays empty, which under no `-e` is indistinguishable from a file with
+    # nothing stale in it — and `--prune` would then rewrite the file from an
+    # empty KEPT_PORTS, discarding every live allocation in it.
+    if ! PORT_LINES=$(cat "$PORT_FILE" 2>/dev/null); then
+        PORTS_UNKNOWN="$PORT_FILE exists but could not be read"
+    else
+        while IFS= read -r line; do
+            [[ -z "${line//[[:space:]]/}" ]] && continue
+            name="${line#*:}"
+            if is_live_suffix "$name"; then KEPT_PORTS+=("$line"); else STALE_PORTS+=("$line"); fi
+        done <<< "$PORT_LINES"
+    fi
 fi
 
 # ============================================
@@ -492,6 +530,7 @@ shopt -u nullglob
 # directory above. That evidence-gating guarantees we never touch a main-stack
 # container that merely shares the "<project>-" prefix.
 ORPHAN_CONTAINERS=()
+CONTAINERS_UNKNOWN=""
 if command -v docker >/dev/null 2>&1; then
     declare -A DEAD_SUFFIX=()
     for line in "${STALE_PORTS[@]:-}"; do
@@ -502,16 +541,26 @@ if command -v docker >/dev/null 2>&1; then
         [[ -z "$d" ]] && continue
         b=$(basename "$d"); DEAD_SUFFIX["${b#${PROJECT}-}"]=1
     done
+    # No known-dead suffix means this never asks, and "none" is then the right
+    # answer rather than an unchecked one: the sweep is evidence-gated, so with
+    # no evidence there is nothing a container listing could qualify.
     if [[ ${#DEAD_SUFFIX[@]} -gt 0 ]]; then
-        while IFS= read -r cname; do
-            [[ -z "$cname" ]] && continue
-            suf=""
-            [[ "$cname" == "${PROJECT}-"* ]] && suf="${cname#${PROJECT}-}"
-            [[ -n "$WORKER_PREFIX" && "$cname" == "${WORKER_PREFIX}-"* ]] && suf="${cname#${WORKER_PREFIX}-}"
-            [[ -z "$suf" ]] && continue
-            is_live_suffix "$suf" && continue
-            [[ -n "${DEAD_SUFFIX[$suf]:-}" ]] && ORPHAN_CONTAINERS+=("$cname")
-        done < <(docker ps -a --format '{{.Names}}' 2>/dev/null)
+        # `docker` on PATH does not mean a daemon answering it. Through process
+        # substitution a refused socket read exactly like a host with no
+        # containers on it — #735, in the category next door.
+        if ! DOCKER_PS=$(docker ps -a --format '{{.Names}}' 2>/dev/null); then
+            CONTAINERS_UNKNOWN="\`docker ps\` failed — is the daemon running?"
+        else
+            while IFS= read -r cname; do
+                [[ -z "$cname" ]] && continue
+                suf=""
+                [[ "$cname" == "${PROJECT}-"* ]] && suf="${cname#${PROJECT}-}"
+                [[ -n "$WORKER_PREFIX" && "$cname" == "${WORKER_PREFIX}-"* ]] && suf="${cname#${WORKER_PREFIX}-}"
+                [[ -z "$suf" ]] && continue
+                is_live_suffix "$suf" && continue
+                [[ -n "${DEAD_SUFFIX[$suf]:-}" ]] && ORPHAN_CONTAINERS+=("$cname")
+            done <<< "$DOCKER_PS"
+        fi
     fi
 fi
 
@@ -523,15 +572,26 @@ fi
 # is orphaned. is_live_suffix normalises "/" -> "-" so "feat/x" matches the
 # "feat-x" dir suffix.
 ORPHAN_NGINX=()
+NGINX_UNKNOWN=""
 NGINX_CONF_PATH=""
 if [[ -n "$NGINX_CONFIG" && -f "$MAIN_REPO/$NGINX_CONFIG" ]]; then
     NGINX_CONF_PATH="$MAIN_REPO/$NGINX_CONFIG"
-    while IFS= read -r br; do
-        [[ -z "$br" ]] && continue
-        is_live_suffix "$br" && continue
-        ORPHAN_NGINX+=("$br")
-    done < <(grep -oE '# WORKTREE-START:[^[:space:]]+' "$NGINX_CONF_PATH" 2>/dev/null \
-                | sed 's/# WORKTREE-START://' | sort -u)
+    # `grep` has three answers and only two of them agree: 1 is "no worktree
+    # blocks in here", which is the ordinary state of a config nobody has
+    # wired yet, and 2-or-more is "I could not read it". Piped into the loop
+    # both arrived as no lines. A file present but unreadable therefore said
+    # `Orphan nginx blocks: none`, and `--remove-nginx` would go on to rewrite
+    # the file it had just failed to read.
+    NGINX_MARKS=$(grep -oE '# WORKTREE-START:[^[:space:]]+' "$NGINX_CONF_PATH" 2>/dev/null)
+    if [[ $? -gt 1 ]]; then
+        NGINX_UNKNOWN="$NGINX_CONF_PATH could not be read"
+    else
+        while IFS= read -r br; do
+            [[ -z "$br" ]] && continue
+            is_live_suffix "$br" && continue
+            ORPHAN_NGINX+=("$br")
+        done < <(printf '%s\n' "$NGINX_MARKS" | sed 's/# WORKTREE-START://' | sort -u)
+    fi
 fi
 
 # ============================================
@@ -647,6 +707,13 @@ else
             ORPHAN_CLAIM_BRANCHES+=("$br")
         done <<< "$CLAIMS_TSV"
     fi
+    # Suppressing the stderr keeps the run quiet; it must not also make the
+    # answer undiagnosable. An exit 2 covers an unconfigured board, a rotated
+    # token, a TLS failure, a timeout and an outage, and `qb-claimed` prints
+    # which — so the line names the command that will say, instead of carrying
+    # the prose or leaving the reader to guess. Still one line, still no output
+    # from a feature nobody enabled.
+    [[ -n "$CLAIMS_UNKNOWN" ]] && CLAIMS_UNKNOWN+="; for the reason run: qb-claimed --repo-path '$MAIN_REPO' --session ''"
 fi
 # <<< claim-sweep
 
@@ -654,44 +721,39 @@ fi
 # REPORT
 # ============================================
 # Print a labelled section. Args after the count are the items (may be zero).
+# `why` is the FOURTH state (#735), and it comes before the count because it
+# outranks it: a sweep that could not run has no count, and zero is the one thing
+# it must not be reported as. "none" and "not checked" are opposite answers with
+# opposite remedies, and only the first is a reason to stop looking. `qb-doctor`
+# settled this for its own six checks — `?` is not `ok`, "a doctor that prints ok
+# because it could not look is worse than one that does not check" — and this is
+# that verdict, in the sweep.
+#
+# One parameter on the one function every category already goes through, rather
+# than a second function beside it: a category whose sweep grows a way to fail
+# has somewhere to say so without a call site being rewritten to notice, and the
+# six lines below then read as one table with one empty column.
 report() {
-    local title="$1" count="$2"; shift 2
-    if [[ "$count" -eq 0 ]]; then
+    local title="$1" why="$2" count="$3"; shift 3
+    if [[ -n "$why" ]]; then
+        echo -e "${YELLOW}? $title: NOT CHECKED — $why${NC}"
+    elif [[ "$count" -eq 0 ]]; then
         echo -e "${GREEN}✓ $title: none${NC}"
     else
         echo -e "${CYAN}$title ($count):${NC}"
         printf '    %s\n' "$@"
     fi
 }
-
-# The fourth state (#735). A sweep that could not run has no count, and a count
-# of zero is the one thing it must not be reported as: "none" and "not checked"
-# are opposite answers with opposite remedies, and only the first is a reason to
-# stop looking. `qb-doctor` settled the same argument for its own six checks —
-# `?` is not `ok`, "a doctor that prints ok because it could not look is worse
-# than one that does not check" — and this is that verdict, in the sweep.
-#
-# A separate function rather than a sentinel count so that no call site can print
-# it by accident, and so the colour and the wording are decided once.
-report_unknown() {
-    local title="$1" why="$2"
-    echo -e "${YELLOW}? $title: NOT CHECKED — $why${NC}"
-}
 echo ""
-if [[ -n "$DB_SCAN_UNKNOWN" ]]; then
-    report_unknown "Orphan databases" "$DB_SCAN_UNKNOWN"
-else
-    report "Orphan databases" "${#ORPHAN_DBS[@]}" "${ORPHAN_DBS[@]:-}"
-fi
-report "Stale port entries"   "${#STALE_PORTS[@]}"       "${STALE_PORTS[@]:-}"
-report "Leftover directories" "${#LEFTOVER_DIRS[@]}"     "${LEFTOVER_DIRS[@]:-}"
-report "Orphan containers"    "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]:-}"
-report "Orphan nginx blocks"  "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
-if [[ -n "$CLAIMS_UNKNOWN" ]]; then
-    report_unknown "Orphan board claims" "$CLAIMS_UNKNOWN"
-else
-    report "Orphan board claims" "${#ORPHAN_CLAIMS[@]}" "${ORPHAN_CLAIMS[@]:-}"
-fi
+report "Orphan databases"     "$DB_SCAN_UNKNOWN"    "${#ORPHAN_DBS[@]}"        "${ORPHAN_DBS[@]:-}"
+report "Stale port entries"   "$PORTS_UNKNOWN"      "${#STALE_PORTS[@]}"       "${STALE_PORTS[@]:-}"
+# Leftover directories is the one category with no fourth state, and that is not
+# an omission: it is derived entirely from the live list, which is now refused
+# outright above rather than allowed to come back short.
+report "Leftover directories" ""                    "${#LEFTOVER_DIRS[@]}"     "${LEFTOVER_DIRS[@]:-}"
+report "Orphan containers"    "$CONTAINERS_UNKNOWN" "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]:-}"
+report "Orphan nginx blocks"  "$NGINX_UNKNOWN"      "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
+report "Orphan board claims"  "$CLAIMS_UNKNOWN"     "${#ORPHAN_CLAIMS[@]}"     "${ORPHAN_CLAIMS[@]:-}"
 if [[ ${#PROTECTED_DBS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}Protected by .database.protect — not counted as orphans (${#PROTECTED_DBS[@]}):${NC}"
     printf '    %s\n' "${PROTECTED_DBS[@]}"
@@ -713,8 +775,15 @@ TOTAL=$(( ${#ORPHAN_DBS[@]} + ${#STALE_PORTS[@]} + ${#LEFTOVER_DIRS[@]} \
 # it — that sentence is precisely what a caller quotes back as "the sweep ran and
 # found nothing" (#735).
 UNCHECKED=""
-[[ -n "$DB_SCAN_UNKNOWN" ]] && UNCHECKED="orphan databases"
-[[ -n "$CLAIMS_UNKNOWN" ]] && UNCHECKED="${UNCHECKED:+$UNCHECKED and }board claims"
+note_unchecked() {
+    [[ -n "$1" ]] && UNCHECKED="${UNCHECKED:+$UNCHECKED, }$2"
+    return 0            # or a category with no failure ends the function non-zero
+}
+note_unchecked "$DB_SCAN_UNKNOWN"    "orphan databases"
+note_unchecked "$PORTS_UNKNOWN"      "stale port entries"
+note_unchecked "$CONTAINERS_UNKNOWN" "orphan containers"
+note_unchecked "$NGINX_UNKNOWN"      "orphan nginx blocks"
+note_unchecked "$CLAIMS_UNKNOWN"     "board claims"
 
 if [[ "$TOTAL" -eq 0 ]]; then
     if [[ -n "$UNCHECKED" ]]; then
@@ -828,12 +897,22 @@ elif [[ "$REMOVE_CONTAINERS" != true && ${#ORPHAN_CONTAINERS[@]} -gt 0 ]]; then
 fi
 
 # Strip orphan nginx blocks + restart nginx (--remove-nginx)
+# Two facts, not one: whether the config actually changed (which decides the
+# restart) and whether any block failed (which the per-block line reports). A
+# run that strips three of four still needs the restart for the three.
+NGINX_REMOVED_ANY=false
 if [[ "$REMOVE_NGINX" = true && ${#ORPHAN_NGINX[@]} -gt 0 && -n "$NGINX_CONF_PATH" ]]; then
     for br in "${ORPHAN_NGINX[@]}"; do
         [[ -z "$br" ]] && continue
         # Match the branch AFTER the tag exactly, so "issue-5" can't also strip
         # "issue-50" (substring). Trim trailing whitespace/CR before comparing.
-        awk -v br="$br" '
+        #
+        # The `&& mv` used to be followed by an unconditional success line, and
+        # under no `-e` an `awk` that could not read the config or an `mv` across
+        # a full disk left the file untouched and the run still said "removed".
+        # Same rule as `--prune` and the claims: a line reporting an action is a
+        # claim that the action happened.
+        if awk -v br="$br" '
             match($0, /# WORKTREE-(START|END):/) {
                 tag  = substr($0, RSTART, RLENGTH)
                 rest = substr($0, RSTART + RLENGTH)
@@ -842,20 +921,39 @@ if [[ "$REMOVE_NGINX" = true && ${#ORPHAN_NGINX[@]} -gt 0 && -n "$NGINX_CONF_PAT
             }
             skip { next }
             { print }
-        ' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
-        echo -e "  ${GREEN}removed nginx block: $br${NC}"
+        ' "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"; then
+            echo -e "  ${GREEN}removed nginx block: $br${NC}"
+            NGINX_REMOVED_ANY=true
+        else
+            # The half-written temp file goes rather than sitting next to the
+            # config it was going to replace.
+            rm -f "$NGINX_CONF_PATH.tmp"
+            echo -e "  ${YELLOW}could not remove nginx block: $br — config left as it was${NC}"
+        fi
     done
-    # Collapse the blank lines the removed blocks leave behind (mirror remove-worktree).
-    awk 'NF {blank=0; print} !NF {blank++; if (blank <= 2) print}' \
-        "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
-    # Restart nginx so the stripped config takes effect.
-    nc="$NGINX_CONTAINER"
-    [[ "$nc" = "auto" || -z "$nc" ]] && nc=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1)
-    if [[ -n "$nc" ]]; then
-        docker restart "$nc" >/dev/null 2>&1 && echo -e "  ${GREEN}restarted nginx ($nc)${NC}" \
-            || echo -e "  ${YELLOW}could not restart nginx ($nc)${NC}"
+    if [[ "$NGINX_REMOVED_ANY" = true ]]; then
+        # Collapse the blank lines the removed blocks leave behind (mirror
+        # remove-worktree). Cosmetic, so a failure here is not worth a line of
+        # its own — but the temp file still goes.
+        if ! { awk 'NF {blank=0; print} !NF {blank++; if (blank <= 2) print}' \
+                "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" \
+                && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"; }; then
+            rm -f "$NGINX_CONF_PATH.tmp"
+        fi
+        # Restart nginx so the stripped config takes effect.
+        nc="$NGINX_CONTAINER"
+        [[ "$nc" = "auto" || -z "$nc" ]] && nc=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1)
+        if [[ -n "$nc" ]]; then
+            docker restart "$nc" >/dev/null 2>&1 && echo -e "  ${GREEN}restarted nginx ($nc)${NC}" \
+                || echo -e "  ${YELLOW}could not restart nginx ($nc)${NC}"
+        else
+            echo -e "  ${YELLOW}nginx container not found — restart it manually${NC}"
+        fi
     else
-        echo -e "  ${YELLOW}nginx container not found — restart it manually${NC}"
+        # No restart, and said out loud: a restart line is what tells the reader
+        # the change is live, so printing one over a config nothing was stripped
+        # from is the same false report as the rest of this issue.
+        echo -e "  ${YELLOW}nginx not restarted — nothing was stripped from the config${NC}"
     fi
 elif [[ "$REMOVE_NGINX" != true && ${#ORPHAN_NGINX[@]} -gt 0 ]]; then
     echo -e "  ${YELLOW}left ${#ORPHAN_NGINX[@]} orphan nginx block(s) (use --remove-nginx)${NC}"

@@ -679,6 +679,28 @@ claim is on an 8h TTL and this sweep is the thing that exists to hand it back ea
 so a false "none" means the claim runs quietly to its fuse: #135's complaint arriving
 through the tool built to prevent it.
 
+**Every external read in the file now captures its status before parsing.** That was the
+mechanical cause and it was not confined to the claim sweep: a producer piped straight into
+a `while read` loop, or into a process substitution, hands this shell no exit status at all —
+so `docker ps` against a stopped daemon, a `psql` listing that failed after the liveness
+probe passed, a port file that exists and cannot be opened, and an nginx config `grep` could
+not read all arrived as *no lines*, which is what an empty answer looks like too. Two of
+those go on to be acted on: `--prune` rewrites `.worktree-ports` from the list it just failed
+to read, and `--remove-nginx` rewrites a config it just failed to parse.
+
+The severe one is the **live worktree list** itself, which is not a category but the input
+every category derives "is this live?" from. `LIVE_LIST_OK` was set from inside the loop, so
+it only ever proved that *one line arrived* — a listing that emitted the main checkout and
+then failed satisfied it, and every other live worktree then looked like debris to a sweep
+whose `--remove-dirs` runs `rm -rf`. The listing is captured whole, with its status, and a
+failure is refused rather than reported.
+
+A **config file that does not parse** reaches the same place from the other side: `cfg` drops
+`jq`'s error and falls back to its default, so one stray comma erases the database engine, the
+nginx path, the worker prefix and the protect patterns — and the categories those configure
+then answer "none" for a reason that has nothing to do with the repo. It is now refused at
+load.
+
 Three consequences, and the last is the one a caller quotes:
 
 - **The database scan carries it too.** Its two "skipping DB scan" paths — no DB user, no
@@ -688,7 +710,10 @@ Three consequences, and the last is the one a caller quotes:
   warning it grew then stays, for the candidate list; the report line no longer contradicts
   it.
 - **`--prune` says outright that it swept no claims.** Every other line in the apply pass
-  reports an action, so silence there reads as claims handed back.
+  reports an action, so silence there reads as claims handed back. `--remove-nginx` gets the
+  same treatment: its `awk … && mv` chain was followed by an unconditional "removed nginx
+  block", so under no `-e` a rewrite that never happened still reported as one — and nginx was
+  then restarted to pick up a config nothing had changed.
 - **`Nothing to prune. Clean.` is a statement about all six categories**, so a run that
   looked at four of them does not print it, and names the ones it could not look at instead.
   That sentence is precisely what a caller reads as "the sweep ran and found nothing".

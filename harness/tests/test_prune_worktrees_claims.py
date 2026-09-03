@@ -35,6 +35,7 @@ Run: pytest harness/tests
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -345,18 +346,46 @@ BIN = Path(__file__).resolve().parents[1] / "bin"
 
 GIT = shutil.which("git")
 
-#: One stub answering both questions the DB scan asks, so the database category
-#: has a real answer and cannot be what suppresses "Clean." in the runs below.
-#: `ps` names a container matching the resolver's `postgres|pgdb|_db` filter;
-#: `exec ... -tAc` answers the `SELECT 1` probe, then lists one database — the
-#: project's own, which is protected and therefore not an orphan.
+#: One stub answering every question the script asks `docker`, so the database
+#: and container categories have real answers and cannot be what suppresses
+#: "Clean." in the runs below. Two `ps` forms, and they are different questions:
+#: bare `ps` names candidate Postgres containers (matching the resolver's
+#: `postgres|pgdb|_db` filter), `ps -a` enumerates containers for the orphan
+#: sweep. `exec ... -tAc` answers the `SELECT 1` probe, then lists one database —
+#: the project's own, which is protected and therefore not an orphan.
+#:
+#: `$DOCKER_FAIL` names the one call that should fail, so a test can break
+#: exactly one of them and leave the rest answering.
 _DOCKER_STUB = """
-if [[ "${1:-}" == "ps" ]]; then printf "%s\\n" "proj-postgres-1"; exit 0; fi
+fail=${DOCKER_FAIL:-}
+if [[ "${1:-}" == "ps" ]]; then
+    for a in "$@"; do [[ "$a" == "-a" ]] && {
+        [[ "$fail" == "ps-a" ]] && exit 1
+        printf "%s\\n" "proj-fix-issue-gone"; exit 0
+    }; done
+    [[ "$fail" == "ps" ]] && exit 1
+    printf "%s\\n" "proj-postgres-1"; exit 0
+fi
 if [[ "${1:-}" == "exec" ]]; then
     for a in "$@"; do
         [[ "$a" == "SELECT 1" ]] && exit 0
-        [[ "$a" == *pg_database* ]] && { printf "%s\\n" "proj"; exit 0; }
+        [[ "$a" == *pg_database* ]] && {
+            [[ "$fail" == "listing" ]] && exit 2
+            printf "%s\\n" "proj"; exit 0
+        }
     done
+fi
+exit 0
+"""
+
+#: A `git` that answers the toplevel question and fails the worktree listing —
+#: the one failure the live-list guard could not see, because the listing was
+#: piped straight into the loop and its status went nowhere.
+_GIT_STUB = """
+if [[ "${1:-}" == "rev-parse" ]]; then printf "%s\\n" "$PWD"; exit 0; fi
+if [[ "${1:-}" == "worktree" && "${2:-}" == "list" ]]; then
+    printf "worktree %s\\n" "$PWD"      # the main checkout, then the failure
+    exit 1
 fi
 exit 0
 """
@@ -370,16 +399,29 @@ ANSWERED_EMPTY = "printf '%s' '{\"claims\": [], \"held\": false}'\nexit 1\n"
 
 
 def real_run(tmp_path, *, claimed: str, args: tuple[str, ...] = (),
-             ports: str | None = None):
-    """`prune-worktrees` itself, in a throwaway repo, with `qb-claimed` stubbed."""
+             ports: str | None = None, config_raw: str | None = None,
+             nginx: str | None = None, unreadable: tuple[str, ...] = (),
+             docker_fail: str = "", stub_git: bool = False):
+    """`prune-worktrees` itself, in a throwaway repo, with `qb-claimed` stubbed.
+
+    The failure-injection arguments each break exactly one of the script's
+    external reads, which is the only way to reach the paths this PR added:
+    `docker_fail` picks a `docker` call to fail, `unreadable` chmods a file the
+    script will try to open, `config_raw` writes a config that will not parse,
+    and `stub_git` makes the worktree listing fail after emitting a line.
+    """
     main = tmp_path / "proj"
     main.mkdir()
     subprocess.run([GIT, "init", "-q", "-b", "main", str(main)], check=True)
     subprocess.run([GIT, "-C", str(main), "config", "user.email", "t@example.com"],
                    check=True)
     subprocess.run([GIT, "-C", str(main), "config", "user.name", "T"], check=True)
-    (main / ".worktree.json").write_text(json.dumps(
-        {"project": "proj", "database": {"engine": "postgresql"}}))
+    config = {"project": "proj", "database": {"engine": "postgresql"}}
+    if nginx is not None:
+        config["nginx"] = {"config": "nginx.conf"}
+        (main / "nginx.conf").write_text(nginx)
+    (main / ".worktree.json").write_text(
+        config_raw if config_raw is not None else json.dumps(config))
     (main / ".env").write_text("POSTGRES_USER=proj\n")
     if ports is not None:
         (main / ".worktree-ports").write_text(ports)
@@ -389,20 +431,38 @@ def real_run(tmp_path, *, claimed: str, args: tuple[str, ...] = (),
 
     stubs = tmp_path / "stubs"
     stubs.mkdir()
-    for name, body in (("docker", _DOCKER_STUB), ("qb-claimed", claimed),
-                       ("qb-release", "exit 0\n")):
+    bodies = [("docker", _DOCKER_STUB), ("qb-claimed", claimed),
+              ("qb-release", "exit 0\n")]
+    if stub_git:
+        bodies.append(("git", _GIT_STUB))
+    for name, body in bodies:
         f = stubs / name
         f.write_text(f"#!{BASH}\n{body}")
         f.chmod(0o755)
+
+    # Last, so the repo is fully built before anything in it becomes unopenable.
+    for rel in unreadable:
+        (main / rel).chmod(0o000)
 
     # `inherit_path` because the subject is the real script: `git` and `tr` have
     # to be findable. The stub directory goes in FRONT, so the three tools this
     # test has an opinion about are the ones it wrote — including `docker`, which
     # must not be the developer's.
-    return subprocess.run(
+    got = subprocess.run(
         [str(BIN / "prune-worktrees"), *args], cwd=str(main),
         capture_output=True, text=True,
-        env=_path_sandbox.sandbox_env(tmp_path, stubs, inherit_path=True))
+        env=_path_sandbox.sandbox_env(tmp_path, stubs, inherit_path=True,
+                                      DOCKER_FAIL=docker_fail))
+    for rel in unreadable:                       # so pytest can clean tmp_path up
+        (main / rel).chmod(0o644)
+    return got
+
+
+#: `chmod 000` does not stop root, so the unreadable-file cases would run with the
+#: file readable and pass without taking their branch — the shape `_path_sandbox`
+#: exists to prevent.
+not_root = pytest.mark.skipif(os.geteuid() == 0,
+                              reason="chmod 000 does not make a file unreadable to root")
 
 
 @pytest.mark.skipif(GIT is None, reason="git must be on PATH")
@@ -445,3 +505,116 @@ def test_prune_says_outright_that_it_swept_no_claims(tmp_path):
     assert "Applying" in r.stdout, r.stdout
     assert "claims NOT swept" in r.stdout, r.stdout
     assert "released claim" not in r.stdout, r.stdout
+
+
+# ============================================== the other four external reads
+#
+# The claim sweep was the reported case, and the same discarded exit status is in
+# every category that shells out (#736 review). Each of these breaks exactly one
+# external read and asks whether the category says "none" about it. They come in
+# pairs with the runs above, which prove the same categories still report `none`
+# when nothing is broken.
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_database_listing_that_failed_suppresses_clean(tmp_path):
+    """`test_prune_worktrees_protect.py` pins this in the extracted block. This is
+    the half that block cannot show: what the whole script PRINTS, which is where
+    a false clean is actually read."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY, docker_fail="listing")
+    assert "Orphan databases: none" not in r.stdout, r.stdout
+    assert "Orphan databases: NOT CHECKED" in r.stdout, r.stdout
+    assert "Nothing to prune. Clean." not in r.stdout, r.stdout
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_container_listing_that_failed_is_not_no_containers(tmp_path):
+    """`docker` on PATH is not a daemon answering it. The stale port entry is what
+    gives the sweep a known-dead suffix, without which it never asks at all."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY, docker_fail="ps-a",
+                 ports="5001:fix-issue-gone\n")
+    assert "Orphan containers: none" not in r.stdout, r.stdout
+    assert "Orphan containers: NOT CHECKED" in r.stdout, r.stdout
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_with_no_dead_suffix_the_container_sweep_is_none_not_unknown(tmp_path):
+    """The pair, and the reason the unknown is inside the evidence gate: with
+    nothing known dead the sweep never asks, so there is nothing it failed to
+    learn — "none" is the answer, not a guess at one."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY, docker_fail="ps-a")
+    assert "Orphan containers: none" in r.stdout, r.stdout
+
+
+@not_root
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_an_unreadable_port_file_is_not_an_empty_one(tmp_path):
+    """`done < "$PORT_FILE"` on a file it cannot open leaves both arrays empty,
+    and `--prune` rewrites the file from the empty one — discarding every live
+    allocation in it."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY, ports="5001:fix-issue-gone\n",
+                 unreadable=(".worktree-ports",))
+    assert "Stale port entries: none" not in r.stdout, r.stdout
+    assert "Stale port entries: NOT CHECKED" in r.stdout, r.stdout
+
+
+@not_root
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_an_unreadable_nginx_config_is_not_one_with_no_blocks(tmp_path):
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY,
+                 nginx="# WORKTREE-START:fix/issue-gone\n# WORKTREE-END:fix/issue-gone\n",
+                 unreadable=("nginx.conf",))
+    assert "Orphan nginx blocks: none" not in r.stdout, r.stdout
+    assert "Orphan nginx blocks: NOT CHECKED" in r.stdout, r.stdout
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_readable_nginx_config_with_no_blocks_is_none(tmp_path):
+    """The pair, and it is the one that needs saying: `grep` exits 1 when it
+    matches nothing, which is the ordinary state of a config nobody has wired.
+    Treating every non-zero as a failure would make this run unknown forever."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY, nginx="server { listen 80; }\n")
+    assert "Orphan nginx blocks: none" in r.stdout, r.stdout
+    assert "NOT CHECKED" not in r.stdout, r.stdout
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_worktree_listing_that_failed_halfway_refuses(tmp_path):
+    """The severe one. Every sweep here decides what to DELETE by asking "is this
+    live?", so a listing that emitted the main checkout and then failed leaves
+    every other live worktree looking like debris — and `--remove-dirs` runs
+    `rm -rf`. `LIVE_LIST_OK` only ever proved that one line arrived."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY, stub_git=True)
+    assert r.returncode != 0, r.stdout
+    assert "Refusing to classify anything as orphaned" in r.stderr, r.stderr
+    assert "Leftover directories" not in r.stdout, (
+        f"it reported categories off a live list it could not trust:\n{r.stdout}")
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_config_that_does_not_parse_is_refused_not_defaulted(tmp_path):
+    """Every `cfg` call drops jq's error and falls back to its default, so one
+    stray comma erases the database engine — and the category it configures then
+    reports "none" for a reason that has nothing to do with the repo."""
+    r = real_run(tmp_path, claimed=ANSWERED_EMPTY,
+                 config_raw='{"project": "proj", "database": {,}}')
+    assert r.returncode != 0, r.stdout
+    assert "not valid JSON" in r.stderr, r.stderr
+    assert "Orphan databases" not in r.stdout, r.stdout
+
+
+#: The exit code is deliberately 0 for both a complete sweep and one that could
+#: not check a category. This script has never given the code a meaning — every
+#: path returns 0, including a dry run that found plenty — and giving one to a
+#: single path would be a contract nobody could rely on. Pinned in both
+#: directions so that a later decision to give it one is a decision rather than a
+#: side effect, and so that the refusals above (which DO exit non-zero, because
+#: `die` always has) stay distinguishable from an ordinary run.
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_complete_run_exits_zero(tmp_path):
+    assert real_run(tmp_path, claimed=ANSWERED_EMPTY).returncode == 0
+
+
+@pytest.mark.skipif(GIT is None, reason="git must be on PATH")
+def test_a_run_that_could_not_check_a_category_also_exits_zero(tmp_path):
+    assert real_run(tmp_path, claimed=UNREACHABLE).returncode == 0
