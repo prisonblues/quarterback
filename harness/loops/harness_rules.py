@@ -1977,6 +1977,58 @@ DEFAULTS: dict = {
             # This repo's own spend over a rolling window (`budget_window_hours`).
             "tokens_per_day": None,
             "runs_per_day": None,
+            # #483's per-ROUND allowance, and the PRIMARY of the two per-PR dials:
+            # `tokens_per_pr` below is DERIVED from it (`tokens_per_round ×
+            # max_rounds`) rather than set beside it, and a `tokens_per_pr` written
+            # below that total is refused by name.
+            #
+            # WHY THE ROUND IS THE UNIT. A round is what gets dispatched and what a
+            # seat's cost is a function of; a flat per-PR total bounds not spend per
+            # unit of work but HOW MANY UNITS OF WORK a PR is allowed, which is the
+            # decision the round logic is supposed to make on evidence. And it binds
+            # latest and hardest on the round that matters most: it is spent on rounds
+            # 1 and 2, which were happening anyway, and refuses round 3 — the first
+            # round that reads the fixer's own commit, and the band `max_rounds: 6`
+            # was raised to buy. Measured over this board's own 115 recorded review
+            # runs (`GET /reviews?days=365&limit=500` — the params matter, `limit`
+            # defaults to 50 and the counts below do not reproduce without them): ten
+            # PRs reached round 3, and of the seven of them that recorded any tokens
+            # at all, rounds 1 and 2 take a MEDIAN 57% of the PR's whole measured
+            # spend (n=7, 0%-89%, where the 0% is a PR whose first two rounds recorded
+            # no tokens at all; the other three measured nothing anywhere and have no
+            # share to take), and on the worst of them a flat total had 11% of itself
+            # left for the four rounds that followed.
+            #
+            # HOW IT IS ENFORCED, since the check runs before any seat is dispatched
+            # and the round about to start has therefore spent nothing. The allowance
+            # is RELEASED one round at a time: at a round boundary the ceiling in
+            # force is `tokens_per_round × min(rounds already recorded + 1,
+            # max_rounds)`, checked against `pr_total.tokens`. A round that overspent
+            # is refused at the next boundary — a round gone wrong, which is the
+            # meaningful refusal — while a cycle whose rounds each stayed inside the
+            # allowance can run every round the cap allows. Rounds are counted from
+            # the BOARD's rows (`pr_total.runs`) and never from `--round`, which
+            # restarts under `--new-cycle` while `pr_total` has no time bound.
+            #
+            # `None`, LIKE ALL THE OTHERS, and for the block property recorded above
+            # rather than for want of a number: setting this key wakes the budget for
+            # every repo on the fleet and turns an unanswerable board into a refusal on
+            # the unattended path. That property is what reverted `tokens_per_pr:
+            # 20,000,000` on 2026-08-31 and it is untouched by this key.
+            #
+            # AND THE SIZE IS A HUMAN'S CALL, on the evidence rather than for want of
+            # asking. The board's own history cannot state a per-round figure: 72 of
+            # its 115 recorded review runs are the fleet's ordinary four-seat shape
+            # and NOT ONE of them measured all four seats — 62 measured three, five
+            # measured two, five measured none. Over the 62 that measured three, the
+            # measured (therefore undercounting) spend is median 729,755 tokens per
+            # round, p75 1,973,566, p90 4,506,368, min 185,377, max 10,049,641 — a
+            # 54x spread within one seat configuration, which is a policy choice and
+            # not a measurement. #483's own 1.2M-1.7M
+            # comes from one PR in another repo, on a seat mix this fleet does not
+            # run, and is itself stated as measured over 6 of 8 reviewer runs. So the
+            # mechanism ships and the number does not; see #483.
+            "tokens_per_round": None,
             # This PR's whole life, across every cycle and every head it has had.
             #
             # **`None`. It was 20,000,000 for one day — Rich's number, taken on #621
@@ -1993,13 +2045,25 @@ DEFAULTS: dict = {
             # is a ceiling arriving where there was none. Anyone reading it as a
             # raise is reading it against a number that is not there.
             #
-            # **The shape complaint in #483 is unfixed and this does not fix it.** A
-            # per-PR ceiling binds latest and hardest on the LAST rounds of a cycle:
-            # it spends itself on rounds 1 and 2, which were happening anyway, and
+            # **AS OF #483 THIS KEY IS THE DERIVED ONE.** `tokens_per_round` above is
+            # the primary dial and `tokens_per_round × max_rounds` is the total it
+            # implies; written here at all, this may only TIGHTEN that total, and a
+            # value below it is refused rather than allowed to contradict it silently.
+            # Left `None` beside an allowance it is not absent, it is derived, and the
+            # `config_notes` line says the number in force. The paragraphs below are
+            # about the 2026-08-30 attempt to set this key ALONE, which is the shape
+            # #483 was filed against.
+            #
+            # **The shape complaint in #483 was what made the 2026-08-30 number a
+            # stopgap, and `tokens_per_round` above is now the fix for it.** A per-PR
+            # ceiling binds latest and hardest on the LAST rounds of a cycle: it
+            # spends itself on rounds 1 and 2, which were happening anyway, and
             # refuses round 3 — which is precisely the band of rounds `max_rounds: 6`
             # was raised to buy, and precisely the rounds that read the fixer's own
             # work. The fix is a per-ROUND allowance with the per-PR total derived
-            # from it (#483's proposals 1 and 2) and it is not built.
+            # from it (#483's proposals 1 and 2), and it IS built: it is the key
+            # above, and the paragraph that follows is what the number here was
+            # chosen for while it was not.
             #
             # So the number is chosen LARGE ENOUGH NOT TO BIND while that is
             # outstanding. #483's own measurement is 1.2M-1.7M tokens per round at
@@ -3434,6 +3498,13 @@ BOARD_DIALS: dict[str, Dial] = {
         'tokens this repo may spend on panels in the rolling window'),
     "review_panel.budget.runs_per_day": Dial("number", True, "either",
         'panel runs this repo may spend in the rolling window'),
+    # #483's allowance, and the only one of these whose value is not the number
+    # compared: it is released one round at a time, so what binds at a round boundary
+    # is this times the rounds the PR has already bought. The board holds the
+    # allowance, `panel_caps` does the arithmetic — a dial the board multiplied out
+    # would be a second place that knows what `max_rounds` is.
+    "review_panel.budget.tokens_per_round": Dial("number", True, "either",
+        'tokens ONE round may spend; the per-PR total is this times max_rounds'),
     "review_panel.budget.tokens_per_pr": Dial("number", True, "either",
         'tokens one PR may spend across every cycle and every head it has had'),
     "review_panel.budget.runs_per_pr": Dial("number", True, "either",
