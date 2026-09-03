@@ -294,6 +294,16 @@ async def acquire_lease(
         active.holder = holder
         active.ttl_seconds = body.ttl
         active.expires_at = now + timedelta(seconds=body.ttl)
+        # Every reported field below is STICKY: a renewal that omits one, or sends
+        # it blank, leaves the stored value alone. Blank-to-NULL is only exercised
+        # on creation, so a session that loses or changes its origin remote keeps
+        # the old repository for the life of its lease (#721) — and the hook omits
+        # the field when it derives nothing, so there is currently no spelling of
+        # the request that clears it. It self-heals within the TTL and the same is
+        # true of `cwd`, `branch`, `title`, `recap` and `model`, which is why this
+        # is a note and not a patch: "clear on blank" is one rule for six columns
+        # and one wire contract, and changing it under a repo fix would be changing
+        # what an omitted field means for every caller on the fleet.
         if body.cwd:
             active.cwd = body.cwd
         if body.repo:

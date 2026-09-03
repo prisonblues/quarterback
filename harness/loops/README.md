@@ -831,6 +831,14 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   on — never the PR's code, which the panel reads as a diff and never checks out. A
   seat pointed there can quote a different branch as the code under review. The
   members need no working directory at all; they need a reproducible one.
+  Every seat CLI is also started with `QB_SANDBOX=1` in its environment, because
+  `qb-hook` runs inside it — the lifecycle hooks are configured per user, not per
+  repo — and would otherwise put a repository that exists for one process and one
+  temp directory on the fleet's collision index, which is how the board came to
+  hold live agents in a repo called `cwd` (#714). The seat declares it rather than
+  the hook inferring it from the missing origin remote, because "no origin" is also
+  an ordinary local-only repository, and inferring it took every never-pushed
+  checkout off that index too (#721).
 - **The seats can read the PR's code, per repo, on by default** (#113). Each seat that
   can take it runs in a checkout of the PR **at its head**, fetched from GitHub's
   tarball endpoint — never from `cfg["path"]`, which is the main checkout on whatever

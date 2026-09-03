@@ -112,9 +112,44 @@ class Lease(Base):
         #: bare name and only their common half can be compared. Left in place
         #: rather than replaced: both reads are already bounded by
         #: ``released_at IS NULL AND expires_at > now``, which no index serves
-        #: either, so the repo predicate has never been the selective one. If this
-        #: table ever grows enough to matter, the answer is an index on the LIVE
-        #: set — the predicate every one of these queries starts with — and a
-        #: functional index on the fold beside it, not the exact match back.
+        #: either, so the repo predicate has never been the selective one.
+        #:
+        #: **Measured, because "has never been the selective one" was challenged as
+        #: not following** (#721). Postgres 15, a synthetic table shaped like this
+        #: one — leases are never deleted, so it is historic rows plus the twenty or
+        #: so the fleet holds live at any moment — asked the exact predicate
+        #: ``/active`` builds:
+        #:
+        #: ===========  ================================================  ==========
+        #: rows         index available                                   exec
+        #: ===========  ================================================  ==========
+        #: 10,000       today's (seq scan)                                  1.2 ms
+        #: 100,000      today's (seq scan)                                  9.7 ms
+        #: 1,000,000    today's (parallel seq scan)                        44 ms
+        #: 1,000,000    the PRE-#714 exact match, on this index           180 ms
+        #: 1,000,000    a functional index on the fold, alone             260 ms
+        #: 1,000,000    partial index on the live set                      0.14 ms
+        #: ===========  ================================================  ==========
+        #:
+        #: So the two obvious repairs are both slower than the scan they replace,
+        #: and for one reason: a repository selects 200,000 of a million rows and
+        #: five of them are live, so an index scan on ``repo`` reads a fifth of the
+        #: table to discard almost all of it. The exact match was not "able to select
+        #: repository rows first" in any sense worth having — it was 4x worse than
+        #: doing nothing, which is the shape of the argument this note is making.
+        #:
+        #: An index on the LIVE set is the answer, and it is a 300x one:
+        #: ``Index("...", "expires_at", postgresql_where=released_at.is_(None))``.
+        #: ``expires_at > now()`` cannot go in the predicate (a partial index's
+        #: predicate must be immutable), which is why the live column is the KEY and
+        #: only ``released_at`` is the predicate. Beside it a functional index on the
+        #: fold buys nothing measurable — with twenty live rows there is nothing left
+        #: to narrow, and the planner ignored it.
+        #:
+        #: Not added here, because nothing is slow yet: at ~66 sessions a day per
+        #: machine (this fleet's observed rate, one row per session) 100,000 rows is
+        #: 17 months of three machines and a million is 14 years, and 9.7 ms is not a
+        #: problem worth a migration. The row that says what to do is above, so
+        #: whoever does find it slow need not re-derive it.
         Index("ix_leases_repo", "repo"),
     )
