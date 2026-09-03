@@ -254,6 +254,12 @@ class ReviewRun(Base):
     #: before, because ``converged``'s below-floor conjunct is cut at
     #: ``cleared_floor`` and that floor lived nowhere on the row.
     #:
+    #: It has its own column since #732 (:attr:`cleared_floor`), and this one is
+    #: not thereby redundant: that column is the panel's ANSWER and this is the
+    #: three dials the answer was computed from. The pair is what lets a reader
+    #: check one against the other — which is exactly what a board-side derivation
+    #: from these dials alone would have made impossible.
+    #:
     #: Not a replacement for :attr:`converged`. A stored answer still beats a
     #: reconstruction, and the migration for that column says why a board-side
     #: derivation would be free to disagree with the panel about the same round.
@@ -663,6 +669,94 @@ class ReviewRun(Base):
     #: a reader of that verdict needs in order to see who the round thought was
     #: owed the work.
     handed_to: Mapped[str | None] = mapped_column(Text)
+    #: THE FLOOR THE ROUND WAS REQUIRED TO CLEAR (#732), verbatim from
+    #: ``round_stop.cleared_floor`` — ``P1``..``P4``, or the panel's own
+    #: no-floor token.
+    #:
+    #: Stored because :attr:`outstanding_counts` is SPLIT at it and did not carry
+    #: it. A reader holding ``{"fixable": 2, "below_floor": 11}`` cannot say what
+    #: ``below_floor`` means without re-deriving ``Dials.cleared_floor``, which is
+    #: a function of three separate dials inside :attr:`review_panel`
+    #: (``round_trigger_floor``, ``fix_severity_floor`` and whether a low-severity
+    #: budget is in force). That derivation is the panel's, it moves, and a
+    #: board-side copy of it would be a second reading of the policy that produced
+    #: the verdict stored beside it — the thing :attr:`converged` and
+    #: :attr:`outstanding_counts` both refuse to do. One word from the producer is
+    #: not a second reading; it is the producer's answer.
+    #:
+    #: ``trigger_floor`` deliberately has no column beside this one. It is
+    #: ``Dials.round_trigger_floor`` unchanged — the call site passes exactly that
+    #: — so :attr:`review_panel` already holds it, and a second copy would be one
+    #: dial in two places free to disagree.
+    #:
+    #: NULL = the panel did not say: every run recorded before this column, and
+    #: every producer too old to nest the key.
+    cleared_floor: Mapped[str | None] = mapped_column(Text)
+    #: HOW MANY FINDINGS THIS ROUND RAISED THAT NOBODY HAD RAISED AND THAT DID NOT
+    #: BUY A ROUND (#732) — the length of ``round_stop.new_below_trigger_floor``.
+    #:
+    #: A count and not the keys, on :attr:`outstanding_counts`' rule: ``len()`` of
+    #: the published list cannot disagree with that list, and the keys are already
+    #: on the round's own findings.
+    #:
+    #: Nothing else on this row says it. Those findings ARE in the round's buckets
+    #: and :attr:`new_findings` counts them, but only ``round_stop`` knows which of
+    #: them fell under ``review_panel.round_trigger_floor`` and so did not fire
+    #: rule 1. That difference is exactly what #710 had to reassemble by hand to
+    #: calibrate a trigger floor at all.
+    #:
+    #: NULL = the panel did not say. **Never read as zero**: "no new finding fell
+    #: below the floor" and "this producer does not measure it" are opposite
+    #: readings, and only one of them argues for lowering the floor.
+    new_below_trigger_floor: Mapped[int | None] = mapped_column(Integer)
+    #: The same for findings an EARLIER round had already raised (#621, stored by
+    #: #732) — the length of ``round_stop.repeated_below_trigger_floor``.
+    #:
+    #: Its own column rather than a sum with the one above, because the pair is
+    #: what carries the signal: new-below-floor says the floor is turning work away
+    #: at the door, repeated-below-floor says work already inside the cycle is
+    #: never getting done. A repo whose unfinished work is all in the second is a
+    #: repo with a different problem from one where it is all in the first, and a
+    #: total says neither.
+    repeated_below_trigger_floor: Mapped[int | None] = mapped_column(Integer)
+    #: THE ESCALATION RUNGS AS THIS ROUND MEASURED THEM (#732), verbatim: the nine
+    #: blocks ``round_stop`` publishes beside its verdict, keyed by the names the
+    #: panel gives them (:data:`app.api.reviews.STOP_RUNGS`) — ``fix_injection``,
+    #: ``revert``, ``excision``, ``new_findings_not_falling``, ``unrefereed_fix``,
+    #: ``guard_churn``, ``fix_budget``, ``fix_surface`` and ``premises``.
+    #:
+    #: **Why they are on the row at all.** #712's whole complaint is that every
+    #: rung "is a claim about a cycle's series, and no endpoint serves one"; #710
+    #: is a calibration done by hand against numbers that had to be reassembled
+    #: from report text. Part of why no endpoint served them is that they never
+    #: reached this table: the panel has published all nine on every round payload
+    #: for releases, nested inside ``round_stop``, and ingest's ``extra="ignore"``
+    #: dropped every one in silence. That is #626's and #717's shape, one tier
+    #: down, and ``tests/test_payload_key_drift.py`` is what now fails on it.
+    #:
+    #: **One column and not nine.** Each block is a measurement plus its own
+    #: verdict — ``over`` (the number crossed) kept apart from ``fired`` (this is
+    #: why the cycle stopped) — and which scalar out of each one matters is exactly
+    #: the question #710 has not answered yet. Lifting a column per rung now would
+    #: be this board deciding it, from a position of never having held the numbers.
+    #: Stored whole, the series query #712 wants is one ``ORDER BY round`` over a
+    #: cycle; the columns can be lifted later out of data that exists.
+    #:
+    #: Verbatim and uninterpreted, on :attr:`review_panel`'s terms: nothing here
+    #: reads a rung's name, compares a limit or derives one field from another.
+    #: Refused WHOLE if it will not serialise or is over its cap
+    #: (:data:`app.api.reviews.MAX_STOP_RUNGS_CHARS`) — a rung set short one rung
+    #: does not read as a smaller measurement, it reads as a round where that rung
+    #: did not fire.
+    #:
+    #: ``deferred``, on :attr:`rules`' and :attr:`fix_pass`' argument: it is nine
+    #: objects and no list query needs them, so ``GET /reviews`` must not ship them
+    #: and ``GET /review/{id}`` undefers it.
+    #:
+    #: NULL = the panel sent no rung this board could store — every run recorded
+    #: before this column, every producer too old to nest them, and every set
+    #: refused whole.
+    stop_rungs: Mapped[dict[str, Any] | None] = mapped_column(JSONB, deferred=True)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)

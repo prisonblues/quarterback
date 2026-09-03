@@ -520,6 +520,56 @@ by dotted position. ``POST /review/outcomes`` has the same defect and the opposi
 remedy — per-item refusal, see :meth:`OutcomeIn._no_nul` — because that endpoint's
 rule, stated in :func:`_outcome_reason`, is that a fixer can simply be told where
 the panel cannot.
+
+**#732 — the same silent drop, one tier in.** Every drop above is a TOP-LEVEL key
+the panel sent and this model did not name, and ``tests/test_payload_key_drift.py``
+(#643) was written so the next one would fail the suite on the commit that added
+it. That check reads the payload's top level. ``round_stop`` is a nested object,
+:class:`StopIn` binds it, and nothing compared that model's fields against what
+``panel_rounds.round_stop`` nests inside it: the producer returned **24** keys, the
+model declared **6**, and the other eighteen went on the floor by exactly the
+mechanism this whole note is about — ``populate_by_name=True`` with no ``extra=``,
+one indent further in than anybody was looking. #717 is the proof it was live:
+``outstanding`` was sent from #42, bound by nothing, and found by a human noticing
+a number was missing while the drift check stood green.
+
+Eighteen keys, each decided once, and the decision written where a nineteenth
+cannot slip past it. Twelve are bound:
+
+* ``cleared_floor`` — the floor the round was required to clear, and the cut
+  ``outstanding_counts`` is SPLIT at. Storing a split without its cut left a reader
+  holding ``{"fixable": 2, "below_floor": 11}`` unable to say what either number
+  meant. It is derivable from three dials in ``review_panel`` and is deliberately
+  not derived here: a board-side derivation is a second reading of the policy that
+  produced the verdict stored beside it, which is what ``converged`` refuses to be.
+* ``new_below_trigger_floor`` and ``repeated_below_trigger_floor`` — how many
+  findings this round raised, and how many an earlier round had, that fell under
+  the trigger floor and so bought no round. Counted, never carried, on
+  ``outstanding_counts``' rule. Two columns and not a sum: one says the floor is
+  turning work away at the door and the other says work already inside the cycle
+  never gets done, and #710 had to reassemble both by hand.
+* ``stop_rungs`` — the eight ``escalate_on`` rungs and the premise brake's state
+  (:data:`STOP_RUNGS`), verbatim and opaque. #712's complaint is that every rung
+  "is a claim about a cycle's series, and no endpoint serves one"; part of why is
+  that none of them ever reached a row. ONE column and not nine, because each block
+  is a measurement beside its own ``over``/``fired`` verdict and which scalar out
+  of each matters is what #710 has yet to answer — a column per rung now would be
+  this board deciding that from a position of never having held the numbers.
+
+The other six get no column and a written reason each, in that test file:
+``escalated_outstanding``, ``declined_outstanding`` and ``narrowed`` are
+``outstanding``'s own buckets under flatter names, off the same locals, already
+stored as lengths; ``round`` arrives at the top level too; ``max_rounds`` and
+``trigger_floor`` are ``Dials`` attributes ``review_panel`` has held verbatim since
+#643.
+
+**Not ``extra="forbid"`` on ``StopIn``**, and that is the standing rule rather than
+a preference here. A payload is never refused over one field —
+:func:`_outstanding_or_none` makes the argument at length — and
+:class:`OutcomeIn` is deliberately the only ``extra="forbid"`` on this path. A
+misspelled key must not take the findings, the scorecards and the accounts down
+with it. What ends a silent drop is a check that fails in CI on the commit that
+adds the key, not a gate that 500s a producer in the field.
 """
 
 from __future__ import annotations
@@ -1623,6 +1673,70 @@ class StopIn(BaseModel):
     #: findings, the scorecards and the accounts down with it. The coercers below
     #: turn it into NULL and the response names the drop.
     outstanding: Any = None
+    #: THE FLOOR THIS ROUND WAS REQUIRED TO CLEAR (#732) — ``P1``..``P4`` or the
+    #: panel's own no-floor token, verbatim.
+    #:
+    #: Bound because ``outstanding`` above is SPLIT at it. A reader holding
+    #: ``outstanding_counts`` cannot say what ``below_floor`` means without
+    #: re-deriving ``Dials.cleared_floor``, which is a function of three separate
+    #: dials inside ``review_panel`` — and a board-side derivation would be a
+    #: second reading of the policy that produced the verdict stored beside it,
+    #: which is what :attr:`converged` refuses to be. One word from the producer
+    #: is the producer's answer, not a second reading.
+    #:
+    #: ``trigger_floor`` is deliberately NOT bound here. It is
+    #: ``Dials.round_trigger_floor`` unchanged and ``review_panel`` has held it
+    #: since #643; a second copy would be one dial in two places, free to
+    #: disagree. It is on ``DROPPED_BY_DESIGN``'s nested half in
+    #: ``tests/test_payload_key_drift.py`` with that reason written out.
+    cleared_floor: str | None = None
+    #: The findings that fell under ``review_panel.round_trigger_floor`` and so
+    #: bought no round, split by whether this round was the first to raise them
+    #: (#621, bound by #732). Stored as LENGTHS — see :func:`_below_floor_count`.
+    #:
+    #: Typed ``Any`` and not ``list``, on this module's standing rule that a
+    #: payload is never refused over one field: ``new_below_trigger_floor: 3``
+    #: from a hand-rolled caller would be a 422 under a list annotation, taking
+    #: the findings, the scorecards and the accounts down with it.
+    new_below_trigger_floor: Any = None
+    repeated_below_trigger_floor: Any = None
+    #: THE ESCALATION RUNGS, as this round measured them (#732). Nine fields and
+    #: not one nested block, because the panel nests nine — and the drift check
+    #: this issue extended compares field names against the keys the producer
+    #: sends, so a field per key is what makes each of them a decision somebody
+    #: made rather than a key nobody looked at.
+    #:
+    #: Every one is typed ``Any`` for ``outstanding``'s reason and reduced by
+    #: :func:`_stop_rungs_or_none`, which stores the set as one JSONB column: what
+    #: they have in common is that #712 wants a cycle's SERIES of them and #710
+    #: has yet to say which scalar out of each matters, so lifting a column per
+    #: rung now would be this board answering that from a position of never having
+    #: held the numbers.
+    #:
+    #: Nothing here reads a rung's name, compares a limit or derives one field
+    #: from another. Each block keeps its own ``over``/``fired`` split — the
+    #: measurement crossed a limit, versus this rung is why the cycle stopped —
+    #: and collapsing the two is the misreading ``round_stop``'s own docstrings
+    #: are organised against.
+    fix_injection: Any = None
+    revert: Any = None
+    excision: Any = None
+    new_findings_not_falling: Any = None
+    unrefereed_fix: Any = None
+    guard_churn: Any = None
+    fix_budget: Any = None
+    fix_surface: Any = None
+    #: #489's premise-brake state. In :data:`STOP_RUNGS` with the eight above
+    #: rather than beside them, because ``premises.repeated`` is what
+    #: ``PREMISE_REPEATED_EXIT`` stops a cycle on — it is a rung's evidence under
+    #: a different name — and ``undeclared_rounds`` is the honest half a
+    #: calibration needs: those fix passes could not have been braked whatever the
+    #: round's stop says.
+    #:
+    #: Not to be confused with the top-level ``premise_counts``, which is a tally
+    #: of FINDINGS by premise verdict and has had its own column since #490. The
+    #: two share a stem and nothing else.
+    premises: Any = None
 
     @field_validator("veto", mode="before")
     @classmethod
@@ -1630,6 +1744,33 @@ class StopIn(BaseModel):
         """Coerced, not rejected — ``veto: "capped"`` from a hand-rolled caller
         must not cost it the whole run (see :func:`_phrases`)."""
         return _phrases(v)
+
+    @field_validator("cleared_floor", mode="before")
+    @classmethod
+    def _cleared_floor(cls, v: object) -> str | None:
+        """One word, verbatim, against no vocabulary — :func:`_word_or_none`.
+
+        Deliberately not checked against ``P1``..``P4``. A severity floor is a
+        repo dial this board holds as opaque JSON and does not interpret
+        (``app/api/dials.py`` argues that at length), the panel's own no-floor
+        token is a value outside that set today, and a floor spelling that
+        changed would silently become NULL — "the panel did not say" about a round
+        that did — under a vocabulary test. An unrecognised value stored verbatim
+        gives a consumer grouping on it an extra group it can SEE, which is
+        :func:`_word_or_none`'s whole argument.
+        """
+        return _word_or_none(v)
+
+    def rungs(self) -> dict[str, Any]:
+        """The nine :data:`STOP_RUNGS` blocks as they arrived, keyed by name.
+
+        A method rather than a comprehension at the one call site, so the fields
+        declared above and the object that reaches the column cannot drift apart:
+        a tenth rung added to :data:`STOP_RUNGS` without a field here yields
+        ``None`` and is dropped by :func:`_stop_rungs_or_none`, and
+        ``tests/test_payload_key_drift.py`` fails on the same commit.
+        """
+        return {name: getattr(self, name, None) for name in STOP_RUNGS}
 
 
 #: A path longer than this is not a path. Bounded because ``ReviewRunFile.path``
@@ -1702,6 +1843,20 @@ MAX_HARNESS_PATH_CHARS = 512
 #: different one. Drop the new-file list and the pass reads as having opened nothing
 #: — the flattering direction on the one claim this record was filed to make.
 MAX_FIX_PASS_CHARS = 65536
+#: How big a stored ``stop_rungs`` may be, serialised (#732). Measured rather than
+#: picked, and the two blocks that can actually grow are the ones measured: a
+#: ``fix_surface`` naming every file a fix pass opened is bounded by the same real
+#: limit ``MAX_FIX_PASS_CHARS`` is bounded by, and ``premises`` carries a cycle's
+#: declared premise keys plus a list of round numbers. The other seven are limits,
+#: counts and two booleans each. A round of the widest cycle this fleet has run
+#: serialises to about 3,000 characters, so this leaves room for one an order of
+#: magnitude wider and still refuses a measurement block used as a text field.
+#:
+#: REFUSED WHOLE rather than trimmed, on :func:`_opaque_or_none`'s rule and with
+#: this block's own reason: a rung set short one rung does not read as a smaller
+#: measurement, it reads as a round on which that rung did not fire — the
+#: flattering direction, on the eight fields #712 wants a cycle's series of.
+MAX_STOP_RUNGS_CHARS = 65536
 
 #: The keys a ``fix_pass.counts`` block may carry, and the vocabulary
 #: :func:`_fix_pass_counts_or_none` reads it against. It mirrors
@@ -1747,6 +1902,35 @@ OUTSTANDING_REQUIRED = ("fixable", "below_floor", "escalated")
 #: Who a round that ENDED a cycle handed its remainder to (#42). Null on a round
 #: that went again, which is a different fact and not a fourth word.
 HANDED_TO = ("fixer", "human", "nobody")
+
+#: The measurement blocks ``round_stop`` publishes beside its verdict, stored
+#: together as ``review_runs.stop_rungs`` (#732). Eight of them are the
+#: ``escalate_on`` rungs — each a number, the limit it was held against, whether
+#: it crossed (``over``) and whether it is why the cycle stopped (``fired``) —
+#: and ``premises`` is #489's brake state, which is a rung's evidence under a
+#: different name.
+#:
+#: ``panel_rounds.round_stop`` is the producer and this is the same list, written
+#: out here for :data:`OUTSTANDING_COUNTS`' and :data:`FIX_PASS_COUNTS`' reason:
+#: the two halves cannot import each other, and ``tests/test_payload_key_drift.py``
+#: is where both are readable at once, which is where the drift check lives.
+#:
+#: **Nothing here reads a rung's name.** The order is the panel's own and the
+#: stored object keys by it; a block that is not an object is left out and the
+#: whole set is refused if what is left will not store. See
+#: :func:`_stop_rungs_or_none`.
+STOP_RUNGS = ("fix_injection", "revert", "excision", "new_findings_not_falling",
+              "unrefereed_fix", "guard_churn", "fix_budget", "fix_surface",
+              "premises")
+
+#: The two ``round_stop`` keys that publish a LIST of finding keys and are stored
+#: as its length (#732) — findings that fell under the round's trigger floor and
+#: so bought no round, split by whether this round was the first to raise them.
+#:
+#: Counted and not stored, on :func:`_outstanding_or_none`'s rule: ``len()`` of a
+#: published list cannot disagree with that list, whereas a sibling tally can, and
+#: the keys themselves are already on the round's own findings.
+BELOW_TRIGGER_FLOOR = ("new_below_trigger_floor", "repeated_below_trigger_floor")
 
 
 def _outstanding_or_none(v: object) -> tuple[dict[str, int] | None, str]:
@@ -2253,6 +2437,86 @@ def _fix_pass_counts_or_none(v: object) -> dict[str, int] | None:
     return _tally_or_none(counts, FIX_PASS_COUNTS)
 
 
+def _stop_rungs_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """The rungs a round measured, as this board will store them, and why it did
+    not (#732).
+
+    ``v`` is the whole nested ``round_stop`` object as it arrived, not one rung:
+    the nine blocks are stored as ONE column, so the size bound and the refusal
+    are properties of the set rather than of any member, and a helper handed one
+    block at a time could not enforce either.
+
+    **Assembled from the payload rather than read off** :class:`StopIn`. The
+    model is the shape of a verdict and this is a report about what the sender's
+    payload could keep — every other drop signal in this module is gathered the
+    same way, in :meth:`ReviewIn._count_files_sent`, off the raw body.
+
+    **A block that is not an object is left out and SAID OUT LOUD**,
+    which is the one place this departs from :func:`_opaque_or_none`'s
+    whole-object rule, and it is a different question: that rule is about a
+    refusal — a SIZE or a shape this board cannot store — and reaching a wrong
+    shape into the stored object would be storing something the column's contract
+    says is nine measurement blocks. A producer sending ``guard_churn: 4`` has one
+    bug in one rung, and refusing the other eight over it would lose eight true
+    measurements to report one false one. It is named back to the sender all the
+    same, on :func:`_outstanding_or_none`'s rule about a block stored short: the
+    stored object is then missing a key, an absent rung means "the producer sent
+    none", and omitting it in silence would file a value this board refused under
+    the shape a producer too old to send that rung legitimately sends.
+
+    What is left is then refused whole if it will not store, on
+    :func:`_opaque_or_none`'s terms and for this block's reason: a rung set short
+    a rung reads as a round on which that rung did not fire.
+
+    Returns ``(stored, why)`` on :func:`_opaque_or_none`'s contract — ``why`` is
+    ``""`` when nothing was refused, and otherwise the line :func:`record_review`
+    reports back to the sender. ``(None, "")`` is a producer that nested no rung
+    at all, which is every producer older than this column.
+    """
+    if not isinstance(v, Mapping):
+        return None, ""
+    rungs: dict[str, Any] = {}
+    unusable: list[str] = []
+    for name in STOP_RUNGS:
+        block = v.get(name)
+        if isinstance(block, Mapping):
+            rungs[name] = block
+        elif block is not None:
+            unusable.append(name)
+    if not rungs:
+        return None, ("" if not unusable else
+                      f"round_stop carried {', '.join(unusable)} as something "
+                      "other than an object, and no rung this board could read")
+    stored, why = _opaque_or_none(
+        rungs, field="round_stop rungs", cap=MAX_STOP_RUNGS_CHARS,
+        why_whole=("a rung set short a rung does not read as a smaller "
+                   "measurement, it reads as a round on which that rung did not "
+                   "fire"))
+    if why:
+        return None, why
+    if unusable:
+        return stored, (f"round_stop carried {', '.join(unusable)} as something "
+                        "other than an object — the rungs are stored without "
+                        "them, and an absent rung here means the producer sent "
+                        "none rather than that the rung did not fire")
+    return stored, ""
+
+
+def _below_floor_count(v: object) -> int | None:
+    """How many findings one ``*_below_trigger_floor`` list holds, or None (#732).
+
+    A LENGTH, on :func:`_outstanding_or_none`'s rule: the panel publishes the
+    finding keys, ``len()`` of that list cannot disagree with it, and the keys are
+    already on the round's own findings.
+
+    None — never zero — for anything that is not a list. "No new finding fell
+    under the floor" and "this producer does not measure it" are opposite
+    readings of the same round, and only one of them argues for lowering the
+    floor.
+    """
+    return len(v) if isinstance(v, list) else None
+
+
 def _word_or_none(v: object, *, cap: int = MAX_SCOPE_CHARS) -> str | None:
     """One word, verbatim, or nothing — ``scope`` and three others (#647, #112).
 
@@ -2727,6 +2991,15 @@ class ReviewIn(BaseModel):
     #: is older than #42", so a panel that measured its remainder and sent it
     #: would be told nothing while the row said it had none to send.
     outstanding_dropped: str = ""
+    #: Why a round's rungs arrived and were not stored, or ``""`` (#732). Its own
+    #: signal on ``outstanding_dropped``'s rule and read out of the same nested
+    #: block: a rung set refused for its size lands on the NULL that means "this
+    #: producer does not send rungs", so a panel that measured all nine and sent
+    #: them would be told nothing while the row said it had sent none. Named apart
+    #: from ``outstanding_dropped`` because the two are bounded differently and a
+    #: producer told only that something inside ``round_stop`` was refused has to
+    #: guess which half.
+    stop_rungs_dropped: str = ""
     #: Why a fix-pass record arrived and was not stored (#624). Its own key beside
     #: the three above rather than folded into them, on `rules_dropped`'s rule: they
     #: are bounded differently and a producer told only "something you sent was too
@@ -2862,6 +3135,15 @@ class ReviewIn(BaseModel):
         # what the sender's payload lost — which every other field's drop signal is
         # gathered in this one place.
         stop = v.get("round_stop")
+        # #732's three scalars, out of that same nested block and read here for
+        # that same reason. One word and two key lists, so they earn a line in
+        # `unreadable_fields` rather than a signal of their own — `_word_or_none`
+        # states the rule for a one-word field (one way to get it wrong, one
+        # remedy) and `unread_files` states it for a list. Dotted, unlike the
+        # top-level entries beside them, because a sender told `cleared_floor` has
+        # to know which of the payload's two tiers this board was looking at.
+        nested = stop if isinstance(stop, Mapping) else {}
+        floor = nested.get("cleared_floor")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -2939,6 +3221,12 @@ class ReviewIn(BaseModel):
                 # gate reads, so the sender is the party that has to hear about it.
                 "outstanding_dropped": _outstanding_or_none(
                     stop.get("outstanding") if isinstance(stop, Mapping) else None)[1],
+                # #732, on that same rule and out of that same nested block. A
+                # rung set refused for its size would otherwise land on the NULL
+                # that means "this producer sends no rungs", which is a claim
+                # about the payload's AGE rather than about this round — the
+                # absent-versus-refused collapse this model argues at length.
+                "stop_rungs_dropped": _stop_rungs_or_none(stop)[1],
                 # #624, on that same rule. A fix-pass record refused for its size
                 # would otherwise land on the NULL that means "there was no pass",
                 # which is a true statement about round 1 and a false one about a
@@ -3015,6 +3303,25 @@ class ReviewIn(BaseModel):
                         # producer that sent nothing at all.
                         ("recurrence_counts", recurs, isinstance(recurs, Mapping)),
                         ("premise_counts", premise, isinstance(premise, Mapping)),
+                        # #732's three, nested one tier in. Each would otherwise
+                        # land on the NULL that means "this producer is too old to
+                        # send it" — a claim about the payload's AGE rather than
+                        # about this round — and all three are what #710 reads to
+                        # calibrate a floor, where a silent NULL is a round quietly
+                        # left out of the denominator.
+                        ("round_stop.cleared_floor", floor,
+                         _word_or_none(floor) is not None),
+                        # A COUNT where the contract is keys is the commonest way
+                        # to get these two wrong, and it is the one that looks
+                        # right: `new_below_trigger_floor: 3` is a producer sending
+                        # the number this board is about to compute for itself.
+                        #
+                        # Over `BELOW_TRIGGER_FLOOR` rather than written out
+                        # twice, so the two keys this signal names and the two
+                        # `StopIn` binds are one list with one place to change it.
+                        *((f"round_stop.{name}", nested.get(name),
+                           isinstance(nested.get(name), list))
+                          for name in BELOW_TRIGGER_FLOOR),
                     ) if val is not None and not ok),
                 # #646's three, spread last so a caller that spells one of them
                 # itself has its own account overwritten. They are evidence about
@@ -3909,6 +4216,29 @@ async def record_review(
         # going again while the counts are still true of it (#42).
         handed_to=(_handed_to_or_none(body.round_stop.outstanding)
                    if body.round_stop else None),
+        # #732. The cut the counts above are SPLIT at, which they did not carry —
+        # NULL by the same routes `converged` lists, plus a producer too old to
+        # nest the key. Never derived here from `review_panel`: that would be a
+        # second reading of the policy that produced the verdict stored beside it.
+        cleared_floor=body.round_stop.cleared_floor if body.round_stop else None,
+        # ...and the two counts the trigger floor turned away, from the key lists
+        # the panel publishes. NULL and never zero for a producer that sent
+        # neither: "nothing fell under the floor" and "this producer does not
+        # measure it" are opposite readings, and only one argues for moving it.
+        new_below_trigger_floor=(
+            _below_floor_count(body.round_stop.new_below_trigger_floor)
+            if body.round_stop else None),
+        repeated_below_trigger_floor=(
+            _below_floor_count(body.round_stop.repeated_below_trigger_floor)
+            if body.round_stop else None),
+        # #732's nine measurement blocks, verbatim and refused whole. Read off the
+        # bound model here and off the raw body for the drop signal, exactly as
+        # `outstanding` above is: both are pass-through `Any` fields, so the two
+        # reads cannot disagree, and the signal has to be computed where every
+        # other signal is (`ReviewIn._count_files_sent`, which cannot reach a
+        # response) while the value has to be computed where the row is built.
+        stop_rungs=(_stop_rungs_or_none(body.round_stop.rungs())[0]
+                    if body.round_stop else None),
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
         reviewers_selected=body.reviewers_selected or None,
@@ -4115,6 +4445,14 @@ async def record_review(
     # a statement about a payload's age, on the one field a merge gate rules on.
     if body.outstanding_dropped:
         dropped["outstanding_dropped"] = body.outstanding_dropped
+    # #732, out of the same nested block and on the same argument: a rung set
+    # refused in silence reads as "this producer does not send rungs", which is
+    # true of every panel older than the column and false about one that measured
+    # all nine. Named apart from `outstanding_dropped` because the two are bounded
+    # differently — a producer told only that something inside its `round_stop`
+    # was refused would have to guess which half to go and look at.
+    if body.stop_rungs_dropped:
+        dropped["stop_rungs_dropped"] = body.stop_rungs_dropped
     # #624, on the same argument again and with the sharpest version of it: a
     # fix-pass record refused in silence reads as "there was no pass to record",
     # which is what round 1 and every skip legitimately send — so a producer that
@@ -5112,6 +5450,25 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # round that went again and made no disposal, told apart by `stopped`.
         "outstanding": r.outstanding_counts,
         "handed_to": r.handed_to,
+        # #732: the floor those counts are SPLIT at, and the two the trigger floor
+        # turned away. On every view rather than detail-only, on `outstanding`'s
+        # cut directly above and for a reason of its own: the reader these exist
+        # for is a CALIBRATION (#710), which asks "how many findings did this
+        # floor turn away across a population" — a question about thousands of
+        # rows, which detail-only would make one fetch per run to answer.
+        #
+        # Three scalars, so they ride everywhere the tallies do. `stop_rungs` is
+        # the nine objects behind them and does NOT ride: it is deferred on the
+        # model and carried by `GET /review/{id}`, on `rules`' and `fix_pass`'
+        # argument.
+        #
+        # Unmasked, all three. NULL is "the panel did not say" — every round
+        # predating the columns, and every rung set this board refused whole — and
+        # a consumer reading either count as zero would read a floor that turns
+        # away half a repo's findings as one that turns away none.
+        "cleared_floor": r.cleared_floor,
+        "new_below_trigger_floor": r.new_below_trigger_floor,
+        "repeated_below_trigger_floor": r.repeated_below_trigger_floor,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -8772,7 +9129,7 @@ async def get_review(
     run = await session.scalar(
         select(ReviewRun).where(ReviewRun.id == run_id)
         .options(undefer(ReviewRun.unread_files), undefer(ReviewRun.rules),
-                 undefer(ReviewRun.fix_pass))
+                 undefer(ReviewRun.fix_pass), undefer(ReviewRun.stop_rungs))
     )
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no review run {run_id}")
@@ -8855,6 +9212,23 @@ async def get_review(
         # the two cases are told apart by the record's own `range.kind` and never by
         # this key being absent.
         "fix_pass": run.fix_pass,
+        # #732: the nine measurement blocks the stopping rule published beside its
+        # verdict — the eight `escalate_on` rungs and the premise brake's state.
+        # Detail-only on `fix_pass`' rule directly above, and the same cut: the
+        # three scalars a population is calibrated on (`cleared_floor` and the two
+        # below-floor counts) ride `_run_view`, and the objects behind them ride
+        # this endpoint.
+        #
+        # Verbatim and uninterpreted. Nothing here reads a rung's name or collapses
+        # a block's `over` (the measurement crossed a limit) onto its `fired` (this
+        # rung is why the cycle stopped) — that pair is the distinction
+        # `round_stop` publishes them for.
+        #
+        # Unmasked. NULL is "no rung this board could store": every round recorded
+        # before the column, every producer too old to nest them, and every set
+        # refused whole for its size — which `stop_rungs_dropped` told the sender
+        # about at the time.
+        "stop_rungs": run.stop_rungs,
         # #112: where the harness that produced this round ran from. Detail-only,
         # on the rule directly above and for the cut `_run_view` states: the three
         # fields a population is GROUPED by ride every view, and the one a reader
