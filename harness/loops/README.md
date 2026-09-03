@@ -2840,9 +2840,16 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
 - **`systemd/qb-reconcile.{service,timer}`** — reference spec too, and the odd one out in
   this directory: the program it runs is `qb-reconcile` from `bin/`, not a loop. It is here
   because this is where the harness's reference units live and one place for them beats two.
-  Report-only with **no `--execute` to graduate to** — the pass never edits the plan — so the
-  only cutover decision is whether to keep `--post`, which posts only when the report's
-  content has changed since the last post. Like the lander's, the service carries no
+  It runs `--apply --post --quiet`. `--apply` is this pass's equivalent of the lander's
+  `--execute` and it arrived with #552: the timer is what carries the actor, because it covers
+  every route work is picked up through and every abnormal ending. It completes an item whose
+  **own ref is a pull request GitHub reports `MERGED`** and nothing else — `MERGED` is
+  base-branch agnostic, so it reads the same in a repo landing on `test`; an issue-ref
+  `done_candidate` is declined by name every tick, because a closing keyword only fires on a
+  merge into the default branch and an issue-ref item cannot see its PR (#396). `dropped` stays
+  a decision nobody may infer. Drop the flag to go back to reporting; the report is identical
+  either way, and `--post` posts only when the report's content has changed since the last
+  post. Like the lander's, the service carries no
   `[Install]`: the timer is what starts it, and enabling the oneshot would also run it at
   every login. `OnUnitActiveSec=15min`,
   `SuccessExitStatus=0 1` so a partial run (rate-limited `gh`, a board mid-deploy) stays out
@@ -2851,6 +2858,13 @@ is itself one of the checks `ci` reads, and would otherwise gate on its own pend
 
 **Cutover to acting:** keep the timer report-only, watch a few daily logs, hand-run one
 `lander.py --execute` on a single PR, *then* set `LOOPS_EXECUTE=1` in the service env.
+
+`qb-reconcile --apply` took the same route and it is worth saying why the caution ended
+differently: run it by hand first (`qb-reconcile --apply --repo owner/name`), read the
+`COMPLETED` and `LEFT ALONE` blocks, and only then leave it on the timer. What made it safe to
+leave on is that the fact it acts on is GitHub's own word for a merge, re-read at the point of
+the write — where the lander's `--execute` presses a merge button, this records something that
+already happened.
 
 ## Gate model (recap from #117)
 

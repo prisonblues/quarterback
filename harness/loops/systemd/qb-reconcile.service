@@ -14,10 +14,27 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# REPORT-ONLY, and unlike the lander there is no --execute to graduate to. This
-# pass never edits the plan: "this item looks done" is a candidate for a human or
-# a plan_done call, not a state transition to make behind their back. The only
-# write it can make is the board post below.
+# THREE FLAGS, and --apply is the one that acts. Until #552 this unit ran the pass
+# report-only and said so here: "there is no --execute to graduate to. This pass
+# never edits the plan". The detector was right and unheard — ranks 1-3 of this
+# repo's plan were closed work re-confirmed every tick for days, and on lexray
+# thirteen finished items sat above a thirty-one-item ordered plan with every claim
+# already expired, because picking work up writes an item (#427) and nothing writes
+# it back. So the rule is narrowed rather than dropped: the pass never JUDGES.
+#
+# --apply completes an item whose OWN ref is a pull request GitHub reports MERGED,
+# and nothing else. That the work merged is a fact about the code and MERGED is
+# base-branch agnostic, so it reads the same in a repo that lands on `test` as in
+# one that lands on its default branch. `dropped` stays a decision nobody may infer,
+# and a `done_candidate` whose ref is an ISSUE is declined by name on every tick
+# (#396: an issue-ref item cannot see the PR that implemented it, and a closing
+# keyword only fires on a merge into the default branch). Drop the flag to go back
+# to reporting; the report is identical either way.
+#
+# It is worth saying where this flag has to be ADDED to take effect on this fleet.
+# These units are reference specs — the live ones come from nix-fleet's
+# `home/rich-workstation.nix`, which is what #695's row is about — so a change here
+# reaches a host only once that config carries it too.
 #
 # --post puts the report on the board as a `finding`, which is the point of
 # running it on a timer at all — a report that only reaches ~/reconcile-logs is
@@ -36,12 +53,14 @@ Type=oneshot
 # on systemd >= 246), and a home-manager profile's bin is on a login shell's PATH
 # without being reliably on the user manager's. If your qb-reconcile lives
 # somewhere else, name it — the point is that it is named.
-ExecStart=%h/.nix-profile/bin/qb-reconcile --post --quiet
-# Exit 1 is "ran, but some check could not be made" and exit 2 is "could not run
-# at all". Both are worth seeing in `systemctl --user status`, neither is worth
-# restarting for — the next tick retries. SuccessExitStatus keeps a partial run
-# (the common one: a rate-limited gh, a board mid-deploy) out of the failed state,
-# while a genuine 2 still goes red.
+ExecStart=%h/.nix-profile/bin/qb-reconcile --apply --post --quiet
+# Exit 1 is "ran, but some check could not be made — or, under --apply, some write
+# it decided on could not be made" and exit 2 is "could not run at all". Both are
+# worth seeing in `systemctl --user status`, neither is worth restarting for — the
+# next tick retries, and it retries the write too, since the item it failed to
+# complete is still open and still a done candidate. SuccessExitStatus keeps a
+# partial run (the common one: a rate-limited gh, a board mid-deploy) out of the
+# failed state, while a genuine 2 still goes red.
 SuccessExitStatus=0 1
 Nice=10
 
