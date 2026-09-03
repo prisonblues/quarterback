@@ -833,6 +833,31 @@ PR_CLAIM_TAIL = "\n" + PR_CLAIM_END_MARK + "\n\n"
 #: because there is one marker here rather than one per tier.
 PR_CLAIM_CUT_RESERVE = 48
 
+#: The history block's ceiling — its framing and the per-file entries together,
+#: which is what a seat's diff budget is charged (#716).
+#:
+#: Sized off what it has to hold rather than picked: the frame is ~1,600 characters
+#: and one file's entry is ~250, so this buys the frame plus roughly ten files, which
+#: covers the whole of most diffs this panel reviews and a useful head of the rest.
+#: The issue's own open question was "`-n 10` per changed file is a guess, and a diff
+#: touching 40 files would produce a lot of prompt for little value" — this is the
+#: answer: five commits per file, files richest-first, and a hard stop here.
+HISTORY_CHARS = 4200
+
+#: The largest share of a seat's own diff budget the history block may take: one part
+#: in this many.
+#:
+#: An eighth, against the claim's quarter, and the difference is the evidence each
+#: block carries. The claim is the thing a seat is asked to TEST the diff against, so
+#: it has a call on the budget the diff is read out of; history is context that makes
+#: certain questions answerable, and a seat with history and no diff has nothing to
+#: apply it to. The same rule governs both — the block yields, the diff does not —
+#: and it is measured against the TIGHTEST budget on the panel for
+#: :data:`PR_CLAIM_BUDGET_SHARE`'s reason: one string goes to every seat, and a panel
+#: whose members read different amounts of it is one whose disagreements can no
+#: longer be attributed to the code.
+HISTORY_BUDGET_SHARE = 8
+
 
 def pr_claim(title: str, body: str, budget: int = PR_CLAIM_CHARS) -> str:
     """The PR's title and body, framed for the seats as a CLAIM to be tested.
@@ -1602,7 +1627,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # type-silent, so an insertion anywhere inside the positional block can be
         # swallowed by the one caller that passes twenty of them by position. New
         # flags go on the end and get named at the call site.
-        retract: list[str] | None = None) -> int:
+        retract: list[str] | None = None,
+        # #716's control arm, and last for the reason `no_pr_claim` and `retract` are
+        # last: five of this signature's positional boundaries are type-silent and
+        # `main()` passes twenty of them by position, so a new flag goes on the end
+        # and is named at the call site.
+        no_history: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -3279,6 +3309,57 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "diff rather than the other way round — a seat with an assertion and no "
             "evidence is worse off than one with a short diff")
 
+    # ---- the changed files' git HISTORY (#716), from the operator's own clone.
+    #
+    # A code-reading seat gets its checkout from GitHub's tarball endpoint, which
+    # carries no `.git`; and `READ_ONLY_TOOLS` gives it no shell to run `git log` with
+    # if one were there. So it can read every file in the change and cannot tell when
+    # any of them landed — and it declares a coverage gap, which costs the round its
+    # confident stop. Three of eight declared gaps on the measured cycle were exactly
+    # that, and zero were closable by executing the repo's suite (#92 stays closed).
+    #
+    # Computed HERE, once, from `cfg["path"]` — the operator's own trusted clone —
+    # and rendered into every seat's prompt, which is #91's and #548's shape. That is
+    # also what makes it better than widening `reviewer_code_access`: the block is
+    # vendor-neutral, so a `code_blind` codex seat gets it too, and on the measured
+    # cycle codex was code-blind in both rounds and asked `grep`-shaped questions of a
+    # sandbox with nothing in it.
+    #
+    # It executes nothing from the pull request and it never raises: no `path`, an
+    # unfetched PR, a shallow clone → no block, a note, and the round proceeds exactly
+    # as it does today (`history_brief`'s contract, and `fetch_pr_tree`'s).
+    #
+    # Charged on `capped` as it was BEFORE the claim's deduction, not after: two
+    # blocks each taking a share of what the previous one left would compound, and the
+    # second would be sized against a number that no longer describes any seat's
+    # configured budget. Sized this way the two together can take three eighths at
+    # most, and the diff keeps the rest.
+    want_history = history_wanted(panel, no_history, notes)
+    history, history_note = "", ""
+    if want_history:
+        history_allowance = (HISTORY_CHARS if not capped
+                             else min(HISTORY_CHARS,
+                                      min(capped) // HISTORY_BUDGET_SHARE))
+        history, history_note = history_brief(str(cfg.get("path") or ""),
+                                              changed_files, base, base_sha or "",
+                                              history_allowance)
+        if history_note:
+            notes.append(history_note)
+        if history:
+            budgets = {n: (b if b is None else max(0, b - len(history)))
+                       for n, b in budgets.items()}
+    elif changed_files:
+        # Said out loud on the claim block's rule: #716's honest limit is n=1, and the
+        # comparison that fixes that reads finding counts off rounds whose arm is
+        # recorded. A round that did not send the block has to say so.
+        notes.append(
+            "the changed files' git history was NOT shown to the seats (#716): "
+            + ("`--no-history-brief` was passed for this run" if no_history
+               else "`review_panel.history_brief` is off in this repo's rules")
+            + ". This is the pre-#716 posture — a question about when a file landed "
+              "is a declared coverage gap on this round, and the round is the "
+              "unassisted arm of #716's own comparison")
+
     # #508's next-door hints, fetched once for the round and rendered once. A
     # MANIFEST round asks for none and is given none: its whole instruction is
     # "do not review the moved code", and a list of defects confirmed in these
@@ -3341,7 +3422,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # template's, and the bounded replace still lands on the template's.
         return (brief if reads_code else brief_blind).format(
                             n=pr_number, repo=gh_repo, base=base,
-                            ci=ci_text, diff=claim + review.material(budget)[0],
+                            ci=ci_text,
+                            diff=history + claim + review.material(budget)[0],
                             code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
                         ).replace(NEXT_DOOR_SLOT, next_door, 1)
 
@@ -3774,8 +3856,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "the judge ruled on the material alone, so a finding about a claim the "
             "change does not deliver was adjudicated by a party that could not see "
             "the claim — widen the judge's budget to close that")
-    judge_room = (judge_budget if judge_budget is None or not judge_claim
-                  else max(0, judge_budget - len(judge_claim)))
+    # The judge gets the history on the same terms and for #550's reason arriving one
+    # section over: this block makes a finding class possible ("this landed 74 minutes
+    # after that, not a day"), and a judge that cannot see the evidence a finding
+    # rests on rules it unsupported — which is the finding dying at the seam where it
+    # was meant to be confirmed. Same yield rule, same share, same note when it does
+    # not fit, so a reader can tell a judge that ruled without the history from one
+    # that had it.
+    judge_history = (history if not history or judge_budget is None
+                     or len(history) <= judge_budget // HISTORY_BUDGET_SHARE else "")
+    if history and not judge_history:
+        notes.append(
+            f"the changed files' git history was NOT shown to the JUDGE (#716): the "
+            f"block is {len(history):,} chars and `judge_max_diff_chars` is "
+            f"{judge_budget:,}, which allows it "
+            f"{judge_budget // HISTORY_BUDGET_SHARE:,}. The seats read the history and "
+            "the judge ruled without it, so a finding resting on when a file changed "
+            "was adjudicated by a party that could not check it — widen the judge's "
+            "budget to close that")
+    judge_room = (judge_budget if judge_budget is None
+                  else max(0, judge_budget - len(judge_claim) - len(judge_history)))
     judge_text, judge_target, judge_context = review.judge_material(judge_room)
     judge_gaps: list[str] = []
     if judge_target < len(review.target):
@@ -3801,7 +3901,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # empty sandbox, and the judge would silently review blind with the setting on
     # and nothing reporting it. Degrading correctly is exactly what made it silent.
     findings, judge_skip, ruled = adjudicate(
-        clusters, judge_claim + judge_text, panel.get("judge_model", ""), pr_number,
+        clusters, judge_history + judge_claim + judge_text,
+        panel.get("judge_model", ""), pr_number,
         None,
         coverage,
         ci=ci_text, code_tree=code_tree, budget_usd=budget_usd,
@@ -7388,6 +7489,16 @@ def main() -> int:
                          "flag rather than only `review_panel.pr_claim` because that "
                          "key lives in the repo under review, so flipping it to get "
                          "the control arm would change the diff being counted")
+    ap.add_argument("--no-history-brief", action="store_true", dest="no_history",
+                    help="don't show the seats the changed files' git history (#716) — "
+                         "the pre-#716 posture, in which a question about when a file "
+                         "landed is a declared coverage gap the seats cannot close. It "
+                         "is also the CONTROL ARM: #716 is measured on one PR, and the "
+                         "way that stops being n=1 is running the same PRs with and "
+                         "without the block and counting the declared gaps. A flag "
+                         "rather than only `review_panel.history_brief` because that "
+                         "key lives in the repo under review, so flipping it to get the "
+                         "control arm would change the diff being counted")
     ap.add_argument("--json-file", metavar="PATH", default="", dest="json_file",
                     help="also write the JSON payload here, keeping the report "
                          "(and --post) — unlike --json, which replaces them")
@@ -7775,7 +7886,7 @@ def main() -> int:
                args.no_code_access, args.escalated, args.escalated_from_board,
                args.narrowed, args.acknowledge, args.declined, args.premise_file,
                args.new_cycle, no_pr_claim=args.no_pr_claim,
-               retract=args.retract)
+               retract=args.retract, no_history=args.no_history)
 
 
 if __name__ == "__main__":
