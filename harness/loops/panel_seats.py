@@ -1255,6 +1255,198 @@ def record_run(payload: dict) -> str:
     return ""
 
 
+#: How long a round's claim on its PR is good for. The claim is RELEASED when the
+#: round ends (see :func:`release_pr`), so this is not a duration — it is the fuse
+#: for the case where the release never runs, and the only thing it has to outlast
+#: is the slowest round anybody has measured. A round takes 20-40 minutes on this
+#: fleet, which is the figure the CI-settle comment in `panel.py` cites.
+#:
+#: Three hours is a deliberate figure between the two the fleet already uses, and
+#: it is longer than the board's default rather than shorter — the first version of
+#: this comment had that backwards (PR #715 review). The board's own default is
+#: **one hour** (`app/claims`' `DEFAULT_TTL = 3600`, which is what `qb-claim` gets
+#: when nothing passes `--ttl`), and one hour cannot cover a round: 20-40 minutes
+#: is the ordinary case, and a round that waits on CI or a slow vendor exceeds an
+#: hour without anything being wrong. A fuse that expires mid-round would make the
+#: PR read as free while four seats are still reading it, which is worse than no
+#: claim at all.
+#:
+#: It is deliberately far short of `create-worktree`'s eight hours (`CLAIM_TTL`),
+#: which is #608's complaint — a fuse the agent burning it cannot renew — and that
+#: claim covers a whole worktree's work where this covers one round.
+#:
+#: Passive expiry is the intended failure mode and the board has no reaper by
+#: design (`app/models/lease.py`), so this number IS the recovery time for the
+#: paths that cannot release: an exception or an interrupt between the claim and
+#: the release (`panel.py` has no `try/finally` around the round, and the span is
+#: some 2,600 lines) leaves the claim standing for up to this long.
+PR_HOLD_TTL = 10800
+
+#: `qb-claim`'s exit codes, named for the two this cares about. 1 is a definite
+#: holder and 2 is everything else — a board outage, a rotated token, a ref this
+#: board will not key — and the split matters here for the reason it matters to
+#: `create-worktree`: a peer already reviewing this PR is worth a line in the
+#: round's own notes, and a board that could not be reached is not that peer.
+CLAIM_TAKEN, CLAIM_HELD = 0, 1
+
+
+def hold_pr(repo_path: str, pr_number: int, round_no: int,
+            title: str | None = None) -> str:
+    """Take the board's claim on this PR for the length of a round. Best-effort.
+
+    **NOT :func:`panel.pr_claim`**, which is #550's block carrying what the PR's
+    author says the change does. This is quarterback's claim — the exclusivity
+    record naming which agent is on a piece of work — and one file uses the word
+    both ways, so these two are spelled apart.
+
+    #253 asks for the six work-lifecycle events to be OBSERVED rather than
+    volunteered, and names this one: *"start reviewing a PR — `panel.py` run
+    start, it already POSTs at the end, so it knows the PR and round"*. The rule
+    it applies (#229, #172) is that the trigger must be an action that already
+    happens, never a second declaration somebody has to remember to make. A round
+    starting is that action, and this is the line that observes it.
+
+    What it buys: `GET /active` carries no work reference at all — a lease has
+    `repo`, `branch` and `title` and nothing that names an issue or a PR — so an
+    agent three hours into reviewing #1780 read, on every fleet surface, exactly
+    like one that had just opened the repo. The dashboard's AGENTS row already
+    joins a claim onto its holder (`qbdata._agent_row` prefers the claim over the
+    prompt title) and had nothing to join, because nothing on the review path
+    claimed anything. Measured on this board while #253 was open: five live
+    agents, three of them reviewing, and `/claims` empty.
+
+    Through `qb-claim` rather than a POST from here, for :func:`record_run`'s
+    reason exactly — which board this machine belongs to is site configuration,
+    and re-deriving it in Python is how one island's work lands on another
+    island's board. It also means the key is derived by the board and not composed
+    here (#172): the kind and the number go up, the key comes back, and this
+    cannot invent a third spelling of a PR's key.
+
+    **It never gates the round.** Every refusal is a line in `config_notes` and
+    nothing else. The claim exists to make the round discoverable, and a review
+    that would not run because a board was unreachable is a worse failure than a
+    review nobody can see. The HELD case is a note for the same reason and not an
+    exit: two panels on one PR is duplicated spend and worth telling a reader
+    about, and it is not this function's call to stop one.
+
+    The argument against that, which is real (PR #715 review): a claim that never
+    refuses is not an exclusivity record, and if the point were to stop duplicate
+    spend then the HELD case is precisely where it should stop. Two things decide
+    it the other way here. First, this claim can be LEFT STANDING by a round that
+    died — see :data:`PR_HOLD_TTL` — so gating would let a dead round refuse a live
+    one for up to three hours, and a refusal caused by the mechanism's own failure
+    mode is worse than the duplicate it prevents. Second, refusing a review is a
+    policy change and this is not the layer that makes them: `panel.py` already has
+    a gate parameter carrying the preconditions that DO stop a round (#271, #55,
+    #617), each with a dial and a `--force`, and a fourth precondition belongs
+    there with the same furniture rather than inside a telemetry call. Until then
+    the honest description is a record, which is what this says.
+
+    Returns "" when the claim is ours, or the one line saying why it is not.
+    """
+    if not shutil.which("qb-claim"):
+        return _unclaimed(pr_number, "there is no `qb-claim` on this host")
+    argv = ["qb-claim", "pr", str(pr_number), "--repo-path", repo_path,
+            "--ttl", str(PR_HOLD_TTL),
+            "--note", f"panel review round {round_no}"]
+    # The title from the read this round already made, rather than the `gh` call
+    # `qb-claim` makes to fetch one itself — `--no-gh-title` is what turns that
+    # off. One fewer API call per round, and it is the copy the round is actually
+    # reviewing. Without a title the flag still goes: a round that could not read
+    # a title has nothing to gain from a second attempt at it here.
+    argv += ["--no-gh-title"] + (["--title", title] if title else [])
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _unclaimed(pr_number, f"`qb-claim` failed ({e.__class__.__name__})")
+    if proc.returncode == CLAIM_TAKEN:
+        return ""
+    said = (proc.stdout or proc.stderr or "").strip().splitlines()
+    quoted = f" — `qb-claim` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    if proc.returncode == CLAIM_HELD:
+        # Through `_note` like the other two, because this is the one of the three
+        # a human watching the round most wants on their terminal: it names a peer
+        # spending money on the same PR right now.
+        return _note(f"PR #{pr_number} is claimed by somebody else{quoted}. This "
+                     "round ran anyway — the claim is a record and not a gate — but "
+                     "two panels on one PR is spend twice, so it is worth knowing "
+                     "which")
+    return _unclaimed(pr_number, f"the board did not take it{quoted}")
+
+
+def _unclaimed(pr_number: int, why: str) -> str:
+    """The one line a round that could not claim its PR says about itself.
+
+    Printed on stderr AND returned, for :func:`_unrecorded`'s reason: those are
+    two different readers, and a line that exists only in a subprocess's stderr
+    is #284's failure.
+
+    It says the review is unaffected because it is — nothing downstream of the
+    claim reads it — and it names what is actually lost, which is not the review
+    but the fleet's ability to say what this agent is doing.
+    """
+    return _note(
+        f"the board has no claim on PR #{pr_number} for this round — {why}. The "
+        "review itself is complete and unaffected; what is missing is the record, "
+        "so no fleet surface will say which PR this agent is on")
+
+
+def _note(line: str) -> str:
+    """Printed on stderr AND returned — the two readers :func:`_unrecorded` names.
+
+    One printer rather than the `print` copied into each branch that has something
+    to say. The copies were how the HELD case became the only note of the three
+    that never reached a terminal, which is the one a human watching a round most
+    needs: it names a peer spending money on the same PR at the same time.
+    """
+    print(f"panel: {line}", file=sys.stderr)
+    return line
+
+
+def release_pr(repo_path: str, pr_number: int) -> str:
+    """Hand back what :func:`hold_pr` took. Best-effort, and nothing to release is
+    not a failure.
+
+    Released at the end of the round rather than left to lapse, for `qb-release`'s
+    own reason: a claim that outlives its work is #135, and it was measured here —
+    four plan items still holding live claims after their PRs had merged, one of
+    them shipped hours earlier. A cycle is several rounds with a fix pass between
+    them, so a claim held to its TTL would also make the FIXER read as an agent
+    queueing behind a reviewer that had already finished.
+
+    The release is idempotent on the board (`released_at` is set once and the row
+    stays as history), so this racing a TTL that has already expired, or a second
+    caller, does nothing rather than damage.
+    """
+    if not shutil.which("qb-release"):
+        return ""
+    try:
+        proc = subprocess.run(["qb-release", "pr", str(pr_number),
+                               "--repo-path", repo_path],
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _unreleased(pr_number, f"`qb-release` failed ({e.__class__.__name__})")
+    if not proc.returncode:
+        return ""
+    said = (proc.stdout or proc.stderr or "").strip().splitlines()
+    quoted = f" — `qb-release` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    return _unreleased(pr_number, f"the board would not release it{quoted}")
+
+
+def _unreleased(pr_number: int, why: str) -> str:
+    """Why a round's claim is still standing after the round finished.
+
+    Worth a note rather than a silence, because the consequence is visible on a
+    surface somebody reads: the dashboard will show this agent holding PR #n for
+    up to :data:`PR_HOLD_TTL` after it stopped working on it, and a reader with no
+    note has to guess whether that is a stuck round or a stale claim.
+    """
+    return _note(
+        f"this round's claim on PR #{pr_number} was not handed back — {why}. It "
+        f"lapses on its own within {PR_HOLD_TTL // 3600}h; until then the fleet "
+        "shows this agent as still holding the PR")
+
+
 #: `qb`'s exit code for a subcommand it does not have — and for several other
 #: things. It exits 2 from its usage branch, and also on a payload it cannot read
 #: on stdin and on argument validation, so this code is a HINT and never a
@@ -5186,6 +5378,8 @@ __all__ = [
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
     "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
+    # The round-start claim (#253) and the release that ends it.
+    "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "pr_claim_wanted",

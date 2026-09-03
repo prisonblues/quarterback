@@ -576,6 +576,64 @@ agent can. `BROWSER_DEV_USER` is a *read* bypass and does not open that door; a 
 that wants the reorder buttons sets `BROWSER_DEV_HUMAN=true` deliberately. See
 [DEPLOY.md](DEPLOY.md) §0.
 
+### A review round claims the PR it is reviewing (#253)
+
+The claims section above is titled *what you are working on, said before you start*, and until
+#253 the review path said nothing. A lease carries `repo`, `branch` and `title` and **no work
+reference at all** — nothing that names an issue or a PR — so an agent three hours into reviewing
+`#1780` was, on every fleet surface, indistinguishable from one that had just opened the repo.
+Measured on this board while the issue was open: five live agents, three of them reviewing,
+`GET /claims` returning `[]`, and the dashboard's AGENTS rows reading `master`, `test` and
+`Panel review PR rework`.
+
+**The dashboard was never the missing half.** `qbdata._agent_row` has preferred a claim over the
+prompt title since the AGENTS table was three panels, and had nothing to join.
+
+**And the join itself was wrong, which the empty board was hiding.** `POST /claim` records the
+MACHINE as an ordinary claim's holder — `holder: "daedalus"`, session in its own field — and only a
+session-owned claim (the plan's, v2.39) records `daedalus/sable-dune`. `agent_rows` indexed by
+holder, so it matched plan claims and nothing else: every `qb-claim issue` and `qb-claim pr` became
+a claim-only row reading `machine`, one line from the agent holding it. Claims are now indexed by
+**session** where they name one and by holder where they do not, asked in that order — a machine
+runs several agents at once and they all authenticate as that machine, so the holder of an ordinary
+claim cannot say which took it and the session can. `machine` consequently stops meaning two
+things: a machine-held claim that names a session and is not live reads `gone`, and only a claim
+naming neither identity — `create-worktree`'s, taken before its agent exists — is `machine`.
+
+`panel.py` now takes the `pr` claim at the moment it dispatches its seats, and hands it back when
+the round ends. The observation point is #253's own: *"`panel.py` run start — it already POSTs at
+the end, so it knows the PR and round"*, and the rule it follows comes from #229 and #172 — the
+trigger has to be an action that already happens, never a second declaration somebody has to
+remember to make. A round dispatching its seats is that action, which is also why the claim is
+taken **there** rather than in `main()`: everything above that line could still have refused the
+round.
+
+Three properties, each of them a decision:
+
+- **It never gates the round.** Every refusal — a board that cannot be reached, a rotated token, a
+  peer already holding the PR — is a line in `config_notes` and nothing else. A review that would
+  not run because a board was down is a worse failure than a review nobody can see. The HELD case
+  is a note for the same reason and not an exit: two panels on one PR is spend twice, worth telling
+  a reader about, and not the round's call to prevent.
+- **It goes through `qb-claim`**, not a POST from `panel.py`, for the reason `record_run` gives —
+  which board this machine belongs to is site configuration, and re-deriving it in Python is how
+  one island's work lands on another island's board. It also means the key is derived by the board
+  (#172): the kind and the number go up, the key comes back.
+- **The TTL is three hours**, which is *above* the board's one-hour default (`DEFAULT_TTL`) and far
+  below `create-worktree`'s eight (#608's fuse). One hour cannot cover a round — 20-40 minutes
+  ordinarily, longer when CI or a vendor is slow — and a fuse that expires mid-round shows the PR as
+  free while four seats are still reading it. The claim is released when the round ends, so the TTL
+  only governs the paths that cannot release: an exception or an interrupt between the claim and the
+  release leaves it standing for up to that long, which is passive expiry working as designed
+  rather than a leak anything sweeps.
+
+On the dashboard the AGENTS cell now reads `PR#1780 · Panel review PR rework` — the ref in front of
+the words rather than instead of them. It was one or the other before: a claim replaced the title
+outright, so the cell answered "which PR is this?" or "what is this agent up to?" and never both.
+A prefix rather than a column because the narrow dash is 69 columns and a column costs that width
+on every row, including the ones with nothing to say. The round number is not in the cell because
+it is already in the `stage` column beside it (`R1`, `R1F`, `R2`).
+
 ### Exempting a PR from review is a human write (#335)
 
 `POST /review-queue` lets a PR leave the review backlog three ways: merged, closed, or
