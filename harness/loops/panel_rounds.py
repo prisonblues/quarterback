@@ -791,6 +791,190 @@ def is_claim_key(raw: object) -> bool:
     return isinstance(raw, str) and bool(CLAIM_KEY_RE.match(raw.strip().lower()))
 
 
+# ------------------------------------------------------- #718's retirable declaration
+#
+# A `could_not_assess` line that the judge did NOT rule unresolvable stays a veto,
+# and until #718 it stayed one forever. `--acknowledge` takes `uc-` keys only, so a
+# coverage declaration had no key, no register and no way out: whatever anybody
+# subsequently learned, the round's record went on holding the landing exactly as
+# hard as it did on the day the seat wrote the sentence.
+#
+# Measured on lexray#1631 round 2. Two of its three vetoes were `could_not_assess`
+# by the claude seat, which cannot execute anything (#92, decided: reviewers stay
+# non-executing, so this is a permanent property of the design). Both were closed
+# from a worktree pinned at the PR head inside ten minutes — one of them by reading
+# a test file, the other by three runs of the suite under three environments. The
+# answers existed and had nowhere to go; `preland` reported both vetoes verbatim
+# afterwards and the PR still read HOLD on them.
+#
+# **This is the OTHER half of #547's shape, not a second mechanism.** A capability
+# limit nobody here could ever settle becomes an obligation and is discharged by
+# `--acknowledge`: a person accepting a RISK. A declaration somebody went and
+# ANSWERED is a different act with a different artefact — a fact that was measured,
+# not a risk that was accepted — so it gets its own key space (`ca-`), its own flag
+# (`--assessed`) and its own register, and the two cannot be passed to each other's
+# door. What it borrows from #547 is everything that made that register work: a
+# content-addressed key printed beside the declaration, one human decision per
+# declaration, and inheritance through `--baseline` so it is done once per cycle
+# rather than once per round.
+
+#: What an assessed declaration's key looks like. A third vocabulary at the same
+#: door, and it is deliberately neither of the two already there: an obligation key
+#: is `uc-` + 12 hex and a finding key is 8-64 bare hex, so `--acknowledge`,
+#: `--escalated` and `--assessed` each refuse the other two's keys loudly rather
+#: than accepting one and matching nothing for the rest of the cycle.
+DECLARATION_KEY_PREFIX = "ca-"
+DECLARATION_KEY_RE = re.compile(rf"^{DECLARATION_KEY_PREFIX}[0-9a-f]{{12}}$")
+
+
+def declaration_key(declaration: str) -> str:
+    """The stable id of a coverage declaration, derived from the declaration itself.
+
+    :func:`claim_key`'s construction on :func:`claim_key`'s reasoning, over a
+    different sentence: the seat's own `could_not_assess` phrase rather than the
+    judge's claim. Content-addressed, so a seat that declares the same gap next round
+    declares it under the same key and one assessment discharges it for the rest of
+    the cycle. Twelve hex behind a word prefix, for the two reasons stated there —
+    short enough that a person types it back off a PR comment, and not a bare digest
+    that every secret scanner reads as an API key.
+
+    Normalised through :func:`_claim_norm`, which absorbs spelling and not rewording.
+    The limit is the same one and it is if anything smaller here: a seat's declaration
+    is its own sentence rather than a judge's synthesis of several, so it is written
+    fresh each round by a model that was not shown last round's wording. A reworded
+    declaration mints a new key and the assessment does not carry — which is REPORTED
+    (an assessed key no declaration this round carries is a note, not silence), never
+    resolved by matching prose."""
+    return DECLARATION_KEY_PREFIX + hashlib.sha256(
+        _claim_norm(declaration).encode("utf-8")).hexdigest()[:12]
+
+
+def is_declaration_key(raw: object) -> bool:
+    """Whether a string is the shape :func:`declaration_key` mints."""
+    return isinstance(raw, str) and bool(
+        DECLARATION_KEY_RE.match(raw.strip().lower()))
+
+
+class Declaration(NamedTuple):
+    """One `could_not_assess` line as the ledger and the report carry it (#718).
+
+    Keyed on the declaration's TEXT and not on `(seat, text)`, which is the same
+    merge :class:`Obligation` makes and for the same reason: four seats stating one
+    gap are one question, and answering it four times is four chances to answer it
+    differently. :attr:`seats` records who said it so the report can still name them.
+
+    Not an :class:`Obligation`. An obligation is a claim the judge ruled nothing here
+    could ever settle; this is a declaration nothing here DID settle, which is the
+    kind somebody with a shell can close in ten minutes. The two are disjoint by
+    construction — :func:`reached_declarations` skips whatever the ruling claimed —
+    so a declaration is never both, and never answerable at both doors."""
+
+    #: :func:`declaration_key` of :attr:`declaration`.
+    key: str
+    #: The declaration, in the seat's own words.
+    declaration: str
+    #: Every seat that raised it, sorted, so the report does not depend on dict
+    #: ordering and two payloads of one round diff to nothing.
+    seats: tuple[str, ...]
+
+
+#: What a run records for `set_by` when nobody said who did the assessing. NOT the
+#: empty string in the report or the payload, because "unattested" is a claim about
+#: the record and "" is a field somebody forgot to fill in, and #40's rule turns on
+#: telling those apart: an unattested judgement is RECORDED as unattested rather than
+#: refused, which only works if the record says which it was.
+ASSESSED_UNATTESTED = "unattested"
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """Somebody went and answered a coverage declaration (#718).
+
+    The fifth register that travels between rounds on the baseline payload, and the
+    second whose value is an object rather than a bare round. ``acknowledged`` (#547)
+    records that a person accepted a risk; this records that a person MEASURED
+    something, and what they measured is most of the value — "the seed produces
+    exactly ten rows, `ics_invite` absent, idempotent on a second pass" is the whole
+    answer, and a bare key throws it away and leaves the next reader to take the
+    closure on trust.
+
+    **The self-grading objection, and the treatment it gets.** An orchestrator
+    marking its own round's vetoes closed is the actor attesting to its own work, and
+    that is exactly the objection ``--escalated`` already carries and
+    ``record-outcome``'s ``refuted`` already answers: the loop takes the caller's
+    word, records WHO said so and WHEN so the claim is checkable afterwards, and #40's
+    rule is that an unattested judgement is recorded as unattested rather than
+    refused. :attr:`set_by` is the caller's own word about itself and is a CLAIM, not
+    a signature — nothing here can authenticate a person, and an agent that wants to
+    write a human's name can. So it is stored beside its claimant and published as
+    one, the way ``ReviewFindingOutcome.attested_by`` is, and the report renders the
+    split rather than a verdict.
+
+    That is strictly stronger than the status quo it replaces, which is the point
+    worth holding on to when the objection comes back: today the answer is recorded
+    NOWHERE AT ALL and the veto stands on a question that has been settled.
+
+    Frozen, because it is inherited: a later round holding a reference to an earlier
+    round's assessment must not be able to re-word it in place."""
+
+    #: The round whose caller recorded it. Earliest wins on a merge, for the reason
+    #: every other register's does — a caller re-passing a key it inherited must not
+    #: re-date the assessment to now.
+    round: int
+    #: What actually closed it, in the assessor's words. May be empty, and an empty
+    #: one is NAMED rather than refused: see :func:`assessment_or_none`.
+    note: str = ""
+    #: Who says they did the assessing. :data:`ASSESSED_UNATTESTED` where nobody was
+    #: named. A claim, never a signature — see the class docstring.
+    set_by: str = ASSESSED_UNATTESTED
+
+    @property
+    def attested(self) -> bool:
+        """Did the caller name anybody? The split the report renders and the payload
+        carries, computed in one place so the two cannot come to disagree."""
+        return self.set_by != ASSESSED_UNATTESTED
+
+    def as_dict(self) -> dict:
+        """The payload shape — an object, like :meth:`Declination.as_dict` and for
+        its reason. ``attested`` is emitted rather than left to be re-derived: a
+        consumer that recomputed it from ``set_by`` would be re-implementing #40's
+        distinction, and the point of writing it down is that it is not re-derived
+        differently by the next reader."""
+        return {"round": self.round, "note": self.note,
+                "set_by": self.set_by, "attested": self.attested}
+
+
+def assessment_or_none(value: object) -> tuple[str, str, str] | None:
+    """Read one ``KEY:NOTE`` assessment — ``(key, note, problem)``, or None.
+
+    :func:`declination_or_none`'s shape and its asymmetry, which is deliberate and is
+    the same asymmetry: ``None`` is returned for one failure only — the KEY half is
+    not the shape :func:`declaration_key` mints — because an assessment nothing can
+    be joined to discharges no declaration for the rest of the cycle while its caller
+    reads the silence as the veto having been lifted.
+
+    A MISSING NOTE is named and recorded, never refused. The fact ("somebody answered
+    this") survives the loss of the sentence that says how, exactly as a declined
+    finding survives the loss of its reason word — and refusing here would leave the
+    veto standing on a question that has in fact been settled, which is the whole
+    defect this register exists to remove, re-committed by its own fix.
+
+    ``:`` splits at the FIRST occurrence, and everything after it is the note however
+    many more it holds. A key is a prefix and hex and cannot contain one, and a note
+    of somebody's shell commands very often does."""
+    raw = str(value)
+    key, _, note = raw.partition(":")
+    if not is_declaration_key(key):
+        return None
+    said = " ".join(note.split())
+    if said:
+        return key.strip().lower(), said, ""
+    return (key.strip().lower(), "",
+            "carries no note — the assessment was recorded with nothing saying what "
+            "closed the declaration, so the next reader has to take the closure on "
+            "trust. Pass KEY:NOTE, where NOTE is what you measured")
+
+
 class Obligation(NamedTuple):
     """A claim this review established that nothing in it could check.
 
@@ -917,6 +1101,48 @@ def reached_obligations(reviewer_meta: dict[str, dict],
             if ob is not None:
                 out.setdefault(ob.key, ob)
     return tuple(out.values())
+
+
+def reached_declarations(reviewer_meta: dict[str, dict],
+                         ruling: CoverageRuling = CoverageRuling(),
+                         ) -> tuple[Declaration, ...]:
+    """The coverage declarations this round is actually VETOING on (#718).
+
+    :func:`reached_obligations`' rule, applied to the complement of what that
+    function returns. It walks the same seats :func:`coverage_veto` walks and under
+    the same recorded state, so the ledger it builds is exactly the set of
+    declarations that cost this round its confidence — no more, which is what stops
+    a `ca-` key ever appearing beside a declaration that was already free, and no
+    fewer, which is what stops a veto standing under a key nobody was shown.
+
+    Three exclusions, each of them one of `coverage_veto`'s own:
+
+    * a seat that did not RUN declared nothing this round can act on;
+    * a **code-blind** seat's declarations are reported and do not vote, so they cost
+      the round nothing today and must not acquire a key that implies they do;
+    * a declaration the judge ruled **unresolvable** is an :class:`Obligation` and is
+      answered at `--acknowledge`'s door. Excluding it here is what keeps the two
+      registers disjoint: a declaration that could be closed at either door is one a
+      caller can close at the easier one, and the easier one is always the one that
+      asks for less.
+
+    Deduplicated by key and in first-seen order, exactly as obligations are — several
+    seats raising one gap is one question — with every seat that raised it recorded
+    against it so the report can still say who."""
+    seen: dict[str, list[str]] = {}
+    text: dict[str, str] = {}
+    for name, meta in sorted(reviewer_meta.items()):
+        if not meta.get("ran") or meta.get("code_blind"):
+            continue
+        for gap in meta.get("could_not_assess") or []:
+            if (name, gap) in ruling.unresolvable:
+                continue
+            key = declaration_key(gap)
+            text.setdefault(key, gap)
+            if name not in seen.setdefault(key, []):
+                seen[key].append(name)
+    return tuple(Declaration(k, text[k], tuple(sorted(v)))
+                 for k, v in seen.items())
 
 
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
@@ -1859,6 +2085,22 @@ class Baseline:
     #: file — and never from a fix pass reporting its own success, which is the actor
     #: attesting to its own work (#622).
     retracted: dict[str, int] = field(default_factory=dict)
+    #: Coverage-declaration keys somebody has ANSWERED (``--assessed``, #718), mapped
+    #: to the round, the note and the claimed assessor each was first recorded under.
+    #:
+    #: The fifth register of this shape, inherited for ``acknowledged``'s reason
+    #: exactly: the answer does not stop being the answer because a round ended, and
+    #: a cycle that forgot it between rounds would put a question somebody has
+    #: already measured back in front of them — the permanent HOLD this register
+    #: exists to end, arriving one round later wearing a discharge.
+    #:
+    #: An object rather than a bare round, like ``declined`` and unlike the other
+    #: three, because the NOTE is most of what an assessment is worth: "somebody
+    #: closed this" is a fact the next reader has to take on trust, and "the seed
+    #: produces exactly ten rows, idempotent on a second pass" is a fact they can
+    #: check. Losing the sentence to save a nesting level would keep the register and
+    #: throw away the thing it exists to carry.
+    assessed: dict[str, Assessment] = field(default_factory=dict)
     #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
     #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
@@ -2135,6 +2377,70 @@ def _inherit_declined(into: dict[str, Declination], raw: object, was: int, path,
         held = into.get(key)
         if held is None or when < held.round:
             into[key] = Declination(when, word)
+
+
+#: What a cycle loses when an `assessed` register cannot be read. Written out once
+#: for :func:`_inherit`'s sake, the way :data:`DECLINED_COST` is.
+ASSESSED_COST = ("a coverage declaration somebody already went and answered goes "
+                 "back to costing the round its confidence, and the person who "
+                 "answered it is asked the same question again next round")
+
+
+def _inherit_assessed(into: dict[str, Assessment], raw: object, was: int, path,
+                      problems: list[str]) -> None:
+    """Read the `{key: {round, note, set_by}}` register out of a baseline payload
+    (#718).
+
+    :func:`_inherit_declined`'s structure, and it is deliberately that function's
+    and not a fresh one: the key half, the container half and the round half go
+    through :func:`_inherit`, so the three registers of this shape cannot drift into
+    three different answers about a malformed baseline. Only the fields no other
+    register carries are judged here.
+
+    A value that is not an object is read as the ROUND alone — a hand-written
+    baseline saying ``{"ca-…": 2}`` means "round 2 recorded this", with no note and
+    nobody named — and it is NOT reported, because nothing went wrong: the payload
+    never claimed to carry either.
+
+    Neither field can fail in a way worth refusing over. A note is free text by
+    definition and there is no vocabulary to check it against; an assessor's name is
+    a claim and not a signature, so the only thing this can do with an unusable one
+    is record it as :data:`ASSESSED_UNATTESTED` — which is what an absent one records
+    too, and is the honest reading of both. Dropping the entry instead would put a
+    veto back on a question somebody answered, over the spelling of a field that
+    proves nothing either way.
+
+    Earliest round wins a collision, and the earliest round's NOTE and ASSESSOR
+    travel with it, for :func:`_inherit_declined`'s reason: merging the three
+    separately would attribute round 2's date to round 5's sentence and name
+    somebody as the author of an answer they did not give."""
+    rounds: dict[str, int] = {}
+    said: dict[str, dict] = {}
+    flat: object = raw
+    if isinstance(raw, dict):
+        split: dict[object, object] = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                split[k] = v.get("round")
+                if is_declaration_key(k):
+                    said[str(k).strip().lower()] = v
+            else:
+                split[k] = v
+        flat = split
+    _inherit(rounds, flat, was, path, problems, "assessed", "the assessment",
+             is_declaration_key, lambda k: k.strip().lower(),
+             "the shape of a declaration key", ASSESSED_COST)
+    for key, when in rounds.items():
+        entry = said.get(key) or {}
+        note = entry.get("note")
+        who = entry.get("set_by")
+        held = into.get(key)
+        if held is None or when < held.round:
+            into[key] = Assessment(
+                when,
+                " ".join(str(note).split()) if isinstance(note, str) else "",
+                " ".join(str(who).split()) if isinstance(who, str) and str(who).strip()
+                else ASSESSED_UNATTESTED)
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -2441,10 +2747,11 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # they exist for if a round drops them.
         #
         # The KEY SHAPES differ and are checked apart — an obligation key is `uc-`
-        # plus eight hex, a finding key is bare hex — so a key pasted into the wrong
-        # flag is reported here rather than inherited into a register where it would
-        # match nothing for the rest of the cycle while the caller read the silence
-        # as the acknowledgement being honoured.
+        # plus twelve hex, a declaration key is `ca-` plus twelve, a finding key is
+        # bare hex — so a key pasted into the wrong flag is reported here rather than
+        # inherited into a register where it would match nothing for the rest of the
+        # cycle while the caller read the silence as the acknowledgement being
+        # honoured.
         _inherit(b.acknowledged, payload.get("acknowledged"), was, path, b.problems,
                  "acknowledged", "acknowledgement", is_claim_key,
                  lambda k: k.strip().lower(), "the shape of an obligation key",
@@ -2473,6 +2780,14 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                  lambda k: k.strip().lower(), "the shape of a finding key",
                  "a declination a human already retracted comes back, and with it the "
                  "veto that stops this PR landing on an earned stop")
+        # #718's register, the fifth of the shape and the second whose entries are
+        # objects. It is `acknowledged`'s sibling and not `declined`'s: both record an
+        # act performed outside the loop that no later round makes untrue, and both
+        # rebuild a permanent HOLD the moment a round drops one. Read through its own
+        # reader for `_inherit_declined`'s reason — the key, the container and the
+        # round are `_inherit`'s job, and only the note and the claimed assessor,
+        # which no other register carries, are judged there.
+        _inherit_assessed(b.assessed, payload.get("assessed"), was, path, b.problems)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -2853,7 +3168,8 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                   flagged: int, diff_chars: int, *, ci_status: str,
                   ci_declared_absent: bool = False,
                   coverage: CoverageRuling = CoverageRuling(),
-                  acknowledged: Iterable[str] = ()) -> list[str]:
+                  acknowledged: Iterable[str] = (),
+                  assessed: Iterable[str] = ()) -> list[str]:
     """Reasons a quiet round is not evidence of a quiet PR.
 
     A counter cannot tell a genuinely dry round from a broken one — a reviewer
@@ -2968,7 +3284,27 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
       claim already on the ledger adds nothing to this list. What a new seat can
       still cost is a gap it found that the others missed and that this panel COULD
       have closed — which is diligence, is discharged by going and looking, and is
-      the behaviour worth keeping."""
+      the behaviour worth keeping.
+
+    **`assessed` is the other half of that last sentence** (#718). "Discharged by
+    going and looking" was true of the act and false of the record: somebody went and
+    looked, and the round had nowhere to put the answer, so the veto stood on a
+    question that had been settled. `assessed` is where the answer goes — a set of
+    `ca-` keys, each naming one declaration a person says they have now answered,
+    carried between rounds on the payload exactly as `acknowledged` is.
+
+    It exempts the per-seat declaration lines above and nothing else. Not an
+    obligation (that is `acknowledged`'s door, and `reached_declarations` keeps the
+    two sets disjoint), not a truncation, not an absent seat, not CI, not a judge
+    skip — every one of which is a different fact that a person answering a coverage
+    question has not touched. So this cannot empty a veto list that was not otherwise
+    empty except by answering every declaration in it one at a time, which is the
+    work, not a way around it."""
+    # Normalised the way `acknowledged` is a few lines below, and for its reason: a
+    # key travels through a shell, a PR comment and a person's clipboard before it
+    # gets here, and a padded or upper-case spelling that silently matched nothing
+    # would leave the caller reading the veto as one they had already answered.
+    seen_assessed = {k.strip().lower() for k in assessed if isinstance(k, str)}
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
@@ -3025,8 +3361,26 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                 # obligation block below, which emits one line for the CLAIM rather
                 # than one per seat that raised it. A gap the judge did not rule on
                 # falls through to the line it has always produced.
-                if (name, gap) not in coverage.unresolvable:
-                    out.append(f"{name} could not assess: {gap}")
+                if (name, gap) in coverage.unresolvable:
+                    continue
+                # #718's exemption, and it is the plainest recorded state in this
+                # function: an argument on the command line naming the declaration's
+                # own key. Not a ruling, not a model's prose, not a regex over the
+                # declaration's wording — the rule every exemption here keeps.
+                #
+                # It is also the only exemption in this function that can be granted
+                # by the actor that ran the round, which is the objection #718 states
+                # and answers rather than dodges. Two things bound it. The key is
+                # content-addressed over the declaration, so the caller cannot
+                # exempt a declaration it has not read and quoted back; and the
+                # answer is RECORDED — round, note and who claims to have done it —
+                # so a closure nobody could defend is a closure somebody can find.
+                # Against the status quo that is strictly more: the alternative is
+                # not scrutiny, it is a veto standing on a question that was settled
+                # and an answer written down nowhere at all.
+                if declaration_key(gap) in seen_assessed:
+                    continue
+                out.append(f"{name} could not assess: {gap}")
     # What the declarations above became. One line per CLAIM, not per seat, and only
     # for the claims a VETOING declaration raised — a blind seat's or an absent
     # seat's cost the round nothing today and must not start costing it something
@@ -7990,6 +8344,10 @@ __all__ = [
     "CLAIM_KEY_PREFIX", "CLAIM_KEY_RE", "_claim_norm", "claim_key",
     "is_claim_key", "Obligation", "CoverageRuling", "_coverage_ruling",
     "reached_obligations",
+    "DECLARATION_KEY_PREFIX", "DECLARATION_KEY_RE", "declaration_key",
+    "is_declaration_key", "Declaration", "ASSESSED_UNATTESTED", "Assessment",
+    "assessment_or_none", "ASSESSED_COST", "_inherit_assessed",
+    "reached_declarations",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",

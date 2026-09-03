@@ -1051,7 +1051,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   host and the sandbox did; a ruling is a model's opinion about a model's sentence,
   and an exemption resting on one alone would be a confidence gate the panel could
   open by writing about itself. So a `resolvable_in_harness: false` *converts* the
-  declaration into a named obligation with a key (`uc-` + 8 hex), which goes on
+  declaration into a named obligation with a key (`uc-` + 12 hex), which goes on
   vetoing until a human passes that key to `--acknowledge` — recorded state of the
   plainest kind, inherited across a cycle's rounds through `--baseline` exactly as
   `--escalated` is. Only a literal JSON `false` counts; a missing key, a malformed
@@ -1068,6 +1068,35 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   filing a task. There is no board row: `qb record-outcome` keys on a finding key and
   an obligation is not a finding, so the payload and the issue are the record, and
   giving it a row would need a schema change this deliberately does not take.
+- **A declaration somebody went and ANSWERED can be retired** (#718). #547 gave the
+  declarations nothing here could ever settle a way out; the ones that simply *were
+  not* settled still had none, so a `could_not_assess` line was permanent for the life
+  of that round's record whatever anybody subsequently learned — and `preland`'s
+  `review` check lists the round's vetoes verbatim, so an answered question went on
+  holding the landing as hard as an unanswered one. Measured on lexray#1631 round 2:
+  two of its three vetoes were the claude seat's, which cannot execute anything (#92),
+  and both were closed from a worktree at the PR head inside ten minutes.
+  Every vetoing declaration now carries a key (`ca-` + 12 hex, content-addressed over
+  the declaration's own text the way an obligation's is over the claim's) and is
+  printed with it, and `--assessed ca-xxxxxxxx:'<what you measured>'` records that
+  somebody answered it — inherited through `--baseline` exactly as `--acknowledge` is,
+  so it is done once per cycle. **Per declaration, never in bulk**: there is no flag
+  that answers them all, for #547's reason.
+  The two key spaces are disjoint and so are the registers. A declaration the judge
+  ruled unresolvable is an obligation and is answered at `--acknowledge`; everything
+  else is a declaration and is answered here, and each door refuses the other's keys
+  loudly rather than accepting one and matching nothing. It exempts the declaration
+  lines and nothing else — not a truncation, an absent seat, CI, or a judge skip — so
+  it cannot empty a veto list except by answering it one line at a time.
+  **The answer is recorded, not trusted.** `--assessed` takes the caller's word, the
+  way `--escalated` does, and stores the round, the note and `--assessed-by`'s claimed
+  assessor in the payload's `assessed` register beside a `coverage_declarations`
+  ledger. Without `--assessed-by` the row is marked **unattested** rather than refused
+  (#40, and `record-outcome`'s `refuted` treatment), the report renders the split, and
+  the name is published as a claim and never as a signature. That is strictly stronger
+  than the status quo it replaces, where the answer was recorded nowhere at all.
+  `preland` needs no change: the declaration stops appearing in `stop_veto`, which is
+  the only thing that check reads.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause
