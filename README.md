@@ -619,9 +619,13 @@ Three properties, each of them a decision:
   which board this machine belongs to is site configuration, and re-deriving it in Python is how
   one island's work lands on another island's board. It also means the key is derived by the board
   (#172): the kind and the number go up, the key comes back.
-- **The TTL is three hours, not `qb-claim`'s eight.** The claim is released when the round ends, so
-  the TTL is only the fuse for the case where the release never runs, and it has to outlast the
-  slowest round rather than the working day (#608; a claim that outlives its work is #135).
+- **The TTL is three hours**, which is *above* the board's one-hour default (`DEFAULT_TTL`) and far
+  below `create-worktree`'s eight (#608's fuse). One hour cannot cover a round — 20-40 minutes
+  ordinarily, longer when CI or a vendor is slow — and a fuse that expires mid-round shows the PR as
+  free while four seats are still reading it. The claim is released when the round ends, so the TTL
+  only governs the paths that cannot release: an exception or an interrupt between the claim and the
+  release leaves it standing for up to that long, which is passive expiry working as designed
+  rather than a leak anything sweeps.
 
 On the dashboard the AGENTS cell now reads `PR#1780 · Panel review PR rework` — the ref in front of
 the words rather than instead of them. It was one or the other before: a claim replaced the title

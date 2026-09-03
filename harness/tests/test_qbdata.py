@@ -2357,3 +2357,78 @@ def test_a_live_agent_the_scope_hid_still_holds_its_claim_from_elsewhere():
                              "claims": [MACHINE_CLAIM]}, ONE)
     [row] = [r for r in rows if r["kind"] == "claim"]
     assert row["state"] == qd.CLAIM_ONLY_STATE["elsewhere"]
+
+
+# ---- the four the first cut of this got wrong (found in review of PR #715) ----
+
+def test_a_scoped_dashboard_keeps_a_pr_claim():
+    """THE ONE THAT MATTERED. `agent_rows` narrows claims by `claim_repo` before it
+    joins them, and `claim_repo` did not know the PR sigil — so it returned the
+    whole key as the repo, a definite mismatch rather than "cannot say", and the
+    scoped dashboard (the default) dropped every PR claim before anything could
+    draw it. The cell then fell back to the prompt title, which is exactly the
+    defect #253 is about, so the feature failed silently in its own case.
+
+    The live check that passed used an ISSUE claim, whose key always split.
+    """
+    assert qd.claim_repo(PR_KEY) == qd.REPO
+    rows, _ = qd.agent_rows({"agents": [_reviewing(repo="quarterback")],
+                             "claims": [{**MACHINE_CLAIM, "key": PR_KEY}]}, ONE)
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    assert row["what"][0] == "PR#1780 · Panel review PR rework"
+
+
+def test_a_release_key_still_splits_now_that_a_third_sigil_exists():
+    """The sigil went into the same chain that reads `#` and `:`, so the two shapes
+    that already worked are the ones a new split can break."""
+    assert qd.claim_repo(f"{qd.REPO}#253") == qd.REPO
+    assert qd.claim_repo(f"{qd.REPO}:2.40") == qd.REPO
+    assert qd.claim_repo("plan:ea9e1623") is None
+
+
+def test_an_agent_holding_one_of_each_kind_of_claim_gets_both():
+    """An agent reviewing a PR while holding its plan item has an ordinary claim
+    (filed by session) and a session-owned one (filed by holder). Returning only
+    the first bucket that answered dropped the second from the row and from the
+    `＋N` count, and then suppressed it below as already drawn."""
+    ordinary = {**MACHINE_CLAIM, "key": PR_KEY}
+    owned = {"holder": "daedalus/pine-mist", "session": None,
+             "key": f"{qd.REPO}#253", "note": "the plan item"}
+    rows, _ = qd.agent_rows({"agents": [_reviewing()],
+                             "claims": [ordinary, owned]})
+    [row] = [r for r in rows if r["kind"] == "agent"]
+    assert row["extra"] == 1, "the second claim is counted, not dropped"
+    assert [r["kind"] for r in rows] == ["agent"], "and not drawn twice"
+
+
+def test_a_claim_from_a_recycled_agent_name_is_still_drawn():
+    """Agent names are recycled when an agent finishes, so a stale `machine/name`
+    claim can share its holder with a LIVE agent that does not hold it. The
+    suppression test therefore asks what was ACTUALLY attached rather than
+    re-deriving it from holders — the re-derived version dropped this row.
+    """
+    stale = {"holder": "daedalus/pine-mist", "session": "a-finished-session",
+             "key": f"{qd.REPO}#99", "note": "the previous pine-mist"}
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [stale]})
+    [claim_row] = [r for r in rows if r["kind"] == "claim"]
+    assert claim_row["state"] == qd.CLAIM_ONLY_STATE["gone"]
+    [agent_row] = [r for r in rows if r["kind"] == "agent"]
+    assert agent_row["what"][0] == "Panel review PR rework", \
+        "the live agent must not inherit a finished session's claim"
+
+
+def test_a_session_id_cannot_be_read_as_another_agents_holder():
+    """Nothing enforces that a session id can never equal some other agent's
+    holder string — the board bounds the length of both and the shape of neither —
+    and one namespace for two identities hands agent A a claim belonging to agent
+    B, silently. The index key is typed, so the collision is unaskable."""
+    collide = "daedalus/other-agent"
+    a = _reviewing(holder="daedalus/pine-mist", session=collide)
+    b = _reviewing(holder=collide, session="s-2", title="something else")
+    bs_claim = {"holder": collide, "session": None, "key": f"{qd.REPO}#7",
+                "note": "b's work"}
+    rows, _ = qd.agent_rows({"agents": [a, b], "claims": [bs_claim]})
+    [row_a] = [r for r in rows if r["who"] == "pine-mist"]
+    [row_b] = [r for r in rows if r["who"] == "other-agent"]
+    assert row_a["what"][0] == "Panel review PR rework", "A must not get B's claim"
+    assert row_b["what"][0].startswith("quarterback#7 · ")

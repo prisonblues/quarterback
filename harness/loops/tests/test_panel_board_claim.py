@@ -109,15 +109,26 @@ def test_a_taken_claim_adds_no_note_and_names_the_resource_not_a_key(monkeypatch
     assert argv[argv.index("--title") + 1] == "fix: a thing"
 
 
-def test_the_fuse_is_shorter_than_the_default_because_a_round_is(monkeypatch):
-    """#608: a claim that outlives its work is #135. The claim is released at the
-    end of the round, so the TTL is only the fuse for the case where the release
-    never runs — and it has to outlast the slowest round, not the working day."""
+def test_the_fuse_outlasts_a_round_and_falls_well_short_of_a_worktrees(monkeypatch):
+    """The two bounds that are load-bearing, and neither of them is a default.
+
+    The board's default is one hour (`DEFAULT_TTL = 3600`), which is BELOW the
+    upper end of a round — 20-40 minutes ordinarily, longer when CI or a vendor is
+    slow — so a fuse at the default would expire mid-round and show the PR as free
+    while four seats were still reading it. And it is far short of
+    `create-worktree`'s eight hours, which covers a whole worktree's work and is
+    #608's complaint about a fuse nothing can renew.
+
+    Asserted as bounds rather than against a remembered default: the first cut of
+    this test asserted `< 8 * 3600` while its comment called eight hours "the
+    default", so it passed and pinned a false belief (PR #715 review).
+    """
     seen = _cli(monkeypatch)
     panel_seats.hold_pr("/tmp/acme", 1780, 1)
     ttl = int(seen["args"][seen["args"].index("--ttl") + 1])
     assert ttl == panel_seats.PR_HOLD_TTL
-    assert 40 * 60 < ttl < 8 * 3600, "longer than a round, shorter than qb-claim's default"
+    assert ttl > 3600, "a round outlives the board's one-hour default"
+    assert ttl < 28800, "and must not become create-worktree's eight-hour fuse"
 
 
 def test_a_round_with_no_title_still_asks_for_no_gh_title(monkeypatch):

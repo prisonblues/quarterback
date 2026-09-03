@@ -6193,6 +6193,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #
     # A cycle's next round takes its own claim at its own dispatch, which is what
     # makes the note on each one say which round is holding it.
+    #
+    # NO `try/finally`, and that is a decision rather than an oversight (PR #715
+    # review). There is no early return between the claim and here — the skip and
+    # refusal exits are all ABOVE the dispatch — so the only paths that reach this
+    # line without releasing are an exception and an interrupt, and the span
+    # between the two is some 2,600 lines: wrapping it would re-indent the whole
+    # body of a round to add a guard for a case the board already handles. A claim
+    # expires passively, by design and with no reaper (`app/models/lease.py`), so a
+    # round that dies holding one frees it within `PR_HOLD_TTL` with nobody
+    # intervening — the same failure mode as the lease of the agent that died with
+    # it. The cost of the choice is stated where the fuse is set.
     if record:
         handed_back = release_pr(cfg["path"], pr_number)
         if handed_back:

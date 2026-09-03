@@ -1250,11 +1250,25 @@ def record_run(payload: dict) -> str:
 #: is the slowest round anybody has measured. A round takes 20-40 minutes on this
 #: fleet, which is the figure the CI-settle comment in `panel.py` cites.
 #:
-#: Three hours rather than `qb-claim`'s eight-hour default, on #608's complaint: a
-#: claim that outlives its work is #135's original bug, and a round that died
-#: holding one should not still be holding it after lunch. Passive expiry is the
-#: intended failure mode and the board has no reaper by design
-#: (`app/models/lease.py`), so this number IS the recovery time.
+#: Three hours is a deliberate figure between the two the fleet already uses, and
+#: it is longer than the board's default rather than shorter — the first version of
+#: this comment had that backwards (PR #715 review). The board's own default is
+#: **one hour** (`app/claims`' `DEFAULT_TTL = 3600`, which is what `qb-claim` gets
+#: when nothing passes `--ttl`), and one hour cannot cover a round: 20-40 minutes
+#: is the ordinary case, and a round that waits on CI or a slow vendor exceeds an
+#: hour without anything being wrong. A fuse that expires mid-round would make the
+#: PR read as free while four seats are still reading it, which is worse than no
+#: claim at all.
+#:
+#: It is deliberately far short of `create-worktree`'s eight hours (`CLAIM_TTL`),
+#: which is #608's complaint — a fuse the agent burning it cannot renew — and that
+#: claim covers a whole worktree's work where this covers one round.
+#:
+#: Passive expiry is the intended failure mode and the board has no reaper by
+#: design (`app/models/lease.py`), so this number IS the recovery time for the
+#: paths that cannot release: an exception or an interrupt between the claim and
+#: the release (`panel.py` has no `try/finally` around the round, and the span is
+#: some 2,600 lines) leaves the claim standing for up to this long.
 PR_HOLD_TTL = 10800
 
 #: `qb-claim`'s exit codes, named for the two this cares about. 1 is a definite
@@ -1303,6 +1317,19 @@ def hold_pr(repo_path: str, pr_number: int, round_no: int,
     review nobody can see. The HELD case is a note for the same reason and not an
     exit: two panels on one PR is duplicated spend and worth telling a reader
     about, and it is not this function's call to stop one.
+
+    The argument against that, which is real (PR #715 review): a claim that never
+    refuses is not an exclusivity record, and if the point were to stop duplicate
+    spend then the HELD case is precisely where it should stop. Two things decide
+    it the other way here. First, this claim can be LEFT STANDING by a round that
+    died — see :data:`PR_HOLD_TTL` — so gating would let a dead round refuse a live
+    one for up to three hours, and a refusal caused by the mechanism's own failure
+    mode is worse than the duplicate it prevents. Second, refusing a review is a
+    policy change and this is not the layer that makes them: `panel.py` already has
+    a gate parameter carrying the preconditions that DO stop a round (#271, #55,
+    #617), each with a dial and a `--force`, and a fourth precondition belongs
+    there with the same furniture rather than inside a telemetry call. Until then
+    the honest description is a record, which is what this says.
 
     Returns "" when the claim is ours, or the one line saying why it is not.
     """
