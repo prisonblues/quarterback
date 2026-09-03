@@ -3261,6 +3261,16 @@ case entirely: every one of lexray's thirteen claims had already expired. The ho
 into the report anyway, because a row that went done under somebody's hand is the one row a
 reader may want to ask about.
 
+**A row somebody else finished is named, and this pass's receipt is not written twice.** Every
+machine in the fleet runs this timer over the same plan, so two hosts sending the same
+completion is the ordinary case rather than an unlucky one. Since #723 the board settles it:
+`open -> done` is a conditional transition, exactly one caller makes it, and the others are
+answered `changed: false` with `done_by` naming who won — so the report says who got there
+first by reading the answer rather than by comparing the returned timestamp against the moment
+the write went out, which was only ever as good as the agreement between two clocks. Against a
+board older than that there is no `changed` and the line is simply absent: a guess nothing
+supports costs more than the sentence it would explain.
+
 **`qb-next` retires a finished row too, and the two agree on the word.** Walking the plan for
 something to claim, it asks the forge about each candidate and records a row whose ref has
 already closed — `MERGED` for a PR, `CLOSED` for an issue, the same per-kind rule for the same

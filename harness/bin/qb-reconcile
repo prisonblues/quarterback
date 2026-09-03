@@ -1409,52 +1409,37 @@ def apply_candidates(report: Report) -> tuple[list[Finding], list[dict]]:
     return doing, declined
 
 
-def _already_done(view: dict, before: str) -> str | None:
-    """Who had recorded this item done before THIS WRITE went out, if anybody.
+def _already_done(view: dict) -> str | None:
+    """Who recorded this item done, when it was not this pass's write that did it.
 
     **Two observers of one merge is the endpoint's design, not a race this caller
     invented.** `POST /plan/item/done` says any agent may record a completion —
-    "whoever observes it may write it down" — and it appends the note rather than
-    replacing it, precisely so two receipts can coexist. `complete_item` only stamps
-    `done_by` when the row was not already done, so a second record leaves the first
-    holder's name and timestamp in place and adds a note line under it.
+    "whoever observes it may write it down". What it no longer does is let both of
+    them write it: since #723 the transition is a conditional `open -> done`
+    decided by the database, and the caller that lost is told so in `changed`.
 
-    What that leaves is not a wrong state — the row is done either way, which is the
-    answer both observers wanted — but a duplicated receipt, and this file's rule is
-    that nothing it does is silent. So the pass reads the timestamp it got back and
-    compares it against the moment it sent the write: a `done` older than that means
-    somebody finished the row while this pass was working (an agent's own
-    `plan_done`, or a sibling host's tick), and the report says so and names them.
+    So this reads the answer instead of inferring one. `changed: false` means the
+    row was already done when this write reached it — an agent's own `plan_done`,
+    or a sibling host's tick fifteen minutes out of step with ours — and `done_by`
+    is the holder the board kept, which is the winner by construction rather than
+    by comparison. The receipt this pass sent was not appended a second time
+    either, so the report line is now about a duplicate that did not happen.
 
-    **`before` is the write, and it cannot be the report's `generated`** (PR #719
-    review). `generated` is stamped before the plan is even read, and `run` reads
-    OPEN rows only — so a row this pass saw as open was still open at `generated`,
-    and `done < generated` is a comparison that cannot come out true in the race it
-    was written to catch. It went the other way instead: every sibling's completion
-    landed after `generated`, was read as ours, and the duplicated receipt the whole
-    function exists to name was the one case it stayed silent about.
+    **The clock-skew residual is gone with the comparison it belonged to.** The
+    previous version compared the returned `done` against the moment this write
+    went out, and a host whose clock ran fast named a peer for a receipt that was
+    its own (a slow one stayed quiet about one that was not). Nothing here reads a
+    timestamp any more, so neither direction exists.
 
-    The residual is clock skew between this host and the board, and it is bounded by
-    the one round trip rather than by the length of the pass. Both directions cost
-    one sentence in a report and neither costs a state: a fast local clock names a
-    peer for a receipt that was ours, a slow one stays quiet about one that was not.
-
-    `None` on anything unparseable, and `None` when the row was ours to record.
-    Guessing either way round would put a sentence in the report that no comparison
-    supports, which costs more than the line it would explain.
+    `None` when the write was ours, and `None` when the board did not say — a board
+    older than #723 returns no `changed`, and the honest answer to a question it was
+    never asked is silence. Guessing either way round would put a sentence in the
+    report that nothing supports, which costs more than the line it would explain.
     """
-    stamp, holder = view.get("done"), view.get("done_by")
-    if not stamp or not holder:
+    if view.get("changed") is not False:
         return None
-    try:
-        done, ours = datetime.fromisoformat(str(stamp)), datetime.fromisoformat(before)
-    except (TypeError, ValueError):
-        return None
-    if done.tzinfo is None:
-        done = done.replace(tzinfo=UTC)
-    if ours.tzinfo is None:
-        ours = ours.replace(tzinfo=UTC)
-    return str(holder) if done < ours else None
+    holder = view.get("done_by")
+    return str(holder) if holder else None
 
 
 def apply_done(report: Report) -> None:
@@ -1494,10 +1479,6 @@ def apply_done(report: Report) -> None:
         return
     for finding in doing:
         note = apply_note(finding)
-        # Stamped per write and not once for the batch: it is the reference
-        # `_already_done` compares the board's `done` against, and a batch-wide one
-        # would widen the window by however long the writes before this took.
-        before = _utcnow().isoformat()
         try:
             got = client.post("/plan/item/done",
                               {"item_id": finding.item_id, "note": note})
@@ -1514,7 +1495,7 @@ def apply_done(report: Report) -> None:
         report.applied.append(_attempt(
             finding, note=note,
             claim_left=(left or {}).get("holder") if isinstance(left, dict) else None,
-            already=_already_done(view, before)))
+            already=_already_done(view)))
 
 
 # ---- reporting --------------------------------------------------------------
@@ -1539,8 +1520,8 @@ def _acted(rows: list[dict], heading: str) -> list[str]:
         held, first = row.get("claim_left"), row.get("already")
         lines.append(f"  {row.get('subject')}{where}: {said}"
                      + (f" — a live claim held by {held} was left" if held else "")
-                     + (f" — {first} had already recorded it, so this receipt is a "
-                        "second one on a row that was already done" if first else ""))
+                     + (f" — {first} had already recorded it, so the board kept "
+                        "their receipt and did not add ours" if first else ""))
     return lines
 
 
