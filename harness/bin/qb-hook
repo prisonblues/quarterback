@@ -425,18 +425,32 @@ if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
   # `quarterback-fix-issue-721` and `quarterback-feat-issue-9`, two repositories on
   # the collision index where there is one, and neither agent can be asked about
   # under the name the other reports. `--git-common-dir` is the one path every
-  # worktree of a repo agrees about (verified: it answers
-  # `/home/rich/source/quarterback/.git` from the main checkout and from a linked
-  # worktree alike). `/.git` off the end gets the repository directory; the second
-  # `.git` strip is for a BARE repo, whose common dir IS the repository directory
-  # and conventionally ends in `.git`.
+  # worktree of a repo agrees about (verified: resolved absolute it answers
+  # `<repo>/.git` from the main checkout and from a linked worktree alike).
+  # `/.git` off the end gets the repository directory; the second `.git` strip is
+  # for a BARE repo, whose common dir IS the repository directory and
+  # conventionally ends in `.git`.
   #
-  # `--path-format` arrived in git 2.31, and without it `--git-common-dir` answers
-  # a path relative to the cwd we did not set — so the fallback is the worktree's
-  # own toplevel, which is the pre-#714 answer: a worse name, not a wrong one.
+  # Resolved with `cd` and `pwd` rather than asked for absolute, and there is NO
+  # fallback under it — deliberately. `--git-common-dir` answers relative to the
+  # directory git ran in (`$cwd`, via `-C`) whenever it can: `.git` from the main
+  # worktree, an absolute path from a linked one. `--path-format=absolute` would
+  # collapse that to one call but arrived in git 2.31, so on an older git it is the
+  # branch that does not run — and the only thing left to fall back TO is
+  # `--show-toplevel`, the per-worktree name this whole block exists to stop
+  # reporting. That is not a degraded answer, it is the defect: an old git would
+  # have put `checkout-wt-a` and `checkout-wt-b` on the collision index again,
+  # silently, with the test that catches it passing on the box that ran it. `cd`
+  # and `pwd` are POSIX and answer identically on every git, so the version
+  # question does not arise.
+  #
+  # The subshell is the guard as well as the resolution: an empty common dir, an
+  # unreadable path or a `cd` that fails leaves `_root` empty, and an empty `_root`
+  # yields an empty `repo` — which is the safe outcome, the same one a sandbox
+  # gets.
   if [ -z "$repo" ] && [ -z "${QB_SANDBOX:-}" ]; then
-    _root=$(git -C "$cwd" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-    [ -n "$_root" ] || _root=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)
+    _gitdir=$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)
+    _root=$([ -n "$_gitdir" ] && cd "$cwd" 2>/dev/null && cd "$_gitdir" 2>/dev/null && pwd)
     repo=$(printf '%s' "${_root%/.git}" | sed -E 's#/+$##; s#\.git$##; s#.*/##')
   fi
   branch=$(git -C "$cwd" branch --show-current 2>/dev/null)

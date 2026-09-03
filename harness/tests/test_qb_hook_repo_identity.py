@@ -43,6 +43,7 @@ Run: pytest harness/tests
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -170,17 +171,34 @@ class Reporting:
                              env={**self.env(), **extra_env}, timeout=60)
         assert got.returncode == 0, got.stderr  # fail-open, by contract
 
-    def lease(self) -> str:
-        """The body of the `POST /lease` the hook sent — the datum under test.
+    def leases(self) -> list[str]:
+        """Every `POST /lease` body the hook has sent, in the order it sent them.
 
-        Asserted to exist rather than defaulted to empty: a rig that stopped
+        Asserted non-empty rather than defaulted to `[]`: a rig that stopped
         registering a lease would make every test here pass by having nothing to
         disagree with.
         """
         sent = self.calls.read_text().splitlines() if self.calls.exists() else []
         leases = [c for c in sent if "http://board.test/lease" in c]
         assert leases, f"the hook registered no lease at all: {sent}"
-        return leases[0]
+        return leases
+
+    def lease(self) -> str:
+        """The FIRST lease body — what a test that starts one session is asking for."""
+        return self.leases()[0]
+
+    @staticmethod
+    def reported_repo(body: str) -> str | None:
+        """The `repo` a lease body carries, or None where it carries none.
+
+        None and `""` are different answers and the caller has to be able to tell
+        them apart: an omitted field is the sandbox reporting nothing, which is the
+        thing #714 wanted, while an empty string would be the hook reporting a name
+        it failed to derive. Only the first can legitimately happen, so a test that
+        conflated them would keep passing through the second.
+        """
+        found = re.search(r'"repo":"([^"]*)"', body)
+        return found.group(1) if found else None
 
 
 @pytest.fixture
@@ -294,7 +312,15 @@ def test_an_originless_checkout_keeps_its_bare_name(hook):
 
     The checkout on disk here is named `checkout`, and that name is genuinely all it
     has. The board's reads accept it (`app.repomatch.name_clause`), which is the same
-    ground on which a non-GitHub remote's bare name is kept two tests below."""
+    ground on which a non-GitHub remote's bare name is kept two tests below.
+
+    This is also the RELATIVE half of the path resolution: `git rev-parse
+    --git-common-dir` answers `.git` from a main worktree and an absolute path from
+    a linked one, and the hook resolves both with `cd` + `pwd` rather than asking
+    for `--path-format=absolute`, which git only learned in 2.31. Both of git's
+    answers are covered by real git — this test for the relative one, the
+    two-worktree test below for the absolute — so there is no version-dependent
+    branch left to stub a `git` for."""
     hook.start()
     assert '"repo":"checkout"' in hook.lease().replace(" ", ""), hook.lease()
 
@@ -309,12 +335,27 @@ def test_two_worktrees_of_an_originless_repo_report_the_SAME_name(hook):
     false clean the whole issue is about, one level in: reporting *a* name is not
     the fix, reporting the name the other agent would use is.
 
-    So the name comes from `--git-common-dir`, the one path every worktree of a
-    repo agrees about, rather than from the worktree's own toplevel."""
+    So TWO worktrees, and the assertion is that their two reports are equal to each
+    other. Comparing one of them against the literal `checkout` would pin the same
+    behaviour today and stop being this test tomorrow: the property is agreement
+    between the peers, and a rule that changed what both of them say — resolving
+    symlinks, say — would break a literal while leaving the collision index
+    perfectly correct. The two guards under it are what equality alone cannot say:
+    that neither reported nothing (which is #714's regression, and two Nones are
+    equal), and that neither reported its own worktree's name (which is the defect,
+    and would only ever be caught by the first assertion if both worktrees happened
+    to be named the same thing)."""
     a = hook.worktree("checkout-wt-a")
+    b = hook.worktree("checkout-wt-b")
     hook.start(cwd=a)
-    from_worktree = hook.lease().replace(" ", "")
-    assert '"repo":"checkout"' in from_worktree, from_worktree
+    hook.start(cwd=b)
+    posted = [hook.reported_repo(body) for body in hook.leases()[:2]]
+    assert len(posted) == 2, f"expected a lease from each worktree: {hook.leases()}"
+    assert all(posted), f"a worktree of a real repository reported no repo: {posted}"
+    assert posted[0] == posted[1], (
+        f"two worktrees of ONE repository named it two things: {posted}")
+    assert not set(posted) & {"checkout-wt-a", "checkout-wt-b"}, (
+        f"the repo was named after a worktree rather than the repository: {posted}")
 
 
 def test_the_sandbox_flag_only_governs_the_fallback_not_a_real_remote(hook):
