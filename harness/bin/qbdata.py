@@ -620,6 +620,14 @@ def stage_cell(agent: dict) -> tuple[str, str]:
     return clip(stage, 6), "bold cyan"
 
 
+#: What separates a repo from a number in a PR's claim key — `app/claimkey.py`'s
+#: `PR_SIGIL`, named here because :func:`_unprefixed` has to recognise it to
+#: respell it. Not imported: this file runs on a box that has the harness and no
+#: server, and one character duplicated across that boundary is cheaper than a
+#: dashboard that cannot start without `app/` on the path.
+PR_SIGIL = "!"
+
+
 def short_key(key: str) -> str:
     """'prisonblues/quarterback:2.40' → 'quarterback:2.40'.
 
@@ -2469,6 +2477,15 @@ def _unprefixed(label: str, scope: Scope | None) -> str:
         return label[len(name):]                  # the '#' stays: it reads as an issue
     if lowered.startswith(f"{name}:"):
         return label[len(name) + 1:]              # the ':' does not: it read as a namespace
+    if lowered.startswith(f"{name}{PR_SIGIL}"):
+        # RESPELLED rather than trimmed, which is what the other two branches do.
+        # `!` is the key's separator for a PR (`app/claimkey.py`: an issue and a PR
+        # can share a number, so they cannot share a sigil) and it is a storage
+        # detail — trimming the repo off `lexray!1780` leaves a bare `!1780`, which
+        # names the right PR in a spelling nothing else on the screen uses. `PR#`
+        # is `plan_ref`'s spelling for the same PR one table over (#272), so a PR
+        # claimed by an agent and a PR ranked on the plan now read alike.
+        return f"PR#{label[len(name) + 1:]}"
     return label
 
 
@@ -2945,19 +2962,62 @@ def claim_summary(claim: dict, items: list[dict] | None = None,
     return f"{label} {words}".strip()
 
 
-def _claim_only_state(holder: str, live: set[str]) -> tuple[str, str]:
+def holding(claim: dict, said: str, items: list[dict] | None = None,
+            scope: Scope | None = None,
+            index: dict[str, dict] | None = None) -> str:
+    """``PR#1780 · Panel review PR rework`` — what an agent is ON, then what it says
+    it is doing.
+
+    The ref goes in FRONT of the words rather than instead of them, and that is the
+    whole of the change. This cell used to hold one or the other: a claim replaced
+    the title outright, so an agent's row answered "which PR is this?" or "what is
+    this agent up to?" and never both — and since nothing on the review path
+    claimed anything (#253), in practice it always answered the second. A reader
+    asking which PR `pine-mist` was reviewing had a prose title, a branch called
+    `test`, and no number anywhere on the screen.
+
+    It is a PREFIX and not a column of its own because the narrow dash is 69
+    columns and this table already spends 13 of them on `who` and 6 on `state`. A
+    column costs that width in every layout; a prefix costs it only on the rows
+    that have something to say, and it says it in the cell a reader is already
+    looking at.
+
+    **A plan or item claim keeps its own words**, because `claim_label` has already
+    resolved those keys to the item's title (`plan #163 Split the fix phase`) — a
+    prefix there would print the same sentence twice, once as the ref and once as
+    the words.
+
+    Without `said` this is :func:`claim_summary` unchanged: a claim held by a
+    machine rather than a session has no agent title to sit beside, and the claim's
+    own note is then the only thing that can fill the cell.
+    """
+    label = claim_label(claim.get("key") or "?", items, scope)
+    if not said or label.startswith("plan "):
+        return claim_summary(claim, items, scope, index)
+    return f"{label} · {said}"
+
+
+def _claim_only_state(holder: str, live: set[str], session: str | None = None,
+                      live_sessions: set[str] | None = None) -> tuple[str, str]:
     """Which of :data:`CLAIM_ONLY_STATE` a holder with no agent row earns.
 
     Presence is asked first, because "alive and off this pane" is a different
     answer from either of the others and is the only one that is not a loose end.
-    After that the holder's SHAPE decides, and it is the right test: a claim
-    recorded as ``machine/name`` names an agent, so presence not listing it means
-    that agent has finished; a claim recorded as a bare ``machine`` never named
-    one, so no amount of presence can say who holds it.
+    It is asked of the SESSION as well as the holder: an ordinary claim's holder
+    is the machine, so a live agent's claim that this pane's scope hid would
+    otherwise read as unheld rather than as elsewhere.
+
+    After that the shape decides — and the question is whether this claim ever
+    named an agent, not whether its HOLDER did. A claim recorded as
+    ``machine/name`` names one; so does a machine-held claim that carries a
+    session, which is what every `qb-claim` writes. Either way, presence not
+    listing it means that agent has finished: ``gone``. Only a claim naming
+    neither is ``machine`` — nobody said who took it, so no amount of presence
+    can say either, and `create-worktree`'s pre-agent claim is the case that is.
     """
-    if holder in live:
+    if holder in live or (session and session in (live_sessions or set())):
         return CLAIM_ONLY_STATE["elsewhere"]
-    return CLAIM_ONLY_STATE["gone" if "/" in holder else "machine"]
+    return CLAIM_ONLY_STATE["gone" if ("/" in holder or session) else "machine"]
 
 
 def _seat_label(seat: dict, screens: int) -> str:
@@ -2974,17 +3034,37 @@ def _seat_label(seat: dict, screens: int) -> str:
     return f"{name} {seat.get('seat')}" if screens > 1 else f"seat {seat.get('seat')}"
 
 
+def _claims_of(agent: dict, mine: dict[str, list[dict]]) -> list[dict]:
+    """The claims this agent holds — by SESSION first, then by holder.
+
+    Two identities reach one agent and the board uses both. An ordinary claim
+    records the MACHINE as its holder (`daedalus`) and names the session
+    separately; a session-owned claim — the plan's, since v2.39 — records
+    `daedalus/sable-dune` and is found by holder. Asking only the second question
+    is what left every `qb-claim issue` and `qb-claim pr` unattributed.
+
+    Session first because it is the exact identity: a machine runs several agents
+    at once and they all authenticate as that machine, so the holder of an
+    ordinary claim cannot say which of them took it and the session can. The
+    holder lookup is the fallback and stays, for the claims that name no session
+    at all — `create-worktree` takes one on behalf of a worktree before the agent
+    that will use it exists.
+    """
+    if (session := agent.get("session")) and session in mine:
+        return mine[session]
+    return mine.get(agent.get("holder") or "", [])
+
+
 def _agent_row(agent: dict, mine: list[dict], items, scope, index) -> dict:
     """The cells an agent contributes, whether or not it is sitting in a pane."""
     word, style = agent_state(agent)
+    # What the agent SAID it was doing, which is what FLEET showed and is all this
+    # cell used to hold.
+    said = agent.get("title") or agent.get("branch") or ""
     if mine:
-        what = (claim_summary(mine[0], items, scope, index), "white")
+        what = (holding(mine[0], said, items, scope, index), "white")
     else:
-        # No claim: what the agent SAID it was doing, which is what FLEET showed.
-        # A claim is the better answer when there is one — it is the fleet's own
-        # record rather than a prompt summary — and the TUI's detail line still
-        # has both.
-        what = (agent.get("title") or agent.get("branch") or "—", "grey70")
+        what = (said or "—", "grey70")
     return {"who": (agent.get("holder") or "?").split("/", 1)[-1],
             "repo": agent.get("repo"),
             "state": (word or "—", style),
@@ -3031,9 +3111,29 @@ def agent_rows(data: dict, scope: Scope | None = None,
     claims, _ = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), items))
     index = plan_index(items)
     live = {a.get("holder") for a in every if a.get("holder")}
+    #: Every live agent's session, so a claim that names one can be attributed to
+    #: the agent that took it.
+    live_sessions = {a.get("session") for a in every if a.get("session")}
+    #: Claims BY SESSION where the claim names one, and by holder where it does
+    #: not — which is the join the AGENTS row needs and did not have.
+    #:
+    #: THE HOLDER OF AN ORDINARY CLAIM IS THE MACHINE. `POST /claim` records
+    #: `holder: "daedalus"` with the session in its own field; only a
+    #: session-owned claim (the plan's, v2.39) records `daedalus/sable-dune`. So
+    #: a join on the holder string alone matched plan claims and nothing else:
+    #: every `qb-claim issue` and `qb-claim pr` on the fleet — the two an agent
+    #: actually takes when it picks up work — fell through to a CLAIM-ONLY row
+    #: reading `machine`, beside the very agent holding it, while that agent's own
+    #: row said `main`. Both halves of the answer were on screen, one row apart,
+    #: and nothing joined them.
+    #:
+    #: One index rather than two lookups per agent: a claim is attributable
+    #: exactly one way, so the `if` here is what stops a session-owned claim being
+    #: counted twice — once for its session and once for its `machine/name`.
     mine: dict[str, list[dict]] = {}
     for claim in claims:
-        mine.setdefault(claim.get("holder") or "?", []).append(claim)
+        mine.setdefault(claim.get("session") or claim.get("holder") or "?",
+                        []).append(claim)
 
     by_session = {s: a for a in every if (s := a.get("session"))}
     rows: list[dict] = []
@@ -3049,7 +3149,7 @@ def agent_rows(data: dict, scope: Scope | None = None,
                "label": _seat_label(seat, screens)}
         if agent is not None:
             seated.add(agent.get("holder") or "")
-            row.update(_agent_row(agent, mine.get(agent.get("holder") or "", []),
+            row.update(_agent_row(agent, _claims_of(agent, mine),
                                   items, scope, index))
         else:
             row.update({"who": _seat_label(seat, screens),
@@ -3069,24 +3169,32 @@ def agent_rows(data: dict, scope: Scope | None = None,
             continue
         row = {"key": f"agent:{i}", "kind": "agent", "agent": agent,
                "claim": None, "seat": None, "live": True, "label": ""}
-        row.update(_agent_row(agent, mine.get(agent.get("holder") or "", []),
-                              items, scope, index))
+        row.update(_agent_row(agent, _claims_of(agent, mine), items, scope, index))
         rows.append(row)
 
     drawn = {r["agent"].get("holder") for r in rows if r.get("agent") is not None}
+    #: And the sessions those same rows carry. The holder set alone cannot answer
+    #: "is this claim already drawn" now that a claim is attributed by session: a
+    #: machine-held claim joined onto its agent's row would have been drawn a
+    #: SECOND time here, because its holder (`daedalus`) is not any agent's.
+    drawn_sessions = {r["agent"].get("session") for r in rows
+                      if r.get("agent") is not None}
     for i, claim in enumerate(claims):
         holder = claim.get("holder") or "?"
         # A ROW FOR EVERY CLAIM THAT IS NOT ALREADY ON ONE, which is not the same
         # test as "its holder is not live": an agent this pane's scope hid is alive
         # and has no row here, so keying on presence dropped its claim from the
         # table altogether. `_claim_only_state` tells the three cases apart.
-        if holder in drawn:
+        if holder in drawn or (claim.get("session") in drawn_sessions
+                               and claim.get("session")):
             continue
         left = minutes_left(claim.get("expires"))
         rows.append({"key": f"claim:{i}", "kind": "claim", "claim": claim,
                      "agent": None, "seat": None, "live": False, "label": "",
                      "who": holder, "repo": claim_repo(claim.get("key"), items),
-                     "state": _claim_only_state(holder, live),
+                     "state": _claim_only_state(holder, live,
+                                                claim.get("session"),
+                                                live_sessions),
                      "stage": (STAGE_UNREPORTED, "grey50"),
                      "what": (claim_summary(claim, items, scope, index), "yellow"),
                      "extra": 0, "ttl": until(claim.get("expires")),

@@ -3534,6 +3534,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # therefore assumed to cost no time; `setup` is what says whether that is true
     # on this repo.
     clock.mark("setup")
+    # ---- #253: the round's START, as an event the board can observe rather than
+    # one an agent has to remember to declare. Every gate that could refuse this
+    # round has returned above and no vendor has been paid yet, so this line is the
+    # first moment at which "a panel is reviewing this PR" is true.
+    #
+    # It is HERE and not in `main()` for the reason #253 gives about deriving an
+    # event from an action that already happens: the action is a round dispatching
+    # its seats, and everything above this could still have decided not to.
+    #
+    # Under `record`, exactly as `record_run` and the escalation posts are:
+    # `--no-record` is a caller saying this run does not go on the board, and a
+    # claim is a board write like any other. `hold_pr` never gates a round — its
+    # refusals are notes — so nothing here can stop a review that was going to run.
+    if record:
+        claimed = hold_pr(cfg["path"], pr_number, round_no, title)
+        if claimed:
+            notes.append(claimed)
     tasks = {}
     with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1) as ex:
         # Every selected LLM reviewer runs — no de-minimis gate. If we asked for
@@ -6167,6 +6184,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         missed = record_run(payload)
         if missed:
             notes.append(missed)
+
+    # The round is over, so the claim it took at dispatch goes back (#253). AFTER
+    # the record rather than before it, so that a reader watching the dashboard
+    # sees the hold stand until the round's own row is on the board — the gap the
+    # other order opens is small and points the wrong way, showing the PR free
+    # while the run that reviewed it is still being written.
+    #
+    # A cycle's next round takes its own claim at its own dispatch, which is what
+    # makes the note on each one say which round is holding it.
+    if record:
+        handed_back = release_pr(cfg["path"], pr_number)
+        if handed_back:
+            notes.append(handed_back)
 
     # #274: the round that formed the judgement is the one that announces it.
     # After the record and before the render, so the board has the run this post
