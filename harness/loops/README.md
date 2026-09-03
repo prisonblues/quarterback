@@ -2249,6 +2249,84 @@ buckets, `provenance_counts`, `pr_chars` — never chained from an earlier round
 a cycle with a skipped round in the middle, or one spanning the release that added this, still gets
 a complete block instead of a tail.
 
+### The fix pass as an artifact (#624) — `fix_pass`
+
+The panel scores reviewers. Every seat's findings are recorded, judged, chained across rounds and
+rolled up. The **fixer** — the actor that writes the code that produces the next round's findings —
+was scored by nothing, and worse than that, was *described* by nothing: `fix-and-review.md:72` says
+outright that the board cannot reliably tell a fixer's work from a reviewer's. On `lexray#1780` the
+four passes ran to +850/−314 across 11 files, +322/−49 across 9, +356/−41 across 12 (seven of them
+files no round had read) and +142/−31 across 7. Nothing anywhere held those as facts about the
+passes; they were reconstructed from `git` by hand, weeks later, to write the issue.
+
+**It is an assembly, not a new measurement, and that is the point of it.** Almost everything in the
+record was already being derived once a round and then filed under the round's *stop decision*, as
+five unrelated rungs: the churn split at `round_stop.unrefereed_fix` (#554), the surface at
+`round_stop.fix_surface` (#619), the range and the brief's fate at `round_stop.revert` (#506), the
+pricing at `round_stop.fix_budget` (#622) and the attribution at `provenance_counts` (#489). #624's
+own words for the last of those: it "already exists per-round as `introduced` — it simply is not
+attached to the pass that caused it". So `panel_rounds.fix_pass_record` reads each sibling's own
+output and re-derives nothing, on this file's standing rule that two derivations of one quantity are
+two things that can disagree — here, inside one payload.
+
+`fix_pass` rides the payload at the top level, never under `round_stop`, because `round_stop` is the
+object every stop rule is read out of and this record takes no part in any of them.
+
+| field | what it is | authority |
+|---|---|---|
+| `range` | `base`/`head`, the display `span`, `_fix_range_diff`'s own `kind` and `why`, the commit and merge counts, `spans` (how many fix phases the range covers) and `source` — which of `compare`, `increment` or `reconstructed` supplied the diff every measurement was taken over | derived |
+| `brief` | `round` (which round's **To fix** list briefed the pass), `findings` (how big that list was), `placed` (how many of them this round could key) and `why` — `budgeted_brief`'s own sentence for the nulls | derived |
+| `churn` | `production`/`test`/`prose`/`churn`, over insertions plus deletions, off `referee_state`'s split | derived |
+| `surface` | `files`, `new_files`, `count`, `prior_files` — `fix_surface_state`'s own output, so it and `round_stop.fix_surface` cannot publish two readings of one set difference | derived |
+| `cleared` / `still_open` | the brief's findings this round no longer raises, and those it still does, as `{key, severity}` — `fix_pass_outcome`'s partition, the same call `round_stop.revert` reads | derived |
+| `introduced` | how many of **this** round's findings were attributed to that pass, through `attributed()` exactly as the trend row's own cell is | derived |
+| `declared` | `narrowed` (#615), `declined` (#665) and `escalated` (#221) — the keys the pass reported, filtered to declarations dated to this round | **declared** |
+| `counts` | the eleven-key integer projection of all of the above, for a consumer reading a population | derived |
+| `gaps` | what the record cannot say, one line each, published on the record itself | — |
+
+**Every measurement is derived from observable state.** #622's second opinion, adopted by #621:
+anything the fixer self-reports is the thing these issues exist to remove. So the numbers come from
+the diff, the commits and the payload the pass was given, and never from the pass's account of
+itself. The two entries that *are* declarations sit under a key that says so, are dated by the round
+that received them rather than by the pass's own say-so, and feed no count. The per-finding
+`fixed | refuted | deferred` the issue also asks for is **not** here and `gaps` says why: it needs a
+finding's type (#623, parked by #621's scope decision) and a line-to-finding attribution a diff does
+not carry, and the declared form already lives on the board as `review_finding_outcomes`, one row
+per defect, with the identity that recorded it.
+
+**`null` means there was no pass**, and only that: round 1, a run outside a cycle, and any round
+that reviewed nothing. A pass that *happened* and could not be read — a rewritten branch, an API
+refusal, a baseline naming no commit — gets a record with nulls inside it, because "opened no file
+and churned no line" is the flattering direction on every claim this record makes. `range.kind` is
+what tells the two apart.
+
+**And it is deliberately not a leaderboard.** #624's title carries that in its parenthesis and its
+own second opinion supplies the argument: every obvious ratio over a fix pass is gameable in a
+direction worse than the disease — *lines per finding cleared* rewards compressed, superficial and
+clustered fixes; *findings introduced per pass* rewards weakening tests and avoiding the files most
+likely to be read; *new files opened* rewards refusing a cross-file repair that is genuinely required,
+which is a P1 left unfixed to protect a metric; and *share of fixes still standing a round later* is
+invalid under increment scope, because the later round may never have re-read the repair. Four
+consequences, each pinned by `tests/test_panel_fix_pass.py`:
+
+* **no ratio.** `FIX_PASS_COUNTS` is a vocabulary of counts. The numerators and the denominators are
+  both published and none of them is divided; a consumer that wants a quotient has to write it down,
+  in its own code, where somebody can argue with which one it means.
+* **no actor.** The record names the pass by its commit range and the round that briefed it, and
+  carries no agent, model or session field. An artifact with no actor key cannot be aggregated into
+  a table of fixers, which is a stronger guarantee than a policy of not writing that query.
+* **no gate.** `round_stop` is not passed the record and does not read it, no dial governs it and
+  `escalate_on` grows no key — #67's instrument-before-gate rule, #621's "not a 29th dial", and
+  #624's own instruction that "the record is the deliverable here; the judgements are a later,
+  separate decision".
+* **and the fixer is told.** The **To fix** header carries a sentence saying the record is made,
+  what it is derived from, and that none of it is scored — on #622's rule that a measurement the
+  measured party does not know about is a trap rather than a brake.
+
+The report prints one line, `**The fix pass this round read**`, ahead of the three existing readings
+of the same pass, and withholds every clause whose own measurement was not made rather than printing
+a zero.
+
 ### Recurrence (#67): is the loop making progress on this defect?
 
 `provenance` asks whether the last fix pass *wrote the line* a finding sits on. `recurrence` asks
