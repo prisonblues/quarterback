@@ -833,6 +833,31 @@ PR_CLAIM_TAIL = "\n" + PR_CLAIM_END_MARK + "\n\n"
 #: because there is one marker here rather than one per tier.
 PR_CLAIM_CUT_RESERVE = 48
 
+#: The history block's ceiling — its framing and the per-file entries together,
+#: which is what a seat's diff budget is charged (#716).
+#:
+#: Sized off what it has to hold rather than picked: the frame is ~1,600 characters
+#: and one file's entry is ~250, so this buys the frame plus roughly ten files, which
+#: covers the whole of most diffs this panel reviews and a useful head of the rest.
+#: The issue's own open question was "`-n 10` per changed file is a guess, and a diff
+#: touching 40 files would produce a lot of prompt for little value" — this is the
+#: answer: five commits per file, files richest-first, and a hard stop here.
+HISTORY_CHARS = 4200
+
+#: The largest share of a seat's own diff budget the history block may take: one part
+#: in this many.
+#:
+#: An eighth, against the claim's quarter, and the difference is the evidence each
+#: block carries. The claim is the thing a seat is asked to TEST the diff against, so
+#: it has a call on the budget the diff is read out of; history is context that makes
+#: certain questions answerable, and a seat with history and no diff has nothing to
+#: apply it to. The same rule governs both — the block yields, the diff does not —
+#: and it is measured against the TIGHTEST budget on the panel for
+#: :data:`PR_CLAIM_BUDGET_SHARE`'s reason: one string goes to every seat, and a panel
+#: whose members read different amounts of it is one whose disagreements can no
+#: longer be attributed to the code.
+HISTORY_BUDGET_SHARE = 8
+
 
 def pr_claim(title: str, body: str, budget: int = PR_CLAIM_CHARS) -> str:
     """The PR's title and body, framed for the seats as a CLAIM to be tested.
@@ -1170,6 +1195,12 @@ def _payload_defaults() -> dict:
         # be exactly the silence this issue exists to stop producing.
         "acknowledged": {},
         "unresolved_claims": [],
+        # #718's two, on #547's terms and for its reason. `assessed` is the register
+        # the next round inherits; `coverage_declarations` is the ledger a human reads
+        # to decide what to go and answer, and it is the half that makes the key
+        # usable at all — a key nobody was shown is a key nobody can type back.
+        "assessed": {},
+        "coverage_declarations": [],
         # #665's, on the same terms: present on every payload, empty by default, so
         # the round that inherits it never has to tell "this cycle declined nothing"
         # from "this payload predates the register".
@@ -1602,7 +1633,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # type-silent, so an insertion anywhere inside the positional block can be
         # swallowed by the one caller that passes twenty of them by position. New
         # flags go on the end and get named at the call site.
-        retract: list[str] | None = None) -> int:
+        retract: list[str] | None = None,
+        # #718's assessments. Last, and keyword-only in practice, for the reason the
+        # two parameters above are: this signature has five type-silent boundaries in
+        # its positional block and exactly one caller that passes twenty arguments by
+        # position, so a new flag goes on the end and is named at the call site.
+        assessed: list[str] | None = None,
+        assessed_by: str = "",
+        # #716's control arm, and last for the same reason: both flags below `retract`
+        # are named at the one call site, so their order here carries no meaning and
+        # neither can be swallowed by a positional caller.
+        no_history: bool = False) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -1987,6 +2028,65 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "it) — it was ignored, so the claim it meant still costs the round its "
                 "confidence")
 
+    # `--assessed` (#718), at the same door, on `--declined`'s PAIR shape rather than
+    # `--acknowledge`'s bare key. The two halves fail differently and for
+    # `assessment_or_none`'s stated reasons: a bad key is refused, because an
+    # assessment nothing joins to discharges no declaration for the rest of the cycle
+    # while its caller reads the silence as the veto lifted; a missing note is
+    # recorded and NAMED, because refusing there would leave the veto standing on a
+    # question that has in fact been answered, which is the defect this register
+    # exists to remove, re-committed by its own fix.
+    #
+    # Deduplicated on the spelling passed, as its four siblings are, because
+    # re-passing an inherited assessment is documented as harmless and a duplicate
+    # note would reach a public PR comment twice under `--post`.
+    #
+    # Who says they did it is a RUN-LEVEL fact and not a per-key one: one command is
+    # one person (or one agent) at one terminal, and a flag that let a single
+    # invocation attribute three assessments to three different people would be
+    # inviting exactly the record nobody can check. Per-DECLARATION is the rule
+    # #718 states and it is about the decision, which is still one flag each.
+    answered: dict[str, str] = {}
+    seen_assessed: set[str] = set()
+    for raw in assessed or []:
+        if str(raw) in seen_assessed:
+            continue
+        seen_assessed.add(str(raw))
+        read = assessment_or_none(raw)
+        if read is None:
+            notes.append(
+                f"--assessed `{_key_gist(raw)}` is not the shape of a declaration key "
+                f"({DECLARATION_KEY_PREFIX} and 12 hex characters, then `:` and what "
+                "you measured, as the report's Coverage declared block prints it) — it "
+                "was ignored, so the declaration it meant still costs the round its "
+                "confidence")
+            continue
+        key, said, problem = read
+        if problem:
+            notes.append(f"--assessed {key} {problem}")
+        # First spelling wins, the rule the four registers above it use for a repeated
+        # key: a caller that answers one declaration twice with two notes has said
+        # something this loop cannot resolve, and one of them has to be picked.
+        answered.setdefault(key, said)
+    # A CLAIM about who did the work, never a signature — nothing in this loop can
+    # authenticate a person, and an agent that wants to type a human's name here can.
+    # So it is stored beside the round that recorded it and published as a claim, the
+    # way `ReviewFindingOutcome.attested_by` is, and the report renders the split
+    # rather than a verdict.
+    assessor = " ".join(str(assessed_by or "").split()) or ASSESSED_UNATTESTED
+    if answered and assessor == ASSESSED_UNATTESTED:
+        # #40's rule, applied where the loop can actually apply it: an unattested
+        # judgement is RECORDED as unattested rather than refused, and the caller is
+        # told which of its rows will read that way rather than finding out from the
+        # report. Refusing instead would leave the answer exactly where it is today —
+        # in a PR comment nothing counts — which is the status quo this replaces.
+        notes.append(
+            f"--assessed recorded {len(answered)} declaration(s) with no --assessed-by: "
+            "the round that answered them is also the round they were answered FOR, "
+            "which is the actor attesting to its own work. They are recorded and "
+            "marked unattested rather than refused (#40), and the report shows the "
+            "split — pass --assessed-by NAME when somebody else did the measuring")
+
     # `--narrowed` (#615), checked at the same door and by the same rules as
     # `--escalated` above, because it arrives the same way: finding keys read out of a
     # fix pass's own prose report. Everything about its ARGUMENT SHAPE is
@@ -2155,6 +2255,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 notes.append(f"--acknowledge {key} was passed to a round that reviewed "
                              "nothing, so it was NOT recorded — pass it again on the "
                              "next round that runs")
+            # #718, and it gets `--acknowledge`'s answer rather than `--retract`'s,
+            # which is the choice worth stating because the flags are so alike. A
+            # retraction is an act about a key already IN a register, so it can be
+            # recorded against a round that read nothing; an assessment is an act
+            # about a DECLARATION, and a round that reviewed nothing has no
+            # declarations — dating one to it would write the answer in against a
+            # question this round never asked.
+            for key in sorted(k for k in answered if k not in skip_prior.assessed):
+                notes.append(f"--assessed {key} was passed to a round that reviewed "
+                             "nothing, so it was NOT recorded — pass it again on the "
+                             "next round that runs")
             # #665, and the same answer for `--escalated`'s reason exactly: a round
             # that reviewed nothing cannot date a declaration to itself, and the typo
             # check that would catch a mistyped key needs findings this round does
@@ -2235,6 +2346,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # the person who accepted them has not un-accepted them because a
                 # title matched /^Merge /.
                 "acknowledged": dict(skip_prior.acknowledged),
+                # Carried forward and added to by nothing, for `acknowledged`'s reason
+                # above: a declaration somebody measured the answer to has not become
+                # unanswered because a title matched /^Merge /, and a register that
+                # emptied on the quietest round of the cycle would put the question
+                # back on the round least likely to be read.
+                "assessed": {k: a.as_dict()
+                             for k, a in sorted(skip_prior.assessed.items())},
                 # Carried forward and added to by nothing, for the reason the two
                 # above are: a correction an earlier pass could not make is not made
                 # by a title matching /^Merge /, and a register that emptied on the
@@ -3279,6 +3397,57 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "diff rather than the other way round — a seat with an assertion and no "
             "evidence is worse off than one with a short diff")
 
+    # ---- the changed files' git HISTORY (#716), from the operator's own clone.
+    #
+    # A code-reading seat gets its checkout from GitHub's tarball endpoint, which
+    # carries no `.git`; and `READ_ONLY_TOOLS` gives it no shell to run `git log` with
+    # if one were there. So it can read every file in the change and cannot tell when
+    # any of them landed — and it declares a coverage gap, which costs the round its
+    # confident stop. Three of eight declared gaps on the measured cycle were exactly
+    # that, and zero were closable by executing the repo's suite (#92 stays closed).
+    #
+    # Computed HERE, once, from `cfg["path"]` — the operator's own trusted clone —
+    # and rendered into every seat's prompt, which is #91's and #548's shape. That is
+    # also what makes it better than widening `reviewer_code_access`: the block is
+    # vendor-neutral, so a `code_blind` codex seat gets it too, and on the measured
+    # cycle codex was code-blind in both rounds and asked `grep`-shaped questions of a
+    # sandbox with nothing in it.
+    #
+    # It executes nothing from the pull request and it never raises: no `path`, an
+    # unfetched PR, a shallow clone → no block, a note, and the round proceeds exactly
+    # as it does today (`history_brief`'s contract, and `fetch_pr_tree`'s).
+    #
+    # Charged on `capped` as it was BEFORE the claim's deduction, not after: two
+    # blocks each taking a share of what the previous one left would compound, and the
+    # second would be sized against a number that no longer describes any seat's
+    # configured budget. Sized this way the two together can take three eighths at
+    # most, and the diff keeps the rest.
+    want_history = history_wanted(panel, no_history, notes)
+    history, history_note = "", ""
+    if want_history:
+        history_allowance = (HISTORY_CHARS if not capped
+                             else min(HISTORY_CHARS,
+                                      min(capped) // HISTORY_BUDGET_SHARE))
+        history, history_note = history_brief(str(cfg.get("path") or ""),
+                                              changed_files, base, base_sha or "",
+                                              history_allowance)
+        if history_note:
+            notes.append(history_note)
+        if history:
+            budgets = {n: (b if b is None else max(0, b - len(history)))
+                       for n, b in budgets.items()}
+    elif changed_files:
+        # Said out loud on the claim block's rule: #716's honest limit is n=1, and the
+        # comparison that fixes that reads finding counts off rounds whose arm is
+        # recorded. A round that did not send the block has to say so.
+        notes.append(
+            "the changed files' git history was NOT shown to the seats (#716): "
+            + ("`--no-history-brief` was passed for this run" if no_history
+               else "`review_panel.history_brief` is off in this repo's rules")
+            + ". This is the pre-#716 posture — a question about when a file landed "
+              "is a declared coverage gap on this round, and the round is the "
+              "unassisted arm of #716's own comparison")
+
     # #508's next-door hints, fetched once for the round and rendered once. A
     # MANIFEST round asks for none and is given none: its whole instruction is
     # "do not review the moved code", and a list of defects confirmed in these
@@ -3341,7 +3510,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # template's, and the bounded replace still lands on the template's.
         return (brief if reads_code else brief_blind).format(
                             n=pr_number, repo=gh_repo, base=base,
-                            ci=ci_text, diff=claim + review.material(budget)[0],
+                            ci=ci_text,
+                            diff=history + claim + review.material(budget)[0],
                             code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
                         ).replace(NEXT_DOOR_SLOT, next_door, 1)
 
@@ -3556,8 +3726,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #: mechanism that took it (PR #715 review).
     holding_pr = False
     if record:
-        claimed = hold_pr(cfg["path"], pr_number, round_no, title)
-        holding_pr = not claimed
+        # Two facts, not one. A note used to imply "and we do not hold it", which
+        # stopped being true with #722's mixed-version notes: a round can hold the
+        # PR *and* have something to say about how (an old board that ignored
+        # `--no-plan-item`, an old `qb-claim` that had to be asked again without
+        # it). Inferring the release from the note would have skipped it on exactly
+        # those runs and left the PR held for PR_HOLD_TTL.
+        claimed, holding_pr = hold_pr(cfg["path"], pr_number, round_no)
         if claimed:
             notes.append(claimed)
     tasks = {}
@@ -3800,8 +3975,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "the judge ruled on the material alone, so a finding about a claim the "
             "change does not deliver was adjudicated by a party that could not see "
             "the claim — widen the judge's budget to close that")
-    judge_room = (judge_budget if judge_budget is None or not judge_claim
-                  else max(0, judge_budget - len(judge_claim)))
+    # The judge gets the history on the same terms and for #550's reason arriving one
+    # section over: this block makes a finding class possible ("this landed 74 minutes
+    # after that, not a day"), and a judge that cannot see the evidence a finding
+    # rests on rules it unsupported — which is the finding dying at the seam where it
+    # was meant to be confirmed. Same yield rule, same share, same note when it does
+    # not fit, so a reader can tell a judge that ruled without the history from one
+    # that had it.
+    judge_history = (history if not history or judge_budget is None
+                     or len(history) <= judge_budget // HISTORY_BUDGET_SHARE else "")
+    if history and not judge_history:
+        notes.append(
+            f"the changed files' git history was NOT shown to the JUDGE (#716): the "
+            f"block is {len(history):,} chars and `judge_max_diff_chars` is "
+            f"{judge_budget:,}, which allows it "
+            f"{judge_budget // HISTORY_BUDGET_SHARE:,}. The seats read the history and "
+            "the judge ruled without it, so a finding resting on when a file changed "
+            "was adjudicated by a party that could not check it — widen the judge's "
+            "budget to close that")
+    judge_room = (judge_budget if judge_budget is None
+                  else max(0, judge_budget - len(judge_claim) - len(judge_history)))
     judge_text, judge_target, judge_context = review.judge_material(judge_room)
     judge_gaps: list[str] = []
     if judge_target < len(review.target):
@@ -3827,7 +4020,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # empty sandbox, and the judge would silently review blind with the setting on
     # and nothing reporting it. Degrading correctly is exactly what made it silent.
     findings, judge_skip, ruled = adjudicate(
-        clusters, judge_claim + judge_text, panel.get("judge_model", ""), pr_number,
+        clusters, judge_history + judge_claim + judge_text,
+        panel.get("judge_model", ""), pr_number,
         None,
         coverage,
         ci=ci_text, code_tree=code_tree, budget_usd=budget_usd,
@@ -4202,12 +4396,41 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # inherited must not re-date the acknowledgement to now.
     ack_held = dict(sorted({**{k: round_no for k in accepted},
                             **prior.acknowledged}.items()))
+    # #718's register, built on `ack_held`'s exact terms: declared this round plus
+    # every key an earlier round of the cycle recorded, `prior` winning a collision so
+    # that re-passing an inherited key does not re-date the assessment — or reattribute
+    # it, which is the sharper version of the same rule here, since the entry carries a
+    # name. Sorted, because it is serialised straight into the payload and a diff
+    # between two payloads has to mean something changed.
+    assessed_held = dict(sorted(
+        {**{k: Assessment(round_no, note, assessor) for k, note in answered.items()},
+         **prior.assessed}.items()))
     obligations = reached_obligations(reviewer_meta, ruled)
+    declarations = reached_declarations(reviewer_meta, ruled)
     veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target),
                           ci_status=ci_status,
                           ci_declared_absent=ci_declared_absent,
-                          coverage=ruled, acknowledged=ack_held)
+                          coverage=ruled, acknowledged=ack_held,
+                          assessed=assessed_held)
             + manifest_veto + moved_head_veto + judge_gaps + inherited + prior.problems)
+    # An assessment naming no declaration this round raised, said out loud for the
+    # reason its `--acknowledge` twin below is: the likeliest explanation is a seat
+    # that reworded its own declaration, which `_claim_norm` says plainly it cannot
+    # absorb, and the alternatives are a typo and a declaration that has simply
+    # stopped being made. Nothing here can tell the three apart. What it can do is
+    # stop the caller reading the cycle's silence as the assessment having landed.
+    #
+    # Against `answered` and not `assessed_held`, on the same rule the pairing note
+    # below states: an INHERITED assessment names no declaration this round in the
+    # ordinary case where it worked — the seat stopped declaring the gap because
+    # somebody answered it — so reporting that every round would be the alert fatigue
+    # these notes are careful not to become.
+    raised_now = {d.key for d in declarations}
+    for key in sorted(k for k in answered if k not in raised_now):
+        notes.append(f"--assessed {key} names no coverage declaration this round "
+                     "raised — check the key against the report's Coverage declared "
+                     "block, and expect a new one if the seat reworded its "
+                     "declaration")
     # An acknowledgement naming no obligation this round raised is almost always a
     # re-worded claim under a new key, which `_claim_norm` says plainly it cannot
     # absorb — so it is SAID rather than corrected. The alternative readings are a
@@ -5845,6 +6068,35 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # key -> the round it was first acknowledged in, inherited by the next round
         # through --baseline exactly as `escalated` is.
         "acknowledged": ack_held,
+        # #718's ledger, beside #547's and on the same terms. Every coverage
+        # declaration this round is vetoing on, under the key that retires it,
+        # whether or not somebody has answered it — the answer is a separate field,
+        # so a reader can tell "no declarations" from "all of them answered" without
+        # holding two payloads side by side.
+        #
+        # It is what makes the key USABLE, which is the half a register cannot do
+        # without: a content-addressed key nobody is shown is a key nobody types back,
+        # and the declaration would go on vetoing under an id that existed only inside
+        # this function.
+        "coverage_declarations": [
+            {"key": d.key, "declaration": d.declaration, "seats": list(d.seats),
+             "assessed": d.key in assessed_held,
+             # The note and the claimant travel WITH the ledger row and not only in
+             # the register, because this is the list a person reads when they are
+             # deciding whether to believe the closure. "Answered" and "answered by
+             # somebody who says they ran the suite, and here is what it printed" are
+             # different rows, and the second is the one worth having.
+             "note": (assessed_held[d.key].note if d.key in assessed_held else ""),
+             "assessed_by": (assessed_held[d.key].set_by
+                             if d.key in assessed_held else None),
+             "attested": (assessed_held[d.key].attested
+                          if d.key in assessed_held else False)}
+            for d in declarations],
+        # key -> `{round, note, set_by, attested}` of every coverage declaration this
+        # cycle has answered, inherited by the next round through --baseline exactly
+        # as `acknowledged` is. Emitted even when empty, so a reader can tell "nobody
+        # answered anything" from "this payload predates #718".
+        "assessed": {k: a.as_dict() for k, a in assessed_held.items()},
         # The REVIEW TARGET's size — the whole PR under "pr" scope, the increment
         # under "increment". Its meaning is scope-dependent and always has been
         # in spirit ("how big was the thing we reviewed"); what is new is that
@@ -7231,10 +7483,75 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # is reading the comment.
     declared = {n: m["could_not_assess"] for n, m in sorted(reviewer_meta.items())
                 if m.get("could_not_assess")}
+    # #718. The key beside the declaration, printed exactly as an obligation's is a
+    # few lines below, because a content-addressed key nobody is shown is a key nobody
+    # can type back — and a declaration nobody can name is a veto that stands for the
+    # life of the round's record whatever anybody subsequently learns.
+    #
+    # Only the ones this round is actually VETOING on carry a key.
+    # `reached_declarations` walks `coverage_veto`'s own seats under its own recorded
+    # state, so a blind seat's declaration and one the judge ruled unresolvable are
+    # rendered as they always were: the first costs the round nothing and must not be
+    # given a flag that implies it does, and the second is an obligation and is
+    # answered at `--acknowledge`'s door under its own key.
+    #
+    # Which is why the lookup is on the `(seat, declaration)` PAIR and not on the
+    # text — the same key `CoverageRuling.unresolvable` uses, for the same reason. Two
+    # seats can raise the identical gap and the judge can rule one of them
+    # unresolvable and leave the other unruled: the ruling is per numbered
+    # `(reviewer, declaration)` entry, so nothing stops it. A text-keyed map rendered
+    # the unruled seat's `ca-` key beside the RULED seat's line too, telling the
+    # reader that a declaration answerable only at `--acknowledge`'s door could be
+    # closed at this one — and, once the key was passed, marking that line
+    # "assessed" while the declaration went on vetoing under `uc-`. The veto
+    # arithmetic was right throughout (`coverage_veto` looks the pair up the same
+    # way); the report was not, and the report is what a person acts on.
+    keyed = {(seat, d.declaration): d for d in declarations for seat in d.seats}
     if declared or coverage_note:
         lines.append("\n### Coverage declared by the reviewers")
         for name, gaps in declared.items():
-            lines.append(f"- **{name}** could not assess: " + "; ".join(gaps))
+            lines.append(f"- **{name}** could not assess:")
+            for gap in gaps:
+                d = keyed.get((name, gap))
+                if d is None:
+                    lines.append(f"  - {gap}")
+                    continue
+                got = assessed_held.get(d.key)
+                if got is None:
+                    mark = "⏳ **unassessed**"
+                else:
+                    # The attested/unattested split, in the artefact, because #40's
+                    # rule is that the judgement is recorded as unattested rather than
+                    # refused — and "recorded as unattested" means nothing at all
+                    # unless the record a person reads says so. `record-outcome` says
+                    # "claims signoff by X" and never "signed off by X"; the same
+                    # words for the same reason, since this is free text from the
+                    # same command that recorded the answer.
+                    who = (f"{got.set_by} says so" if got.attested
+                           else "**unattested** — the round's own caller")
+                    mark = (f"✅ assessed in round {got.round}, {who}"
+                            + (f" — _{got.note}_" if got.note
+                               else " — _no note: nothing records what closed it_"))
+                lines.append(f"  - `{d.key}` — {gap} — {mark}")
+        open_gaps = [d for d in declarations if d.key not in assessed_held]
+        if open_gaps:
+            keys = " ".join(f"--assessed {d.key}:'<what you measured>'"
+                            for d in open_gaps)
+            # The remedy in the artefact, for the reason #547's is: a veto whose
+            # remedy lives in a brief the reader does not have open is a veto they
+            # resolve by dropping the gate.
+            lines.append(
+                "\nEach of these costs the round its confidence until somebody "
+                "answers it. A coverage declaration is often the cheapest veto on "
+                "this list to close, because it names its own instrument — the seat "
+                "says what it could not do, and somebody with a shell does it. When "
+                "you have, pass it back to the next round with what you measured: "
+                f"`{keys}`. Per declaration on purpose — there is no flag that "
+                "answers them all, because a blanket yes is the cheap gate and a "
+                "gate that always passes is worse than one that always holds. Add "
+                "`--assessed-by NAME` when somebody other than this round's own "
+                "caller did the measuring; without it the answer is recorded and "
+                "marked unattested.")
         # Said once, under the declarations themselves, because the report has to
         # answer the question a reader asks HERE: five declared gaps and a
         # confident stop used to be a contradiction, and now it is the design.
@@ -7444,6 +7761,16 @@ def main() -> int:
                          "flag rather than only `review_panel.pr_claim` because that "
                          "key lives in the repo under review, so flipping it to get "
                          "the control arm would change the diff being counted")
+    ap.add_argument("--no-history-brief", action="store_true", dest="no_history",
+                    help="don't show the seats the changed files' git history (#716) — "
+                         "the pre-#716 posture, in which a question about when a file "
+                         "landed is a declared coverage gap the seats cannot close. It "
+                         "is also the CONTROL ARM: #716 is measured on one PR, and the "
+                         "way that stops being n=1 is running the same PRs with and "
+                         "without the block and counting the declared gaps. A flag "
+                         "rather than only `review_panel.history_brief` because that "
+                         "key lives in the repo under review, so flipping it to get the "
+                         "control arm would change the diff being counted")
     ap.add_argument("--json-file", metavar="PATH", default="", dest="json_file",
                     help="also write the JSON payload here, keeping the report "
                          "(and --post) — unlike --json, which replaces them")
@@ -7516,6 +7843,32 @@ def main() -> int:
                          "act instead of a permanent HOLD. Per claim on purpose — "
                          "there is no flag that accepts them all. Repeatable, and "
                          "inherited by later rounds through --baseline")
+    ap.add_argument("--assessed", action="append", default=[], metavar="KEY:NOTE",
+                    help="a coverage declaration somebody has now ANSWERED (#718): "
+                         f"the declaration key ({DECLARATION_KEY_PREFIX} and 12 hex "
+                         "characters, as the report's Coverage declared block prints "
+                         "it), a colon, and what you measured. A `could_not_assess` "
+                         "line is often the cheapest veto on a round to close — the "
+                         "seat names its own missing instrument, and somebody with a "
+                         "shell supplies it — but until this flag existed the answer "
+                         "had nowhere to go, so an answered question went on holding "
+                         "the landing exactly as hard as an unanswered one. What it "
+                         "stops doing is costing the round its confidence; the "
+                         "declaration stays in the report and in the payload's "
+                         "ledger, under the key, with the note beside it. Per "
+                         "declaration on purpose — there is no flag that answers them "
+                         "all. Repeatable, and inherited by later rounds through "
+                         "--baseline")
+    ap.add_argument("--assessed-by", default="", metavar="NAME", dest="assessed_by",
+                    help="who did the measuring behind this run's --assessed answers. "
+                         "A CLAIM and not a signature — nothing here can authenticate "
+                         "a person — so it is recorded beside the round that made it "
+                         "and rendered as a claim, the way `qb record-outcome`'s "
+                         "`attested_by` is. Omit it and the answers are still "
+                         "recorded, marked unattested (#40: an unattended judgement "
+                         "is recorded as unattested rather than refused), and the "
+                         "report shows the split. Applies to every --assessed on the "
+                         "same command line: one invocation is one assessor")
     ap.add_argument("--retract", action="append", default=[], metavar="KEY",
                     help="a finding key whose DECLINATION no longer stands (#674): a "
                          "correction an earlier fix pass recorded it could not make, "
@@ -7634,6 +7987,8 @@ def main() -> int:
                                    ("--acknowledge", bool(args.acknowledge)),
                                    ("--declined", bool(args.declined)),
                                    ("--retract", bool(args.retract)),
+                                   ("--assessed", bool(args.assessed)),
+                                   ("--assessed-by", bool(args.assessed_by)),
                                    # Refused rather than ordered, because the two are
                                    # different questions about one premise and the
                                    # answer to "which ran?" must not be a reading of
@@ -7687,7 +8042,9 @@ def main() -> int:
                                    ("--narrowed", bool(args.narrowed)),
                                    ("--acknowledge", bool(args.acknowledge)),
                                    ("--declined", bool(args.declined)),
-                                   ("--retract", bool(args.retract))) if used]
+                                   ("--retract", bool(args.retract)),
+                                   ("--assessed", bool(args.assessed)),
+                                   ("--assessed-by", bool(args.assessed_by))) if used]
         if wrong:
             raise SystemExit(
                 f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
@@ -7831,7 +8188,8 @@ def main() -> int:
                args.no_code_access, args.escalated, args.escalated_from_board,
                args.narrowed, args.acknowledge, args.declined, args.premise_file,
                args.new_cycle, no_pr_claim=args.no_pr_claim,
-               retract=args.retract)
+               retract=args.retract, assessed=args.assessed,
+               assessed_by=args.assessed_by, no_history=args.no_history)
 
 
 if __name__ == "__main__":

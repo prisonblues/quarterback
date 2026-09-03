@@ -3,6 +3,7 @@
 
   qb-claim issue 172                    this checkout's repo, issue 172
   qb-claim pr 207 --note "reviewing"
+  qb-claim pr 207 --no-plan-item        hold it, but do not call it a pickup
   qb-claim branch main --ttl 7200       the BASE being landed onto, not the head
   qb-claim item <uuid>                  a plan item, by board id
 
@@ -15,6 +16,22 @@ board derives the key from it (`app/claimkey.py`). That is the whole of #172: th
 plan wrote `work/<repo>#163`, an agent wrote `issue/<repo>#163`, and the two
 subsystems reported different answers about one issue in the same second. A shell
 tool composing a third spelling would be the same defect with a new party.
+
+**A claim is a pickup unless you say otherwise.** Taking one writes that repo's
+plan item at rank 1 (#427), because picking work up is the one act that should put
+work on the board. `--no-plan-item` is the exception, and it exists because a
+review round claims the PR it is reading (#715): that is a real exclusivity record
+and a false pickup, and it left the PR sitting at rank 1 of the plan after the
+round released it, so the next agent was offered a review that had already
+happened (#722). Use it when you are holding a key rather than starting the work.
+
+**`--no-plan-item` is checked against the answer, because an older board ignores
+it.** `ClaimIn` takes pydantic's default `extra="ignore"`, and this harness and
+the board are deployed separately — so a new tool against an old board is the
+ordinary state of a rollout, not an edge case. The board answers with the item it
+wrote; if one comes back when none was asked for, that is said loudly and the
+claim still stands, since nothing out here can un-write the row and the claim is
+the half that prevents duplicated work. Roll the BOARD out first.
 
 **1 and 2 are different exits for the reason `qb-claimed` gives.** "Somebody has
 it" is the board saying something definite and a caller should stop. "Cannot tell"
@@ -93,6 +110,12 @@ def main() -> int:
                          "when this is absent; --no-gh-title stops that")
     ap.add_argument("--no-gh-title", action="store_true",
                     help="do not ask `gh` for the issue title (offline, or in a hurry)")
+    ap.add_argument("--no-plan-item", action="store_true",
+                    help="record exclusivity WITHOUT asserting a pickup: hold the key, "
+                         "and do not write the plan item a claim normally implies. For "
+                         "a caller that is not picking the work up — a review round "
+                         "holding the PR it is reading. Implies --no-gh-title, since "
+                         "the item is the title's only consumer")
     ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
                     help="your session id (default: $CLAUDE_CODE_SESSION_ID)")
     ap.add_argument("--json", action="store_true",
@@ -116,14 +139,30 @@ def main() -> int:
                 f"under two keys")
             return UNKNOWN
 
+    # The title has exactly one consumer — the plan item the board writes for a
+    # pickup — so `--no-plan-item` means no title, however it arrived. Not asked
+    # for, and not forwarded when the caller passed one: the board ignores it in
+    # that case, and a payload carrying a field that will be discarded is a wire
+    # that does not say what is about to happen. Not a refusal either: a claim
+    # turned down over a redundant argument is the coordination write lost to the
+    # tidier API, which is the trade `ClaimIn` refuses everywhere else.
     title = args.title
-    if title is None and not args.no_gh_title and args.kind.lower() in ("issue", "pr"):
+    if args.no_plan_item:
+        title = None
+    elif title is None and not args.no_gh_title and args.kind.lower() in ("issue", "pr"):
         title = _gh_title(args.kind.lower(), args.value, repo)
 
     body: dict = {"note": args.note, "session": args.session, "title": title}
     if args.ttl is not None:
         body["ttl"] = args.ttl
     body = {k: v for k, v in body.items() if v is not None}
+    if args.no_plan_item:
+        # Sent only when it is False. The board's default is True and an absent key
+        # means the default, so a claim that wants the ordinary behaviour puts the
+        # same request on the wire it always did — a flag that changed every
+        # caller's payload to say "yes, the default" would be the first place to
+        # look when a board of a different version answered differently.
+        body["plan_item"] = False
 
     try:
         client, _cfg = board_client()
@@ -203,7 +242,32 @@ def main() -> int:
     # The half a caller cannot see from the claim id: the board put this on the
     # plan (#427), and saying so is what stops the next agent adding it by hand.
     item = answer.get("plan_item")
-    if item:
+    if item and args.no_plan_item:
+        # **The flag went up and the item came back anyway: this board predates
+        # `plan_item` (#722).** `ClaimIn` takes pydantic's default `extra="ignore"`,
+        # so an older board discards the field in silence and writes the rank-1 row
+        # the flag exists to prevent — and the harness and the board are deployed
+        # separately here, so during any rollout that combination is not exotic, it
+        # is the default for as long as the two halves disagree.
+        #
+        # Said and never failed. The claim is real, it is exclusive, and it is the
+        # half that prevents duplicated work; refusing it because the plan write
+        # could not be suppressed would trade the coordination record for a tidy
+        # plan, which is the trade `_plan_item_for` refuses in the other direction.
+        # What the fleet gets instead is the evidence, because nothing out here can
+        # un-write the row: the answer carried it all along and nobody read it.
+        # Worded deliberately unlike the ordinary pickup line below it. That line
+        # ("on the plan at rank N of …") is the reassurance a caller who WANTED an
+        # item gets, and it is the sentence a reader skims past; printing it here
+        # would report the defect as the feature working.
+        say(f"  WARNING: --no-plan-item was IGNORED — this board is older than the "
+            f"flag and wrote a plan item for "
+            f"{answer.get('key') or args.value} anyway, at rank {item.get('rank')} "
+            f"of {item.get('repo') or 'the fleet'}: {item.get('title')}")
+        say(f"  the claim is yours and stands. The plan row is not: it will sit "
+            f"open at that rank once this claim is released, which is #722. Upgrade "
+            f"the board, or retire the row by hand.")
+    elif item:
         say(f"  on the plan at rank {item.get('rank')} of "
             f"{item.get('repo') or 'the fleet'}: {item.get('title')}")
     elif answer.get("plan_item_error"):

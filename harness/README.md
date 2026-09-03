@@ -393,6 +393,70 @@ itself reviewed**. Its regression tests are the only thing standing behind it. A
 whose tests pass vacuously has no backstop at all — and that is precisely the pass this
 repo has decided not to review.
 
+### Load-bearing comments — a claim in the diff is reviewable
+
+The same lever, pointed at the other artefact. `REVIEW_PROMPT`'s Documentation dimension asks
+whether a behaviour change left CLAUDE.md, docs, README or docstrings **stale** — a comment the
+diff LEFT BEHIND. Nothing asked about one the diff **wrote**: a comment or docstring stating a
+checkable property of the code beside it — *"this is the only caller"*, *"nothing between here
+and there returns"*, *"this re-reads X rather than trusting the earlier read"*, *"this cannot be
+reached"*. That is a claim, and a claim in a diff is reviewable.
+
+The measurement is 2026-09-03, on the three PRs landed that day. Each had already been through a
+review pass, each was green, and each got one more independent adversarial pass before landing.
+**Two of the three defects that pass found were in the prose**, and the third was a prose claim
+that happened to be true. #719's `qb-reconcile` comment said both facts "are re-asked at the point
+of the WRITE rather than inferred from the finding" — read plainly, a fresh `gh` call immediately
+before mutating the plan, a second safety boundary. There is none; `apply_candidates` reads
+evidence gathered in the earlier pass. Nothing was unsafe, and the comment described a guard that
+does not exist, in the file whose entire thesis is that a check nobody made must not read as a
+check that passed. #715's `panel_seats.PR_HOLD_TTL` comment had its comparison backwards and was
+corrected by an earlier round of its own review.
+
+In most codebases that is a nit, and here it is not, for two reasons. The comments **are** the
+design record — a fifty-line docstring carrying the argument, the measurement and the rejected
+alternative is the normal unit — so a wrong one propagates: the next agent reads it, believes it,
+and builds on it. And it is worse than a wrong test in one specific way. A wrong test can at least
+go red. Nothing ever *executes* a comment, so a wrong one survives every round, every CI run and
+every rebase, indefinitely.
+
+**The severity is conditioned on consequence, not on the artefact being a comment.** #724 argued a
+blanket "at least P2" and the first cut of this shipped one, which is too coarse: severity is what
+the fix pass acts on, so a floor covering every false checkable claim — a stale count, a wrong
+complexity description, a local detail nothing rests on — turns documentation nits into mandatory
+repairs and lengthens rounds. The discriminator is what relying on the claim would cost. A claim
+the change's own correctness argument leans on — a guard's justification, an ordering or
+concurrency property, the reason no `try/finally` was needed — is **P2** when false. A claim
+nothing depends on is **P3**, priced like any other documentation defect. Both tiers name it in the
+severity paragraph, so the scale a seat picks from carries the same rule as the dimension it read.
+
+**Expensive is not impossible, and the bullet has to say which.** #715's `panel.run` carried
+*"there is no early return between the claim and here — the skip and refusal exits are all ABOVE
+the dispatch"*. It is true, and it is what justifies shipping without a `try/finally`; the span is
+~2,600 lines, and what settled it here was an AST walk enumerating every `return` and checking each
+was inside a nested `def`. That was **convenience, not necessity**: grep `return` over the span and
+read the enclosing scopes and you reach the same answer by hand. `CODE_ACCESS_BRIEF` gives a
+code-reading seat Read, Grep and Glob and **no shell**, deliberately (#458, #459) — which makes a
+question like this laborious from the seat's checkout and does not make it unanswerable.
+
+The distinction is the whole of it, and the first draft of this section got it wrong in the
+direction that costs something. `CODE_ACCESS_BRIEF`'s own rule is that a question you can answer by
+opening a file is **not** a coverage gap, and a declared gap costs the round its confident stop
+(`coverage_veto`). A dimension that told seats structural claims are unsettleable would manufacture
+exactly those declarations — paying a real price to record a check nobody attempted. So the bullet
+says to grep the callers and read the enclosing scopes FIRST, and reserves `could_not_assess` for a
+claim the material genuinely cannot settle *after* looking. A load-bearing claim nobody actually
+checked is not better than a false one, just quieter; a claim declared unassessable without anyone
+opening a file is worse than both, because it reads as the check having been attempted.
+
+That residue is also the **measurement** the expensive half is gated on: #724's second proposal is
+to give the seat a shell or a canned set of structural queries, and it is the same shape as #716 (a
+code-reading seat has the files and no history) one step further on. It is not built here, and the
+reason is that the count that would decide between a shell, a fixed query set and nothing does not
+exist yet — the `could_not_assess` entries this bullet produces are how it gets taken, the same way
+#716's was. Quietly undoing "you have NO shell" ahead of that measurement would spend the
+constraint's own argument to buy an answer nobody has yet.
+
 ### `/fix-and-review` and `/fix-and-land` — an issue, end to end
 
 Both take an issue number and come back with a reviewed PR. They differ in exactly one place, and
@@ -432,9 +496,13 @@ commands and the files they touch), or `HOLD` (exit 2, with what is unresolved a
 to resolve it). `--json` for a loop, plain text for a person.
 
 It is not a new gate. It is the gates the harness already had — CI green *now*, the panel's
-newest round read *this* commit and stopped with nothing confirmed, one migration head,
+newest round read *this* commit and stopped owing nothing, one migration head,
 no failing Sonar gate, nobody else landing the same branch — read in one place instead of
-described in two. `/fix-and-land` used to hold about fifty lines of prose about them and
+described in two. "Owing nothing" is the round's own disposal of what it found (#42, #717):
+`fixable + escalated` holds the merge, and findings under the repo's `fix_severity_floor`
+are warned about, because that dial's whole content is that they are reported and not fixed
+here (#165). A round that recorded no disposal is held on its raw confirmed count, as
+before. `/fix-and-land` used to hold about fifty lines of prose about them and
 `/panel-review-pr` held none, which is how they came to disagree; both now call this and
 act on the verdict.
 
@@ -1099,6 +1167,30 @@ answer to an outage and no answer at all to a misconfiguration.
 
 `qb-claim` prints the claim id on **stdout** and everything else on stderr, so a caller can
 capture the id for `claim/renew` and `claim/release` without parsing prose.
+
+**A claim is a pickup unless you say otherwise, and `--no-plan-item` is how you say it.**
+Taking a claim on an issue or a PR writes that repo's plan item at rank 1, because picking work
+up is the one act that should put work on the board (#427). A panel review round claims the PR
+it is reading, and that is a true exclusivity record and a false pickup: the round wrote the PR
+in at rank 1, released the claim when it finished, and left the row open, unclaimed and
+unblocked at the top of the plan — so `next` handed the following agent a review that had
+already happened (#722). Pass the flag when you are holding a key rather than starting the work.
+It writes no item and it retires none, the claim is exclusive exactly as any other, and it
+implies `--no-gh-title` since the plan item was the title's only consumer.
+
+**Roll the board out FIRST, then the harness** — this is a protocol change and the two halves
+ship separately, so for as long as they disagree one of these is what happens. It is the same
+split as the reference-vs-live units under `qb-reconcile` below: what is in this repo is not
+what a host is running.
+
+| what is newer | what happens | what you see |
+| --- | --- | --- |
+| the tool | `ClaimIn` takes pydantic's `extra="ignore"`, so an old board discards `plan_item` and writes the rank-1 row anyway | `qb-claim` reads the answer back and says `WARNING: --no-plan-item was IGNORED` on stderr; a round carries it into `config_notes`. The claim stands — nothing out here can un-write the row |
+| the board | nothing: an old `qb-claim` never sends the field, and the board's default is unchanged | the ordinary pickup item, exactly as before |
+| the round, not its `qb-claim` | argparse refuses the unknown flag and exits 2 | `hold_pr` tells that refusal apart from a board's and asks again without the flag, noting that the claim was taken **with** a plan item. A visible imperfect record beats no record, which is what the round had before #715 |
+
+The order follows from the middle row: a newer board is invisible to every old caller, and a
+newer tool is not.
 
 **`create-worktree` takes the claim for you.** It derives the issue number from the branch
 it is about to make (`feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`) and
@@ -3257,6 +3349,16 @@ case entirely: every one of lexray's thirteen claims had already expired. The ho
 into the report anyway, because a row that went done under somebody's hand is the one row a
 reader may want to ask about.
 
+**A row somebody else finished is named, and this pass's receipt is not written twice.** Every
+machine in the fleet runs this timer over the same plan, so two hosts sending the same
+completion is the ordinary case rather than an unlucky one. Since #723 the board settles it:
+`open -> done` is a conditional transition, exactly one caller makes it, and the others are
+answered `changed: false` with `done_by` naming who won — so the report says who got there
+first by reading the answer rather than by comparing the returned timestamp against the moment
+the write went out, which was only ever as good as the agreement between two clocks. Against a
+board older than that there is no `changed` and the line is simply absent: a guess nothing
+supports costs more than the sentence it would explain.
+
 **`qb-next` retires a finished row too, and the two agree on the word.** Walking the plan for
 something to claim, it asks the forge about each candidate and records a row whose ref has
 already closed — `MERGED` for a PR, `CLOSED` for an issue, the same per-kind rule for the same
@@ -3324,7 +3426,8 @@ lander's. The shipped unit runs `--apply --post --quiet`: the timer is what carr
 because it covers every route work is picked up through and every abnormal ending, including a
 session that died mid-work. **The live units on this fleet come from nix-fleet's
 `home/rich-workstation.nix`** (#695's row is about exactly that split), so a flag added here
-reaches a host only once that config carries it too.
+reaches a host only once that config carries it too. The same split is what decides the rollout
+order for a change to the claim protocol — see `--no-plan-item` under `qb-claim` above.
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.

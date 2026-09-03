@@ -311,6 +311,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
 | `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
 | `review_panel.pr_claim` | Are the seats shown what the PR CLAIMS to be for — its own title and body (#550)? **true**, which is what #631 shipped: the reviewer prompt used to carry five keys and none of them was the claim, so "this change asserts a measured result and ships nothing that produces it" was invisible to the panel by construction. The block is framed as the author's ASSERTION and names the diff as the evidence; it is charged against the tightest seat's diff budget (`PR_CLAIM_BUDGET_SHARE`) and dropped whole below `PR_CLAIM_MIN_CHARS` of the author's own words, because the claim yields to the diff and never the other way round. **`false` exists to be the control arm, not to review less carefully.** #550 shipped the mechanism with its own condition unmet: a body saying "this is safe because X" primes a reviewer to accept X, a primed seat reports FEWER findings, and fewer findings look like a clean PR — so whether the framing holds has to be measured by running the same PRs with and without the block and comparing counts, and without an off switch that control arm cannot be produced at all. `--no-pr-claim` turns it off for one run, and for this key the flag is the instrument rather than a convenience: this file lives in the repo under review, so flipping the dial to get the control arm would change the very diff whose findings are being counted. Which arm a round was in is recorded on `review_runs` (`pr_claim`, `pr_claim_sent`) rather than only in `config_notes`, because no aggregation can partition a population on prose. |
+| `review_panel.history_brief` | Are the seats shown the changed files' **git history** (#716)? **true**. A code-reading seat's checkout is materialised from GitHub's tarball endpoint, which carries no `.git`, and `READ_ONLY_TOOLS = ("Read", "Grep", "Glob")` gives it no shell to run `git log` with if one were there — so it has every file in the change and cannot tell when any of them landed. It declares a coverage gap instead, and each declared gap costs the round its confident stop. On the one instrumented cycle (lexray#1631, 2 rounds, 29 confirmed findings, 8 declared gaps) **three of the eight** were questions a single `git log` answers — when a constant landed relative to a migration, whether a file had ever held another entry, whether a frozen list matched a registry *as it stood on a date* — and **zero** were closable by executing the repo's suite, which is why #92 stays closed and this exists instead. `panel_scope.history_brief` computes the block once per round from the operator's own trusted clone (`cfg["path"]`), at the ref the PR NAMES (`base_sha`, else `origin/<base>`, else `<base>` — **never the checkout's HEAD**, which is on whatever branch it was last left on), and renders it into every seat's prompt and the judge's. Per file: how many non-merge commits it has ever had, when it was first added, and its five most recent commits with author dates to the minute in one timezone — the measured question was whether one commit landed "one day after" another and the true answer was 74 minutes, which a day-granularity block would have let a seat confirm wrongly. **Renames are followed** on every read, which is a correctness fix and not a nicety: `git log -- <path>` stops dead at the commit that renamed a file INTO that path, so a file born as `old.py` and renamed last week reads as "2 commits, first added <the rename>" — a confident wrong answer where the gap it replaced was an honest "I cannot tell". The total is therefore counted off a followed log rather than taken from `rev-list --count`, which has no `--follow`: one entry may not carry a followed date beside an unfollowed count. The block also says that a git date is set by the client and rewritten by a rebase, so a gap of minutes is strong evidence rather than proof. **Vendor-neutral, which is the part no widening of `reviewer_code_access` can do:** `SEAT_READS_CODE` is `{claude}`, and on the measured cycle codex was `code_blind` in both rounds and asked `grep`-shaped questions of an empty sandbox; a prompt block reaches it anyway. **It executes nothing from the PR** — it reads a local, trusted clone's history, the safe side of #75's boundary, strictly smaller than #113 which already shipped. **It fails closed and cheap:** no `cfg["path"]`, a PR this clone never fetched, a shallow clone (whose graft would be reported as the commit that added every file), or no `git` → no block, a `config_notes` line, and the round proceeds exactly as it does today. Same contract as `fetch_pr_tree` ("never raises") and `default_branch_rules` (`{}` on any failure). Budgeted like the claim block and on the same rule — **the block yields, the diff does not**: `HISTORY_CHARS` (**4,200**) or one part in `HISTORY_BUDGET_SHARE` (**8**) of the tightest seat's `max_diff_chars`, whichever is smaller, charged off `capped` as it stood *before* the claim's deduction so the two cannot compound; files richest-first by churn, five commits each, and the block SAYS how many files did not fit so a seat cannot read a budget decision as an absence of history. **What it does not do**, said in the block itself: it answers *when* a file changed and never what it CONTAINED then — the general form is a read-only `git show`, which is a bigger change than a brief. `false` is the pre-#716 posture and `--no-history-brief` turns it off for one run; that flag is #716's control arm, because the finding is n=1 on one history-heavy migration PR and the way that stops being n=1 is running the same PRs both ways and counting the declared gaps. Which arm a round was in is a `config_notes` line. |
 | `review_panel.require_mergeable` | Must the branch be able to MERGE before a round is worth running? **true**. GitHub reporting the branch `CONFLICTING` means the merged state the review is implicitly reasoning about does not exist, and the rebase that resolves it changes the diff every finding is about — so the round is refused before any seat is dispatched. It is nearly free: mergeability rides on the PR metadata the panel already fetches, and the same check used to run only at the merge gate (`preland.check_pr_state`), i.e. after a full multi-vendor round and a judge had been spent. `false` reviews conflicted branches and says so in `config_notes`; `--force` is the per-run override. GitHub computes mergeability lazily and answers `UNKNOWN` while it does, so the question is put a second time when the first answer is cold — measured here, three consecutive reads of an open PR gave `UNKNOWN`, `CONFLICTING`, `CONFLICTING`. An `UNKNOWN` that survives both reads is a note and never a refusal. |
 | `review_panel.reviewer_code_budget_usd` | Dollars the code-reading seat may spend per invocation (`claude --max-budget-usd`). **`null`** — uncapped — for the reason `max_diff_chars` is: reaching the cap is a LOST seat (a skip, which vetoes), not a cheaper review. Measured for calibration: ~$4 for one seat on a 75,628-char diff against ~$0.70 diff-only. Applies only to a seat that got the tree; the cap is per invocation and a reparse retry can spend it twice. |
 | `review_panel.fixer_may_defer` | May a fixer answer "real, and not this change's job"? **true**. Its two exits were a refuted false positive and an escalation about the *approach*, and the brief then said "'Not now' is not available to you" — so a correct third judgement had no legal way out and the only move left was the patch. Maps to the existing `deferred` outcome; the fixer owes a justification and the orchestrator owns the record — a board row always, and a GitHub issue where `file_deferral_issues` calls for one. `false` is the old two-exit behaviour. |
@@ -1059,7 +1060,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   host and the sandbox did; a ruling is a model's opinion about a model's sentence,
   and an exemption resting on one alone would be a confidence gate the panel could
   open by writing about itself. So a `resolvable_in_harness: false` *converts* the
-  declaration into a named obligation with a key (`uc-` + 8 hex), which goes on
+  declaration into a named obligation with a key (`uc-` + 12 hex), which goes on
   vetoing until a human passes that key to `--acknowledge` — recorded state of the
   plainest kind, inherited across a cycle's rounds through `--baseline` exactly as
   `--escalated` is. Only a literal JSON `false` counts; a missing key, a malformed
@@ -1076,6 +1077,35 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   filing a task. There is no board row: `qb record-outcome` keys on a finding key and
   an obligation is not a finding, so the payload and the issue are the record, and
   giving it a row would need a schema change this deliberately does not take.
+- **A declaration somebody went and ANSWERED can be retired** (#718). #547 gave the
+  declarations nothing here could ever settle a way out; the ones that simply *were
+  not* settled still had none, so a `could_not_assess` line was permanent for the life
+  of that round's record whatever anybody subsequently learned — and `preland`'s
+  `review` check lists the round's vetoes verbatim, so an answered question went on
+  holding the landing as hard as an unanswered one. Measured on lexray#1631 round 2:
+  two of its three vetoes were the claude seat's, which cannot execute anything (#92),
+  and both were closed from a worktree at the PR head inside ten minutes.
+  Every vetoing declaration now carries a key (`ca-` + 12 hex, content-addressed over
+  the declaration's own text the way an obligation's is over the claim's) and is
+  printed with it, and `--assessed ca-xxxxxxxx:'<what you measured>'` records that
+  somebody answered it — inherited through `--baseline` exactly as `--acknowledge` is,
+  so it is done once per cycle. **Per declaration, never in bulk**: there is no flag
+  that answers them all, for #547's reason.
+  The two key spaces are disjoint and so are the registers. A declaration the judge
+  ruled unresolvable is an obligation and is answered at `--acknowledge`; everything
+  else is a declaration and is answered here, and each door refuses the other's keys
+  loudly rather than accepting one and matching nothing. It exempts the declaration
+  lines and nothing else — not a truncation, an absent seat, CI, or a judge skip — so
+  it cannot empty a veto list except by answering it one line at a time.
+  **The answer is recorded, not trusted.** `--assessed` takes the caller's word, the
+  way `--escalated` does, and stores the round, the note and `--assessed-by`'s claimed
+  assessor in the payload's `assessed` register beside a `coverage_declarations`
+  ledger. Without `--assessed-by` the row is marked **unattested** rather than refused
+  (#40, and `record-outcome`'s `refuted` treatment), the report renders the split, and
+  the name is published as a claim and never as a signature. That is strictly stronger
+  than the status quo it replaces, where the answer was recorded nowhere at all.
+  `preland` needs no change: the declaration stops appearing in `stop_veto`, which is
+  the only thing that check reads.
 - **A reviewer that produces nothing is SKIPPED, never counted as an empty review.**
   A zero exit with empty stdout is a failure for panel members and the master alike,
   and the skip line quotes the CLI's own stderr, which usually names both the cause
@@ -2755,7 +2785,7 @@ that had written up that exact confusion an hour earlier.
 | `pr_state` | Not OPEN, a draft, or `CONFLICTING`. Uncomputed mergeability warns. |
 | `checkout` | This tree is not at the PR's head, or has tracked modifications. Untracked files warn. |
 | `ci` | Anything but `green`. Six states since [#324](https://github.com/prisonblues/quarterback/issues/324) — `green`, `red`, `pending`, `blocked` (a run exists and is waiting on a human to approve it, so it has executed nothing), `none` (no run was created for this head) and `unknown` (the state could not be read). A push restarts CI, so an earlier green is stale; and the last three are silence, which is never green. A `blocked` HOLD names the newest run on the branch that actually executed. |
-| `review` | The board's newest round for this PR read another commit, did not `stop`, has `confirmed > 0`, or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
+| `review` | The board's newest round for this PR read another commit, did not `stop`, still owes work on its own disposal (`outstanding.fixable + outstanding.escalated`, or `confirmed > 0` where no disposal was recorded), or has a failing Sonar gate. No round at all is a HOLD too, and so is a round that recorded no finding count — unknown is not zero. |
 | `merge_claim` | Another agent holds `kind=merge` on `<repo>:<base>` — it is landing onto this PR's base right now. Keyed on the base rather than the head since [#318](https://github.com/prisonblues/quarterback/issues/318): two agents landing two *different* PRs into `main` is the collision worth serialising, and under head keys they never see each other. |
 | `queue` | This PR is not at the head of the merge queue for its base, or is not in the line at all while others are ([#227](https://github.com/prisonblues/quarterback/issues/227)). The reason names the position and who holds the place ahead. An empty line passes silently; a board with no `/merge-queue` reports `skipped-absent`. |
 | `migrations` | `scripts/migration_reconcile.py` says `stop`, or its plan and its exit code disagree. `relink`/`renumber`/`merge` are RECONCILE. |
@@ -2764,9 +2794,26 @@ that had written up that exact confusion an hour earlier.
 The last two also HOLD when `origin/<base>` could not be refreshed — they are answers about the gap between this branch and the base, and a base last fetched yesterday produces a confident NOOP about a head that moved this morning. `--no-fetch` makes that the caller's choice instead, noted once on the run.
 
 The `review` clauses are the round's **own statements** — `head_sha`, `stopped`,
-`confirmed`, `sonar_gate` — read back rather than re-derived. #62 spent three rounds
-discovering that merge gates trust proxies (the exit code, then the push, then the
+`confirmed`, `outstanding`, `sonar_gate` — read back rather than re-derived. #62 spent three
+rounds discovering that merge gates trust proxies (the exit code, then the push, then the
 existence of a payload file), and this must not become the fourth.
+
+**Severity, and where it comes from** ([#717](https://github.com/prisonblues/quarterback/issues/717)).
+This gate had none: any nonzero `confirmed` was a HOLD, and the file did not contain the
+word. That contradicts `review_panel.fix_severity_floor`, whose entire content is that
+findings below it are *reported and not fixed here* (#165) — so a repo running a raised
+floor could essentially never reach READY, because a round asked to find problems almost
+always finds a P3. It now rules on the round's own disposal, which `round_stop` has
+published since #42 and the board has stored since #717: HOLD on `fixable + escalated`,
+**warn** on `below_floor`. Three things it deliberately does not do. It does not subtract
+anything from `confirmed` — that count is over a larger population (findings an outcome has
+already cleared are gone from the disposal), so a difference between them is a number about
+neither. It does not compare a severity against a floor itself; the floors are repo dials
+the board holds opaquely, and a second reading of them here would be free to disagree with
+the round it is ruling on. And it does not soften on silence: escalated findings block at
+any severity (#221), a round that recorded no disposal is held on the raw `confirmed` count
+exactly as before, and a round that recorded no count at all is still held — unknown is not
+zero, in either clause.
 
 `stop_confident: false` is a **warning, not a hold** by default, deliberately: two
 permanently-absent reviewer seats on a headless box would otherwise make a green verdict

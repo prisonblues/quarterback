@@ -1480,6 +1480,11 @@ def plan_done(ctx: Context, item_id: str, note: str | None = None) -> dict:
     This does not *decide* anything: the issue closing is what makes the work
     done, and if the two disagree the issue is right. What it does is stop the
     next agent's plan read being one item out of date.
+
+    `changed` in the answer says whether THIS call is what finished the row.
+    `false` means somebody else recorded it first — `done_by` names them — and
+    your note was not appended under theirs if it said the same thing. Not an
+    error: the row is done, which is what you wanted.
     """
     try:
         return _get_client(ctx).plan_item("done", {"item_id": item_id, "note": note})

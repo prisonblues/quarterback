@@ -2063,8 +2063,11 @@ class ApplyingBoard(FakeBoard):
             raise RuntimeError(self.refuse)
         self.posts.append((path, body))
         if path == "/plan/item/done":
-            return {"item_id": body["item_id"], "state": "done",
-                    "claim_left": self.claim_left}
+            # `changed: True` because that is what a board answers a write that
+            # transitioned the row, and a fake that omitted it would let a
+            # regression in `_already_done`'s reading of the field pass unseen.
+            return {"item_id": body["item_id"], "state": "done", "changed": True,
+                    "done_by": "daedalus", "claim_left": self.claim_left}
         return {}
 
 
@@ -2558,58 +2561,37 @@ def test_a_pass_that_completed_everything_it_found_says_no_disagreement(monkeypa
     assert summary == "plan reconcile: no disagreement; 1 completed"
 
 
-#: The pass's own timeline, in the order the code makes it: the report is stamped,
-#: THEN the plan is read, THEN the writes go out. Every test below that talks about
-#: who got there first has to sit inside it, because a row this pass is writing to
-#: was read as OPEN — so nothing that finished it can have happened before the read,
-#: and a test that says otherwise is describing a sequence the pass cannot produce.
-GENERATED = "2026-08-20T12:00:00+00:00"
-WRITTEN_AT = datetime(2026, 8, 20, 12, 30, tzinfo=UTC)
+def test_a_receipt_the_board_did_not_add_is_said_out_loud(monkeypatch):
+    """Two observers of one merge is the endpoint's design — any agent may record a
+    completion — and since #723 exactly one of them transitions the row. The other
+    is told so: `changed: false`, with `done_by` naming the holder the board kept.
 
+    That window is not exotic. `--apply` runs on a fifteen-minute timer on every
+    machine in the fleet, so the second observer is usually a sibling host, and
+    sometimes the agent's own `plan_done` between this pass's plan read and its
+    write. This file's rule is that nothing it does is silent, so the receipt the
+    board declined to add is a line in the report rather than an absence.
 
-def test_a_second_receipt_on_a_row_somebody_else_finished_is_said_out_loud(
-        monkeypatch):
-    """Found by Codex on this change's own diff, and its interleaving corrected by a
-    second pass over the fix (PR #719 review).
-
-    Two observers of one merge is the endpoint's design — any agent may record a
-    completion, and the note is appended rather than replaced so two receipts can
-    coexist. What it leaves is not a wrong state but a duplicated receipt, in the
-    window between the plan read and the write: an agent's own `plan_done`, or a
-    sibling host's tick. `done_by` and `done` keep the FIRST holder's name and time,
-    so the pass can tell, and this file's rule is that nothing it does is silent.
-
-    The sibling finishes the row at 12:29:59 — after this pass was stamped at 12:00
-    and read the row open, one second before this write went out at 12:30. That is
-    the ONLY shape the race has, and it is why the comparison cannot be against
-    `report.generated`: measured from there, a peer's completion is always in the
-    future and always reads as ours.
-
-    red/green: fails on the `generated` comparison with `already is None` and no
-    line in the report — silent about the one thing it was written to say.
+    red/green: fails on `already is None` and no line in the report — the pass
+    stayed silent about the one thing this function exists to say, because
+    `_already_done` was reading a timestamp this fixture does not supply.
     """
     board = ApplyingBoard({"items": []})
     board.post = lambda path, body: {
         "item_id": body["item_id"], "state": "done", "claim_left": None,
-        "done": "2026-08-20T12:29:59+00:00", "done_by": "zeus/f5ca7491"}
-    report = full_report()
-    report.generated = GENERATED
-    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
-    _applied(report, board, monkeypatch)
+        "changed": False, "done_by": "zeus/f5ca7491"}
+    report = _applied(full_report(), board, monkeypatch)
 
     # The rendered line first: it is the assertion that names the defect, and a
     # missing key would otherwise raise before this pass could be shown to be silent.
-    assert "already recorded it" in qr.render(report)
+    assert "had already recorded it" in qr.render(report)
     assert report.applied[0]["already"] == "zeus/f5ca7491"
 
 
 def test_a_row_this_pass_finished_itself_claims_no_second_receipt(monkeypatch):
-    """The other way round, and it has to be the other way round: a `done` stamped
-    by our own write is not evidence somebody beat us to it, and reporting it as one
-    would put a peer's name on every completion this pass ever makes.
-
-    The board stamps the row as it handles the request, so our own receipt's `done`
-    lands just AFTER the moment the write left — which is the whole of the test.
+    """The other way round, and it has to be the other way round: a completion this
+    pass made is not evidence somebody beat us to it, and reporting it as one would
+    put a peer's name on every row this pass ever finishes.
 
     red/green: N-A (the negative companion). It passed before the fix too, for the
     wrong reason: nothing was ever named, so nothing was ever named wrongly.
@@ -2617,58 +2599,47 @@ def test_a_row_this_pass_finished_itself_claims_no_second_receipt(monkeypatch):
     board = ApplyingBoard({"items": []})
     board.post = lambda path, body: {
         "item_id": body["item_id"], "state": "done", "claim_left": None,
-        "done": "2026-08-20T12:30:01+00:00", "done_by": "daedalus"}
-    report = full_report()
-    report.generated = GENERATED
-    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
-    _applied(report, board, monkeypatch)
+        "changed": True, "done_by": "daedalus"}
+    report = _applied(full_report(), board, monkeypatch)
 
-    assert "already recorded it" not in qr.render(report)
+    assert "had already recorded it" not in qr.render(report)
     assert report.applied[0]["already"] is None
 
 
-def test_the_reference_for_who_got_there_first_is_the_write_not_the_report(
-        monkeypatch):
-    """The defect stated as a property rather than as one interleaving.
+def test_who_got_there_first_no_longer_depends_on_this_hosts_clock():
+    """The residual #723 retired, pinned so it cannot come back.
 
-    `report.generated` is stamped before the plan is read and `run` reads OPEN rows
-    only, so every completion this comparison exists to catch necessarily lands
-    after it. Pinned here so that a later change cannot quietly move the reference
-    back to the report and leave the two tests above passing on a coincidence of
-    their fixtures.
+    The previous version inferred the answer by comparing the board's `done` stamp
+    against the moment this write went out, and named a peer when `done` was the
+    older of the two. That was correct only while the two clocks agreed: a fast
+    local clock named a peer for a receipt that was ours, a slow one stayed quiet
+    about one that was not, and neither host could tell which had happened.
+
+    Both rows here carry a `done` stamp that would have inverted that comparison —
+    hours in the future on the row somebody else finished, hours in the past on the
+    one we finished ourselves — and the answers are unchanged, because nothing reads
+    a timestamp any more. `changed` is the board's own answer to the question, made
+    where the transition was decided.
     """
-    board = ApplyingBoard({"items": []})
-    board.post = lambda path, body: {
-        "item_id": body["item_id"], "state": "done", "claim_left": None,
-        # Later than `generated` — as any real second observer must be — and
-        # earlier than the write.
-        "done": "2026-08-20T12:15:00+00:00", "done_by": "hermes/seat-1"}
-    report = full_report()
-    report.generated = GENERATED
-    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
-    _applied(report, board, monkeypatch)
-
-    assert report.applied[0]["already"] == "hermes/seat-1"
+    theirs = {"changed": False, "done_by": "hermes/seat-1",
+              "done": "2099-01-01T00:00:00+00:00"}
+    ours = {"changed": True, "done_by": "daedalus",
+            "done": "1999-01-01T00:00:00+00:00"}
+    assert qr._already_done(theirs) == "hermes/seat-1"
+    assert qr._already_done(ours) is None
 
 
 @pytest.mark.parametrize("view", [
     {},
-    {"done": None, "done_by": "zeus"},
-    {"done": "not a timestamp", "done_by": "zeus"},
-    {"done": "2026-08-20T09:00:00+00:00"},
+    {"changed": True, "done_by": "zeus"},
+    {"changed": False},
+    {"changed": False, "done_by": None},
+    # A board older than #723 answers a question it was never asked with nothing.
+    {"done": "2026-08-20T09:00:00+00:00", "done_by": "zeus"},
 ])
 def test_a_response_that_cannot_answer_who_got_there_first_says_nothing(view):
-    """Guessing either way round would put a sentence in the report that no
-    comparison supports — which costs more than the line it would explain. A board
-    too old to return the field is exactly this case."""
-    assert qr._already_done(view, "2026-08-20T12:00:00+00:00") is None
-
-
-def test_a_naive_timestamp_either_side_does_not_take_the_tick_down():
-    """`fromisoformat` yields a naive datetime for a stamp with no offset, and
-    comparing naive with aware raises — inside a loop that is mid-way through a set
-    of writes, which would lose the report for the ones already made."""
-    assert qr._already_done({"done": "2026-08-20T09:00:00", "done_by": "zeus"},
-                            "2026-08-20T12:00:00+00:00") == "zeus"
-    assert qr._already_done({"done": "2026-08-20T09:00:00+00:00", "done_by": "zeus"},
-                            "2026-08-20T12:00:00") == "zeus"
+    """Guessing either way round would put a sentence in the report that nothing
+    supports — which costs more than the line it would explain. A board too old to
+    return the field is exactly this case, and it is the one that will actually
+    happen: the fleet's harnesses are updated one machine at a time."""
+    assert qr._already_done(view) is None

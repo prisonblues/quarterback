@@ -610,6 +610,59 @@ class ReviewRun(Base):
     #: collapsing them would either block landings this repo's own policy allows
     #: or count them as clean finishes they are not.
     converged: Mapped[bool | None] = mapped_column(Boolean)
+    #: WHAT THE CYCLE LEFT BEHIND, counted (#717). ``round_stop.outstanding`` on
+    #: the round payload, as ``{"fixable": n, "below_floor": n, "escalated": n,
+    #: "narrowed": n, "declined": n}`` — the length of each list the panel
+    #: published, and nothing else.
+    #:
+    #: **The counts are what** :attr:`n_confirmed` **is not.** That column is every
+    #: judge-confirmed finding on the round; this is the round's own disposal of
+    #: them, cut at the repo's ``cleared_floor`` and with the escalated and
+    #: narrowed keys already taken out. The two populations are different and a
+    #: reader cannot get from one to the other by subtraction — which is what
+    #: ``preland`` was doing without knowing it, holding every below-floor finding
+    #: against a merge on a repo whose own policy says they are reported and not
+    #: fixed here (#165, #717).
+    #:
+    #: **Three disjoint sets**, and that is a property of the panel rather than a
+    #: hope about it: ``cleared_out`` removes every escalated and narrowed key
+    #: before ``fixable``/``below_floor`` are split at the floor, so
+    #: ``fixable + escalated`` is a sum and not a double count.
+    #: ``panel_rounds.round_stop`` computes it and
+    #: ``harness/loops/tests/test_panel_outstanding.py`` pins it.
+    #:
+    #: **Counted here, never re-derived.** The keys are lists on the payload and
+    #: this is their length; nothing on this board decides which finding is below
+    #: which floor, because the floors are repo dials the board holds as opaque
+    #: JSON and does not interpret — the argument :attr:`converged` and
+    #: ``m6bc45ff1`` make at length, and it applies here with more force: a
+    #: board-side split would be a second reading of the policy that produced the
+    #: verdict stored beside it.
+    #:
+    #: NULL = the panel did not say. Every run recorded before this column, every
+    #: producer too old to send the block, and every payload whose block arrived
+    #: without all three of the counted-and-read keys — a disposal missing one of
+    #: them is not a smaller disposal, it is a false one, so it is refused whole.
+    #: A consumer must read NULL as "how much is owed is unknown" and never as
+    #: zero.
+    outstanding_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: WHO the round handed that remainder to (#42, stored by #717) —
+    #: ``fixer``, ``human`` or ``nobody``, out of the panel's own vocabulary
+    #: (:data:`app.api.reviews.HANDED_TO`). The verdict beside the measurement, on
+    #: the terms ``round_stop`` keeps them apart: the counts are a property of the
+    #: ROUND and true of it either way, and this is the property of a round that is
+    #: ENDING a cycle.
+    #:
+    #: NULL by two routes that a reader has to keep apart with the row's own
+    #: ``stopped``: the panel did not say (every pre-column run), or the round went
+    #: again and made no disposal at all. Reading it for truthiness answers "is
+    #: anything owed" with a fact about the payload's age.
+    #:
+    #: Stored as one word and gated on nothing here. ``preland`` rules on the
+    #: counts, which cannot drift from the lists they were taken from; this is what
+    #: a reader of that verdict needs in order to see who the round thought was
+    #: owed the work.
+    handed_to: Mapped[str | None] = mapped_column(Text)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)

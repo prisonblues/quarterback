@@ -506,6 +506,31 @@ DEFAULTS: dict = {
         # file lives in the repo under review, so flipping it here to get the control
         # arm would change the diff whose findings are being counted.
         "pr_claim": True,
+        # Do the seats see the changed files' GIT HISTORY? **On** (#716).
+        #
+        # A code-reading seat's checkout comes from GitHub's tarball endpoint and
+        # carries no `.git`, and `READ_ONLY_TOOLS` gives it no shell to run `git log`
+        # with anyway — so it can read every file in the change and cannot tell when
+        # any of them landed. On the one instrumented cycle, three of eight declared
+        # coverage gaps were questions a single `git log` answers, and each declared
+        # gap costs the round its confident stop. The block is computed once by the
+        # panel from the operator's own clone and rendered into every seat's prompt,
+        # so a `code_blind` seat gets it too — which is the part no widening of
+        # `reviewer_code_access` can do.
+        #
+        # `false` is the pre-#716 posture and costs nothing but the answers: the block
+        # is charged to the seat's diff budget (an eighth of it at most), so a repo
+        # that would rather spend every character on the diff is making a real choice.
+        # It is also #716's control arm — the finding is n=1, and the comparison that
+        # fixes that runs the same PRs both ways. `panel.py --no-history-brief` is the
+        # per-run override, and for that use it is the instrument rather than a
+        # convenience: this file lives in the repo under review, so flipping it here
+        # to get the control arm would change the diff whose gaps are being counted.
+        #
+        # Absent from `BOARD_DIALS` on `pr_claim`'s and `reviewer_code_access`'
+        # precedent: what the board may set is a judgement about COST, and this is a
+        # judgement about what evidence a seat is given.
+        "history_brief": True,
         # Must the branch be able to MERGE before a round is worth running? **On.**
         # The merged state a review is implicitly reasoning about does not exist
         # while GitHub reports the branch CONFLICTING, and the rebase that resolves
