@@ -358,6 +358,30 @@ def test_two_worktrees_of_an_originless_repo_report_the_SAME_name(hook):
         f"the repo was named after a worktree rather than the repository: {posted}")
 
 
+def test_an_exported_CDPATH_cannot_redirect_the_repo_name(hook):
+    """The hook resolves `--git-common-dir` with `cd`, and from a main checkout that
+    answer is the BARE relative `.git`. A `cd` operand not beginning with `/`, `./`
+    or `..` is searched for on CDPATH first, so an agent whose shell profile exports
+    CDPATH with any entry holding a `.git` directory resolves somebody else's
+    repository — and `cd` echoes the directory when CDPATH is what found it, so the
+    command substitution captures the wrong path TWICE.
+
+    That is worse than the bug this whole branch is about. #714's failure was a name
+    nobody could resolve; this one is a name that resolves to a real repository the
+    session is not in, and a peer asking `/active` about that repo is answered with
+    an agent who was never there. Neither empty nor obviously wrong is the hardest
+    kind to notice.
+
+    The decoy is a directory containing nothing but `.git`, which is all CDPATH
+    resolution needs — it never looks inside. Asserting the exact name catches both
+    halves: the misresolution puts the decoy's name here, and the doubled `cd` echo
+    corrupts the value even when CDPATH happens to resolve to the right place."""
+    decoy = hook.root / "decoy"
+    (decoy / ".git").mkdir(parents=True)
+    hook.start(CDPATH=str(decoy))
+    assert hook.reported_repo(hook.lease()) == "checkout", hook.lease()
+
+
 def test_the_sandbox_flag_only_governs_the_fallback_not_a_real_remote(hook):
     """`QB_SANDBOX` says "the directory I gave you is a throwaway", not "publish
     nothing". A seat that somehow ran in a checkout with a real origin has a repo

@@ -444,13 +444,36 @@ if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
   # and `pwd` are POSIX and answer identically on every git, so the version
   # question does not arise.
   #
-  # The subshell is the guard as well as the resolution: an empty common dir, an
-  # unreadable path or a `cd` that fails leaves `_root` empty, and an empty `_root`
-  # yields an empty `repo` — which is the safe outcome, the same one a sandbox
-  # gets.
+  # `CDPATH=` is load-bearing, not hygiene. `--git-common-dir` answers the BARE
+  # relative `.git` from a main checkout, and a `cd` operand that does not begin
+  # with `/`, `./` or `..` is searched for on CDPATH first — so an agent whose
+  # shell profile exports CDPATH with any entry holding a `.git` lands in somebody
+  # else's repository, and the hook publishes a lease for a repo this session is
+  # not in. That is #714's own failure made worse: not a name nobody can resolve,
+  # a name that resolves to the wrong thing. Measured with a decoy at
+  # `$CDPATH/.git`: the substitution came back
+  # `/tmp/…/decoy/.git\n/tmp/…/decoy/.git` — wrong, and DOUBLED, because `cd`
+  # echoes the directory it landed on whenever CDPATH is what found it. Emptying
+  # CDPATH closes both halves at once (no search, so nothing to echo); the
+  # `>/dev/null` under it is belt-and-braces so no stdout from `cd` can ever reach
+  # the value, whatever a future shell decides to print.
+  #
+  # The subshell is the guard as well as the resolution. `_root` is empty when the
+  # common dir came back empty, when either `cd` fails (the checkout deleted under
+  # us, an unreadable git dir) or when `pwd` fails — every one of them short-
+  # circuits before `pwd`, so nothing partial is printed. An empty `_root` then
+  # yields an empty `repo`: `${_root%/.git}` is empty, `printf` writes nothing, and
+  # `sed` over no input outputs nothing. No repo is the safe outcome and the same
+  # one a sandbox gets.
   if [ -z "$repo" ] && [ -z "${QB_SANDBOX:-}" ]; then
     _gitdir=$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)
-    _root=$([ -n "$_gitdir" ] && cd "$cwd" 2>/dev/null && cd "$_gitdir" 2>/dev/null && pwd)
+    _root=$(
+      [ -n "$_gitdir" ] || exit 1
+      CDPATH=
+      cd "$cwd" >/dev/null 2>&1 || exit 1
+      cd "$_gitdir" >/dev/null 2>&1 || exit 1
+      pwd
+    )
     repo=$(printf '%s' "${_root%/.git}" | sed -E 's#/+$##; s#\.git$##; s#.*/##')
   fi
   branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
