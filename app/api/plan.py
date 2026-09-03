@@ -54,7 +54,19 @@ from typing import Literal, NamedTuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import case, delete, func, or_, select, text, tuple_, update
+from sqlalchemy import (
+    ColumnElement,
+    Text,
+    case,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+    tuple_,
+    update,
+)
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -151,6 +163,11 @@ STALE_DAYS = 14
 MAX_TITLE = 200
 MAX_NOTE = 2000
 MAX_DEPS = 32
+#: What separates a completion receipt from the reasoning it is appended to. A
+#: constant because the rule is written twice — once in Python for a plan's note
+#: (:func:`_completion_note`) and once in SQL for an item's
+#: (:func:`_completion_note_sql`) — and this is the part that would drift.
+_DONE_SEP = "\n— done: "
 #: A plan label is a handle an agent says out loud, not a description. The old
 #: ``phase`` column was bounded at 64 on the wire and this keeps that.
 MAX_LABEL = 64
@@ -2638,37 +2655,178 @@ async def complete_item(
     would mean an agent that watched the PR merge has to wait for a lapsed claim
     before the plan stops offering finished work. The response names the claim
     that was left, so a disagreement is legible rather than silent.
+
+    **And exactly one of them transitions the row (#723).** "Whoever observes it
+    may write it down" was implemented as read-modify-write with no lock and no
+    condition: every caller that found the row open stamped `done_by` over the
+    last one and appended its receipt either way. That was tolerable while the
+    observers were people and the agents they were driving. `qb-reconcile --apply`
+    made it the ordinary case — an actor on a fifteen-minute timer on every
+    machine in the fleet, each reading the same open row and writing the same
+    completion — so an item finished by the fleet collected one receipt per host.
+
+    The transition is now a conditional UPDATE, `open -> done`, decided by the
+    database. `changed` says whether this call is the one that made it; a caller
+    that lost gets `changed: false` beside the winner's `done_by`, and its
+    receipt is not appended a second time. What did NOT change is who may call:
+    the losing caller is answered 200 with the row's true state, not 409, because
+    "somebody already recorded this" is the answer the caller wanted.
     """
     item = await _get(session, body.item_id)
     if item.state == "dropped":
-        # A drop is a human decision that this should NOT happen. Letting an
-        # agent finish it anyway would route around the one rule the human-only
-        # endpoints exist to keep — quietly, and in the record.
-        raise HTTPException(409, detail={
-            "error": "a human dropped this item", "item_id": str(item.id),
-            "hint": "if the work happened anyway, ask for it to be reopened first"})
+        raise _dropped(item)
     # The COMPLETING agent's own words, never the note it is appending to: an
     # exemption a person already granted must not make its own PR impossible to
     # record as finished. A completed item exempts nothing anyway — the queue only
     # reads OPEN items — but a human may reopen one, and that is the seam.
     _refuse_agent_exemption(item.ref_kind, body.note)
     now = _utcnow()
+    said = _norm_text(body.note)
     claim = await live_claim(session, CLAIM_KIND, claim_key(item), now)
     mine = claim is not None and _is_mine(claim, holder, body.session)
     left = None if mine or claim is None else claim_view(claim)
     if claim is not None and mine:
         claim.released_at = now
-    if item.state != "done":
-        item.state, item.done_at, item.done_by = "done", now, holder
-    item.note = _completion_note(item.note, body.note)
-    item.updated_at = now
+    # Conditional UPDATE, not read-then-write — `renew_claim`'s pattern, for the
+    # reason its comment gives: the predicate is evaluated by the database at
+    # write time, so the row cannot move between the look and the write. The
+    # expected state the issue asks for is spelled as that predicate rather than
+    # taken in the body, because every caller of `done` expects the same one and
+    # a field that is always `"open"` is a constant the caller has to type.
+    stamped: dict = {"state": "done", "done_at": now, "done_by": holder,
+                     "updated_at": now}
+    if said:
+        stamped["note"] = _completion_note_sql(said)
+    won = await session.execute(
+        update(PlanItem)
+        .where(PlanItem.id == item.id, PlanItem.state == "open")
+        .values(**stamped)
+        .returning(PlanItem.id))
+    changed = won.scalar_one_or_none() is not None
+    if not changed:
+        # Nothing transitioned: the row was already finished, another caller won
+        # the race, or a human dropped it inside the gap the check above cannot
+        # cover — that check read a row this transaction never locked. Under READ
+        # COMMITTED the UPDATE above has already waited out whoever was writing,
+        # so this reads the settled row and not the one we opened with.
+        state = await session.scalar(
+            select(PlanItem.state).where(PlanItem.id == item.id))
+        if state is None:
+            raise HTTPException(404, "plan item not found")
+        if state == "dropped":
+            raise _dropped(item)
+        if said:
+            # **The human path stays open.** A person's `plan_done` following an
+            # agent's still gets to say something, and it still lands: what is
+            # refused is the same sentence twice. `qb-reconcile --apply` runs on a
+            # fifteen-minute timer on every machine in the fleet and `apply_note`
+            # renders byte-identical text on each of them — no host, no timestamp —
+            # so the duplicate this drops is exactly the fleet's and nobody else's.
+            #
+            # In SQL rather than in Python for the same reason as the transition:
+            # the value is derived from the note as it is AT THE WRITE, so two
+            # callers appending different words cannot overwrite one another the
+            # way the read-modify-write did.
+            #
+            # `state == "done"` for the same reason again, and it is not
+            # belt-and-braces: a person may reopen a done item, and the SELECT
+            # above is a read this transaction did not lock either. Without the
+            # predicate, a reopen landing in that gap gets a completion receipt
+            # written onto live work.
+            await session.execute(
+                update(PlanItem)
+                .where(PlanItem.id == item.id, PlanItem.state == "done",
+                       ~_note_already_says(said))
+                .values(note=_completion_note_sql(said), updated_at=now))
     await session.commit()
+    # The row as the writes left it. `expire_on_commit=False`, so `item` still
+    # holds what the opening SELECT read — which, now that the write is a Core
+    # UPDATE and not an attribute assignment, is a row that never went done.
+    await session.refresh(item)
     view = (await _view_items(session, [item], now, mine=holder,
                               session_id=body.session))[0]
     # The claim itself, not a bool: `done` no longer renders a claim on the item
     # (it is history), so "somebody else was holding this when it was recorded
     # finished" would otherwise be a fact with nowhere left to read it.
-    return {**view, "claim_left": left}
+    #
+    # `changed` says whether THIS call is what finished the row. It is the whole
+    # of #723's reporting half: a caller that lost can read the answer instead of
+    # inferring it from timestamps, and `done_by` beside it names who won.
+    #
+    # It says nothing about what the row IS — `state` in the view does, refreshed
+    # after the write. The two come apart in one race, and the pairing is what
+    # keeps it legible: a person reopening the item between the failed transition
+    # and the read gets `changed: false` with `state: "open"` and no `done_by`,
+    # because reopening clears it. Nobody is named for a completion that was
+    # undone, which is what a caller inferring "somebody else recorded it" from
+    # `changed` alone would have done.
+    return {**view, "claim_left": left, "changed": changed}
+
+
+def _dropped(item: PlanItem) -> HTTPException:
+    """A drop is a human decision that this should NOT happen.
+
+    Letting an agent finish it anyway would route around the one rule the
+    human-only endpoints exist to keep — quietly, and in the record. Raised from
+    two places now: before the write, where it costs nothing, and after a
+    transition that did not happen, where it is the only way to tell "somebody
+    else recorded it done" from "a person dropped it while I was writing".
+    """
+    return HTTPException(409, detail={
+        "error": "a human dropped this item", "item_id": str(item.id),
+        "hint": "if the work happened anyway, ask for it to be reopened first"})
+
+
+def _note_already_says(said: str) -> ColumnElement[bool]:
+    """Is this exact receipt already a LINE of the item's note?
+
+    The rule the no-op append is documented to keep — "the same sentence twice" —
+    stated as the predicate it actually needs. A plain substring test was wider
+    than the argument for it (found by Codex on this change's own diff): a note
+    reading `— done: landed in PR #143 after the schema change` would have
+    swallowed a later caller's `landed in PR #143`, which is a different sentence
+    somebody wanted on the record. Dropping a distinct one is the failure this
+    whole no-op path was written to avoid, one clause narrower.
+
+    A note is `\n`-joined and every element after the first carries
+    :data:`_DONE_SEP`, so a receipt is present exactly when the padded text holds
+    ``\n<said>\n`` (it was the first thing written) or ``\n— done: <said>\n``
+    (it was appended). Padding both ends is what lets one `contains` answer for
+    the head, the middle and the tail at once, instead of four anchored LIKEs.
+    """
+    padded = func.concat(literal("\n", Text), func.coalesce(PlanItem.note, ""),
+                         literal("\n", Text), type_=Text)
+    return or_(padded.contains(f"\n{said}\n", autoescape=True),
+               padded.contains(f"{_DONE_SEP}{said}\n", autoescape=True))
+
+
+def _completion_note_sql(said: str) -> ColumnElement[str]:
+    """:func:`_completion_note`'s rule as an expression the DATABASE evaluates.
+
+    The same append, against the note as it is at the moment of the write rather
+    than as some earlier SELECT found it. That is what makes it safe to run from
+    two hosts at once: `note = <text read a round trip ago> + receipt` silently
+    dropped whichever concurrent append committed first, which is the second half
+    of #723 and the half no reader would ever notice — the row is done either
+    way, and only the sentence explaining it is missing.
+
+    **Two implementations of one rule, deliberately, and pinned together by a
+    test.** :func:`_completion_note` stays for ``finish_plan``, which appends to a
+    *plan's* note through the ORM and is not written by anything on a timer; the
+    shared constants (:data:`_DONE_SEP`, :data:`MAX_NOTE`) are the parts that can
+    drift, and ``test_the_sql_append_and_the_python_one_say_the_same_thing``
+    fails if they do. Rewriting ``finish_plan`` to match would be the same fix on
+    an endpoint no ticket is about.
+
+    ``literal(said, Text)`` and not a bare string: the ``THEN`` arm is a bind
+    parameter with nothing around it to type it, and asyncpg asks the server to
+    infer, which it cannot always do inside a ``CASE``.
+    """
+    merged = case((func.coalesce(PlanItem.note, "") == "", literal(said, Text)),
+                  else_=PlanItem.note.concat(literal(_DONE_SEP + said, Text)))
+    # `right(s, n)` is `merged[-MAX_NOTE:]`: the last n characters, or the whole
+    # string when it is shorter.
+    return func.right(merged, MAX_NOTE)
 
 
 def _completion_note(existing: str | None, said: str | None) -> str | None:
@@ -2680,11 +2838,17 @@ def _completion_note(existing: str | None, said: str | None) -> str | None:
     stale (#478). What it is not is a side effect of finishing something. Replacing it with a completing agent's receipt
     ("landed in PR #143") deleted the intent and left the receipt in a field the
     agent was not allowed to write, unrecoverably.
+
+    A PLAN's note, since #723 — an item's is appended by
+    :func:`_completion_note_sql`, which states the rule as SQL so that two hosts
+    completing the same item cannot lose one another's words. A plan is finished
+    by an agent that decided to, never by a timer, so the race that forced the
+    move does not reach here and the ORM write stays.
     """
     said = _norm_text(said)
     if not said:
         return existing
-    merged = f"{existing}\n— done: {said}" if existing else said
+    merged = f"{existing}{_DONE_SEP}{said}" if existing else said
     return merged[-MAX_NOTE:] if len(merged) > MAX_NOTE else merged
 
 

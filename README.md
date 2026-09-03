@@ -457,6 +457,12 @@ POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
                           claim blocks, it is not a note to read past
 POST  /plan/item/release { item_id, session? }         (idempotent)
 POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
+                          `open -> done` is a conditional UPDATE, so of two callers
+                          racing the same row exactly one transitions it. The other is
+                          answered 200 with `changed: false`, `done_by` naming who won,
+                          and its note is not appended a second time if the row already
+                          carries it — a fleet of `qb-reconcile --apply` timers writes
+                          the same receipt on every host (#723)
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
 POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← delegated
                                           (plan/state person-only)
