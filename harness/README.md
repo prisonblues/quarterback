@@ -418,28 +418,44 @@ design record — a fifty-line docstring carrying the argument, the measurement 
 alternative is the normal unit — so a wrong one propagates: the next agent reads it, believes it,
 and builds on it. And it is worse than a wrong test in one specific way. A wrong test can at least
 go red. Nothing ever *executes* a comment, so a wrong one survives every round, every CI run and
-every rebase, indefinitely. Hence the floor: at least **P2**, stated in the dimension and again in
-the severity paragraph, where the tier a seat would otherwise reach for is P3 "style, naming,
-simplifications".
+every rebase, indefinitely.
 
-**The claim a seat cannot check goes in `could_not_assess`, and that is deliberate.** #715's
-`panel.run` carried *"there is no early return between the claim and here — the skip and refusal
-exits are all ABOVE the dispatch"*. It is true, and it is what justifies shipping without a
-`try/finally`; the span is ~2,600 lines and confirming it took an AST walk enumerating every
-`return` and checking each was inside a nested `def`. `CODE_ACCESS_BRIEF` gives a code-reading seat
-Read, Grep and Glob and **no shell**, deliberately (#458, #459), so structural claims of that shape
-are not settleable from the seat's checkout. A dimension that asks for a check no seat can perform,
-with nowhere to say so, is answered by a silence that reads as a pass — a load-bearing claim nobody
-can check is not better than a false one, just quieter.
+**The severity is conditioned on consequence, not on the artefact being a comment.** #724 argued a
+blanket "at least P2" and the first cut of this shipped one, which is too coarse: severity is what
+the fix pass acts on, so a floor covering every false checkable claim — a stale count, a wrong
+complexity description, a local detail nothing rests on — turns documentation nits into mandatory
+repairs and lengthens rounds. The discriminator is what relying on the claim would cost. A claim
+the change's own correctness argument leans on — a guard's justification, an ordering or
+concurrency property, the reason no `try/finally` was needed — is **P2** when false. A claim
+nothing depends on is **P3**, priced like any other documentation defect. Both tiers name it in the
+severity paragraph, so the scale a seat picks from carries the same rule as the dimension it read.
 
-So the bullet routes those into the coverage channel the envelope already has. That is also the
-**measurement** the expensive half is gated on: #724's second proposal is to give the seat a shell
-or a canned set of structural queries, and it is the same shape as #716 (a code-reading seat has
-the files and no history) one step further on. It is not built here, and the reason is that the
-count that would decide between a shell, a fixed query set and nothing does not exist yet — the
-`could_not_assess` entries this bullet produces are how it gets taken, the same way #716's was.
-Quietly undoing "you have NO shell" ahead of that measurement would spend the constraint's own
-argument to buy an answer nobody has yet.
+**Expensive is not impossible, and the bullet has to say which.** #715's `panel.run` carried
+*"there is no early return between the claim and here — the skip and refusal exits are all ABOVE
+the dispatch"*. It is true, and it is what justifies shipping without a `try/finally`; the span is
+~2,600 lines, and what settled it here was an AST walk enumerating every `return` and checking each
+was inside a nested `def`. That was **convenience, not necessity**: grep `return` over the span and
+read the enclosing scopes and you reach the same answer by hand. `CODE_ACCESS_BRIEF` gives a
+code-reading seat Read, Grep and Glob and **no shell**, deliberately (#458, #459) — which makes a
+question like this laborious from the seat's checkout and does not make it unanswerable.
+
+The distinction is the whole of it, and the first draft of this section got it wrong in the
+direction that costs something. `CODE_ACCESS_BRIEF`'s own rule is that a question you can answer by
+opening a file is **not** a coverage gap, and a declared gap costs the round its confident stop
+(`coverage_veto`). A dimension that told seats structural claims are unsettleable would manufacture
+exactly those declarations — paying a real price to record a check nobody attempted. So the bullet
+says to grep the callers and read the enclosing scopes FIRST, and reserves `could_not_assess` for a
+claim the material genuinely cannot settle *after* looking. A load-bearing claim nobody actually
+checked is not better than a false one, just quieter; a claim declared unassessable without anyone
+opening a file is worse than both, because it reads as the check having been attempted.
+
+That residue is also the **measurement** the expensive half is gated on: #724's second proposal is
+to give the seat a shell or a canned set of structural queries, and it is the same shape as #716 (a
+code-reading seat has the files and no history) one step further on. It is not built here, and the
+reason is that the count that would decide between a shell, a fixed query set and nothing does not
+exist yet — the `could_not_assess` entries this bullet produces are how it gets taken, the same way
+#716's was. Quietly undoing "you have NO shell" ahead of that measurement would spend the
+constraint's own argument to buy an answer nobody has yet.
 
 ### `/fix-and-review` and `/fix-and-land` — an issue, end to end
 

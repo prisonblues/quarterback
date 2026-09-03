@@ -236,11 +236,18 @@ assertion that the defect is gone, and it will keep passing when the defect retu
 On PR #90 a deliberate, docstring'd regression test passed because its fixture
 happened to list two baselines in the working order, and the defect it was written
 for had to be found a round later in code that was already "covered". Docs that describe changed behaviour
-(CLAUDE.md, docs/, README, docstrings) get updated. And the comments the diff WRITES are
-read as claims, not as scenery: "this is the only caller", "nothing between here and
-there returns", "this re-reads X" are checkable properties of the code beside them, and
-a wrong one is at least P2 — nothing ever executes a comment, so it survives every round,
-every CI run and every rebase, and the next change is made on the strength of it. Related code — callers,
+(CLAUDE.md, docs/, README, docstrings) get updated. And the comments the diff WRITES
+are read as claims, not as scenery: "this is the only caller", "nothing between here
+and there returns", "this re-reads X" are checkable properties of the code beside them.
+Nothing ever executes a comment, so a wrong one survives every round, every CI run and
+every rebase. Price it by what RESTS on it — a claim the change's own correctness
+argument leans on (a guard's justification, an ordering or concurrency property, the
+reason no `try/finally` was needed) is P2 when false; one nothing depends on is P3, an
+ordinary documentation defect. And checking is usually laborious rather than
+impossible: grep the callers, read the enclosing scopes, and only then decide you
+cannot settle it. What is left after looking goes on the summary's `Unverified claims`
+line — that residue is the measurement that decides whether a reviewer needs more than
+Read, Grep and Glob, and a line nobody looked before writing corrupts it. Related code — callers,
 siblings, parallel implementations — is governed by **`reviewer_scope`**: under
 `repo` it gets made consistent (search the codebase, don't just review the diff);
 under `diff`, the default, you read it to judge the change and file work only where
@@ -1032,6 +1039,13 @@ Surface — files touched outside the change under review: <none, or one line pe
   file: the path, why the finding could not be answered inside the change, and what
   kept the edit small. This is the declaration step 3 requires; `none` is the
   expected answer and is written out rather than omitted>
+
+Unverified claims — load-bearing comments in the diff this pass could not settle:
+  <none, or one line per claim: the `file:line`, the claim, and what would settle it.
+  Written out rather than omitted, for `Surface`'s reason, and `none` is the expected
+  answer — checking one of these is usually laborious rather than impossible, so a
+  claim you did not grep for is not one of them. This line is the residue AFTER
+  looking, and it is what says whether a reviewer needs more than Read, Grep and Glob>
 
 Tests added: ...
 Docs updated: ... (or "none needed")

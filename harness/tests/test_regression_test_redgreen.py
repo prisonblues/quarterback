@@ -349,6 +349,53 @@ def test_review_pr_reports_the_redgreen_count(briefs):
         "skipped the step reports identically to one that did it")
 
 
+def _completeness(text: str) -> str:
+    """`/review-pr`'s **Completeness** paragraph — the operative section, not the brief.
+
+    Delimited for `_dimensions`' reason one artefact over, and this change is what made it
+    concrete rather than hypothetical. The `Unverified claims` block it adds to the report
+    format matches TWO of the three patterns asserted below ("comments … claims" and
+    "laborious"), so a whole-file search passes with the Completeness instruction deleted and
+    only the reporting line left standing — an assertion that cannot fail on the thing it names,
+    which is the shape this file exists to object to."""
+    start = text.index("**Completeness:**")
+    rest = text[start + len("**Completeness:**"):]
+    nxt = re.search(r"^\*\*[A-Z]", rest, re.M)
+    return rest[:nxt.start()] if nxt else rest
+
+
+def _summary_block(text: str) -> str:
+    """The report format `/review-pr` tells a reviewer to return, delimited by its fence.
+
+    A separate accessor from `_completeness` because the two answer different halves: what the
+    reviewer is told to LOOK for, and what the reviewer is made to SAY. A dimension present in
+    the first and absent from the second is a check with no channel to report through."""
+    start = text.index("## Review Summary")
+    return text[start:text.index("\n```", start)]
+
+
+def _summary_field(summary: str, name: str) -> str:
+    """One declaration line of the report format, bounded to its OWN block.
+
+    A field is a heading line plus its indented continuation, ended by a blank line. Bounding
+    matters and the first draft of this file proved why: the `none` assertion below scanned from
+    the field's heading to the end of the summary, where `Docs updated: ... (or "none needed")`
+    would have answered it — so the assertion passed whether or not the field it names spells its
+    empty case. That is the shape this file objects to, found by an independent pass on the very
+    change that adds the dimension for it."""
+    start = summary.lower().index(name.lower())
+    rest = summary[start:]
+    end = rest.find("\n\n")
+    return rest if end < 0 else rest[:end]
+
+
+def _panel_dimensions(text: str) -> str:
+    """`/panel`'s own enumeration of the dimensions it sends — the parenthesis after "Craft
+    review", and not the hundred-odd lines of argument-parsing and workflow below it."""
+    start = text.index("Craft review (")
+    return text[start:text.index(")", start)]
+
+
 def test_review_pr_asks_the_reviewer_to_read_tests_as_tests(briefs):
     """The review half, distinct from the fix half.
 
@@ -367,11 +414,44 @@ def test_review_pr_asks_the_reviewer_to_read_comments_as_claims(briefs):
 
     `/review-pr` and the panel apply the same bar by design — `panel.md`'s opening paragraph
     says "the same exhaustive bar as `/review-pr`" — so a dimension in one and not the other
-    means which reviewer you spent decides whether the comments in the diff were read at all."""
-    text = briefs["review-pr.md"]
-    assert re.search(r"comments?\b[^.]*\bclaims?\b", text, re.IGNORECASE), (
-        "review-pr.md asks for stale docs but never asks whether a comment the diff WROTE is "
-        "true of the code beside it, which REVIEW_PROMPT has asked since #724")
+    means which reviewer you spent decides whether the comments in the diff were read at all.
+
+    Three assertions because the dimension is three things, and a brief carrying only the first
+    is the one that quietly changes behaviour: the check, the severity rule that decides what a
+    fix pass does about it, and the instruction to LOOK before declaring a claim unverifiable."""
+    section = _completeness(briefs["review-pr.md"])
+    assert re.search(r"comments?\b[^.]*\bclaims?\b", section, re.IGNORECASE), (
+        "review-pr.md's Completeness section asks for stale docs but never asks whether a "
+        "comment the diff WROTE is true of the code beside it, which REVIEW_PROMPT has asked "
+        "since #724")
+    assert re.search(r"rests? on|leans on|depends on", section, re.IGNORECASE), (
+        "review-pr.md carries the check without the rule that prices it, so every false "
+        "comment claim reads as the same severity — which is the blanket floor #724's first "
+        "cut shipped and this one replaced")
+    assert re.search(r"laborious|only then|before you decide", section, re.IGNORECASE), (
+        "review-pr.md never says that checking a structural claim is laborious rather than "
+        "impossible, so a reviewer declares one unverifiable without opening a file")
+
+
+def test_review_pr_reports_the_claims_it_could_not_verify(briefs):
+    """The other half of the parity, and the half that was missing when it was first claimed.
+
+    `REVIEW_PROMPT` routes a claim the material cannot settle into `could_not_assess`, which is
+    a channel the envelope already has. `/review-pr` has no envelope — it returns a table — so
+    carrying the dimension across without a line to put the residue on left the workflow with
+    the check and nowhere to report the uncertainty, while the PR body claimed parity. That
+    residue is also what #724 defers its expensive half on, so a workflow that cannot record it
+    cannot contribute to the count."""
+    summary = _summary_block(briefs["review-pr.md"])
+    assert re.search(r"unverified claims", summary, re.IGNORECASE), (
+        "review-pr.md's Completeness section asks the reviewer to check the diff's comment "
+        "claims, and its report format has no line for the ones it could not settle — so the "
+        "uncertainty half of the dimension is asked for and cannot be reported")
+    assert re.search(r"\bnone\b", _summary_field(summary, "Unverified claims"),
+                     re.IGNORECASE), (
+        "review-pr.md's `Unverified claims` line does not spell its empty case, so a pass with "
+        "nothing to declare reads identically to one that forgot the line — `Surface` above it "
+        "writes `none` out for exactly this reason")
 
 
 # ---- the panel's prompt ----------------------------------------------------
@@ -527,42 +607,64 @@ def test_the_review_prompt_says_why_a_wrong_comment_outlives_a_wrong_test(review
 
 
 def test_an_unverifiable_comment_claim_has_somewhere_to_go(review_prompt):
-    """The #715 case, and the half that is deliberately NOT a mechanism.
+    """The #715 case — with the channel gated on having actually looked.
 
-    `panel.run`'s "there is no early return between the claim and here" is TRUE, and it took an
-    AST walk over 2,600 lines to establish — a seat with Read, Grep and Glob and no shell
-    cannot settle it. A dimension that asks for a check no seat can perform, with no channel
-    for saying so, is answered by silence that reads as a pass. `could_not_assess` is the
-    channel the envelope already has, and routing structural claims into it is also the
-    measurement #724 gates its expensive half on: how many of these are questions a script
-    would settle."""
+    `panel.run`'s "there is no early return between the claim and here" is TRUE, and an AST walk
+    over 2,600 lines is what settled it here. That is convenience, not necessity: grep `return`
+    over the span and read the enclosing scopes and a seat with no shell reaches the same
+    answer. The first cut of this said such a claim was unsettleable, which is false — and false
+    in the direction that costs something, because `CODE_ACCESS_BRIEF`'s own rule is that a
+    question you can answer by opening a file is not a coverage gap, and a declared gap costs
+    the round its confident stop.
+
+    So both assertions, and the second is the one that keeps the first honest: a channel with no
+    obligation to look first manufactures declarations, and the residue is what #724 defers its
+    expensive half on. A count inflated by claims nobody opened a file about is not a
+    measurement of anything."""
     bullet = _dimension(review_prompt, r"comment")
     assert "could_not_assess" in bullet, (
-        "REVIEW_PROMPT's comment dimension asks a seat to check claims it may have no way to "
-        "check — an unverifiable claim with no channel is reported as nothing at all, which "
-        "is indistinguishable from a claim that was checked and held")
+        "REVIEW_PROMPT's comment dimension asks a seat to check claims the material may not "
+        "settle and gives it nowhere to say so — an unreported uncertainty is indistinguishable "
+        "from a claim that was checked and held")
+    assert re.search(r"laborious|after you have looked|grep the callers", bullet, re.IGNORECASE), (
+        "REVIEW_PROMPT's comment dimension offers `could_not_assess` without saying that "
+        "checking is usually laborious rather than impossible, so a seat declares a coverage "
+        "gap — which costs the round its confident stop — instead of opening a file")
 
 
-def test_a_false_comment_claim_is_not_priced_as_polish(review_prompt):
-    """A floor, asserted where severities are actually chosen.
+def test_the_comment_severity_is_conditioned_on_what_rests_on_the_claim(review_prompt):
+    """A discriminator, not a floor — and the first cut of #724 shipped the floor.
 
-    The dimension list says what to look for and the severity paragraph says what it is worth,
-    and a seat reaching for a P-number reads the second. Its P3 tier is "style, naming,
-    simplifications", which is where a comment defect lands by default in any other repo. Both
-    ends are asserted: the bullet's own floor, and the tier the paragraph files it under —
-    and that the tiers BELOW it do not also offer it, since an example listed twice is not a
-    floor."""
-    assert re.search(r"at least P2|P2 at least", _dimension(review_prompt, r"comment"),
-                     re.IGNORECASE), (
-        "REVIEW_PROMPT's comment dimension states no severity floor, so a false load-bearing "
-        "claim is filed as the P4 polish a stale comment would be")
-    assert re.search(r"comment", _severity_tier(review_prompt, "P2"), re.IGNORECASE), (
-        "REVIEW_PROMPT's severity paragraph does not name a false comment claim under P2 — "
-        "the bullet's floor and the scale a seat picks from disagree, and the scale wins")
-    for tier in ("P3", "P4"):
+    "At least P2 for any false checkable claim" is assigned by ARTEFACT TYPE, and severity is
+    what the fix pass acts on: a blanket floor sweeps in a stale count, a wrong complexity
+    description and a local detail nothing rests on, turns each into a mandatory repair and
+    lengthens the round. The consequence of relying on the claim is the thing that varies, so it
+    is what the rule keys on.
+
+    Asserted in both places and asserted to AGREE. The dimension list says what to look for and
+    the severity paragraph says what it is worth; a seat reaching for a P-number reads the
+    second, so a rule stated only in the bullet is a rule the scale overrides. P1 and P4 are
+    asserted silent because a two-way split with a third tier offering the same example is not a
+    split — the seat picks whichever it reads first."""
+    bullet = _dimension(review_prompt, r"comment")
+    assert re.search(r"rests? on|leans on|depends on", bullet, re.IGNORECASE), (
+        "REVIEW_PROMPT's comment dimension names no discriminator, so every false claim in a "
+        "comment is priced the same — which is the blanket floor this replaced")
+    assert "P2" in bullet and "P3" in bullet, (
+        "REVIEW_PROMPT's comment dimension does not price BOTH cases, so the case it leaves "
+        "unpriced is decided by whatever the seat reads next")
+    for tier, expect in (("P2", r"rests on|leans on"), ("P3", r"nothing rests on|nothing")):
+        text = _severity_tier(review_prompt, tier)
+        assert re.search(r"comment", text, re.IGNORECASE), (
+            f"REVIEW_PROMPT's severity paragraph does not name a comment claim under {tier}; "
+            f"the bullet's rule and the scale a seat picks from disagree, and the scale wins")
+        assert re.search(expect, text, re.IGNORECASE), (
+            f"REVIEW_PROMPT lists a comment claim under {tier} unconditionally, so the two "
+            f"tiers offer the same example and the discriminator decides nothing")
+    for tier in ("P1", "P4"):
         assert not re.search(r"comment", _severity_tier(review_prompt, tier), re.IGNORECASE), (
-            f"REVIEW_PROMPT offers a comment defect as an example of {tier} as well as P2, so "
-            f"the floor is not a floor — a seat picks whichever tier it reads first")
+            f"REVIEW_PROMPT offers a comment claim as an example of {tier} as well, so the "
+            f"P2/P3 split is not a split — a seat picks whichever tier it reads first")
 
 
 def test_the_review_prompt_keeps_asking_about_stale_docs_too(review_prompt):
@@ -584,11 +686,11 @@ def test_the_panel_command_describes_the_dimensions_it_actually_sends(briefs):
     It enumerates the review dimensions for a reader deciding whether to run the
     panel. A dimension in `REVIEW_PROMPT` and not in that list is a reviewer doing
     work the command says it does not do."""
-    text = brief(PANEL).read_text(encoding="utf-8")
-    assert re.search(r"load-bearing", text, re.IGNORECASE), (
+    listed = _panel_dimensions(brief(PANEL).read_text(encoding="utf-8"))
+    assert re.search(r"load-bearing", listed, re.IGNORECASE), (
         "panel.md's dimension list does not mention load-bearing tests, which "
         "REVIEW_PROMPT now asks every reviewer for")
-    assert re.search(r"comment[^.]*\b(true|claim)", text, re.IGNORECASE), (
+    assert re.search(r"comment[^)]*\b(true|claim)", listed, re.IGNORECASE), (
         "panel.md's dimension list does not mention the comments the diff writes, which "
         "REVIEW_PROMPT has asked every reviewer about since #724 — a reader deciding whether "
         "to spend a panel is told it reviews less than it does")
