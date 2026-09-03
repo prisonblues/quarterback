@@ -26,6 +26,7 @@ Run: pytest harness/tests
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -38,7 +39,8 @@ CLAIM, CLAIMED = BIN / "qb-claim", BIN / "qb-claimed"
 
 def run(script: Path, *args, board: str | None = None, repo: str = "acme/widget",
         answer: dict | None = None, status: int = 200,
-        replies: list | None = None, tmp_path: Path = None):
+        replies: list | None = None, tmp_path: Path = None,
+        gh_title: str | None = None):
     """Run one of the CLIs against a stubbed board and a stubbed repo lookup.
 
     Both are stubbed by running a COPY of the script beside a stub `qbdata.py`.
@@ -48,6 +50,13 @@ def run(script: Path, *args, board: str | None = None, repo: str = "acme/widget"
     Doubling the module rather than standing up a board keeps this suite in the
     harness job, which has no database and no services: the same reason every
     other test here doubles `sh`.
+
+    `gh_title` puts a `gh` on PATH ahead of any real one, answering that title and
+    recording that it was asked (`gh_asked`). The title lookup is a subprocess and
+    therefore the only part of this tool that cannot be observed from the request
+    body: a claim that skips it and one that made the call and got nothing back
+    send the same payload. `--no-plan-item` is supposed to skip it, and "supposed
+    to" without a seam is what an assertion on the payload alone would have proved.
 
     `replies` scripts CONSECUTIVE answers — `[(status, body), …]` — for the one
     path that asks twice: a contended 409 is a lost race with no holder, which a
@@ -61,7 +70,7 @@ def run(script: Path, *args, board: str | None = None, repo: str = "acme/widget"
     copied = stub / script.name
     copied.write_bytes(script.read_bytes())
     (stub / "qbdata.py").write_text(f"""
-import json, urllib.error, io
+import json, os, urllib.error, io
 
 REPO = {repo!r}
 BOARD = {board!r}
@@ -78,6 +87,14 @@ class _Client:
         return _answer()
 
     def claim_ref(self, kind, value, repo=None, **over):
+        # Recorded to disk rather than kept in memory: the CLI runs as a
+        # subprocess, so this module's globals die with it and the request body is
+        # otherwise unobservable. It is the body — not the exit code — that carries
+        # `plan_item`, so a test for #722 has nowhere else to look.
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "call.json")
+        with open(path, "w") as fh:
+            json.dump({{"kind": kind, "value": value, "repo": repo,
+                        "body": over}}, fh)
         return _answer()
 
 
@@ -105,8 +122,30 @@ def lapsed_redirect(previously, repo_path="."):
 """)
     env = {**os.environ}
     env.pop("CLAUDE_CODE_SESSION_ID", None)
+    if gh_title is not None:
+        env["PATH"] = f"{_fake_gh(tmp_path, gh_title)}{os.pathsep}{env['PATH']}"
     return subprocess.run([sys.executable, str(copied), *args],
                           capture_output=True, text=True, env=env)
+
+
+def _fake_gh(tmp_path: Path, title: str) -> Path:
+    """A `gh` that answers one title and leaves a mark saying it was asked."""
+    bindir = tmp_path / "ghbin"
+    bindir.mkdir(exist_ok=True)
+    gh = bindir / "gh"
+    # Quoted through `shlex`, not interpolated: `tmp_path` is pytest's and a title
+    # is a PR's, so both can carry a space or a quote, and a fake tool that breaks
+    # on one would fail the test it is the seam for rather than the code.
+    gh.write_text("#!/bin/sh\n"
+                  f"touch {shlex.quote(str(tmp_path / 'gh_asked'))}\n"
+                  f"printf '%s\\n' {shlex.quote(title)}\n")
+    gh.chmod(0o755)
+    return bindir
+
+
+def sent(tmp_path: Path) -> dict:
+    """The request body `qb-claim` actually put on the wire."""
+    return json.loads((tmp_path / "stub" / "call.json").read_text())["body"]
 
 
 # ------------------------------------------------------------------- qb-claimed
@@ -386,3 +425,75 @@ def test_quiet_wins_over_json(script, tmp_path):
                       "claim_id": "abc", "kind": "work", "key": "k", "expires": "t",
                       "renewed": False})
     assert got.stdout == "" and got.stderr == ""
+
+
+# ------------------------------------------- exclusivity without a pickup (#722)
+
+TAKEN = {"claim_id": "abc-123", "kind": "work", "key": "acme/widget!715",
+         "expires": "2026-09-04T18:00:00Z", "renewed": False}
+
+
+def test_an_ordinary_claim_asks_for_the_plan_item_by_saying_nothing(tmp_path):
+    """The default is the board's, and the request does not restate it.
+
+    A flag that put `plan_item: true` on every payload would be the first thing to
+    suspect when a board of a different version answered differently, for no gain:
+    absent means the default, and the default is #427's rule.
+    """
+    got = run(CLAIM, "issue", "172", board="http://b", tmp_path=tmp_path,
+              answer=TAKEN)
+    assert got.returncode == 0, got.stderr
+    assert "plan_item" not in sent(tmp_path)
+
+
+def test_no_plan_item_says_so_on_the_wire(tmp_path):
+    """#722. A review round holds the PR it is reading so the fleet can see who is
+    spending money on it — a true exclusivity record and a false pickup. Without
+    this the claim wrote the PR onto the plan at rank 1, and the release at the end
+    of the round left the row there: open, unclaimed, unblocked, and `next`.
+
+    red/green: fails on `plan_item` missing from the body — the flag did not exist,
+    so `qb-claim` exited 2 on an unrecognised argument.
+    """
+    got = run(CLAIM, "pr", "715", "--no-plan-item", board="http://b",
+              tmp_path=tmp_path, answer=TAKEN)
+    assert got.returncode == 0, got.stderr
+    assert sent(tmp_path)["plan_item"] is False
+
+
+def test_a_claim_that_writes_no_item_does_not_pay_for_a_title(tmp_path):
+    """The flag's one side-effect, and it is worth a test because it is a network
+    call per round spent on a string with no consumer: the title exists to name the
+    plan item, so no item means nothing to name.
+
+    red/green: fails with `gh` recorded as asked and `title` on the body.
+    """
+    got = run(CLAIM, "pr", "715", "--no-plan-item", board="http://b",
+              tmp_path=tmp_path, answer=TAKEN, gh_title="fix: a thing")
+    assert got.returncode == 0, got.stderr
+    assert not (tmp_path / "gh_asked").exists(), "asked `gh` for a title nothing uses"
+    assert "title" not in sent(tmp_path)
+
+
+def test_an_ordinary_claim_still_reads_the_title_from_gh(tmp_path):
+    """The other side of the same gate. `--no-plan-item` must not be the flag that
+    quietly turned the title lookup off for everybody — the seam is the same one,
+    so the case that keeps it has to be asserted beside the case that drops it."""
+    got = run(CLAIM, "issue", "172", board="http://b", tmp_path=tmp_path,
+              answer=TAKEN, gh_title="the issue's real name")
+    assert got.returncode == 0, got.stderr
+    assert (tmp_path / "gh_asked").exists()
+    assert sent(tmp_path)["title"] == "the issue's real name"
+
+
+def test_an_explicit_title_is_still_dropped_when_no_item_will_hold_it(tmp_path):
+    """A caller passing both is contradicting itself, and the board ignores the
+    title anyway with `plan_item: false`. Nothing is refused over it — a claim
+    turned down for a redundant argument would be the coordination write lost to
+    the tidier API — but it is not sent either, so the wire says what will happen.
+    """
+    got = run(CLAIM, "pr", "715", "--no-plan-item", "--title", "fix: a thing",
+              board="http://b", tmp_path=tmp_path, answer=TAKEN)
+    assert got.returncode == 0, got.stderr
+    assert sent(tmp_path)["plan_item"] is False
+    assert "title" not in sent(tmp_path)

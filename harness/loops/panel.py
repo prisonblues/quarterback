@@ -3645,7 +3645,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     #: mechanism that took it (PR #715 review).
     holding_pr = False
     if record:
-        claimed = hold_pr(cfg["path"], pr_number, round_no, title)
+        claimed = hold_pr(cfg["path"], pr_number, round_no)
         holding_pr = not claimed
         if claimed:
             notes.append(claimed)

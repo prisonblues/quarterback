@@ -1290,8 +1290,7 @@ PR_HOLD_TTL = 10800
 CLAIM_TAKEN, CLAIM_HELD = 0, 1
 
 
-def hold_pr(repo_path: str, pr_number: int, round_no: int,
-            title: str | None = None) -> str:
+def hold_pr(repo_path: str, pr_number: int, round_no: int) -> str:
     """Take the board's claim on this PR for the length of a round. Best-effort.
 
     **NOT :func:`panel.pr_claim`**, which is #550's block carrying what the PR's
@@ -1342,19 +1341,36 @@ def hold_pr(repo_path: str, pr_number: int, round_no: int,
     there with the same furniture rather than inside a telemetry call. Until then
     the honest description is a record, which is what this says.
 
+    **It takes the claim with `--no-plan-item`, and that is #722.** Every issue/PR
+    claim writes a top-ranked plan item, because picking work up is the one act
+    that should put work on the board (#427) — and a review round is not picking
+    the PR up. The round wrote PR #n in at rank 1, released the claim at the end,
+    and left the row open, unclaimed and unblocked at the top of the plan, so
+    `plan_read`'s `next` handed the following agent a review that had already
+    happened, above whatever a human had ordered. Read off this board while #722
+    was open: `next` for this repo was the item for **PR #715** — the PR that added
+    this claim — open at rank 8, `rank_source: picked-up`, its claim released, and
+    ahead of every ordered item below it.
+
+    The flag is the whole fix and it does nothing else — it does not retire an item
+    that is already there, so a PR somebody genuinely picked up keeps its row and
+    its position while a round reviews it.
+
+    So this passes no title either: `--title` and `--no-gh-title` both exist to
+    name the plan item, and there is no longer one to name. `qb-claim` reads
+    `--no-plan-item` as implying `--no-gh-title`, which is where the saved `gh`
+    call went.
+
     Returns "" when the claim is ours, or the one line saying why it is not.
     """
     if not shutil.which("qb-claim"):
         return _unclaimed(pr_number, "there is no `qb-claim` on this host")
     argv = ["qb-claim", "pr", str(pr_number), "--repo-path", repo_path,
             "--ttl", str(PR_HOLD_TTL),
-            "--note", f"panel review round {round_no}"]
-    # The title from the read this round already made, rather than the `gh` call
-    # `qb-claim` makes to fetch one itself — `--no-gh-title` is what turns that
-    # off. One fewer API call per round, and it is the copy the round is actually
-    # reviewing. Without a title the flag still goes: a round that could not read
-    # a title has nothing to gain from a second attempt at it here.
-    argv += ["--no-gh-title"] + (["--title", title] if title else [])
+            "--note", f"panel review round {round_no}",
+            # Exclusivity, not a pickup — see the docstring. The note is what a
+            # reader gets instead of a plan row, and it says which round.
+            "--no-plan-item"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as e:

@@ -99,14 +99,11 @@ def test_a_taken_claim_adds_no_note_and_names_the_resource_not_a_key(monkeypatch
     third spelling would be the same defect with a new party.
     """
     seen = _cli(monkeypatch)
-    assert panel_seats.hold_pr("/tmp/acme", 1780, 2, "fix: a thing") == ""
+    assert panel_seats.hold_pr("/tmp/acme", 1780, 2) == ""
     argv = seen["args"]
     assert argv[:3] == ["qb-claim", "pr", "1780"]
     assert "--repo-path" in argv and argv[argv.index("--repo-path") + 1] == "/tmp/acme"
     assert argv[argv.index("--note") + 1] == "panel review round 2"
-    # The round's own read of the title, not a second `gh` call for the same string.
-    assert "--no-gh-title" in argv
-    assert argv[argv.index("--title") + 1] == "fix: a thing"
 
 
 def test_the_fuse_outlasts_a_round_and_falls_well_short_of_a_worktrees(monkeypatch):
@@ -131,13 +128,25 @@ def test_the_fuse_outlasts_a_round_and_falls_well_short_of_a_worktrees(monkeypat
     assert ttl < 28800, "and must not become create-worktree's eight-hour fuse"
 
 
-def test_a_round_with_no_title_still_asks_for_no_gh_title(monkeypatch):
-    """A round that could not read a title has nothing to gain from `qb-claim`
-    trying again for it — and the flag is what stops the extra API call."""
+def test_a_round_holds_the_pr_without_claiming_to_have_picked_it_up(monkeypatch):
+    """#722, and it is the whole of this change.
+
+    The claim is a true exclusivity record and a false pickup. Every issue/PR claim
+    writes a top-ranked plan item (#427), so a round put PR #n in at rank 1 and the
+    release at the end left it there — open, unclaimed, unblocked — and `next`
+    offered the following agent a review that had already happened.
+
+    `--title` and `--no-gh-title` go with it: both exist to name the plan item, and
+    a round no longer writes one. `qb-claim` reads `--no-plan-item` as implying
+    `--no-gh-title`, so the saved `gh` call is not lost with the flag.
+
+    red/green: fails on `--no-plan-item` missing from the argv.
+    """
     seen = _cli(monkeypatch)
     panel_seats.hold_pr("/tmp/acme", 1780, 1)
-    assert "--no-gh-title" in seen["args"]
-    assert "--title" not in seen["args"]
+    assert "--no-plan-item" in seen["args"]
+    assert "--title" not in seen["args"], "there is no item left for a title to name"
+    assert "--no-gh-title" not in seen["args"], "implied by --no-plan-item"
 
 
 def test_a_pr_somebody_else_holds_is_a_note_and_never_a_refusal(monkeypatch, capsys):
@@ -261,12 +270,12 @@ def test_a_round_claims_its_pr_and_hands_it_back(monkeypatch, capsys, pr_claims)
     # ORDER of the two calls rather than about what either one says to `qb-claim`.
     seen: list[tuple] = []
     monkeypatch.setattr(panel, "hold_pr",
-                        lambda p, n, r, t=None: seen.append(("hold", p, n, r, t)) or "")
+                        lambda p, n, r: seen.append(("hold", p, n, r)) or "")
     monkeypatch.setattr(panel, "release_pr",
                         lambda p, n: seen.append(("release", p, n)) or "")
     assert panel.run("board", 1780, post=False, json_out=True) == 0
     capsys.readouterr()
-    assert seen == [("hold", "/tmp/acme-board", 1780, 1, "fix: a thing"),
+    assert seen == [("hold", "/tmp/acme-board", 1780, 1),
                     ("release", "/tmp/acme-board", 1780)]
 
 

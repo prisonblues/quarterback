@@ -547,8 +547,8 @@ def pr_claims(monkeypatch):
     """
     seen: list[tuple] = []
 
-    def _hold(repo_path, pr_number, round_no, title=None) -> str:
-        seen.append(("hold", str(repo_path), int(pr_number), int(round_no), title))
+    def _hold(repo_path, pr_number, round_no) -> str:
+        seen.append(("hold", str(repo_path), int(pr_number), int(round_no)))
         return ""
 
     def _release(repo_path, pr_number) -> str:

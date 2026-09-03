@@ -3,6 +3,7 @@
 
   qb-claim issue 172                    this checkout's repo, issue 172
   qb-claim pr 207 --note "reviewing"
+  qb-claim pr 207 --no-plan-item        hold it, but do not call it a pickup
   qb-claim branch main --ttl 7200       the BASE being landed onto, not the head
   qb-claim item <uuid>                  a plan item, by board id
 
@@ -15,6 +16,14 @@ board derives the key from it (`app/claimkey.py`). That is the whole of #172: th
 plan wrote `work/<repo>#163`, an agent wrote `issue/<repo>#163`, and the two
 subsystems reported different answers about one issue in the same second. A shell
 tool composing a third spelling would be the same defect with a new party.
+
+**A claim is a pickup unless you say otherwise.** Taking one writes that repo's
+plan item at rank 1 (#427), because picking work up is the one act that should put
+work on the board. `--no-plan-item` is the exception, and it exists because a
+review round claims the PR it is reading (#715): that is a real exclusivity record
+and a false pickup, and it left the PR sitting at rank 1 of the plan after the
+round released it, so the next agent was offered a review that had already
+happened (#722). Use it when you are holding a key rather than starting the work.
 
 **1 and 2 are different exits for the reason `qb-claimed` gives.** "Somebody has
 it" is the board saying something definite and a caller should stop. "Cannot tell"
@@ -93,6 +102,12 @@ def main() -> int:
                          "when this is absent; --no-gh-title stops that")
     ap.add_argument("--no-gh-title", action="store_true",
                     help="do not ask `gh` for the issue title (offline, or in a hurry)")
+    ap.add_argument("--no-plan-item", action="store_true",
+                    help="record exclusivity WITHOUT asserting a pickup: hold the key, "
+                         "and do not write the plan item a claim normally implies. For "
+                         "a caller that is not picking the work up — a review round "
+                         "holding the PR it is reading. Implies --no-gh-title, since "
+                         "the item is the title's only consumer")
     ap.add_argument("--session", default=os.environ.get("CLAUDE_CODE_SESSION_ID") or None,
                     help="your session id (default: $CLAUDE_CODE_SESSION_ID)")
     ap.add_argument("--json", action="store_true",
@@ -116,14 +131,30 @@ def main() -> int:
                 f"under two keys")
             return UNKNOWN
 
+    # The title has exactly one consumer — the plan item the board writes for a
+    # pickup — so `--no-plan-item` means no title, however it arrived. Not asked
+    # for, and not forwarded when the caller passed one: the board ignores it in
+    # that case, and a payload carrying a field that will be discarded is a wire
+    # that does not say what is about to happen. Not a refusal either: a claim
+    # turned down over a redundant argument is the coordination write lost to the
+    # tidier API, which is the trade `ClaimIn` refuses everywhere else.
     title = args.title
-    if title is None and not args.no_gh_title and args.kind.lower() in ("issue", "pr"):
+    if args.no_plan_item:
+        title = None
+    elif title is None and not args.no_gh_title and args.kind.lower() in ("issue", "pr"):
         title = _gh_title(args.kind.lower(), args.value, repo)
 
     body: dict = {"note": args.note, "session": args.session, "title": title}
     if args.ttl is not None:
         body["ttl"] = args.ttl
     body = {k: v for k, v in body.items() if v is not None}
+    if args.no_plan_item:
+        # Sent only when it is False. The board's default is True and an absent key
+        # means the default, so a claim that wants the ordinary behaviour puts the
+        # same request on the wire it always did — a flag that changed every
+        # caller's payload to say "yes, the default" would be the first place to
+        # look when a board of a different version answered differently.
+        body["plan_item"] = False
 
     try:
         client, _cfg = board_client()

@@ -1104,6 +1104,16 @@ answer to an outage and no answer at all to a misconfiguration.
 `qb-claim` prints the claim id on **stdout** and everything else on stderr, so a caller can
 capture the id for `claim/renew` and `claim/release` without parsing prose.
 
+**A claim is a pickup unless you say otherwise, and `--no-plan-item` is how you say it.**
+Taking a claim on an issue or a PR writes that repo's plan item at rank 1, because picking work
+up is the one act that should put work on the board (#427). A panel review round claims the PR
+it is reading, and that is a true exclusivity record and a false pickup: the round wrote the PR
+in at rank 1, released the claim when it finished, and left the row open, unclaimed and
+unblocked at the top of the plan — so `next` handed the following agent a review that had
+already happened (#722). Pass the flag when you are holding a key rather than starting the work.
+It writes no item and it retires none, the claim is exclusive exactly as any other, and it
+implies `--no-gh-title` since the plan item was the title's only consumer.
+
 **`create-worktree` takes the claim for you.** It derives the issue number from the branch
 it is about to make (`feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`) and
 claims it *before* the tree exists, so a refusal costs nothing to unwind:

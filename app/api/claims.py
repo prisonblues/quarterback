@@ -535,9 +535,34 @@ class ClaimIn(BaseModel):
     #: forge-free on purpose (#327) so it cannot read an issue's real title; a
     #: client that just ran `gh issue view` can, and passing it here is the whole
     #: of the "clients enrich" half of #427. Ignored when the key names no unit of
-    #: work, and ignored on a renew. Bounded to the plan's own title length —
-    #: `_pickup_title` truncates too, so this only stops a megabyte arriving.
+    #: work, ignored on a renew, and ignored with ``plan_item=False`` — the item is
+    #: its only consumer. Bounded to the plan's own title length — `_pickup_title`
+    #: truncates too, so this only stops a megabyte arriving.
     title: str | None = Field(default=None, max_length=200)
+    #: Write the plan item this claim implies? True by default, and the default is
+    #: #427's rule: picking work up is the one act that should put work on the
+    #: board, so the claim that expresses a pickup writes the item.
+    #:
+    #: Send ``false`` for **a claim that records exclusivity without asserting a
+    #: pickup** — the distinction the board was missing (#722). A panel review
+    #: round claims the PR it is reading (#715) so that `GET /active` can say which
+    #: agent is spending money on which PR; that claim is a true exclusivity record
+    #: and a false pickup, and it wrote the PR onto the plan at rank 1. When the
+    #: round hands the claim back the row stays — open, unclaimed, unblocked, rank
+    #: 1 — so ``plan_read``'s ``next`` offered the following agent a review that had
+    #: already happened, above whatever a human had actually ordered.
+    #:
+    #: **It never removes or completes an item that is already there**, and a
+    #: renew with it writes nothing rather than repairing. "Do not write one" and
+    #: "retire the one you find" are different powers and a flag on a claim must
+    #: not carry the second: the row it would retire may be a human's, or a real
+    #: pickup's by an agent still working — the claim path cannot tell.
+    #:
+    #: Rejected: teaching the board that a *PR* claim is never a pickup. It is
+    #: sometimes exactly that — an agent picking up somebody's stalled PR to finish
+    #: it — and the key cannot tell the two apart. What can tell them apart is the
+    #: caller, so the caller says.
+    plan_item: bool = True
 
     @model_validator(mode="after")
     def _one_way_or_the_other(self) -> ClaimIn:
@@ -736,6 +761,11 @@ async def take_claim(
     means "permanently invisible on the first bad day" — the exact state this
     feature was built to abolish. So a renew runs the same write, which finds the
     item already there and returns it, and writes it when it is not.
+
+    **``plan_item: false`` turns that half off** — a claim that records exclusivity
+    without asserting a pickup (#722). The default stays on because #427's rule is
+    right for a pickup; what the board had no way to say was that some claims are
+    not pickups. See :class:`ClaimIn` for the round that proved it.
     """
     try:
         kind, key = body.resolve()
@@ -781,9 +811,22 @@ async def take_claim(
     # fixed it. `item_for_claim` is idempotent by construction (an existing open
     # item is returned, not rewritten), so the repair costs one indexed SELECT on a
     # renew that had nothing to fix.
-    out.update(await _plan_item_for(
-        session, kind=kind, key=key, holder=holder,
-        note=body.note, title=body.title))
+    #
+    # Unless the caller said this is not a pickup (#722). The skip is here rather
+    # than inside `_plan_item_for` because it is a statement about the REQUEST and
+    # not about the key: `work_ref` decides what the plan *can* hold, and this
+    # decides what this caller is claiming to have done. Two different judgements,
+    # and folding them into one function is how the second becomes invisible.
+    if body.plan_item:
+        out.update(await _plan_item_for(
+            session, kind=kind, key=key, holder=holder,
+            note=body.note, title=body.title))
+    else:
+        # A null item rather than an absent key: every claim answer carries
+        # `plan_item`, so a client that reads it gets "no item" in the same shape
+        # whether the key named no work or the caller wanted none. No error and no
+        # note beside it — the one caller this can happen to is the one that asked.
+        out["plan_item"] = None
     return out
 
 
