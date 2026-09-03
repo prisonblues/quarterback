@@ -24,7 +24,7 @@ import importlib.util
 import json
 import re
 import sys
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -2558,9 +2558,19 @@ def test_a_pass_that_completed_everything_it_found_says_no_disagreement(monkeypa
     assert summary == "plan reconcile: no disagreement; 1 completed"
 
 
+#: The pass's own timeline, in the order the code makes it: the report is stamped,
+#: THEN the plan is read, THEN the writes go out. Every test below that talks about
+#: who got there first has to sit inside it, because a row this pass is writing to
+#: was read as OPEN — so nothing that finished it can have happened before the read,
+#: and a test that says otherwise is describing a sequence the pass cannot produce.
+GENERATED = "2026-08-20T12:00:00+00:00"
+WRITTEN_AT = datetime(2026, 8, 20, 12, 30, tzinfo=UTC)
+
+
 def test_a_second_receipt_on_a_row_somebody_else_finished_is_said_out_loud(
         monkeypatch):
-    """Found by Codex on this change's own diff.
+    """Found by Codex on this change's own diff, and its interleaving corrected by a
+    second pass over the fix (PR #719 review).
 
     Two observers of one merge is the endpoint's design — any agent may record a
     completion, and the note is appended rather than replaced so two receipts can
@@ -2568,13 +2578,23 @@ def test_a_second_receipt_on_a_row_somebody_else_finished_is_said_out_loud(
     window between the plan read and the write: an agent's own `plan_done`, or a
     sibling host's tick. `done_by` and `done` keep the FIRST holder's name and time,
     so the pass can tell, and this file's rule is that nothing it does is silent.
+
+    The sibling finishes the row at 12:29:59 — after this pass was stamped at 12:00
+    and read the row open, one second before this write went out at 12:30. That is
+    the ONLY shape the race has, and it is why the comparison cannot be against
+    `report.generated`: measured from there, a peer's completion is always in the
+    future and always reads as ours.
+
+    red/green: fails on the `generated` comparison with `already is None` and no
+    line in the report — silent about the one thing it was written to say.
     """
     board = ApplyingBoard({"items": []})
     board.post = lambda path, body: {
         "item_id": body["item_id"], "state": "done", "claim_left": None,
-        "done": "2026-08-20T09:00:00+00:00", "done_by": "zeus/f5ca7491"}
+        "done": "2026-08-20T12:29:59+00:00", "done_by": "zeus/f5ca7491"}
     report = full_report()
-    report.generated = "2026-08-20T12:00:00+00:00"
+    report.generated = GENERATED
+    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
     _applied(report, board, monkeypatch)
 
     # The rendered line first: it is the assertion that names the defect, and a
@@ -2588,20 +2608,47 @@ def test_a_row_this_pass_finished_itself_claims_no_second_receipt(monkeypatch):
     by our own write is not evidence somebody beat us to it, and reporting it as one
     would put a peer's name on every completion this pass ever makes.
 
-    red/green: N-A (the negative companion) — pre-fix nothing was rendered and
-    nothing was recorded, so there is no wrong sentence for this to catch. Its
-    sibling above is the one that goes red.
+    The board stamps the row as it handles the request, so our own receipt's `done`
+    lands just AFTER the moment the write left — which is the whole of the test.
+
+    red/green: N-A (the negative companion). It passed before the fix too, for the
+    wrong reason: nothing was ever named, so nothing was ever named wrongly.
     """
     board = ApplyingBoard({"items": []})
     board.post = lambda path, body: {
         "item_id": body["item_id"], "state": "done", "claim_left": None,
-        "done": "2026-08-20T12:00:05+00:00", "done_by": "daedalus"}
+        "done": "2026-08-20T12:30:01+00:00", "done_by": "daedalus"}
     report = full_report()
-    report.generated = "2026-08-20T12:00:00+00:00"
+    report.generated = GENERATED
+    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
     _applied(report, board, monkeypatch)
 
     assert "already recorded it" not in qr.render(report)
     assert report.applied[0]["already"] is None
+
+
+def test_the_reference_for_who_got_there_first_is_the_write_not_the_report(
+        monkeypatch):
+    """The defect stated as a property rather than as one interleaving.
+
+    `report.generated` is stamped before the plan is read and `run` reads OPEN rows
+    only, so every completion this comparison exists to catch necessarily lands
+    after it. Pinned here so that a later change cannot quietly move the reference
+    back to the report and leave the two tests above passing on a coincidence of
+    their fixtures.
+    """
+    board = ApplyingBoard({"items": []})
+    board.post = lambda path, body: {
+        "item_id": body["item_id"], "state": "done", "claim_left": None,
+        # Later than `generated` — as any real second observer must be — and
+        # earlier than the write.
+        "done": "2026-08-20T12:15:00+00:00", "done_by": "hermes/seat-1"}
+    report = full_report()
+    report.generated = GENERATED
+    monkeypatch.setattr(qr, "_utcnow", lambda: WRITTEN_AT)
+    _applied(report, board, monkeypatch)
+
+    assert report.applied[0]["already"] == "hermes/seat-1"
 
 
 @pytest.mark.parametrize("view", [

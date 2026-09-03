@@ -1304,15 +1304,23 @@ def run(repo_filter: str | None = None, include_drafts: bool = False) -> Report:
 
 #: What `--apply` acts on, spelled as three separate facts rather than one label.
 #:
-#: The condition alone is not enough and the ref kind alone is not enough, and both
-#: are re-asked at the point of the WRITE rather than inferred from the finding —
-#: even though :func:`ref_verdict` gives a pull request `done_candidate` for
-#: `MERGED` and for nothing else today. `CONDITIONS` is a vocabulary five checks
-#: share and any of them may legitimately widen; the day a `done_candidate` is
-#: raised for a PR GitHub reports some other way, an actor that trusted the label
-#: would complete a plan item on a fact nobody checked, silently, on a
-#: fifteen-minute timer. So the write asks GitHub's own word for it, and a state it
-#: does not recognise is declined and named rather than acted on.
+#: The condition alone is not enough and the ref kind alone is not enough, so the
+#: write re-reads both off the finding's own evidence rather than trusting the
+#: LABEL — even though :func:`ref_verdict` gives a pull request `done_candidate`
+#: for `MERGED` and for nothing else today. `CONDITIONS` is a vocabulary five
+#: checks share and any of them may legitimately widen; the day a `done_candidate`
+#: is raised for a PR GitHub reports some other way, an actor that trusted the
+#: label would complete a plan item on a fact nobody checked, silently, on a
+#: fifteen-minute timer. So the write reads the state GitHub actually reported, and
+#: one it does not recognise is declined and named rather than acted on.
+#:
+#: **It is not a second call to GitHub, and the guard is not claiming to be one**
+#: (PR #719 review). `github_state` is what this pass already fetched, minutes
+#: earlier at most, and re-fetching it would buy nothing here: `MERGED` is terminal
+#: on GitHub, so the one state acted on cannot have stopped being true in between.
+#: What the re-read defends against is this file drifting away from itself — a
+#: condition widening upstream of an actor that reads only the condition — which is
+#: a change to the code and not a change on the forge.
 APPLY_CONDITION = "done_candidate"
 APPLY_REF_KIND = "pr"
 APPLY_STATE = "MERGED"
@@ -1401,8 +1409,8 @@ def apply_candidates(report: Report) -> tuple[list[Finding], list[dict]]:
     return doing, declined
 
 
-def _already_done(view: dict, generated: str) -> str | None:
-    """Who had recorded this item done BEFORE this pass ran, if anybody.
+def _already_done(view: dict, before: str) -> str | None:
+    """Who had recorded this item done before THIS WRITE went out, if anybody.
 
     **Two observers of one merge is the endpoint's design, not a race this caller
     invented.** `POST /plan/item/done` says any agent may record a completion —
@@ -1413,10 +1421,23 @@ def _already_done(view: dict, generated: str) -> str | None:
 
     What that leaves is not a wrong state — the row is done either way, which is the
     answer both observers wanted — but a duplicated receipt, and this file's rule is
-    that nothing it does is silent. So the pass reads the timestamp it got back: a
-    `done` older than the report's own `generated` means the row was finished in the
-    window between the plan read and this write (an agent's own `plan_done`, or a
-    sibling host's tick), and the report says so and names who got there first.
+    that nothing it does is silent. So the pass reads the timestamp it got back and
+    compares it against the moment it sent the write: a `done` older than that means
+    somebody finished the row while this pass was working (an agent's own
+    `plan_done`, or a sibling host's tick), and the report says so and names them.
+
+    **`before` is the write, and it cannot be the report's `generated`** (PR #719
+    review). `generated` is stamped before the plan is even read, and `run` reads
+    OPEN rows only — so a row this pass saw as open was still open at `generated`,
+    and `done < generated` is a comparison that cannot come out true in the race it
+    was written to catch. It went the other way instead: every sibling's completion
+    landed after `generated`, was read as ours, and the duplicated receipt the whole
+    function exists to name was the one case it stayed silent about.
+
+    The residual is clock skew between this host and the board, and it is bounded by
+    the one round trip rather than by the length of the pass. Both directions cost
+    one sentence in a report and neither costs a state: a fast local clock names a
+    peer for a receipt that was ours, a slow one stays quiet about one that was not.
 
     `None` on anything unparseable, and `None` when the row was ours to record.
     Guessing either way round would put a sentence in the report that no comparison
@@ -1426,7 +1447,7 @@ def _already_done(view: dict, generated: str) -> str | None:
     if not stamp or not holder:
         return None
     try:
-        done, ours = datetime.fromisoformat(str(stamp)), datetime.fromisoformat(generated)
+        done, ours = datetime.fromisoformat(str(stamp)), datetime.fromisoformat(before)
     except (TypeError, ValueError):
         return None
     if done.tzinfo is None:
@@ -1473,6 +1494,10 @@ def apply_done(report: Report) -> None:
         return
     for finding in doing:
         note = apply_note(finding)
+        # Stamped per write and not once for the batch: it is the reference
+        # `_already_done` compares the board's `done` against, and a batch-wide one
+        # would widen the window by however long the writes before this took.
+        before = _utcnow().isoformat()
         try:
             got = client.post("/plan/item/done",
                               {"item_id": finding.item_id, "note": note})
@@ -1489,7 +1514,7 @@ def apply_done(report: Report) -> None:
         report.applied.append(_attempt(
             finding, note=note,
             claim_left=(left or {}).get("holder") if isinstance(left, dict) else None,
-            already=_already_done(view, report.generated)))
+            already=_already_done(view, before)))
 
 
 # ---- reporting --------------------------------------------------------------
