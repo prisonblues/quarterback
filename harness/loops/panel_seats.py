@@ -828,7 +828,13 @@ def seat_checkout(tree: Path, where: Path) -> tuple[str, bool]:
 
     `git init` runs either way, because :func:`member_sandbox` is non-destructive —
     `mkdir(exist_ok=True)` then `git init` — so initialising a populated directory is
-    intended here rather than tolerated."""
+    intended here rather than tolerated.
+
+    That `git init` also has no origin, so this tree is as nameless to the fleet as
+    an empty sandbox: it is a copy of a PR's files at a temp path, not a checkout of
+    the repository. It reports no repo for the same reason and by the same route —
+    :data:`SANDBOX_ENV`, exported by :func:`run_cli` — rather than needing its own
+    rule."""
     try:
         shutil.copytree(tree, where, symlinks=True, dirs_exist_ok=True)
     except OSError as e:
@@ -919,16 +925,23 @@ def member_sandbox(where: Path) -> str:
     stop (:attr:`ReviewerRun.code_blind`), which is the mitigation available to a repo
     that keeps this function.
 
-    **This repo has no origin, and the board depends on that staying true** (#714).
-    A seat's cwd is a throwaway `git init`, so `qb-hook` — which runs in it, because
-    a hooked `claude -p` is how a seat is invoked — can read no origin remote and
-    therefore reports no repo for the session. It used to fall back to the directory
-    basename, which is how the board came to hold live agents in a repository called
-    `cwd` on a branch called `master`, indistinguishable from an unexpanded variable.
-    The directory is named `seat` for the same reason. Neither the fallback nor the
-    old name should come back: a name only this process can resolve is not a repo the
-    fleet shares, and putting one on a collision index gives peers something to ask
-    about and be answered about.
+    **This repo must not reach the board, and saying so is now this module's job**
+    (#714, #721). A seat's cwd is a throwaway `git init`, so `qb-hook` — which runs
+    in it, because a hooked `claude -p` is how a seat is invoked — reports the
+    session's repo from a checkout that exists for one process and one run. It read
+    the directory basename, which is how the board came to hold live agents in a
+    repository called `cwd` on a branch called `master`, indistinguishable from an
+    unexpanded variable. The directory is named `seat` for the same reason, and
+    neither the old name nor an origin remote should come back here.
+
+    What changed in #721 is WHERE that is enforced. The hook used to infer it —
+    no origin, therefore no repo — and that sentence is true of this directory and
+    false of an ordinary local-only repository, which went silent with it and took
+    two agents in it off the collision index. The hook cannot tell those apart:
+    a fresh `git init` and a never-pushed repo of ten years' commits differ in
+    nothing it can see. This module can, because it made the directory. So
+    :data:`SANDBOX_ENV` declares it and :func:`run_cli` exports it to every seat
+    CLI, whose hook is a child process and inherits it.
 
     A `git init` that fails is reported and then degraded past, never raised. **Every
     way it can fail, not just a non-zero exit** — `git` absent from PATH raises
@@ -965,6 +978,39 @@ def member_sandbox(where: Path) -> str:
         print(f"! sandbox: git init failed in {where} ({why}) — a seat that requires "
               f"a git repo will refuse to start and say so", file=sys.stderr)
     return str(where)
+
+
+#: What a seat's environment says about the directory it was given (#721).
+#:
+#: `qb-hook` runs inside every seat — a seat is a hooked `claude -p`, and the
+#: lifecycle hooks are configured per USER, not per repo, so they fire wherever the
+#: CLI is started. Left to itself the hook reports the checkout it is standing in,
+#: and for a seat that checkout is :func:`member_sandbox`'s `git init` (or
+#: :func:`seat_checkout`'s copy of the PR tree, which is `git init`ed by the same
+#: function): a repository that exists for one process, one run and one temp dir.
+#: This flag is how the thing that CREATED it says so.
+#:
+#: The alternative — and what #714 actually shipped — was for the hook to infer it
+#: from the absence of an origin remote. That is a property of this directory and
+#: also of an ordinary local-only repository, so it took every never-pushed
+#: checkout off the collision index alongside the sandboxes. The knowledge lives
+#: here; the declaration should too.
+SANDBOX_ENV = {"QB_SANDBOX": "1"}
+
+
+def sandbox_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment a seat CLI runs in: the caller's, plus :data:`SANDBOX_ENV`.
+
+    An OVERLAY, and that is the whole reason this is a function. `subprocess.run`'s
+    `env=` REPLACES the environment rather than adding to it, so handing it the flag
+    alone would start every seat with no PATH (the CLI is not found), no HOME (no
+    vendor config, no credentials) and none of the API keys the seats authenticate
+    with — a total panel outage in exchange for one field on a lease.
+
+    `base` defaults to the live `os.environ` and is a parameter only so a test can
+    hand in a known one; nothing in the harness passes it.
+    """
+    return {**(os.environ if base is None else base), **SANDBOX_ENV}
 
 
 class CliFailure(str):
@@ -1018,8 +1064,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     NOT retried (it already burned the whole budget; retrying just doubles the
     wall-clock).
 
-    **`cwd` is the member's own empty sandbox repo (see `member_sandbox`), and
-    passing it is what makes a seat reproducible.** Without it every reviewer
+    **`cwd` is the member's own sandbox repo (see `member_sandbox`), and passing it
+    is what makes a seat reproducible.** Without it every reviewer
     inherited whatever directory the panel process happened to be started from,
     so a run's membership was decided by ambient state that nothing configured,
     nothing recorded, and nothing could reproduce. That is not hypothetical: on
@@ -1030,6 +1076,22 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     scratch directory under /tmp, and codex refuses to start outside a repo. The
     panel lost a whole vendor's eyes to the caller's shell, and #68 is the report
     that reads the same either way.
+
+    **`cwd` is also what marks the run as a seat's** (#721). A sandbox is a
+    throwaway repo, `qb-hook` fires inside every seat because the lifecycle hooks
+    are configured per user rather than per repo, and a hook that reported this
+    directory would put a repository nobody outside this process can name on the
+    fleet's collision index. So a call that passes a `cwd` gets
+    :func:`sandbox_env`, and one that does not runs in the panel process's own
+    directory — a real checkout, where the hook should report normally.
+
+    Derived from `cwd` rather than taken as a parameter beside it, because the two
+    are the same fact: the docstring above already promises that this parameter is a
+    member sandbox, all five call sites in the harness pass one, and an `env=`
+    argument would be five more places to forget the flag and five ways for the two
+    to disagree — two of them in `panel_rounds`, which is a different module and
+    would have to be told. The defect this closes is exactly a fact about the
+    sandbox being enforced somewhere other than where the sandbox is made.
 
     A sandbox satisfies codex's check by construction, which is why no
     `--skip-git-repo-check` appears anywhere here — verified against an untrusted
@@ -1098,12 +1160,16 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     (codex) would otherwise under-report exactly the seat that is flaking."""
     last = f"{label}: no attempt made"
     feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+    # Resolved once for the whole retry loop rather than per attempt: nothing
+    # between attempts changes it, and building it three times would be three
+    # copies of `os.environ` for one dict entry.
+    env = sandbox_env() if cwd is not None else None
     for _ in range(max(1, attempts)):
         argv = args() if callable(args) else args
         started = time.monotonic()
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout, cwd=cwd, **feed)
+                                  timeout=timeout, cwd=cwd, env=env, **feed)
         except subprocess.TimeoutExpired as e:
             # A timeout is the most expensive outcome the panel has: the model
             # read the whole diff and thought about it for the full budget before
@@ -5527,7 +5593,8 @@ __all__ = [
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
-    "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
+    "is_deterministic_failure", "member_sandbox", "SANDBOX_ENV", "sandbox_env",
+    "run_cli", "record_run",
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",

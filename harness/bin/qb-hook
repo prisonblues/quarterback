@@ -384,12 +384,98 @@ if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
     # board's reads accept it. Only the *identity* is unavailable, not the grouping.
     [ -n "$repo" ] || repo=$(printf '%s' "$_url" | sed -E 's#.*[:/]##')
   fi
-  # No origin at all => NO repo. It used to fall back to the directory basename,
-  # which is why the panel's per-seat sandbox — a `git init` in a temp directory
-  # named `cwd` — put `repo: "cwd"` and `branch: "master"` on the board and read as
-  # an unexpanded variable. A throwaway repo nobody else can name is not a repo the
-  # fleet shares, and reporting one is worse than reporting none: it is a repo name
-  # a peer can ask about and be answered about.
+  # No origin at all: the directory basename is the only name this checkout has,
+  # and whether it is worth putting on the board depends on WHOSE directory it is.
+  #
+  # #714 dropped the fallback outright, for a real case: the panel's per-seat
+  # sandbox is a `git init` in a temp directory, so it put `repo: "cwd"` and
+  # `branch: "master"` on the board — read, reasonably, as an unexpanded variable.
+  # A throwaway repo nobody else can name is not a repo the fleet shares, and
+  # reporting one is worse than reporting none: it is a repo name a peer can ask
+  # `/active` about and be answered about.
+  #
+  # But "no origin" is not only the sandbox (#721). An ordinary local-only
+  # repository — never pushed anywhere, two agents, two worktrees — reported
+  # `repo: NULL` on both leases, and a repo-scoped read cannot match NULL, so
+  # `active(repo="<basename>")` answered a clean board while two agents were live
+  # in it. That is the same false clean #714 exists to abolish, arriving through
+  # the other half of the same field. It is also the opposite of what the board
+  # does one function away: `_subagents_in_repo` KEEPS a sub-agent whose parent
+  # cannot be placed, because on a collision index "unknown" must not be
+  # representable as a clean answer.
+  #
+  # So the suppression is declared rather than inferred. `QB_SANDBOX` is exported
+  # by whoever MADE the throwaway checkout — `panel_seats.run_cli`, for the seat
+  # sandboxes that are the whole of the #714 case — and only that process's
+  # children go silent. Everything else keeps the bare name, which the board's
+  # reads already accept (`app.repomatch.name_clause`): only the *identity* is
+  # unavailable there, not the grouping.
+  #
+  # Inferring it from the checkout instead was the alternative, and there is no
+  # test for it that a real repo cannot fail: a fresh `git init` and a local-only
+  # repository of ten years' commits differ in nothing the hook can see — not the
+  # remote, not the temp-dir prefix (a worktree under /tmp is legitimate), not the
+  # branch name. The process that created the directory is the only thing that
+  # knows, so it is the thing that says.
+  #
+  # The name is the REPOSITORY's directory and not this worktree's, which is what
+  # makes it an answer two agents can share. #721's whole scenario is a local-only
+  # repo with two agents in two worktrees, and `create-worktree` names those
+  # `<repo>-<branch>` — so the obvious `--show-toplevel` gives them
+  # `quarterback-fix-issue-721` and `quarterback-feat-issue-9`, two repositories on
+  # the collision index where there is one, and neither agent can be asked about
+  # under the name the other reports. `--git-common-dir` is the one path every
+  # worktree of a repo agrees about (verified: resolved absolute it answers
+  # `<repo>/.git` from the main checkout and from a linked worktree alike).
+  # `/.git` off the end gets the repository directory; the second `.git` strip is
+  # for a BARE repo, whose common dir IS the repository directory and
+  # conventionally ends in `.git`.
+  #
+  # Resolved with `cd` and `pwd` rather than asked for absolute, and there is NO
+  # fallback under it — deliberately. `--git-common-dir` answers relative to the
+  # directory git ran in (`$cwd`, via `-C`) whenever it can: `.git` from the main
+  # worktree, an absolute path from a linked one. `--path-format=absolute` would
+  # collapse that to one call but arrived in git 2.31, so on an older git it is the
+  # branch that does not run — and the only thing left to fall back TO is
+  # `--show-toplevel`, the per-worktree name this whole block exists to stop
+  # reporting. That is not a degraded answer, it is the defect: an old git would
+  # have put `checkout-wt-a` and `checkout-wt-b` on the collision index again,
+  # silently, with the test that catches it passing on the box that ran it. `cd`
+  # and `pwd` are POSIX and answer identically on every git, so the version
+  # question does not arise.
+  #
+  # `CDPATH=` is load-bearing, not hygiene. `--git-common-dir` answers the BARE
+  # relative `.git` from a main checkout, and a `cd` operand that does not begin
+  # with `/`, `./` or `..` is searched for on CDPATH first — so an agent whose
+  # shell profile exports CDPATH with any entry holding a `.git` lands in somebody
+  # else's repository, and the hook publishes a lease for a repo this session is
+  # not in. That is #714's own failure made worse: not a name nobody can resolve,
+  # a name that resolves to the wrong thing. Measured with a decoy at
+  # `$CDPATH/.git`: the substitution came back
+  # `/tmp/…/decoy/.git\n/tmp/…/decoy/.git` — wrong, and DOUBLED, because `cd`
+  # echoes the directory it landed on whenever CDPATH is what found it. Emptying
+  # CDPATH closes both halves at once (no search, so nothing to echo); the
+  # `>/dev/null` under it is belt-and-braces so no stdout from `cd` can ever reach
+  # the value, whatever a future shell decides to print.
+  #
+  # The subshell is the guard as well as the resolution. `_root` is empty when the
+  # common dir came back empty, when either `cd` fails (the checkout deleted under
+  # us, an unreadable git dir) or when `pwd` fails — every one of them short-
+  # circuits before `pwd`, so nothing partial is printed. An empty `_root` then
+  # yields an empty `repo`: `${_root%/.git}` is empty, `printf` writes nothing, and
+  # `sed` over no input outputs nothing. No repo is the safe outcome and the same
+  # one a sandbox gets.
+  if [ -z "$repo" ] && [ -z "${QB_SANDBOX:-}" ]; then
+    _gitdir=$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)
+    _root=$(
+      [ -n "$_gitdir" ] || exit 1
+      CDPATH=
+      cd "$cwd" >/dev/null 2>&1 || exit 1
+      cd "$_gitdir" >/dev/null 2>&1 || exit 1
+      pwd
+    )
+    repo=$(printf '%s' "${_root%/.git}" | sed -E 's#/+$##; s#\.git$##; s#.*/##')
+  fi
   branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
 fi
 
