@@ -1168,6 +1168,30 @@ answer to an outage and no answer at all to a misconfiguration.
 `qb-claim` prints the claim id on **stdout** and everything else on stderr, so a caller can
 capture the id for `claim/renew` and `claim/release` without parsing prose.
 
+**A claim is a pickup unless you say otherwise, and `--no-plan-item` is how you say it.**
+Taking a claim on an issue or a PR writes that repo's plan item at rank 1, because picking work
+up is the one act that should put work on the board (#427). A panel review round claims the PR
+it is reading, and that is a true exclusivity record and a false pickup: the round wrote the PR
+in at rank 1, released the claim when it finished, and left the row open, unclaimed and
+unblocked at the top of the plan — so `next` handed the following agent a review that had
+already happened (#722). Pass the flag when you are holding a key rather than starting the work.
+It writes no item and it retires none, the claim is exclusive exactly as any other, and it
+implies `--no-gh-title` since the plan item was the title's only consumer.
+
+**Roll the board out FIRST, then the harness** — this is a protocol change and the two halves
+ship separately, so for as long as they disagree one of these is what happens. It is the same
+split as the reference-vs-live units under `qb-reconcile` below: what is in this repo is not
+what a host is running.
+
+| what is newer | what happens | what you see |
+| --- | --- | --- |
+| the tool | `ClaimIn` takes pydantic's `extra="ignore"`, so an old board discards `plan_item` and writes the rank-1 row anyway | `qb-claim` reads the answer back and says `WARNING: --no-plan-item was IGNORED` on stderr; a round carries it into `config_notes`. The claim stands — nothing out here can un-write the row |
+| the board | nothing: an old `qb-claim` never sends the field, and the board's default is unchanged | the ordinary pickup item, exactly as before |
+| the round, not its `qb-claim` | argparse refuses the unknown flag and exits 2 | `hold_pr` tells that refusal apart from a board's and asks again without the flag, noting that the claim was taken **with** a plan item. A visible imperfect record beats no record, which is what the round had before #715 |
+
+The order follows from the middle row: a newer board is invisible to every old caller, and a
+newer tool is not.
+
 **`create-worktree` takes the claim for you.** It derives the issue number from the branch
 it is about to make (`feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`) and
 claims it *before* the tree exists, so a refusal costs nothing to unwind:
@@ -3402,7 +3426,8 @@ lander's. The shipped unit runs `--apply --post --quiet`: the timer is what carr
 because it covers every route work is picked up through and every abnormal ending, including a
 session that died mid-work. **The live units on this fleet come from nix-fleet's
 `home/rich-workstation.nix`** (#695's row is about exactly that split), so a flag added here
-reaches a host only once that config carries it too.
+reaches a host only once that config carries it too. The same split is what decides the rollout
+order for a change to the claim protocol — see `--no-plan-item` under `qb-claim` above.
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.

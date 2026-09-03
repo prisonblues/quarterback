@@ -529,3 +529,140 @@ async def test_a_fleet_wide_key_is_not_invented(client):
     before = len((await read(client))["items"])
     await claim(client, kind="work", key=f"plan:{uuid.uuid4()}", note="board object")
     assert len((await read(client))["items"]) == before
+
+
+# ----------------------------------------- exclusivity without a pickup (#722)
+
+async def claim_pr(client, repo: str, number: int, headers=LAPTOP, **over) -> dict:
+    return await claim(client, headers=headers,
+                       ref={"kind": "pr", "repo": repo, "value": str(number)}, **over)
+
+
+async def test_a_claim_that_is_not_a_pickup_writes_no_item(client):
+    """#722. #715 made a panel review round claim the PR it is reading, so the
+    fleet can see which agent is spending money on which PR. That claim is a true
+    exclusivity record and a false pickup: it wrote the PR onto the plan at rank 1,
+    with `rank_source: picked-up`, on behalf of an agent that was reviewing
+    somebody else's work rather than starting any.
+
+    The claim is unchanged — it is still exclusive, it still refuses a second
+    holder, it still names the round in its note. Only the assertion that work has
+    been picked up is withdrawn."""
+    repo = "acme/reviewed"
+    out = await claim_pr(client, repo, 715, plan_item=False,
+                         note="panel review round 1")
+    assert out["claimed"] is True
+    assert out["plan_item"] is None
+    assert "plan_item_error" not in out, "not a failure — nothing was attempted"
+    assert (await read(client, repo))["items"] == []
+
+
+async def test_a_round_that_claims_and_releases_leaves_the_plan_as_it_found_it(client):
+    """The consequence, end to end, and the reason the flag is worth a field.
+
+    Step for step it is the issue: a round starts and claims the PR; the round
+    ends and releases it. Before this the plan then held an item for that PR —
+    open, unclaimed, unblocked, rank 1 — so `next` handed the following agent a
+    review that had already happened, above the order a human had actually set.
+    Read off this board while #722 was open: `next` for this repo was the item for
+    PR #715 — the PR that added the round's claim — open at rank 8, its own claim
+    released, ahead of every ordered item below it."""
+    repo = "acme/roundtrip"
+    human = await add(client, repo, "the thing Rich actually wants first",
+                      ref_kind="issue", ref_value="63")
+    r = await client.post("/plan/reorder",
+                          json={"repo": repo, "order": [human["item_id"]]}, headers=HUMAN)
+    assert r.status_code == 200, r.text
+
+    held = await claim_pr(client, repo, 715, plan_item=False,
+                          note="panel review round 1")
+    r = await client.post("/claim/release", json={"claim_id": held["claim_id"]},
+                          headers=LAPTOP)
+    assert r.status_code == 200, r.text
+
+    plan = await read(client, repo)
+    assert [i["item_id"] for i in plan["items"]] == [human["item_id"]]
+    assert plan["next"]["item_id"] == human["item_id"]
+    assert plan["next"]["caveat"] is None
+
+
+async def test_the_default_is_still_a_pickup(client):
+    """#427's rule is right for a real pickup and nothing about it changes. The
+    flag has to be asked for, so every caller that has not heard of it — every
+    agent, hook and skill on the fleet — goes on putting its work on the board."""
+    repo = "acme/stillapickup"
+    out = await claim_issue(client, repo, 426, note="picking this up")
+    assert out["plan_item"]["rank"] == 1
+    assert out["plan_item"]["rank_source"] == "picked-up"
+    assert len((await read(client, repo))["items"]) == 1
+
+
+async def test_a_pr_claim_is_a_pickup_unless_the_caller_says_otherwise(client):
+    """The alternative fix, refused: teaching the board that a PR claim is never a
+    pickup. Sometimes it is exactly that — an agent taking over somebody's stalled
+    PR to finish it — and nothing in the key can tell the two apart. The caller
+    can, so the caller says."""
+    repo = "acme/prpickup"
+    out = await claim_pr(client, repo, 207, note="finishing this one off")
+    assert out["plan_item"]["rank_source"] == "picked-up"
+    assert (await read(client, repo))["items"][0]["ref"] == {"kind": "pr", "value": "207"}
+
+
+async def test_it_does_not_retire_an_item_that_is_already_there(client):
+    """"Do not write one" and "retire the one you find" are different powers, and a
+    flag on a claim must not carry the second. The row a round would have retired
+    may be a human's, or a real pickup's by an agent still working; the claim path
+    cannot tell, and a review that quietly cleared the plan row for the PR it was
+    reading would be a worse defect than the one this fixes."""
+    repo = "acme/alreadyplanned"
+    existing = await add(client, repo, "somebody is finishing this PR",
+                         ref_kind="pr", ref_value="715")
+
+    out = await claim_pr(client, repo, 715, plan_item=False,
+                         note="panel review round 1")
+    assert out["claimed"] is True
+    assert out["plan_item"] is None, "it reports no item, and it wrote none"
+
+    plan = await read(client, repo)
+    assert [i["item_id"] for i in plan["items"]] == [existing["item_id"]]
+    assert plan["items"][0]["title"] == "somebody is finishing this PR"
+    assert plan["items"][0]["state"] == "open"
+
+
+async def test_a_renew_without_the_item_does_not_repair_one_into_existence(client):
+    """A renew repairs a plan write that failed (#427), and that repair must not
+    fire for a caller that never wanted the item. A round renews for as long as it
+    is reviewing, so a repairing renew would put the PR on the plan on the second
+    heartbeat and the flag would buy nothing but a delay."""
+    repo = "acme/renewnoitem"
+    first = await claim_pr(client, repo, 715, session="s1", plan_item=False,
+                           note="panel review round 1")
+    again = await claim_pr(client, repo, 715, session="s1", plan_item=False,
+                           note="panel review round 1")
+    assert first["claimed"] is True and again["renewed"] is True
+    assert again["plan_item"] is None
+    assert (await read(client, repo))["items"] == []
+
+
+async def test_a_title_is_ignored_rather_than_refused_when_no_item_will_hold_it(client):
+    """The item is the title's only consumer, so with no item there is nothing for
+    it to name. Ignored and not refused: a claim turned down over a redundant field
+    costs the duplicated work the claim exists to prevent, which is the trade this
+    endpoint declines everywhere else."""
+    out = await claim_pr(client, "acme/titleignored", 715, plan_item=False,
+                         title="fix: the thing the round is reading")
+    assert out["claimed"] is True
+    assert out["plan_item"] is None
+
+
+async def test_the_claim_is_as_exclusive_as_any_other(client):
+    """What the flag withdraws is the assertion of a pickup and nothing else. A
+    second agent is still refused, and told who to talk to — which is the whole
+    reason a round takes a claim at all."""
+    repo = "acme/stillexclusive"
+    await claim_pr(client, repo, 715, plan_item=False, note="panel review round 1")
+    r = await client.post("/claim", json={
+        "ref": {"kind": "pr", "repo": repo, "value": "715"},
+        "note": "my round too", "plan_item": False}, headers=SERVER)
+    assert r.status_code == 409, r.text
+    assert "laptop" in r.text
