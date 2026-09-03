@@ -239,7 +239,8 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           population) and confirmed_defects, never outcomes_recorded
 GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by_repo, by_size,
                                                                      by_kind, by_shape, by_rounds,
-                                                                     marginal_by_round}
+                                                                     marginal_by_round,
+                                                                     injection_by_round}
                           the share of review CYCLES that ended in a confident dry round
                           (#626) — the number the convergence epic is judged on. One cycle
                           is one (repo, pr, cycle), its ending is its TERMINAL round's, and
@@ -256,7 +257,26 @@ GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by
                           that way. A caps refusal is NOT among them: it ends the cycle and
                           counts `unconverged`, as `preland` and the review queue already
                           call it. `by_rounds` is keyed `final_round`, the terminal round's
-                          NUMBER rather than a count of rounds recorded. **`days` defaults
+                          NUMBER rather than a count of rounds recorded.
+                          `injection_by_round` (#637) is the OTHER population: per round
+                          number, the distribution of `provenance_counts.introduced` over
+                          every bucket — the quantity `escalate_on.fix_injection` divides,
+                          at the grain it divides it, which `marginal_by_round` (counts) and
+                          `/review/stats` (a ratio of sums across a window) both miss. Read
+                          `rate_min`/`rate_p25`/`rate_median`/`rate_p75`/`rate_max` and not
+                          `pooled_rate`: the rule weights a 4-finding round like a
+                          44-finding one and a pooled ratio does not. Every SUM and RATE is
+                          over `rated_runs` (a non-zero denominator existed), which is
+                          smaller than `attributed_runs` (the panel sent a tally) and
+                          smaller again than `rounds`; those three are the markers, not
+                          figures over it. `dial_runs` counts the RATED rounds carrying a
+                          `rules` record — the only field that says what the threshold WAS
+                          while the round ran — and it read 1 of 38 on 2026-09-02; it
+                          shares `rated_runs`' population deliberately, a marker over any
+                          other being worse than none. **No threshold
+                          and no minimum denominator is applied**: the dial is a repo's and
+                          `FIX_INJECTION_MIN_NEW` is the harness's, so the board publishes
+                          the population and never the verdict. **`days` defaults
                           to 90** where the rest of `/review/*` defaults to all time: this
                           one classifies a row per cycle in Python rather than aggregating
                           in SQL, and the applied boundary is always in `window.since`
@@ -1134,6 +1154,53 @@ what a recalibration groups a population by must not cost one fetch per run; the
 detail-only. There is deliberately no release NUMBER among them — `package.nix` ships no
 `pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
 a merge, so a running harness has none to report and a branch's harness never had one.
+
+**And the FIX PASS itself, which is the one actor here nothing recorded (#624).** Everything above
+is about a round: what it read, under which dials, with which seats, produced by which harness,
+ending in which verdict. Reviewers have scorecards, findings have keys and terminal outcomes,
+rounds have a row. The actor *between* two rounds — the fix pass, which writes the code that
+produces the next round's findings — had a paragraph in a markdown brief. On `lexray#1780` its four
+passes ran to +850/−314 across 11 files, +322/−49 across 9, +356/−41 across 12 (seven of them files
+no round had read) and +142/−31 across 7, and every one of those numbers was reconstructed from
+`git` by hand, afterwards, in order to file the issue.
+
+`fix_pass` is that record, and it is an **assembly** rather than a new measurement: the churn split
+(#554), the surface (#619), the range and the brief's fate (#506), the pricing (#622) and the
+attribution (#489) were each already derived once a round and then filed under the round's *stop
+decision* as five unrelated rungs. #624's own words: the interesting field "already exists per-round
+as `introduced` — it simply is not attached to the pass that caused it".
+
+| field | what it is | authority |
+|---|---|---|
+| `range` | both ends of the commit range, which of three readers supplied the diff, how many commits and merges it holds, and `spans` — how many fix phases it actually covers | derived |
+| `brief` | which round's **To fix** list briefed it, how many findings that list held, and how many of them this round could key | derived |
+| `churn` | production / test / prose / total, over insertions plus deletions | derived |
+| `surface` | the files it touched, and which of them no earlier round of the cycle had read | derived |
+| `cleared` / `still_open` | brief entries this round no longer raises, and those it still does — keys and severities | derived |
+| `introduced` | how many of **this** round's findings were attributed to that pass | derived |
+| `declared` | the `narrowed` / `declined` / `escalated` keys the pass reported, dated to this round | **declared** |
+| `counts` | the eleven-key integer summary, which is what rides `GET /reviews` | derived |
+| `gaps` | the record's own account of what it cannot say | — |
+
+Every measurement comes from the diff, the commits and the payload the pass was given — never from
+the pass's account of itself, which is what #622 and #621 exist to remove — and the two things that
+*are* declarations sit under a key that says so and feed no count. The record is opaque JSONB on
+`GET /review/{id}`; `fix_pass_counts` is its own `counts` block, lifted rather than recomputed, and
+rides `GET /reviews` on the rule the three tallies already state.
+
+**And it is deliberately not a leaderboard**, which is the other half of #624's title. Its second
+opinion, adopted in full: every obvious ratio here is gameable in a direction worse than the
+disease — *lines per finding cleared* rewards compressed and superficial fixes, *findings introduced
+per pass* rewards weakening tests and avoiding the files most likely to be read, *new files opened*
+rewards refusing a cross-file repair that is genuinely required (a P1 left unfixed to protect a
+metric), and *share still standing a round later* is invalid under increment scope because the later
+round may never have re-read the repair. So the record carries **no actor key at all** — it names
+the pass by its range and the round that briefed it, never the agent, model or session that
+performed it, which is a stronger guarantee than a policy of not writing the query. No ratio is
+stored, nothing is indexed to invite an aggregation, `round_stop` is not passed it and does not read
+it, no dial governs it, and `GET /review/stats` — the leaderboard this table already feeds — does
+not touch it. The fixer's brief says the record is made and says it is not scored, because a
+measurement the measured party is not told about is a trap rather than a brake.
 
 **And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
 A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;

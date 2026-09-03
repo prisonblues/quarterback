@@ -4950,6 +4950,277 @@ def revert_state(kind: str, *, why: str | None = None, base_sha: str | None = No
     }
 
 
+#: The record's own integer summary, and every number on it. Each entry is a COUNT
+#: or ``None`` — never a share, a rate, a ratio, a score or a rank — and that is
+#: #624's "do not leaderboard it" written as a vocabulary rather than as a
+#: paragraph. Every obvious ratio over a fix pass is gameable in a direction worse
+#: than the disease, and the issue enumerates four of them: lines per finding
+#: cleared rewards compressed and superficial fixes; findings introduced per pass
+#: rewards weakening tests and avoiding the files most likely to be read; new files
+#: opened rewards refusing a cross-file repair that is genuinely required — a P1
+#: left unfixed to protect a metric; and share still standing a round later is
+#: invalid under increment scope, because the later round may never have re-read
+#: the repair. So the record carries the numerators and the denominators and
+#: divides none of them: a consumer that wants a ratio has to write it down, in its
+#: own code, where somebody can argue with it.
+#:
+#: It is also a PROJECTION and not a second measurement. Every entry is the same
+#: value the record already publishes in its structured blocks
+#: (:func:`fix_pass_record` says which), flattened into one bounded integer mapping
+#: so that a board can carry it on a run LIST without carrying the path lists and
+#: the finding keys with it — the cut `_run_view` already makes for `unread_files`
+#: and `harness_path`. ``test_every_count_is_the_records_own_number`` pins the
+#: projection, so the flat copy cannot drift from the block it came from.
+FIX_PASS_COUNTS = ("briefed", "placed", "cleared", "still_open",
+                   "production", "test", "prose", "churn",
+                   "files", "new_files", "introduced")
+
+#: What a fix-pass record does NOT carry, one line each, published ON the record.
+#:
+#: An artifact whose gaps are only in the release notes is an artifact a consumer
+#: two years from now reads as complete. These travel with the row for the reason
+#: :data:`NO_PRIOR_BRIEF`'s ``why`` travels with a null verdict: the question "why
+#: is this field not here" has several different answers, and a reader holding one
+#: stored record cannot reconstruct which of them applied.
+#:
+#: The first is the one #624 was scoped around. #621's 2026-08-31 scope decision
+#: parks #623 (typed obligations), and a per-finding `fixed | refuted | deferred`
+#: column is not buildable without it: a diff carries no attribution from a churned
+#: line back to the finding it was written for, so the only available source is the
+#: fixer's own account of itself — which is the thing this family of issues exists
+#: to remove. The declaration that DOES exist is not smuggled in here either: it
+#: lives in the board's `review_finding_outcomes`, one row per defect, with the
+#: identity that recorded it and a separate field for the human it CLAIMS signed it
+#: off, and it is a different artifact with a different author.
+FIX_PASS_GAPS = (
+    "no per-finding outcome: `fixed | refuted | deferred` needs a finding's TYPE "
+    "(#623, parked) and a line-to-finding attribution a diff does not carry; the "
+    "declared form lives in `review_finding_outcomes` with its own claimant",
+    "`cleared` is not `verified fixed`: it means this round did not raise the "
+    "complaint again, and under `increment` scope this round re-read only the fix "
+    "range — `scope` is beside it so the reading cannot be taken for a stronger one",
+    "no actor: this record names the PASS, by its commit range and the round that "
+    "briefed it, and never the agent, model or session that performed it — an "
+    "artifact with no actor key cannot be aggregated into a table of fixers",
+    "no per-finding line ranges, so no cost per finding: the fixer would have to "
+    "declare them, which is a self-report (#622), and nothing else in the round can "
+    "check one",
+)
+
+
+def fix_pass_record(round_no: int, *, revert: dict | None, referee: dict | None,
+                    surface: object = None, brief: dict | None = None,
+                    cleared: Iterable[dict] = (), still_open: Iterable[dict] = (),
+                    introduced: int | None = None, cycle: str | None = None,
+                    source: str | None = None, narrowed: Iterable[str] = (),
+                    declined: Mapping[str, object] | None = None,
+                    escalated: Mapping[str, int] | None = None) -> dict | None:
+    """The fix pass this round read, as a first-class artifact — #624, epic item 4.
+
+    **The fixer is the only actor in this loop nobody records.** Reviewers have
+    scorecards, rounds have payloads, findings have keys and outcomes, judges have a
+    model and an effort. The pass BETWEEN two rounds — the actor that writes the code
+    that produces the next round's findings — had no record of its own. On
+    `prisonblues/lexray#1780` the four passes came out at +850/-314 across 11 files,
+    +322/-49 across 9, +356/-41 across 12 (7 of them files no round had read) and
+    +142/-31 across 7, and every one of those numbers had to be reconstructed from
+    `git` by hand, afterwards, to write the issue.
+
+    **This is an ASSEMBLY, not a new measurement, and that is the point of it.**
+    Almost everything here was already being derived, once a round, and then filed
+    under the round's stop decision as five unrelated rungs: the churn split at
+    ``round_stop.unrefereed_fix`` (#554), the surface at ``round_stop.fix_surface``
+    (#619), the range and the brief's fate at ``round_stop.revert`` (#506), the
+    budget pricing at ``round_stop.fix_budget`` (#622) and the attribution at
+    ``provenance_counts`` (#489). #624's own words: the interesting field "already
+    exists per-round as ``introduced`` — it simply is not attached to the pass that
+    caused it". So every value here is READ OFF THE SIBLING THAT ALREADY DERIVED IT
+    — ``revert`` is :func:`revert_state`'s output, ``referee`` is
+    :func:`referee_state`'s, ``brief`` is :func:`budgeted_brief`'s, ``surface`` goes
+    through :func:`fix_surface_state` exactly as `round_stop` sends it — on this
+    module's standing rule that two derivations of one quantity are two things that
+    can disagree, and here they would disagree inside one payload.
+
+    **Every field is derived from observable state, and the two that are not say so
+    in their own key.** #622's second opinion, adopted by #621: anything the fixer
+    self-reports is the thing these issues exist to remove. So the measurements come
+    from the diff, the commits and the payload the pass was given — never from the
+    pass's account of itself — and the declarations the loop already carries are
+    segregated under ``declared``, kept out of every count, and named as
+    declarations:
+
+    ======================  ==========================================  ==============
+    field                   what it is                                  authority
+    ======================  ==========================================  ==============
+    ``range``               both ends of the commit range, which of the  derived
+                            three readers supplied the diff, how many
+                            commits and merges it holds, and ``spans``
+                            — how many fix phases it actually covers
+    ``brief.round``         which round's To fix list the pass answered  derived
+    ``brief.findings``      how many findings that list held            derived
+    ``churn``               production / test / prose / total, over     derived
+                            insertions plus deletions
+    ``surface``             files touched, and which of them no          derived
+                            earlier round of this cycle had read
+    ``cleared``             brief entries this round no longer raises    derived
+    ``still_open``          brief entries it still raises                derived
+    ``introduced``          how many of THIS round's findings were       derived
+                            attributed to this pass
+    ``declared.narrowed``   keys the pass said it answered at the point  **declared**
+                            they were raised and no wider (#615)
+    ``declared.declined``   corrections it said it would not make (#665) **declared**
+    ``declared.escalated``  findings it referred to a human (#221)       **declared**
+    ======================  ==========================================  ==============
+
+    ``declared`` is here rather than dropped because a declaration the loop already
+    ACTS on has to be visible on the pass that made it — ``narrowed`` clears a
+    finding, ``escalated`` takes one out of every stop rule, ``declined`` files a
+    veto — and an auditable record of a consequential claim is worth more than a
+    silence. It is dated by THIS round, not by the pass's own say-so: `--narrowed`,
+    `--declined` and `--escalated` are passed to the round that reads the pass, so an
+    entry stamped ``round_no`` is one made about the pass this record is about, and
+    an inherited entry from an earlier round belongs to an earlier pass and is left
+    there. Nothing in ``counts`` is computed from any of it.
+
+    **It gates nothing, and there is no flag to arm one.** :func:`round_stop` does
+    not read this record and is not passed it; no dial is added; ``escalate_on``
+    grows no key. #67's instrument-before-gate rule for the first and #621's "not a
+    29th dial" for the second — and #624 is explicit beyond both of those: "record
+    the pass, report the numbers as diagnostics, and calibrate against real cycles
+    before anything is scored, ranked or gated. The record is the deliverable here;
+    the judgements are a later, separate decision." :data:`FIX_PASS_COUNTS` is where
+    the no-ratio half of that is enforced, and :data:`FIX_PASS_GAPS` is what the
+    record admits it cannot say.
+
+    **``None`` IS "THERE WAS NO PASS", AND IT IS THE ONLY THING IT MEANS.** Round 1,
+    and a run with no earlier round, have no pass in front of them — which is
+    :data:`REVERT_NOT_ASKED`, the one verdict in this file that means exactly that,
+    reused rather than re-derived from a round number. A pass that HAPPENED and could
+    not be read — a rewritten branch, an API refusal, a baseline that named no commit
+    — gets a record with nulls in it, because "the pass opened no file and churned no
+    line" is the flattering direction on every claim this artifact makes, and it is
+    the claim an unmeasured round would otherwise publish. Every block here follows
+    the null-not-zero rule its own producer already follows (:func:`churn_cells`,
+    :func:`fix_surface_state`, :func:`_introduced`), and shares their presence tests
+    rather than inventing new ones.
+
+    A skipped round records ``None`` too, though a pass may well have landed in front
+    of it: the round reviewed nothing, so it measured nothing, and a record of zeros
+    would attribute an unread pass's silence to the pass. `panel.py` leaves the key
+    at its default on those exits for the same reason ``round_stop`` is null there.
+    """
+    # The one clean test for "there was a pass at all", and it is the anchor's own
+    # verdict rather than `round_no > 1`: a run OUTSIDE a cycle has no earlier round
+    # whatever its round number says, and `revert_state` is already the place that
+    # distinction is made.
+    if not isinstance(revert, dict) or revert.get("kind") == REVERT_NOT_ASKED:
+        return None
+    said = brief if isinstance(brief, dict) else {**NO_PRIOR_BRIEF}
+    briefed = _nonneg_int(said.get("findings"))
+    # ONE presence test for the churn cells and their total, and it is
+    # `churn_cells`' own — a pass that genuinely churned nothing and a round with no
+    # readable range record zeros in every bucket and the payload distinguishes them
+    # nowhere else, so a zero total reads as "not measured" here exactly as it does
+    # in the trend block. The cost is a real empty fix range rendering as unknown;
+    # the alternative is publishing `0 production` for a pass nobody could see.
+    split = referee if isinstance(referee, dict) else {}
+    total = _nonneg_int(split.get("churn"))
+    cells = churn_cells(split)
+    # `fix_surface_state` and not the raw mapping: it is the normaliser `round_stop`
+    # sends the same object through, so the record and `round_stop.fix_surface`
+    # cannot publish two different readings of one set difference.
+    shown = fix_surface_state(surface)
+    # Keys and severities, not the five-field records `revert_state` carries. The
+    # identity is the key — it is what joins to a stored finding — and the full
+    # records are already in `round_stop.revert` for the rounds that asked for a
+    # proposal, read out of the SAME `fix_pass_outcome` call, so nothing here can
+    # disagree with them about which complaints survived.
+    def keyed(records: Iterable[dict]) -> list[dict]:
+        return [{"key": r.get("key"), "severity": r.get("severity")}
+                for r in records if isinstance(r, dict)]
+
+    was_cleared, was_open = keyed(cleared), keyed(still_open)
+    # `placed` is how many of the brief this round could KEY, and it is published
+    # because `cleared + still_open` does not have to equal `findings`:
+    # `Baseline.fixed_findings` drops a record with no key or no file, while
+    # `fixed_severities` counts every entry in both buckets including one that is not
+    # a record at all (#694's own correction). Without this a reader would see two
+    # lists that do not add up to the total beside them and have no way to tell a
+    # dropped record from a lost one.
+    #
+    # Null, not zero, wherever there was no brief to place: `briefed` is null for
+    # round 1, an unreadable baseline and an anchor that asked for nothing alike
+    # (`budgeted_brief` tells those apart in `why`), and a `0` here would say the
+    # pass cleared nothing when what happened is that nobody knows what it was sent
+    # to do.
+    placed = len(was_cleared) + len(was_open) if briefed is not None else None
+    dated = {k for k, when in (escalated or {}).items() if when == round_no}
+    unmade = {k for k, d in (declined or {}).items()
+              if getattr(d, "round", None) == round_no}
+    return {
+        # The round that READ the pass — this one. Named rather than left implicit
+        # beside `brief.round`, because the pair is the whole address of a pass: it
+        # is the work between those two rounds, and `spans` says when that is more
+        # than one phase.
+        "read_round": round_no,
+        "cycle": cycle or None,
+        # What the reading round reviewed, which decides how `cleared` may be read
+        # (`fix_pass_outcome`) — recorded rather than described, so the caveat in
+        # `gaps` and the payload cannot drift.
+        "scope": revert.get("scope") or "",
+        "range": {
+            "base": revert.get("base"),
+            "head": revert.get("head"),
+            # The abbreviated display span `revert_state` renders; the full SHAs are
+            # beside it. Never a command: nothing about this record proposes an
+            # action, which `round_stop.revert` is the place for.
+            "span": revert.get("range"),
+            # `_fix_range_diff`'s own verdict and its sentence — `ok`, `no-fix`,
+            # `blind`, `rewritten` — because "the pass could not be read" and "the
+            # pass changed nothing" are opposite facts behind one set of nulls.
+            "kind": revert.get("kind"),
+            "why": revert.get("why"),
+            # How many fix phases the range covers. 1 in the ordinary case, more
+            # where an intervening round recorded no commit to anchor on — and where
+            # it is more than 1 the word "pass", singular, is wrong about this row.
+            "spans": revert.get("spans"),
+            "commits": revert.get("commit_count"),
+            "merges": revert.get("merges"),
+            # Which of the three readers supplied the diff every measurement here
+            # was taken over: the compare endpoint, the round's own increment, or
+            # #504's local reconstruction. A population that mixes them is measuring
+            # against a denominator that moved (#512, #637).
+            "source": source or None,
+        },
+        "brief": {"round": said.get("round"), "findings": briefed, "placed": placed,
+                  # `budgeted_brief`'s sentence, carried rather than re-derived:
+                  # "there was no earlier round" and "the earlier round asked for
+                  # nothing" are two nulls in `findings` and one of them is a fact
+                  # about the cycle.
+                  "why": said.get("why")},
+        "churn": {**cells, "churn": total if total else None},
+        "surface": shown,
+        "cleared": was_cleared,
+        "still_open": was_open,
+        "introduced": introduced,
+        "declared": {"narrowed": sorted({str(k) for k in narrowed}),
+                     "declined": sorted(unmade),
+                     "escalated": sorted(dated)},
+        "counts": {
+            "briefed": briefed,
+            "placed": placed,
+            "cleared": len(was_cleared) if briefed is not None else None,
+            "still_open": len(was_open) if briefed is not None else None,
+            **{kind: cells[kind] for kind in panel_seats.REFEREE_KINDS},
+            "churn": total if total else None,
+            "files": len(shown["files"]) if shown else None,
+            "new_files": shown["count"] if shown else None,
+            "introduced": introduced,
+        },
+        "gaps": list(FIX_PASS_GAPS),
+    }
+
+
 def _by_severity(records: Iterable[dict]) -> str:
     """`2×P2, 1×P3` — a severity census of a finding list, worst first, for the one
     line a human reads. Empty string for an empty list, so a caller can drop it into a
@@ -7725,6 +7996,7 @@ __all__ = [
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
     "sub_floor_brief", "_names_finding", "excision_seams", "_read_once",
     "excision_state",
+    "FIX_PASS_COUNTS", "FIX_PASS_GAPS", "fix_pass_record",
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
     "unrefereed_fix_brake", "referee_state", "fix_surface_state", "fix_budget_state",

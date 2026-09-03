@@ -681,6 +681,23 @@ def test_the_names_are_filtered_by_the_half_a_person_remembers():
     assert qd.dial_matches(vocab, "no such thing") == []
 
 
+def test_the_unfiltered_list_is_every_dial_however_many_there_are():
+    """The claim above held by COINCIDENCE and stopped holding. `dial_matches` bounded
+    itself at 40 by default, which was the number of dials there were — so "which
+    dials are there" answered all of them right up to the 41st
+    (`review_panel.budget.tokens_per_round`, #483), which silently pushed
+    `spawn.max_sessions_fleet` off the end of a list whose whole point is
+    completeness. Written against a vocabulary far larger than the real one, so it
+    cannot come back to true by the count moving again."""
+    many = {f"scope.dial_{i:03d}": {"what": "x"} for i in range(200)}
+    assert qd.dial_matches(many, "") == list(many)
+    assert qd.dial_matches(many, "dial_") == list(many)
+    # The bound still exists and is still honoured — the command-line
+    # disambiguation asks for exactly two — it is just nobody's default now.
+    assert qd.dial_matches(many, "", limit=2) == list(many)[:2]
+    assert len(qd.dial_matches(many, "dial_", limit=2)) == 2
+
+
 def test_an_exact_name_sorts_above_the_names_that_merely_contain_it():
     """Typing one in full has to put it at the top, or the completion offered on a
     refusal names something the person did not ask for."""

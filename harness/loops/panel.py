@@ -1127,6 +1127,20 @@ def _payload_defaults() -> dict:
         "new_findings": 0,
         "new_finding_keys": [],
         "round_stop": None,
+        # #624's artifact: the fix pass this round read, recorded in its own right
+        # rather than as five rungs of somebody else's stop decision. Null on every
+        # path here and NOT `{}`, on `guard_ratio`'s rule two blocks up: an empty
+        # mapping would let a consumer index it and get zeros for a pass nobody
+        # measured, and "the pass opened no file and churned no line" is the
+        # flattering direction on every claim the record makes.
+        #
+        # Present on every exit for `rules`' and `harness_*`'s reason: a consumer
+        # must never have to tell "there was no pass" from "this payload predates
+        # the key". A skipped round leaves it null even where a pass really did
+        # land in front of it — that round reviewed nothing, so it measured
+        # nothing, and `fix_pass_record`'s docstring says why zeros there would be
+        # worse than a silence.
+        "fix_pass": None,
         "stop_reason": None,
         # #507's constructive pass, ALWAYS present and never null — an absent key
         # and "we did not ask" are different claims, and a consumer forced to tell
@@ -1803,7 +1817,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # that cannot proceed; the board read that checks it against what has actually
     # been spent waits until this PR is known to be one the panel would review at
     # all. Dormant unless somebody has set a number.
-    budget = panel_caps.resolve_budget(panel, notes)
+    # `cap` and not the file's wish: #483's per-round allowance derives the per-PR
+    # total as `tokens_per_round × max_rounds`, so the cap this run will actually
+    # honour is the one the total has to be derived against. A `--max-rounds 2` run on
+    # a repo that wrote 6 must not be told it may spend six rounds' worth.
+    budget = panel_caps.resolve_budget(panel, notes, max_rounds=cap)
 
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
@@ -2343,6 +2361,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if again:
             mergeable, mergeable_said = mergeability({"mergeable": again})
     gate = mergeable_said if mergeable == "CONFLICTING" and require_mergeable else ""
+    # WHICH precondition is occupying `gate`, carried alongside the sentence because
+    # the refusal notice owes each one a different remedy list and could not tell them
+    # apart (#483). Three of them reach `preflight` through this one variable and
+    # `refusal_report` keyed its whole "what to do" block on the mergeability case, so
+    # a round refused on the spend ceiling told its reader to rebase the branch, to
+    # set `review_panel.require_mergeable: false`, and to pass `--force` — the last of
+    # which the same refusal says two paragraphs earlier does not work. Set at each of
+    # the three places `gate` is, so a fourth cannot inherit the wrong prose by
+    # default.
+    gate_kind = "merge" if gate else ""
     merge_gate = gate
     if mergeable == "CONFLICTING" and not merge_gate:
         notes.append(f"{mergeable_said}. Reviewed anyway because "
@@ -2433,7 +2461,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the payload, where the next round reads it.
     gate_overridable = not caps.stop
     if caps.stop:
-        gate = caps.refusal
+        gate, gate_kind = caps.refusal, "spend"
         if force:
             notes.append(
                 "--force did NOT override the spend ceiling. It overrides this "
@@ -2453,6 +2481,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # an answer to "an earlier round already ended this cycle", and letting it
         # serve as one would leave the only opt-in indistinguishable from the flag
         # people already pass to get past a size refusal.
+        gate_kind = "cycle"
         gate = (f"an earlier round already ENDED this cycle for PR #{pr_number} — "
                 f"{prior_said}. Continuing it as a fresh round would repeat "
                 "`prisonblues/lexray#1780` rounds 3-5, where three standalone "
@@ -2765,7 +2794,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # means an empty `budgets` and nothing to ask about — which is why there is no
     # test for it. It is spelled the safe way because the cost is a dunder.
     pre = preflight(review.target, budgets, panel, notes, forced=force, gate=gate,
-                    gate_overridable=gate_overridable,
+                    gate_overridable=gate_overridable, gate_kind=gate_kind,
                     # #617's record, whichever gate ended up occupying `gate`. It is
                     # carried on a `run` verdict too — a round that stepped past a
                     # terminal verdict with --new-cycle publishes what it stepped
@@ -4813,10 +4842,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # on a number neither of them spent against, and on a small PR (#551's own note:
     # a ~120-char PR is cut to the clamp) that is a false breach at exactly the sizes
     # where this rung fires.
+    #
+    # Bound to a NAME rather than passed inline since #624, because two consumers now
+    # read it: #622's pricing below, and the fix-pass record further down, whose
+    # `brief.round` and `brief.findings` are this verdict's own fields. One call, so
+    # the round cannot price a breach against one brief and record another.
+    brief = budgeted_brief(prior, round_no, budget_lines,
+                           dials.unrefereed_line_weight)
     budgeting = fix_budget_state(refereeing, budget_lines,
                                  dials.unrefereed_line_weight, dials.budgeted_band,
-                                 budgeted_brief(prior, round_no, budget_lines,
-                                                dials.unrefereed_line_weight))
+                                 brief)
     trend_rows = [*prior.trend,
                   RoundTrend(round=round_no, reviewed=True,
                              findings=len(outstanding),
@@ -5068,6 +5103,43 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             + (f" — {_by_severity(refused['caused'])} attributed to it stay in the "
                "cycle and are handed to a fixer like any other finding"
                if refused.get("caused") else ""))
+
+    # ---- #624: the pass itself, as one addressable artifact.
+    #
+    # Every argument here is an object some sibling already derived — `revert` is the
+    # range and the brief's fate, `refereeing` the churn split, `surface` the file
+    # set, `brief` #622's verdict about the anchor's list, `provenance_counts` the
+    # attribution — and NOTHING is measured a second time. That is this file's
+    # standing rule (two derivations of one quantity are two things that can
+    # disagree) and here it would show up as a payload disagreeing with itself about
+    # one pass.
+    #
+    # It is built AFTER `revert` because it reads `revert_state`'s output, and BEFORE
+    # `round_stop` because it must be visible in the report; `round_stop` is not
+    # passed it and does not read it. Nothing on this record moves `stop` in either
+    # direction, no dial governs it and there is no `escalate_on` key to arm — #67's
+    # instrument-before-gate rule, #621's "not a 29th dial", and #624's own
+    # instruction that the record is the deliverable and the judgements are a later,
+    # separate decision.
+    #
+    # `introduced` comes through `attributed()` exactly as the trend row's own cell
+    # does, off `provenance_counts` and not the raw tally: an unanswerable attribution
+    # publishes null rather than the `0` that reads as a pass which introduced
+    # nothing.
+    #
+    # The three DECLARED registers are filtered to declarations dated to THIS round,
+    # which are the ones made about the pass just read — `--narrowed`, `--declined`
+    # and `--escalated` are passed to the round that reads the pass, and an inherited
+    # entry belongs to an earlier one. `declined_held` and not `live_declined`:
+    # history reads the record, and a declaration a human later retracted was still a
+    # declaration this pass made.
+    fix_pass = fix_pass_record(
+        round_no, revert=revert, referee=refereeing, surface=surface, brief=brief,
+        cleared=revert_cleared, still_open=revert_open,
+        introduced=(provenance_counts.get("introduced")
+                    if attributed(provenance_counts) else None),
+        cycle=prior.cycle, source=fix_range_source,
+        narrowed=told, declined=declined_held, escalated=held)
 
     # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
     # ones itself, so the rule lives in one place instead of depending on every
@@ -6012,6 +6084,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # three files and a resolution order.
         "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
+        # #624's artifact. Top level and NOT under `round_stop`, which is the block
+        # that records a decision this record takes no part in: it gates nothing,
+        # `round_stop` is not passed it, and filing it there would put a diagnostic
+        # inside the object every stop rule is read out of. Null where there was no
+        # pass — see `fix_pass_record`, which is the only thing that decides that.
+        "fix_pass": fix_pass,
         # WHICH range answered (#512): `increment` — the diff this round actually
         # reviewed — or `compare`, the separate API fetch used under `pr` scope and
         # wherever the increment fell back. `null` where the question does not arise
@@ -6372,6 +6450,68 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         lines.append(f"**Refereed-ness of the last fix pass:** {rf['churn']} churned "
                      f"line(s) — {rf['test']} test, {rf['prose']} prose, "
                      f"{verdict}.{armed}")
+    # ---- #624: the pass itself, in one line, ahead of the three readings of it
+    # below. Read back off THIS RUN's own `payload` rather than off the local
+    # variable, on the rule the two blocks under it follow: the line a human reads and
+    # the object a consumer reads have to be one measurement, and a report built from
+    # a second variable is a report that can disagree with the payload beside it.
+    # (`round_stop.fix_surface`'s block goes the other way for a stated reason — that
+    # block is null on a review-only run and the measurement is not.) Null means there
+    # was no pass, which is the only thing it means.
+    #
+    # THE COUNTS AND NO ARITHMETIC OVER THEM. Not "N lines per finding cleared", not
+    # "X% of the round's findings", not a verdict on whether the pass was good: the
+    # numerators and the denominators sit beside each other and a reader who wants a
+    # ratio has to compute it themselves, which is the point at which they will have
+    # to say which one they mean. #624 lists four such ratios and says each rewards
+    # the wrong behaviour.
+    #
+    # Every clause is withheld where its own measurement was not made, rather than
+    # printing a zero: an unreadable range and a pass that wrote nothing are
+    # different facts and the numbers cannot tell them apart, so the sentence names
+    # only what was actually counted. `kind` is what says which happened, and it is
+    # printed where it is not `ok`.
+    fp = payload.get("fix_pass") or {}
+    if fp:
+        c, at = fp["counts"], fp["brief"]
+        said = [f"{c['churn']} churned line(s) "
+                f"({c['production']} production, {c['test']} test, {c['prose']} prose)"
+                if c["churn"] is not None else "",
+                f"{c['files']} file(s) touched"
+                + (f", **{c['new_files']} of them never in front of a reviewer**"
+                   if c["new_files"] else ", none of them new")
+                if c["files"] is not None else "",
+                # Named against the round that briefed it where that round is known,
+                # and against the list alone where it is not. `budgeted_brief` can
+                # publish a finding count beside a null round — an anchor payload
+                # carrying a To fix list and no commit — and "round None's 3
+                # finding(s)" is a wrong number where the sentence without it is a
+                # true one.
+                (f"{c['cleared']} of round {at['round']}'s {c['briefed']} finding(s) "
+                 if at["round"] is not None else
+                 f"{c['cleared']} of the {c['briefed']} finding(s) it was sent to fix, ")
+                + f"no longer raised, {c['still_open']} still open"
+                if c["briefed"] is not None and c["cleared"] is not None else "",
+                f"{c['introduced']} of this round's findings attributed to it"
+                if c["introduced"] is not None else ""]
+        # The span, or why there is none. A record whose range could not be read is
+        # the case a reader most needs told, because every withheld clause above
+        # follows from it and a bare list of absences reads like the pass being
+        # small.
+        where = (f"`{fp['range']['span']}`" if fp["range"]["span"]
+                 else f"range not readable ({fp['range']['kind']})")
+        # `spans` is the one caveat that changes what the noun means, so it is not
+        # left to a reader to notice: more than one fix phase in the range makes
+        # "the pass", singular, wrong about this row.
+        phases = ("" if fp["range"]["spans"] in (1, None) else
+                  f" This range covers {fp['range']['spans']} fix phases, not one — "
+                  "an intervening round recorded no commit to anchor on.")
+        body = ", ".join(s for s in said if s) or "nothing about it was measurable"
+        lines.append(f"**The fix pass this round read** ({where}): {body}. "
+                     "Recorded as a fix-pass artifact, derived from the range and "
+                     "the brief rather than from the fixer's own account (#624). "
+                     "Diagnostics — nothing is scored, ranked or gated on any of "
+                     f"it.{phases}")
     # ---- guard churn against the per-pass ceiling (#618). Printed only where a
     # ceiling was WRITTEN: with `max_fix_guard_lines` at its shipped null there is no
     # number to be under, and a line reading "58 guard lines, no ceiling" on every
@@ -6728,6 +6868,44 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     lines.append(f"\n### To fix ({len(for_fix)}) — {counted}"
                  + (f", {dials.fix_floor} and above"
                     if under_floor else ""))
+    # #624, said to the fixer and not only recorded about it. The budget note below is
+    # conditional on a budget being in force; this is not, because the record is made
+    # of every pass — so a repo with no budget written would otherwise have a fixer
+    # measured by machinery nobody told it about, which is a trap rather than a brake
+    # (#622's own rule, applied to the artifact instead of to the count).
+    #
+    # It says what the record is derived FROM, because that is the part that decides
+    # what a fixer can do about it: the range, the brief and the file set, none of
+    # which is a self-report — so there is no field to write carefully and nothing
+    # here rewards a smaller-looking pass. And it says nothing is scored, because a
+    # measurement announced without that reads as a score being kept, which is
+    # exactly the behaviour #624 refuses to create.
+    #
+    # Placed with the list rather than on the dials line for the budget note's own
+    # reason: an orchestrator that pastes the To fix list into a fixer's brief has to
+    # sweep this up with it.
+    # `cycle_run`, the predicate the payload's own `cycle_trend` and `new_findings`
+    # are gated on: a review-only run has no next round to record anything, and a
+    # round 1 of a cycle has the pass that round 2 will record.
+    #
+    # AND on `for_fix`, which is not belt-and-braces: a round whose To fix list is
+    # empty is a round that stops, so no fix pass follows it and there is nothing for
+    # a next round to record. Printed there, the note would promise an artifact about
+    # a pass that is never going to exist — under a list reading "- none", which is
+    # the shape a reader learns to distrust the whole note from. The below-floor
+    # findings do not count for this: they are explicitly not this round's work
+    # (#165), so a round holding only those is still a round with no pass in front of
+    # the next one.
+    if for_fix and cycle_run:
+        lines.append(
+            "\n_The next round records this pass as a fix-pass artifact: its commit "
+            "range, the churn split, the files it touched and which of them no "
+            "earlier round had read, which of these findings it cleared, and how many "
+            "of the next round's findings are attributed to it. All of it is derived "
+            "from the range and from this brief — nothing is taken from the pass's own "
+            "account of itself — and none of it is scored, ranked or gated on: it is "
+            "a record, so that the actor writing the code is no longer the only one in "
+            "this loop nobody can describe (#624)._")
     # #297's budget, stated where the list it bounds is, not only on the dials line.
     # A mark inside **To fix** rather than a section of its own, which is the opposite
     # of the choice the below-floor findings get below — and for the same reason read
