@@ -2513,6 +2513,20 @@ def _below_floor_count(v: object) -> int | None:
     under the floor" and "this producer does not measure it" are opposite
     readings of the same round, and only one of them argues for lowering the
     floor.
+
+    **What is NOT checked, said out loud.** The OUTER shape is checked and the
+    MEMBERS are not: ``[None]``, ``[True]``, ``[{}]`` and ``["k", "k"]`` are
+    stored as 1, 1, 1 and 2. So "the keys cannot disagree with their count" is a
+    property of a well-formed producer and not something this coercer enforces,
+    and a reader calibrating against these counts is trusting the panel, not the
+    board. That is deliberate and it is not a decision taken here:
+    :func:`_outstanding_or_none` counts ``round_stop.outstanding``'s five buckets
+    the same way and shipped one hour earlier, and two adjacent count fields
+    validating to different depths would be worse than both being lax — the
+    reader would have to know which was which. Tightening belongs to both at once,
+    behind one shared coercer, which is a change to a contract that has already
+    shipped and wants its own review rather than a rider on this one. Raised by
+    codex on #734 and deferred on those grounds, not dismissed.
     """
     return len(v) if isinstance(v, list) else None
 

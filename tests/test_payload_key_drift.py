@@ -75,7 +75,9 @@ missing allow-list entry as loudly as on a new one.
 from __future__ import annotations
 
 import ast
+import textwrap
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import AliasChoices, BaseModel
@@ -180,9 +182,45 @@ def _dict_keys(node: ast.Dict) -> set[str]:
 
     A spread is not lost: ``_payload_defaults()`` is the only one the panel uses
     here and :func:`panel_payload_keys` reads it directly.
+
+    **Lenient, and only the top-level readers may use it as such.** The nested
+    tier goes through :func:`_dict_keys_closed`, because there is no second reader
+    down there to pick a spread back up and a scan that shrugs at one reports
+    fewer keys while reading as though it had reported all of them.
     """
     return {k.value for k in node.keys
             if isinstance(k, ast.Constant) and isinstance(k.value, str)}
+
+
+def _dict_keys_closed(node: ast.Dict, where: str) -> set[str]:
+    """:func:`_dict_keys`, but a construct this scan cannot read is a FAILURE.
+
+    A drift check's own blind spot is the one defect it can never report, and
+    every way of building a dict except a literal key is invisible to an `ast`
+    reader that only collects ``ast.Constant`` keys: ``**spread``, ``dict(...)``,
+    ``a | b``, ``.update()``, a name bound elsewhere. Today ``round_stop``'s
+    producer uses none of them — measured, zero spreads across all four producer
+    sites — so failing closed costs nothing now and is the whole value later:
+    the commit that introduces one gets a red suite naming it, instead of a
+    silently narrower scan that goes on passing.
+
+    This is :func:`_round_stop_return_keys`' single-return assertion generalised,
+    and for the reason that one gives in as many words: a reader that took half
+    of the block "would check half of it while reading as though it had checked
+    all of it". A key added inside a spread is exactly #732 happening again, in
+    the file written to stop it.
+
+    Non-string constant keys are not an error — a dict may legitimately be keyed
+    by something that is not a payload key at all — but a ``**`` is, because it
+    is the shape that hides string keys specifically.
+    """
+    spreads = sum(1 for k in node.keys if k is None)
+    assert not spreads, (
+        f"{where} is built with {spreads} `**spread`, which this scan cannot "
+        f"read: the keys inside it would be invisible to the drift check and "
+        f"bound by nothing, which is #732 verbatim. Either inline the keys or "
+        f"teach this reader to resolve the spread — do not delete this assertion.")
+    return _dict_keys(node)
 
 
 def panel_payload_keys(module: ast.Module) -> set[str]:
@@ -463,6 +501,44 @@ NESTED_BLOCKS = {
     "pr_claim": reviews.PrClaimIn,
 }
 
+#: The nested blocks this file does NOT scan, and why — one written reason each.
+#:
+#: **The pairing with** :data:`NESTED_BLOCKS` **is the point, and it is what the
+#: first cut of #732 got wrong.** That set was hand-written and nothing checked it
+#: against the model, so a nested block added to ``ReviewIn`` and left out of it
+#: would be a tier nobody looks at — which is the exact lifecycle that left
+#: ``round_stop`` unchecked for a year, reproduced one level up in the file written
+#: to end it. Codex found that on review and it was right.
+#:
+#: So the two halves are split the way the top level splits them:
+#: :func:`nested_model_fields` DISCOVERS every nested-model field on ``ReviewIn``
+#: mechanically, and every one of them must then appear here or in
+#: :data:`NESTED_BLOCKS` — a decision typed into a diff somebody reviews. Discovery
+#: is computed because a computed discovery cannot go stale; the decision stays
+#: written out because a computed decision "would pass forever", which is
+#: :data:`DROPPED_BY_DESIGN`'s rule and is not in tension with this.
+#:
+#: Every entry here is one shape: a producer that is not a dict literal under a
+#: known payload key, so reading its keys needs a scan that does not exist yet.
+#: That is a real cost and not a shrug — these five blocks are, today, exactly as
+#: unchecked as ``round_stop`` was. What has changed is that the gap is now
+#: written down, counted, and impossible to grow silently.
+NESTED_SCAN_UNSUPPORTED = {
+    # A finding is assembled across several call sites and several helpers rather
+    # than written as one literal, so there is no dict display to read. All three
+    # of these bind `FindingIn`.
+    "to_fix": "FindingIn: assembled across call sites, no literal to scan",
+    "dismissed": "FindingIn: assembled across call sites, no literal to scan",
+    "sonar_findings": "FindingIn: assembled across call sites, no literal to scan",
+    # Comes off `gh`'s own JSON and is reshaped, so its keys are GitHub's rather
+    # than the panel's and a scan of panel source would not see them at all.
+    "changed_files": "ChangedFileIn: keys come from gh's JSON, not panel source",
+    # A dict keyed by seat name whose values are built per seat in a loop; the
+    # block's own keys are seat names, and `ReviewerIn`'s keys are one level below
+    # that again.
+    "reviewers": "ReviewerIn: values built per seat in a loop, keyed by seat name",
+}
+
 #: Keys the panel nests inside a payload block and this board does not bind.
 #: Per block, and — like :data:`DROPPED_BY_DESIGN` — **written out, not computed**,
 #: with the reason on each line. The test reads the union of one block's set.
@@ -526,7 +602,7 @@ def _round_stop_return_keys(module: ast.Module) -> set[str]:
                        if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)]
             assert len(returns) == 1, (
                 f"round_stop has {len(returns)} dict returns; this scan reads one")
-            return _dict_keys(returns[0].value)
+            return _dict_keys_closed(returns[0].value, "round_stop's return")
     raise AssertionError(f"no def round_stop in {PANEL_ROUNDS}")
 
 
@@ -553,13 +629,14 @@ def nested_block_keys(module: ast.Module, block: str) -> set[str]:
             for key, value in zip(node.keys, node.values):
                 if (isinstance(key, ast.Constant) and key.value == block
                         and isinstance(value, ast.Dict)):
-                    keys |= _dict_keys(value)
+                    keys |= _dict_keys_closed(value, f"the {block!r} block")
         if isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
             for target in node.targets:
                 if (isinstance(target, ast.Subscript)
                         and isinstance(target.slice, ast.Constant)
                         and target.slice.value == block):
-                    keys |= _dict_keys(node.value)
+                    keys |= _dict_keys_closed(
+                        node.value, f"the {block!r} block assigned by subscript")
     return keys
 
 
@@ -649,6 +726,137 @@ def test_a_block_with_nothing_dropped_says_so_by_having_no_entry():
         f"NESTED_DROPPED_BY_DESIGN exempts keys inside {sorted(orphans)}, which "
         f"NESTED_BLOCKS does not check. Either the block belongs in NESTED_BLOCKS "
         f"or its exemptions belong in the bin.")
+
+
+def nested_model_fields() -> dict[str, type[BaseModel]]:
+    """Every field on ``ReviewIn`` whose value this board binds with a model of its
+    own — DISCOVERED, not listed (#732 review).
+
+    Unwraps the annotation rather than matching its text: ``StopIn | None``,
+    ``list[FindingIn]`` and ``dict[str, ReviewerIn]`` are three spellings of "there
+    is a nested model under this key", and a check that read the string would miss
+    whichever spelling nobody thought of.
+
+    Keyed by the field's own name, which is the name the producer nests under and
+    therefore the name :data:`NESTED_BLOCKS` and :data:`NESTED_SCAN_UNSUPPORTED`
+    key on too.
+    """
+    found: dict[str, type[BaseModel]] = {}
+    for name, info in reviews.ReviewIn.model_fields.items():
+        stack = [info.annotation]
+        while stack:
+            ann = stack.pop()
+            if isinstance(ann, type) and issubclass(ann, BaseModel):
+                found[name] = ann
+                break
+            stack.extend(get_args(ann))
+    return found
+
+
+def test_every_nested_model_is_scanned_or_written_off_as_unscannable():
+    """A nested block on ``ReviewIn`` is either checked or explicitly not, and
+    nothing is silently neither.
+
+    **This is #732's own defect, one level up.** The first cut hand-wrote
+    :data:`NESTED_BLOCKS` and reasoned that a computed set "passes forever" — true
+    of the DECISION, and this test does not compute one. What it computes is the
+    QUESTION: which nested blocks exist. Leaving that to memory is what left
+    ``round_stop`` unchecked, and repeating it here would mean the next nested
+    block added to ``ReviewIn`` is unchecked by exactly the same silence, in the
+    file whose entire subject is that silence.
+
+    So: adding a nested model to ``ReviewIn`` now fails this suite until somebody
+    either scans it or writes down why they are not. Both are a line in a diff.
+    """
+    discovered = set(nested_model_fields())
+    decided = set(NESTED_BLOCKS) | set(NESTED_SCAN_UNSUPPORTED)
+    unaccounted = discovered - decided
+    assert not unaccounted, (
+        f"ReviewIn binds {sorted(unaccounted)} with a nested model, and this file "
+        f"neither scans it (NESTED_BLOCKS) nor records why it cannot "
+        f"(NESTED_SCAN_UNSUPPORTED). An unlisted nested block is a tier where "
+        f"extra='ignore' drops keys in silence — #732, again.")
+
+
+def test_no_block_is_both_scanned_and_written_off():
+    """The two registers are disjoint. A block in both would be scanned while
+    reading as excused, so a real drop in it would be reported and then explained
+    away by the wrong half of the file."""
+    both = set(NESTED_BLOCKS) & set(NESTED_SCAN_UNSUPPORTED)
+    assert not both, f"{sorted(both)} is in NESTED_BLOCKS and NESTED_SCAN_UNSUPPORTED"
+
+
+def test_nothing_is_written_off_that_is_not_a_nested_block():
+    """``NESTED_SCAN_UNSUPPORTED`` names only fields that actually exist and
+    actually bind a model.
+
+    The orphan check, on ``test_no_exemption_names_an_unchecked_block``'s argument:
+    an excuse for a block that was renamed or is no longer nested sits in the file
+    reading like a considered decision, and hides that the real block is now
+    unaccounted for.
+    """
+    orphans = set(NESTED_SCAN_UNSUPPORTED) - set(nested_model_fields())
+    assert not orphans, (
+        f"NESTED_SCAN_UNSUPPORTED excuses {sorted(orphans)}, which ReviewIn does "
+        f"not bind with a nested model. Renamed, or no longer nested?")
+
+
+def test_the_scanner_finds_a_key_added_to_the_producers_source(panel_rounds_source):
+    """Red/green done to the SCAN, not to the set it produced (#732 review).
+
+    :func:`test_the_nested_check_catches_an_injected_key` injects into the
+    already-scanned set, which proves set subtraction works and says nothing about
+    whether the `ast` reader would have found the key in the first place. The thing
+    this file exists to catch is a new key in the PRODUCER, so the proof has to
+    start there: mutate the producer's source, re-run the reader, and watch the key
+    come out the other end.
+
+    Codex raised this and it was the right call — a check whose red/green is done
+    downstream of the part that can silently stop working is #516's class, which
+    this repository has been bitten by four times in one PR before.
+    """
+    source = textwrap.dedent(
+        """
+        def round_stop(a, b):
+            return {"stop": True, "reason": "", "a_key_nobody_bound": 1}
+        """)
+    keys = _round_stop_return_keys(ast.parse(source))
+    assert "a_key_nobody_bound" in keys, (
+        "the reader did not find a key added to round_stop's own return — the "
+        "scan, not the comparison, is where this check would go blind")
+    assert nested_dropped_keys("round_stop", keys) == {"a_key_nobody_bound"}
+    # ...and the real producer, read by that same reader, still has every key the
+    # live assertion is made of: a mutation test that passed against a reader
+    # returning nothing at all would be worthless.
+    assert len(_round_stop_return_keys(panel_rounds_source)) >= 20
+
+
+def test_a_producer_shape_the_scanner_cannot_read_fails_it():
+    """An unreadable construction is a FAILURE, never a shorter answer (#732 review).
+
+    ``**spread`` is the measured case — the reader collects ``ast.Constant`` keys
+    and a spread has none, so keys inside one are invisible while every assertion
+    in this file goes on passing. That is a drift check that has quietly stopped
+    checking, which is the one failure it cannot report about itself.
+
+    Asserted on a synthetic producer rather than by breaking the real one, and
+    both directions are asserted: the spread must fail, and the same source
+    without it must pass, or this test would also pass against a reader that
+    refused everything.
+    """
+    spread = textwrap.dedent(
+        """
+        def round_stop(a, b):
+            return {"stop": True, **extra_keys()}
+        """)
+    with pytest.raises(AssertionError, match="spread"):
+        _round_stop_return_keys(ast.parse(spread))
+    plain = textwrap.dedent(
+        """
+        def round_stop(a, b):
+            return {"stop": True}
+        """)
+    assert _round_stop_return_keys(ast.parse(plain)) == {"stop"}
 
 
 def test_the_nested_check_catches_an_injected_key(panel_source, panel_rounds_source):
