@@ -654,6 +654,56 @@ The commands are thin, guarded drivers over these. The scripts hold the determin
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
 
+#### Every category has a fourth state: `NOT CHECKED`
+
+`prune-worktrees` reports six categories, and each of them could come back two ways: none,
+or a list. The third is the one that took until #735 to exist:
+
+```
+✓ Orphan board claims: none                    # asked; the board holds nothing
+Orphan board claims (7): #723 #722 …           # asked; here they are
+? Orphan board claims: NOT CHECKED — `qb-claimed` exited 2 (no board configured,
+                                     or it could not be reached)
+```
+
+Every way the ask could fail produced the first line. The claim sweep ended in `|| true`
+with stderr dropped, so an unreachable board, a rotated token and a payload `jq` declined
+all left an empty answer — which is what a board holding nothing also leaves, and `report`
+prints "none" for an empty array. Observed on two consecutive `/tree-shake` runs with
+nothing changed in between: seven claims, then `✓ … none` and a successful exit, then the
+same seven.
+
+**Claims are where it costs most, and the reason is the clock.** Every other category is
+recoverable by running the sweep again — a leftover directory is still there next time. A
+claim is on an 8h TTL and this sweep is the thing that exists to hand it back early (#337),
+so a false "none" means the claim runs quietly to its fuse: #135's complaint arriving
+through the tool built to prevent it.
+
+Three consequences, and the last is the one a caller quotes:
+
+- **The database scan carries it too.** Its two "skipping DB scan" paths — no DB user, no
+  container answering as that user — ended with an empty list and a green `Orphan
+  databases: none`. That is the failure the caveat at the foot of this file records, where a
+  misresolved container reported none over a hundred orphans in the real one. The loud
+  warning it grew then stays, for the candidate list; the report line no longer contradicts
+  it.
+- **`--prune` says outright that it swept no claims.** Every other line in the apply pass
+  reports an action, so silence there reads as claims handed back.
+- **`Nothing to prune. Clean.` is a statement about all six categories**, so a run that
+  looked at four of them does not print it, and names the ones it could not look at instead.
+  That sentence is precisely what a caller reads as "the sweep ran and found nothing".
+
+**A category that does not apply is not unknown**, and keeping those apart is what stops the
+new line appearing on every run of a repo that has no board. A project naming no database
+engine, and a host carrying neither `qb-claimed` nor `qb-release`, were told there is nothing
+there — as opposed to being stopped from looking. One half of that pair present and the other
+missing is the reverse: a partial install is where a false `none` hides, because the half that
+is there says claims are being taken on this host.
+
+This is `qb-doctor`'s four verdicts (below) in the sweep, and the same argument: `?` is not
+`ok`, and a tool that reports a clean result because it could not look is worse than one
+that does not check, because it launders ignorance into assurance.
+
 #### Databases the sweep must not touch — `.database.protect`
 
 `prune-worktrees` calls a database orphaned when no live worktree maps to it, and the
@@ -1267,7 +1317,7 @@ was meant to be:
 | --- | --- |
 | the land step | `/review-pr`, `/panel-review-pr` and `/fix-and-land` run `qb-release issue <n>` after `gh pr merge` — the common case and the cheapest |
 | `remove-worktree` | step 8, releasing what the create-name names (so `/drop-worktree` covers it too). `--keep-claim` opts out, for a teardown that is not the end of the work |
-| `prune-worktrees --prune` | claims whose note names a worktree that is no longer live — the debris case, matched on the note `create-worktree` writes and nothing else does |
+| `prune-worktrees --prune` | claims whose note names a worktree that is no longer live — the debris case, matched on the note `create-worktree` writes and nothing else does. A board it could not ask is reported as `NOT CHECKED` rather than as no claims (#735) |
 
 ### `qb-admit` — is there room to start? (#337)
 
@@ -3746,7 +3796,9 @@ path existing in the checkout.
 shell alias. Three of the six symptoms on #204 are a check that could not run being reported
 as a check that passed: `prune-worktrees` calling a skipped database scan `Nothing to prune.
 Clean.` over a 13 MB orphan, `worktree-holder`'s exit 4 that `/tree-shake` proceeded on, and
-`qb-reconcile`'s `stopped` that the deployed board could not attribute. #324 settled the
+`qb-reconcile`'s `stopped` that the deployed board could not attribute. The first of those
+is now fixed where it happened rather than only here: `prune-worktrees` reports `NOT CHECKED`
+per category and withholds `Clean.` from a run that could not look (#735, above). #324 settled the
 same argument for CI results a day before this landed. **A doctor that prints `ok` because
 it could not look is worse than one that does not check**, because it launders ignorance
 into assurance — and unlike a stale layer, a false green never announces itself later.
@@ -5077,7 +5129,8 @@ Read these before adopting rather than after.
   On a host also running self-hosted CI it originally picked a runner's throwaway
   `<hex>_postgres16_<hex>` service, which made `create-worktree` fail with `role "..." does
   not exist` and, worse, made `prune-worktrees` report `Orphan databases: none` while a
-  hundred orphans sat in the real container. An explicit name (as in
+  hundred orphans sat in the real container (that line now reads `NOT CHECKED` — #735 — but
+  the wrong container is still the wrong container). An explicit name (as in
   `worktree.example.json`) removes the ambiguity entirely.
 - **`/fix-issue` does not stop to ask.** It plans, implements, pushes and opens a PR in one
   run. That is the point of it, and it is also the reason to read it before pointing it at
