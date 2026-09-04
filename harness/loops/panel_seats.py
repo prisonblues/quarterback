@@ -13,11 +13,14 @@ keeps working for it.
 
 from __future__ import annotations
 
-from panel_core import *          # noqa: F401,F403
-import panel_core                 # noqa: F401  — for anything wanting the module
+# Named directly and BELOW the star imports, on `panel_rounds`' rule and for its
+# reason: `Iterator` has to still mean `collections.abc.Iterator` the day a module
+# above re-exports the name, and the last import wins.
+from collections.abc import Iterator  # noqa: E402
+
+import panel_core  # noqa: F401  — for anything wanting the module
 
 # ----------------------------------------------------------------------------- reviewers
-
 # Reasoning levels each CLI accepts for the shared `effort` config key — codex
 # spells it `model_reasoning_effort`, pi spells it `--thinking`, grok spells it
 # `--reasoning-effort`, and the sets genuinely differ (pi has off/minimal, codex
@@ -33,13 +36,14 @@ import panel_core                 # noqa: F401  — for anything wanting the mod
 # recognising a level this CLI accepts, or accept one it does not, the first time a
 # vendor adds one. `run_seat` below is the other reader, and both now read the one
 # tuple. Import direction is fixed by panel_core already importing harness_rules.
-from harness_rules import (            # noqa: F401  — re-exported, see __all__
-    AGY_EFFORTS, CODEX_EFFORTS, EFFORTS, GROK_EFFORTS, PI_EFFORTS)
-
-# Named directly and BELOW the star imports, on `panel_rounds`' rule and for its
-# reason: `Iterator` has to still mean `collections.abc.Iterator` the day a module
-# above re-exports the name, and the last import wins.
-from collections.abc import Iterator   # noqa: E402
+from harness_rules import (  # noqa: F401  — re-exported, see __all__
+    AGY_EFFORTS,
+    CODEX_EFFORTS,
+    EFFORTS,
+    GROK_EFFORTS,
+    PI_EFFORTS,
+)
+from panel_core import *  # noqa: F401,F403
 
 # How long a seat may ALREADY have spent and still be allowed to lower an
 # unsatisfiable pin and go again (#215). A count of attempts is not a bound on
@@ -487,6 +491,94 @@ def code_access_wanted(panel: dict, no_code_access: bool, notes: list[str]) -> b
     return False
 
 
+def pr_claim_wanted(panel: dict, no_pr_claim: bool, notes: list[str]) -> bool:
+    """Whether this round shows its seats what the PR CLAIMS to be for (#550).
+
+    #631 shipped the block and shipped it always-on, which is one arm of an
+    experiment #550 asked for before the mechanism was trusted: **compare finding
+    counts on the same PRs with and without the body**, because a body that says
+    "this is safe because X" primes a reviewer to accept X, a primed seat reports
+    FEWER findings, and fewer findings look like a clean PR. That failure is
+    invisible from inside a round. It is only visible across two arms, and until
+    this function existed the control arm could not be produced at all — there was
+    no supported way to run a round without the block.
+
+    So this is the OFF switch, and it is the whole reason it exists. It is not a
+    thoroughness dial anybody is expected to turn down: `pr_claim: false` is the
+    pre-#550 posture, where a claim the diff does not deliver is unreviewable by
+    construction, and a repo that leaves the key unwritten gets #631's behaviour
+    unchanged.
+
+    **A value this cannot read as a boolean falls CLOSED**, exactly as
+    :func:`code_access_wanted` does and for its reason rather than a new one:
+    `bool("false")` is True, so the intuitive read turns a hand-written
+    `"pr_claim": "false"` into the setting's opposite on the one key where the
+    author was trying to stop the seats being primed. The closed posture is also
+    the one that ran for months. It is reported, never silent — a round that did
+    not send the claim has to say so, because #550's own measurement cannot be read
+    off rounds whose arm is a guess.
+
+    `--no-pr-claim` is a one-run override in the OFF direction only, and here that
+    is not merely symmetry with `--no-code-access`: it is the instrument. The
+    control arm has to be produced on the SAME PR as the primed arm, and the dial
+    lives in `.harness-rules` in the repo under review — so producing the control
+    arm by editing that file would change the very diff whose findings are being
+    counted. A flag changes nothing the seats can see except the block itself."""
+    if no_pr_claim:
+        return False
+    raw = panel.get("pr_claim", True)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None or raw == "":
+        # Unset means unset, the reading `code_access_wanted` gives an absent
+        # setting: silent, and the default applies.
+        return True
+    notes.append(f"`pr_claim`={raw!r} is not true or false — the seats were NOT shown "
+                 "the PR's own title and body this round (#550). A setting whose "
+                 "whole purpose is to decide whether a reviewer is primed by the "
+                 "author's words is not guessed at")
+    return False
+
+
+def history_wanted(panel: dict, no_history: bool, notes: list[str]) -> bool:
+    """Whether this round shows its seats the changed files' git history (#716).
+
+    On by default, because the block exists to close a gap that was MEASURED: three
+    of eight declared coverage gaps on the instrumented cycle were questions a single
+    `git log` answers, and every one of them cost the round its confident stop.
+
+    An off switch all the same, and for two reasons that are not symmetry with
+    :func:`pr_claim_wanted`. The first is cost: this block is charged to the seat's
+    diff budget, and a repo that would rather spend every character on the diff is
+    making a defensible call rather than a mistake. The second is #550's, arriving
+    one section over — the honest limit on #716 is `n=1`, a single history-heavy
+    migration PR, and the way that stops being `n=1` is by running the same PRs with
+    the block and without it and counting the declared gaps. `history_brief: false`
+    in the repo's rules and `panel.py --no-history-brief` for one run are what make
+    that comparison producible at all; the flag is the instrument, because the dial
+    lives in the repo under review and flipping it there would change the diff whose
+    gaps are being counted.
+
+    **A value this cannot read as a boolean falls CLOSED**, on
+    :func:`code_access_wanted`'s reasoning rather than a new one: `bool("false")` is
+    True, so the intuitive read turns a hand-written `"history_brief": "false"` into
+    the setting's opposite. The closed posture here is also the cheap one and the one
+    that ran for the whole life of the panel before this."""
+    if no_history:
+        return False
+    raw = panel.get("history_brief", True)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None or raw == "":
+        # Unset means unset, the reading `code_access_wanted` gives an absent
+        # setting: silent, and the default applies.
+        return True
+    notes.append(f"`history_brief`={raw!r} is not true or false — the seats were NOT "
+                 "shown the changed files' git history this round (#716). A setting "
+                 "that decides what evidence a seat is given is not guessed at")
+    return False
+
+
 def strip_convention_files(root: Path) -> list[str]:
     """Remove every vendor instruction file and config directory under `root`,
     returning what was removed, repo-relative and sorted.
@@ -736,7 +828,13 @@ def seat_checkout(tree: Path, where: Path) -> tuple[str, bool]:
 
     `git init` runs either way, because :func:`member_sandbox` is non-destructive —
     `mkdir(exist_ok=True)` then `git init` — so initialising a populated directory is
-    intended here rather than tolerated."""
+    intended here rather than tolerated.
+
+    That `git init` also has no origin, so this tree is as nameless to the fleet as
+    an empty sandbox: it is a copy of a PR's files at a temp path, not a checkout of
+    the repository. It reports no repo for the same reason and by the same route —
+    :data:`SANDBOX_ENV`, exported by :func:`run_cli` — rather than needing its own
+    rule."""
     try:
         shutil.copytree(tree, where, symlinks=True, dirs_exist_ok=True)
     except OSError as e:
@@ -827,6 +925,24 @@ def member_sandbox(where: Path) -> str:
     stop (:attr:`ReviewerRun.code_blind`), which is the mitigation available to a repo
     that keeps this function.
 
+    **This repo must not reach the board, and saying so is now this module's job**
+    (#714, #721). A seat's cwd is a throwaway `git init`, so `qb-hook` — which runs
+    in it, because a hooked `claude -p` is how a seat is invoked — reports the
+    session's repo from a checkout that exists for one process and one run. It read
+    the directory basename, which is how the board came to hold live agents in a
+    repository called `cwd` on a branch called `master`, indistinguishable from an
+    unexpanded variable. The directory is named `seat` for the same reason, and
+    neither the old name nor an origin remote should come back here.
+
+    What changed in #721 is WHERE that is enforced. The hook used to infer it —
+    no origin, therefore no repo — and that sentence is true of this directory and
+    false of an ordinary local-only repository, which went silent with it and took
+    two agents in it off the collision index. The hook cannot tell those apart:
+    a fresh `git init` and a never-pushed repo of ten years' commits differ in
+    nothing it can see. This module can, because it made the directory. So
+    :data:`SANDBOX_ENV` declares it and :func:`run_cli` exports it to every seat
+    CLI, whose hook is a child process and inherits it.
+
     A `git init` that fails is reported and then degraded past, never raised. **Every
     way it can fail, not just a non-zero exit** — `git` absent from PATH raises
     `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
@@ -862,6 +978,39 @@ def member_sandbox(where: Path) -> str:
         print(f"! sandbox: git init failed in {where} ({why}) — a seat that requires "
               f"a git repo will refuse to start and say so", file=sys.stderr)
     return str(where)
+
+
+#: What a seat's environment says about the directory it was given (#721).
+#:
+#: `qb-hook` runs inside every seat — a seat is a hooked `claude -p`, and the
+#: lifecycle hooks are configured per USER, not per repo, so they fire wherever the
+#: CLI is started. Left to itself the hook reports the checkout it is standing in,
+#: and for a seat that checkout is :func:`member_sandbox`'s `git init` (or
+#: :func:`seat_checkout`'s copy of the PR tree, which is `git init`ed by the same
+#: function): a repository that exists for one process, one run and one temp dir.
+#: This flag is how the thing that CREATED it says so.
+#:
+#: The alternative — and what #714 actually shipped — was for the hook to infer it
+#: from the absence of an origin remote. That is a property of this directory and
+#: also of an ordinary local-only repository, so it took every never-pushed
+#: checkout off the collision index alongside the sandboxes. The knowledge lives
+#: here; the declaration should too.
+SANDBOX_ENV = {"QB_SANDBOX": "1"}
+
+
+def sandbox_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment a seat CLI runs in: the caller's, plus :data:`SANDBOX_ENV`.
+
+    An OVERLAY, and that is the whole reason this is a function. `subprocess.run`'s
+    `env=` REPLACES the environment rather than adding to it, so handing it the flag
+    alone would start every seat with no PATH (the CLI is not found), no HOME (no
+    vendor config, no credentials) and none of the API keys the seats authenticate
+    with — a total panel outage in exchange for one field on a lease.
+
+    `base` defaults to the live `os.environ` and is a parameter only so a test can
+    hand in a known one; nothing in the harness passes it.
+    """
+    return {**(os.environ if base is None else base), **SANDBOX_ENV}
 
 
 class CliFailure(str):
@@ -915,8 +1064,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     NOT retried (it already burned the whole budget; retrying just doubles the
     wall-clock).
 
-    **`cwd` is the member's own empty sandbox repo (see `member_sandbox`), and
-    passing it is what makes a seat reproducible.** Without it every reviewer
+    **`cwd` is the member's own sandbox repo (see `member_sandbox`), and passing it
+    is what makes a seat reproducible.** Without it every reviewer
     inherited whatever directory the panel process happened to be started from,
     so a run's membership was decided by ambient state that nothing configured,
     nothing recorded, and nothing could reproduce. That is not hypothetical: on
@@ -927,6 +1076,22 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     scratch directory under /tmp, and codex refuses to start outside a repo. The
     panel lost a whole vendor's eyes to the caller's shell, and #68 is the report
     that reads the same either way.
+
+    **`cwd` is also what marks the run as a seat's** (#721). A sandbox is a
+    throwaway repo, `qb-hook` fires inside every seat because the lifecycle hooks
+    are configured per user rather than per repo, and a hook that reported this
+    directory would put a repository nobody outside this process can name on the
+    fleet's collision index. So a call that passes a `cwd` gets
+    :func:`sandbox_env`, and one that does not runs in the panel process's own
+    directory — a real checkout, where the hook should report normally.
+
+    Derived from `cwd` rather than taken as a parameter beside it, because the two
+    are the same fact: the docstring above already promises that this parameter is a
+    member sandbox, all five call sites in the harness pass one, and an `env=`
+    argument would be five more places to forget the flag and five ways for the two
+    to disagree — two of them in `panel_rounds`, which is a different module and
+    would have to be told. The defect this closes is exactly a fact about the
+    sandbox being enforced somewhere other than where the sandbox is made.
 
     A sandbox satisfies codex's check by construction, which is why no
     `--skip-git-repo-check` appears anywhere here — verified against an untrusted
@@ -995,12 +1160,16 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     (codex) would otherwise under-report exactly the seat that is flaking."""
     last = f"{label}: no attempt made"
     feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+    # Resolved once for the whole retry loop rather than per attempt: nothing
+    # between attempts changes it, and building it three times would be three
+    # copies of `os.environ` for one dict entry.
+    env = sandbox_env() if cwd is not None else None
     for _ in range(max(1, attempts)):
         argv = args() if callable(args) else args
         started = time.monotonic()
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout, cwd=cwd, **feed)
+                                  timeout=timeout, cwd=cwd, env=env, **feed)
         except subprocess.TimeoutExpired as e:
             # A timeout is the most expensive outcome the panel has: the model
             # read the whole diff and thought about it for the full budget before
@@ -1189,6 +1358,309 @@ def record_run(payload: dict) -> str:
     # sees the record land.
     print(f"panel: {proc.stdout.strip().splitlines()[-1]}", file=sys.stderr)
     return ""
+
+
+#: How long a round's claim on its PR is good for. The claim is RELEASED when the
+#: round ends (see :func:`release_pr`), so this is not a duration — it is the fuse
+#: for the case where the release never runs, and the only thing it has to outlast
+#: is the slowest round anybody has measured. A round takes 20-40 minutes on this
+#: fleet, which is the figure the CI-settle comment in `panel.py` cites.
+#:
+#: Three hours is a deliberate figure between the two the fleet already uses, and
+#: it is longer than the board's default rather than shorter — the first version of
+#: this comment had that backwards (PR #715 review). The board's own default is
+#: **one hour** (`app/claims`' `DEFAULT_TTL = 3600`, which is what `qb-claim` gets
+#: when nothing passes `--ttl`), and one hour cannot cover a round: 20-40 minutes
+#: is the ordinary case, and a round that waits on CI or a slow vendor exceeds an
+#: hour without anything being wrong. A fuse that expires mid-round would make the
+#: PR read as free while four seats are still reading it, which is worse than no
+#: claim at all.
+#:
+#: It is deliberately far short of `create-worktree`'s eight hours (`CLAIM_TTL`),
+#: which is #608's complaint — a fuse the agent burning it cannot renew — and that
+#: claim covers a whole worktree's work where this covers one round.
+#:
+#: Passive expiry is the intended failure mode and the board has no reaper by
+#: design (`app/models/lease.py`), so this number IS the recovery time for the
+#: paths that cannot release: an exception or an interrupt between the claim and
+#: the release (`panel.py` has no `try/finally` around the round, and the span is
+#: some 2,600 lines) leaves the claim standing for up to this long.
+PR_HOLD_TTL = 10800
+
+#: `qb-claim`'s exit codes, named for the two this cares about. 1 is a definite
+#: holder and 2 is everything else — a board outage, a rotated token, a ref this
+#: board will not key — and the split matters here for the reason it matters to
+#: `create-worktree`: a peer already reviewing this PR is worth a line in the
+#: round's own notes, and a board that could not be reached is not that peer.
+CLAIM_TAKEN, CLAIM_HELD = 0, 1
+
+
+def hold_pr(repo_path: str, pr_number: int, round_no: int) -> str:
+    """Take the board's claim on this PR for the length of a round. Best-effort.
+
+    **NOT :func:`panel.pr_claim`**, which is #550's block carrying what the PR's
+    author says the change does. This is quarterback's claim — the exclusivity
+    record naming which agent is on a piece of work — and one file uses the word
+    both ways, so these two are spelled apart.
+
+    #253 asks for the six work-lifecycle events to be OBSERVED rather than
+    volunteered, and names this one: *"start reviewing a PR — `panel.py` run
+    start, it already POSTs at the end, so it knows the PR and round"*. The rule
+    it applies (#229, #172) is that the trigger must be an action that already
+    happens, never a second declaration somebody has to remember to make. A round
+    starting is that action, and this is the line that observes it.
+
+    What it buys: `GET /active` carries no work reference at all — a lease has
+    `repo`, `branch` and `title` and nothing that names an issue or a PR — so an
+    agent three hours into reviewing #1780 read, on every fleet surface, exactly
+    like one that had just opened the repo. The dashboard's AGENTS row already
+    joins a claim onto its holder (`qbdata._agent_row` prefers the claim over the
+    prompt title) and had nothing to join, because nothing on the review path
+    claimed anything. Measured on this board while #253 was open: five live
+    agents, three of them reviewing, and `/claims` empty.
+
+    Through `qb-claim` rather than a POST from here, for :func:`record_run`'s
+    reason exactly — which board this machine belongs to is site configuration,
+    and re-deriving it in Python is how one island's work lands on another
+    island's board. It also means the key is derived by the board and not composed
+    here (#172): the kind and the number go up, the key comes back, and this
+    cannot invent a third spelling of a PR's key.
+
+    **It never gates the round.** Every refusal is a line in `config_notes` and
+    nothing else. The claim exists to make the round discoverable, and a review
+    that would not run because a board was unreachable is a worse failure than a
+    review nobody can see. The HELD case is a note for the same reason and not an
+    exit: two panels on one PR is duplicated spend and worth telling a reader
+    about, and it is not this function's call to stop one.
+
+    The argument against that, which is real (PR #715 review): a claim that never
+    refuses is not an exclusivity record, and if the point were to stop duplicate
+    spend then the HELD case is precisely where it should stop. Two things decide
+    it the other way here. First, this claim can be LEFT STANDING by a round that
+    died — see :data:`PR_HOLD_TTL` — so gating would let a dead round refuse a live
+    one for up to three hours, and a refusal caused by the mechanism's own failure
+    mode is worse than the duplicate it prevents. Second, refusing a review is a
+    policy change and this is not the layer that makes them: `panel.py` already has
+    a gate parameter carrying the preconditions that DO stop a round (#271, #55,
+    #617), each with a dial and a `--force`, and a fourth precondition belongs
+    there with the same furniture rather than inside a telemetry call. Until then
+    the honest description is a record, which is what this says.
+
+    **It takes the claim with `--no-plan-item`, and that is #722.** Every issue/PR
+    claim writes a top-ranked plan item, because picking work up is the one act
+    that should put work on the board (#427) — and a review round is not picking
+    the PR up. The round wrote PR #n in at rank 1, released the claim at the end,
+    and left the row open, unclaimed and unblocked at the top of the plan, so
+    `plan_read`'s `next` handed the following agent a review that had already
+    happened, above whatever a human had ordered. Read off this board while #722
+    was open: `next` for this repo was the item for **PR #715** — the PR that added
+    this claim — open at rank 8, `rank_source: picked-up`, its claim released, and
+    ahead of every ordered item below it.
+
+    The flag is the whole fix and it does nothing else — it does not retire an item
+    that is already there, so a PR somebody genuinely picked up keeps its row and
+    its position while a round reviews it.
+
+    So this passes no title either: `--title` and `--no-gh-title` both exist to
+    name the plan item, and there is no longer one to name. `qb-claim` reads
+    `--no-plan-item` as implying `--no-gh-title`, which is where the saved `gh`
+    call went.
+
+    **Mixed versions are the ordinary state here, and both directions are handled.**
+    This harness and the board deploy separately, so during any rollout one of them
+    is older than the other and neither can be assumed. Each direction fails in its
+    own way and neither may fail silently:
+
+    * *New harness, old board.* `ClaimIn` takes pydantic's default `extra="ignore"`,
+      so an old board discards `plan_item` and writes the rank-1 row anyway. The
+      answer says so — a non-null `plan_item` on a request that asked for none — and
+      `--json` is what lets this read it rather than grep prose. Noted, never
+      failed: the claim is real and it is the half that prevents duplicated work.
+    * *New harness, old `qb-claim`.* argparse refuses the unknown flag and exits 2,
+      which this used to file as "the board did not take it" — so a host part-way
+      through an upgrade would run every round UNCLAIMED, silently undoing #715 a
+      few hours after it shipped. That refusal is now told apart from a board's
+      (argparse's own wording, plus the flag's name) and the claim is retried once
+      without the flag. The round then holds the PR *and* writes a plan item, which
+      is the #722 defect — and it is the better of the two, because an imperfect
+      record somebody can see beats no record at all.
+
+    Returns ``(note, holding)``. **Two facts, not one**, and they used to be one
+    string: "" meant both "nothing to report" and "the claim is ours", because every
+    note this raised also meant the claim was not. The two combinations above break
+    that — a note beside a claim we do hold — and a caller that inferred one from the
+    other would skip the release and leave the PR held for :data:`PR_HOLD_TTL`.
+    """
+    if not shutil.which("qb-claim"):
+        return _unclaimed(pr_number, "there is no `qb-claim` on this host"), False
+    # `--json` puts the board's whole answer on stdout, which is how the old-board
+    # case below is detected: the evidence is structured, and reading it out of
+    # `qb-claim`'s prose would be the coupling `create-worktree` warns about.
+    base = ["qb-claim", "pr", str(pr_number), "--repo-path", repo_path,
+            "--ttl", str(PR_HOLD_TTL),
+            "--note", f"panel review round {round_no}", "--json"]
+    # Exclusivity, not a pickup — see the docstring. The note is what a reader gets
+    # instead of a plan row, and it says which round.
+    proc = _qb_claim(base + ["--no-plan-item"])
+    if isinstance(proc, Exception):
+        return _unclaimed(pr_number, f"`qb-claim` failed ({proc.__class__.__name__})"), False
+    stale_tool = _rejected_the_flag(proc)
+    if stale_tool:
+        proc = _qb_claim(base)
+        if isinstance(proc, Exception):
+            return _unclaimed(
+                pr_number, f"`qb-claim` failed ({proc.__class__.__name__})"), False
+
+    if proc.returncode == CLAIM_TAKEN:
+        if stale_tool:
+            return _note(
+                f"the claim on PR #{pr_number} was taken WITH a plan item: this "
+                f"host's `qb-claim` predates `--no-plan-item`, so the round is on "
+                f"the board and the PR is now on the plan at rank 1 too (#722). "
+                f"Upgrade the harness on this host; until then the row has to be "
+                f"retired by hand once this round releases the claim"), True
+        if _wrote_a_plan_item(proc.stdout):
+            return _note(
+                f"the claim on PR #{pr_number} is ours, but this BOARD is older "
+                f"than `--no-plan-item` and ignored it, so the PR is on the plan at "
+                f"rank 1 (#722). The review is unaffected; the plan row will sit "
+                f"open at that rank once this round releases the claim, and only a "
+                f"board upgrade or a hand edit removes it"), True
+        return "", True
+    # stderr first: with `--json`, stdout is the board's answer on the paths that
+    # have one, and quoting a line of JSON at a human tells them nothing. Every
+    # message worth quoting here has always been on stderr.
+    said = (proc.stderr or proc.stdout or "").strip().splitlines()
+    quoted = f" — `qb-claim` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    if proc.returncode == CLAIM_HELD:
+        # Through `_note` like the other two, because this is the one of the three
+        # a human watching the round most wants on their terminal: it names a peer
+        # spending money on the same PR right now.
+        return _note(f"PR #{pr_number} is claimed by somebody else{quoted}. This "
+                     "round ran anyway — the claim is a record and not a gate — but "
+                     "two panels on one PR is spend twice, so it is worth knowing "
+                     "which"), False
+    return _unclaimed(pr_number, f"the board did not take it{quoted}"), False
+
+
+def _qb_claim(argv: list[str]):
+    """One `qb-claim` run, or the exception that stopped it. Never raises.
+
+    Returning the exception rather than None because the caller says its class name
+    out loud, and because there are two call sites now — the flagged attempt and the
+    retry — and a helper that reported the failure itself would say it twice.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return e
+
+
+def _rejected_the_flag(proc) -> bool:
+    """Did THIS `qb-claim` refuse `--no-plan-item` as an unknown argument?
+
+    Told apart from every other exit 2 — an outage, a rotated token, a ref the board
+    will not key — because the remedy is different and only this one has one: drop
+    the flag and ask again. Retrying any of the others is a second wrong answer at
+    twice the latency, which is the rule `qb-claim` itself states about its retry.
+
+    Matched on argparse's own wording rather than on `qb-claim`'s: the string
+    belongs to the standard library, has been that sentence for the life of the
+    module, and is what the tool prints without choosing to. The flag's own name is
+    required beside it so that a DIFFERENT unknown argument — a future flag this
+    file grows, sent to a host older still — is not answered by dropping this one
+    and retrying into the identical refusal.
+    """
+    return (proc.returncode not in (CLAIM_TAKEN, CLAIM_HELD)
+            and "unrecognized arguments" in (proc.stderr or "")
+            and "--no-plan-item" in (proc.stderr or ""))
+
+
+def _wrote_a_plan_item(stdout: str) -> bool:
+    """Did the board write a plan item for a claim that asked for none? Never raises.
+
+    Reads `--json`'s own payload. A board that cannot be parsed, or one whose answer
+    carries no `plan_item` at all, is a "no": the note this feeds is an alarm, and an
+    alarm that fires on an unreadable answer is one people learn to ignore. The cost
+    of a miss is the pre-#722 behaviour, which is what the fleet had yesterday.
+    """
+    try:
+        return bool(json.loads(stdout or "{}").get("plan_item"))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _unclaimed(pr_number: int, why: str) -> str:
+    """The one line a round that could not claim its PR says about itself.
+
+    Printed on stderr AND returned, for :func:`_unrecorded`'s reason: those are
+    two different readers, and a line that exists only in a subprocess's stderr
+    is #284's failure.
+
+    It says the review is unaffected because it is — nothing downstream of the
+    claim reads it — and it names what is actually lost, which is not the review
+    but the fleet's ability to say what this agent is doing.
+    """
+    return _note(
+        f"the board has no claim on PR #{pr_number} for this round — {why}. The "
+        "review itself is complete and unaffected; what is missing is the record, "
+        "so no fleet surface will say which PR this agent is on")
+
+
+def _note(line: str) -> str:
+    """Printed on stderr AND returned — the two readers :func:`_unrecorded` names.
+
+    One printer rather than the `print` copied into each branch that has something
+    to say. The copies were how the HELD case became the only note of the three
+    that never reached a terminal, which is the one a human watching a round most
+    needs: it names a peer spending money on the same PR at the same time.
+    """
+    print(f"panel: {line}", file=sys.stderr)
+    return line
+
+
+def release_pr(repo_path: str, pr_number: int) -> str:
+    """Hand back what :func:`hold_pr` took. Best-effort, and nothing to release is
+    not a failure.
+
+    Released at the end of the round rather than left to lapse, for `qb-release`'s
+    own reason: a claim that outlives its work is #135, and it was measured here —
+    four plan items still holding live claims after their PRs had merged, one of
+    them shipped hours earlier. A cycle is several rounds with a fix pass between
+    them, so a claim held to its TTL would also make the FIXER read as an agent
+    queueing behind a reviewer that had already finished.
+
+    The release is idempotent on the board (`released_at` is set once and the row
+    stays as history), so this racing a TTL that has already expired, or a second
+    caller, does nothing rather than damage.
+    """
+    if not shutil.which("qb-release"):
+        return ""
+    try:
+        proc = subprocess.run(["qb-release", "pr", str(pr_number),
+                               "--repo-path", repo_path],
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _unreleased(pr_number, f"`qb-release` failed ({e.__class__.__name__})")
+    if not proc.returncode:
+        return ""
+    said = (proc.stdout or proc.stderr or "").strip().splitlines()
+    quoted = f" — `qb-release` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    return _unreleased(pr_number, f"the board would not release it{quoted}")
+
+
+def _unreleased(pr_number: int, why: str) -> str:
+    """Why a round's claim is still standing after the round finished.
+
+    Worth a note rather than a silence, because the consequence is visible on a
+    surface somebody reads: the dashboard will show this agent holding PR #n for
+    up to :data:`PR_HOLD_TTL` after it stopped working on it, and a reader with no
+    note has to guess whether that is a stuck round or a stale claim.
+    """
+    return _note(
+        f"this round's claim on PR #{pr_number} was not handed back — {why}. It "
+        f"lapses on its own within {PR_HOLD_TTL // 3600}h; until then the fleet "
+        "shows this agent as still holding the PR")
 
 
 #: `qb`'s exit code for a subcommand it does not have — and for several other
@@ -1428,19 +1900,26 @@ def severity_floor(panel: dict, key: str, fallback: str, notes: list[str]) -> st
     return got
 
 
-def deferral_issue_floor(panel: dict, notes: list[str]) -> str:
-    """`file_deferral_issues` — one of ``SEVERITIES``, ``"always"`` or ``"never"``.
+def deferral_issue_gate(panel: dict, notes: list[str]) -> str:
+    """`file_deferral_issues` — one of ``DEFERRAL_ISSUE_WORDS`` or ``SEVERITIES``.
 
     Which deferrals get a GitHub issue as well as the board row every deferral gets
-    anyway (#482). Not :func:`severity_floor` with a wider vocabulary, because the
-    two ends are words rather than bands: `"below P4"` names no band this panel has,
-    and `P0` is deliberately absent from ``SEVERITIES`` — so `"never"` would be
-    unwritable and `"always"` would have to be spelled `P4`, which reads as a
-    severity judgement about a decision that is not one.
+    anyway (#482). **Named a gate and not a floor since #620**, because at its
+    shipped value it is not a comparison: `shape` asks what shape the ticket would
+    be — a category or one substantive item, against a round's leftovers swept into
+    one — and no severity band can spell that question, let alone its answer. The
+    bands remain legal and remain a floor when one is written, which is the
+    documented way back to the cut this ran under until 2026-08-30.
+
+    Not :func:`severity_floor` with a wider vocabulary, and the two ends made that
+    true before `shape` did: `"below P4"` names no band this panel has and `P0` is
+    deliberately absent from ``SEVERITIES``, so `"never"` would be unwritable and
+    `"always"` would have to be spelled `P4`, which reads as a severity judgement
+    about a decision that is not one.
 
     Case-insensitive on both halves, and normalised to the spelling each half uses
     everywhere else: a band comes back upper-cased like every other severity in the
-    panel, an end lower-cased like every other word in a rules file. Unset — missing,
+    panel, a word lower-cased like every other word in a rules file. Unset — missing,
     null or ``""`` — takes the default silently, the reading every setting here gives
     it. Anything else is refused (:func:`_refuse_value`), because a repo that wrote
     `file_deferral_issues: "P-2"` meaning "the tail stays off the tracker" and
@@ -1450,14 +1929,18 @@ def deferral_issue_floor(panel: dict, notes: list[str]) -> str:
     if want is None or want == "":
         return DEFAULT_FILE_DEFERRAL_ISSUES
     if isinstance(want, str):
-        if want.strip().lower() in DEFERRAL_ISSUE_ENDS:
+        if want.strip().lower() in DEFERRAL_ISSUE_WORDS:
             return want.strip().lower()
         got = _severity(want, "")
         if got:
             return got
+    # Built off the constants rather than spelled, so a word added to the vocabulary
+    # reaches the refusal too — the drift `_KIND_HINTS` is built this way to avoid.
+    # The last item takes the "or" so the list stays a sentence at three words as it
+    # was at two.
     _refuse_value("file_deferral_issues", want,
-                  f"one of {', '.join(SEVERITIES)}, "
-                  f"{' or '.join(DEFERRAL_ISSUE_ENDS)} (case-insensitive)")
+                  f"one of {', '.join(SEVERITIES + DEFERRAL_ISSUE_WORDS[:-1])} "
+                  f"or {DEFERRAL_ISSUE_WORDS[-1]} (case-insensitive)")
 
 
 def reviewer_scope(panel: dict, notes: list[str]) -> str:
@@ -1540,6 +2023,103 @@ def low_severity_budget(panel: dict, notes: list[str]) -> int | None:
     return n
 
 
+#: The smallest below-floor fix that can honestly be made, in churned lines and before
+#: `unrefereed_line_weight` prices it — the quantity :meth:`Dials.budget_for` clamps the
+#: pro-rata budget at.
+#:
+#: **2, and it is arithmetic on the counting rule rather than an estimate.** `git diff
+#: --numstat` reports AGGREGATE insertions and deletions per file; it has no notion of a
+#: "changed line", and an earlier draft of this comment said it did. What is true and
+#: sufficient: a one-line replacement COMMONLY comes out as one deletion plus one
+#: insertion — checked rather than assumed — and :func:`_referee_kind_lines` counts every
+#: `-` and every `+` alike ("insertions plus deletions, which is what `git diff
+#: --numstat` reports"). So the cheapest correction to a line that already exists
+#: commonly costs two, and a budget under two can buy only an ADDED line — which is not
+#: the shape most below-floor findings have.
+#:
+#: Weighted at the point of use rather than baked in here: the commonest below-floor fix
+#: is a comment or a stale docstring, `unrefereed_line_weight` prices those at 2 apiece,
+#: and a clamp that could not pay for one wherever it landed would be a zero wearing a
+#: budget's clothes. Since #674 that is expensive rather than untidy — an unpayable fix
+#: is declared `--declined <key>:budget`, which vetoes the round, costs `stop_confident`
+#: and fails `preland --require-earned-stop`.
+MIN_HONEST_FIX_CHURN = 2
+
+
+def low_severity_full_budget_chars(panel: dict, notes: list[str]) -> int | None:
+    """`low_severity_fix_full_chars` — a positive whole number of chars, or ``None`` for
+    "the absolute binds on its own".
+
+    #551's proportional half of the low-severity budget, written as the first round's
+    SIZE: at or above this many `pr_chars` the whole `low_severity_fix_lines` budget
+    applies, and below it :meth:`Dials.budget_for` scales it pro rata.
+
+    **The MIRROR IMAGE of :func:`fix_growth_floor_chars`**, with the opposite operator.
+    There the defect is that a multiple's allowance shrinks with the PR while diff
+    framing does not, so a tiny PR cannot afford one honest fix — a floor. Here the
+    measurement is accumulation RELATIVE TO THE CHANGE (#297: PR #188's feature became
+    721 churned lines, 74% of it review-response code), so the dangerous end is the
+    SMALL PR, where a fixed 40 lines can exceed the diff it is polishing. A `max`
+    written here on the strength of the floor next door would reintroduce #188; both
+    halves are ceilings and the round spends the smaller.
+
+    **CHARS, and that is a correctness point rather than a style one.** The budget is
+    counted in churned lines and the only first-round size a baseline records is
+    `pr_chars`, so the companion had to be written in one unit or the other. Chars is
+    the unit the comparison happens in, so a size in chars states its crossing in the
+    unit the code compares and needs no chars-per-line rate AT RUN TIME. An earlier draft
+    of this key was a percentage over a `CHARS_PER_CHURNED_LINE` constant, and both are
+    gone. The CALIBRATION of the default still anchors on a churned-line count, so it is
+    less exposed to #692 rather than immune to it — `harness_rules` says exactly how
+    far that goes.
+
+    **Absent inherits the default and a written ``null`` switches it off**, the reading
+    :func:`low_severity_budget` and the three growth keys already have. ``null`` is the
+    exact pre-#551 behaviour, which is what makes the shape reversible from the board
+    rather than by a release.
+
+    ``0`` is refused rather than read as "no proportion". A size of zero is one every
+    PR is at or above, so it is the OFF position written in a spelling that does not say
+    so — `max_fix_growth_chars`' own argument about `0` — and `null` is already that
+    spelling. A bool is refused before the numeric read for :func:`resolve_max_rounds`'
+    reason (``isinstance(True, int)``), and a fractional value because half a char is
+    not a size any diff has.
+
+    Not bounded above. A very large value makes every PR proportional, which reads as
+    an inert dial and is not: it is the policy "scale the budget with the change, always",
+    and the clamp in :meth:`Dials.budget_for` keeps the result spendable."""
+    raw = panel.get("low_severity_fix_full_chars", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("low_severity_fix_full_chars", raw,
+                      f"{what} — chars the cycle's first round must reach before the "
+                      "whole low-severity budget applies, or null to let "
+                      "`low_severity_fix_lines` bind on its own")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
 def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
     """`unrefereed_line_weight` — a whole number >= 1, what one unrefereed churned
     line costs the low-severity budget against a production line's 1 (#554).
@@ -1592,6 +2172,165 @@ def unrefereed_line_weight(panel: dict, notes: list[str]) -> int:
         return refuse("a whole number")
     if n < 1:
         return refuse("1 or more")
+    return n
+
+
+def threshold_by_severity(panel: dict, notes: list[str]) -> dict[str, int]:
+    """`threshold_by_severity` — how many DISTINCT seats must independently raise a
+    finding at each severity before it is this round's work (#78).
+
+    A mapping of severity band to a whole number >= 1: ``{"P3": 2}`` reads "a P3 one
+    seat raised is reported, not fixed". A band the mapping does not name needs one
+    seat, which is what every band has always needed, so ``{}`` is the whole off
+    switch and is the shipped default.
+
+    **`1` is legal and means no threshold at that band.** It is not a second spelling
+    of anything — the identity, written out — and a repo that wants to say "P3 is
+    deliberately left at one seat" beside a `P4: 2` can. `0` is refused: no finding
+    can be raised by fewer than one seat, so a threshold of nothing is a value with no
+    behaviour, and a hand that wrote it meant either the off switch (leave the band
+    out) or `1`, and nothing here can tell which.
+
+    An explicit `null` inherits the default like any other absent value. There is no
+    nullable switch to want: `{}` already spells "no threshold anywhere" and a second
+    spelling for it would be one written value with two meanings, which is the
+    collapse :func:`unrefereed_line_weight` refuses one function up.
+
+    A bool is rejected before the integer read, for :func:`low_severity_budget`'s
+    reason — ``isinstance(True, int)`` is True, so ``{"P3": true}`` would otherwise
+    become a threshold of one, which is not off and is not anything else either. An
+    integral float counts and a fractional one does not: a finding is raised by a
+    whole number of seats, and `1.5` is not a count anything can be short of.
+
+    **The keys are severities and nothing else.** A band this panel does not have —
+    `P0`, `BLOCKER`, a typo — is refused rather than dropped, because a dropped key is
+    a policy the operator wrote and the round did not run, and the whole of this dial
+    is per-band. Normalised on the way in (stripped, upper-cased) exactly as every
+    other severity entering the panel is, so `" p3 "` out of a hand-edited rules file
+    resolves to the same band a board dial spelling `P3` does.
+
+    **What this function does NOT decide is which bands the threshold may act on.**
+    That is :meth:`Dials.corroboration_applies`, and it is deliberately downstream: a
+    repo may legally write `{"P2": 2}` and the round will refuse to apply it and say
+    so, rather than the file failing to load. The difference matters because
+    `round_trigger_floor` is a separate dial that a board layer can move underneath a
+    written mapping — so whether a band is actionable is a property of the resolved
+    round, not of the value.
+    """
+    raw = panel.get("threshold_by_severity", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        return dict(DEFAULT_THRESHOLD_BY_SEVERITY)
+
+    def refuse(what: str) -> dict[str, int]:
+        _refuse_value("threshold_by_severity", raw,
+                      f"{what} — a mapping of severity band "
+                      f"({', '.join(SEVERITIES)}) to the whole number of seats, 1 or "
+                      "more, that must independently raise a finding at that band "
+                      "before it is fixed, or {} for no threshold anywhere")
+        return {}                  # unreachable; `_refuse_value` always raises
+
+    if not isinstance(raw, dict):
+        return refuse("a mapping")
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        band = str(key).strip().upper()
+        if band not in SEVERITIES:
+            return refuse(f"keyed by severity band ({key!r} is not one)")
+        if band in out:
+            # Two spellings of one band, refused rather than resolved. Normalising on
+            # the way in is what makes `" p3 "` and `"P3"` the same band, and it is
+            # also what lets them BOTH be written — after which one of the two numbers
+            # silently wins on dict insertion order, and a repo reading its own rules
+            # file cannot tell which. Refused for `low_severity_fix_lines`' reason: a
+            # hand that wrote two meant one of them, and nothing here can tell which.
+            return refuse(f"one entry per severity band ({band} is written twice)")
+        n = None
+        if isinstance(value, bool):
+            n = None
+        elif isinstance(value, int):
+            n = value
+        elif isinstance(value, float):
+            n = int(value) if value.is_integer() else None
+        elif isinstance(value, str):
+            try:
+                n = int(value.strip())
+            except ValueError:
+                n = None
+        if n is None:
+            return refuse(f"a whole number of seats at every band ({band} is "
+                          f"{value!r})")
+        if n < 1:
+            return refuse(f"1 or more at every band ({band} is {value!r})")
+        out[band] = n
+    return out
+
+
+def next_door_days(panel: dict, notes: list[str]) -> int:
+    """`next_door_days` — whole days >= 0, how far back #508's hints may reach.
+
+    `0` is OFF and is the one value with a second meaning: no board call is made,
+    the slot is filled with nothing, and the reviewer prompt is byte-identical to
+    the one this panel sent before #508 existed. That is a real switch and not a
+    degenerate window — "look back zero days" and "do not look" would otherwise be
+    two spellings of one behaviour, and a repo that wrote `0` meant the switch.
+
+    Negative is refused rather than clamped, on :func:`unrefereed_line_weight`'s
+    rule: a repo that wrote `-1` meant something, and nothing here can tell which
+    of two opposite things it was.
+
+    A bool is rejected before the integer read, and for the sharper of the two
+    reasons this codebase keeps writing down. ``isinstance(True, int)`` is True, so
+    `next_door_days: false` — which is exactly how a hand writes "off" — would
+    otherwise read as `0`, land on the OFF branch, and be **right by accident**.
+    `true` would read as `1` and silently narrow the window to a day. One of those
+    is harmless and one is not, and a reader that cannot tell them apart is a
+    reader that will get the second one wrong later.
+    """
+    raw = panel.get("next_door_days", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        return DEFAULT_NEXT_DOOR_DAYS
+
+    def refuse(what: str) -> int:
+        _refuse_value("next_door_days", raw,
+                      f"{what} — how many days back a confirmed finding on another "
+                      "PR may be carried in front of the reviewers as context, or "
+                      "0 to send none")
+        return DEFAULT_NEXT_DOOR_DAYS            # unreachable; `_refuse_value` raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number of days")
+    if n < 0:
+        return refuse("0 or more")
+    if n > NEXT_DOOR_DAYS_MAX:
+        # CLAMPED, not refused, and this is the one place in this block where that
+        # is the right answer rather than the lazy one. Everything else here refuses
+        # because the written value could mean two opposite things and nothing can
+        # tell which. `5000` means one thing only — "reach back as far as you can" —
+        # and the board's own ceiling is 3650, so honouring it as far as the board
+        # allows delivers what was asked for. Refusing would hard-exit a whole panel
+        # over an advisory hint, and passing it through unchanged would send a
+        # `days` the board answers with HTTP 422: a note, no hints, and an operator
+        # who widened the window and silently got none.
+        #
+        # Said out loud, because `Dials` records what was APPLIED and a payload
+        # reading 3650 under a rules file reading 5000 is otherwise unexplained.
+        notes.append(
+            f"`review_panel.next_door_days` is {n} and the board accepts at most "
+            f"{NEXT_DOOR_DAYS_MAX}; this round used {NEXT_DOOR_DAYS_MAX} days of "
+            "next-door context (#508)")
+        return NEXT_DOOR_DAYS_MAX
     return n
 
 
@@ -1740,6 +2479,157 @@ def fix_growth_chars_limit(panel: dict, notes: list[str]) -> int | None:
                       f"{what} — chars the PR may grow past the size the cycle's "
                       "first round read it at, or null to switch this half of the "
                       "check off")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
+def fix_growth_floor_chars(panel: dict, notes: list[str]) -> int | None:
+    """`min_fix_growth_chars` — a positive whole number of chars, or ``None`` for "the
+    multiple binds on its own".
+
+    #664's floor under the MULTIPLE, and the one value resolved in this module that
+    LOOSENS a check: the ratio half of the growth ceiling fires only where the PR has
+    also grown past this. :func:`fix_growth_chars_limit` is untouched by it, so an
+    absolute stop still fires on a PR of any size.
+
+    **Why a floor at all**, since the two functions above are both ceilings. Diff
+    framing is fixed per file-hunk — `diff --git`, `index`, `---`/`+++`, `@@` and a
+    hunk's context lines are ~430 chars before any repair — while a multiple's
+    allowance scales with the PR. On the 439-char PR #664 measured, the whole 3.0x
+    allowance was 878 chars and the smallest honest single-hunk fix cost 827 of it,
+    49% of that being framing; below ~413 chars the ceiling cannot afford one truthful
+    one-file fix at all. The fixer on that cycle named two corrections it could not
+    pay for and the next round found one of them, so the ceiling did not merely
+    prevent a fix — it caused a regression and then bought a round to rediscover it.
+
+    **Absent inherits the default and a written ``null`` switches it off**, on the
+    reading the two keys beside it already have. ``null`` here is the exact pre-#664
+    behaviour, which is what makes a shape decision reversible without a release.
+
+    **The empty string is null too**, said here because the paragraph below reads as
+    though `null` were the only off spelling and a reviewer took it that way (#686).
+    It is not a quirk of this key. EVERY dial resolver in this module reads `""` as
+    null — all seventeen of them, with no exception — so it is the module's
+    convention rather than this dial's behaviour, and refusing it here alone would
+    make this the only dial in the file that answers an emptied value differently
+    from every other. Stated as "every" rather than as a bare count deliberately: a
+    count is what three earlier drafts of this paragraph each got wrong, because the
+    answer moves with what you decide to grep for, while "every resolver, no
+    exception" is checkable against the list of resolvers itself.
+
+    WHY the convention exists is not recorded anywhere and is deliberately not guessed
+    at here. Two routes DO deliver one, so it is not unreachable: a hand-written
+    `.harness-rules` with a key emptied rather than deleted, and `POST /dials`, which
+    `json.dumps`es whatever `value` it is given and stores it — the API validates the
+    dial NAME and the payload size but not the value's type, on the stated rule that
+    "the client owns the vocabulary". `POST /dials/clear` is the one route that cannot:
+    it stamps `cleared_at` and the dial then resolves as ABSENT, which is a different
+    answer from `null` here (absent inherits the default; `null` switches the floor
+    off).
+
+    That is not in tension with `0` below. `0` is a number a repo can mean and whose
+    meaning would be wrong; `""` is the absence of a value, which is what `null` is.
+
+    ``0`` is refused rather than read as "no floor". A floor of zero is one every
+    growth clears the moment a fix pass writes a character, so it is the OFF position
+    written in a spelling that does not say so, and `null` is already that spelling —
+    the same argument the two keys above make about `0` from the ceiling side. A bool
+    is refused before the numeric read for their reason (``isinstance(True, int)``),
+    and a fractional value because half a char is not a size any diff has."""
+    raw = panel.get("min_fix_growth_chars", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_MIN_FIX_GROWTH_CHARS
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("min_fix_growth_chars", raw,
+                      f"{what} — chars the PR must have grown before the MULTIPLE may "
+                      "stop the cycle, or null to let the multiple bind on its own")
+        return None            # unreachable; `_refuse_value` always raises
+
+    n = None
+    if isinstance(raw, bool):
+        n = None
+    elif isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, float):
+        n = int(raw) if raw.is_integer() else None
+    elif isinstance(raw, str):
+        try:
+            n = int(raw.strip())
+        except ValueError:
+            n = None
+    if n is None:
+        return refuse("a whole number")
+    if n <= 0:
+        return refuse("above zero")
+    return n
+
+
+def fix_guard_lines_limit(panel: dict, notes: list[str]) -> int | None:
+    """`max_fix_guard_lines` — a positive whole number of test and prose lines ONE
+    fix pass may churn, or ``None`` for "do not check" (#618).
+
+    The GUARD half of the growth question, and the only one of the three measured per
+    PASS. :func:`fix_growth_limit` and :func:`fix_growth_chars_limit` both divide this
+    round's whole PR by the cycle's first round, which is a CUMULATIVE reading — and a
+    cumulative reading is exactly what went quiet on the cycle this was filed from:
+    `guard_ratio` fell 2.21 -> 2.19 -> 2.13 -> 2.09 -> 2.02 across five rounds in which
+    source and test both nearly doubled, because a proportion moves its numerator and
+    its denominator together. The per-pass delta is the quantity that can see the
+    event, and it does not BANK: each round reads the churn of its own fix range and
+    nothing earlier, so a quiet round cannot fund a loud one.
+
+    **Absent inherits the default and a written ``null`` switches it off** — the
+    distinction :func:`fix_growth_limit` draws — and here the two land in the same
+    place, because the shipped default IS ``None``. That is not an omission. The only
+    measurement anyone has is one cycle, whose passes wrote 380, 205, 205 and 58 guard
+    lines, and a threshold drawn between the quiet round and the loud one on a single
+    PR is the ceiling-with-its-argument-written-afterwards that #67 forbids. So the
+    count is taken and published every round and nothing fires until a repo writes a
+    number it can defend. The sentinel is kept anyway rather than collapsed into
+    ``.get()``: the two readings are different facts about a rules file, and the day
+    this earns a non-null default is the day the difference starts to matter.
+
+    ``0`` is refused rather than read as "a fix pass may write no test line at all".
+    That is not a stricter ceiling, it is a ceiling every healthy pass carrying a
+    regression test crosses — the "switch turned all the way on" failure
+    :func:`fix_growth_chars_limit` refuses for its own key, and ``null`` already spells
+    what an operator writing ``0`` here would have meant.
+
+    A bool is rejected before the integer read for :func:`low_severity_budget`'s
+    reason (``isinstance(True, int)`` is True, so `max_fix_guard_lines: false` — the
+    other way a hand writes "off" — would otherwise become a ONE-LINE ceiling, which
+    fires on every fix pass there is). An integral float counts and a fractional one
+    does not, since half a line is not a quantity a diff can report."""
+    raw = panel.get("max_fix_guard_lines", _ABSENT)
+    if raw is _ABSENT:
+        return DEFAULT_MAX_FIX_GUARD_LINES
+    if raw is None or raw == "":
+        return None
+
+    def refuse(what: str) -> int | None:
+        _refuse_value("max_fix_guard_lines", raw,
+                      f"{what} — lines of test and prose ONE fix pass may churn "
+                      "before the ceiling reports, or null to switch the check off")
         return None            # unreachable; `_refuse_value` always raises
 
     n = None
@@ -1984,7 +2874,8 @@ def resolve_max_rounds(asked: int | None, panel: dict, notes: list[str],
 
 @dataclass(frozen=True)
 class Dials:
-    """The eleven #165/#297/#492/#482/#554 settings as this round applied them.
+    """The sixteen #165/#297/#492/#482/#554/#508/#618/#78/#664/#551 settings as this
+    round applied them.
 
     One object, resolved once, for the four consumers that would otherwise each read
     the rules dict: the reviewer prompt, the report, the stop rule and the payload. A
@@ -1997,12 +2888,39 @@ class Dials:
     fix_severity_floor: str = DEFAULT_FIX_SEVERITY_FLOOR
     round_trigger_floor: str = DEFAULT_ROUND_TRIGGER_FLOOR
     low_severity_fix_lines: int | None = DEFAULT_LOW_SEVERITY_FIX_LINES
+    #: #551's proportional half of that budget, and the mirror of `min_fix_growth_chars`
+    #: below — the same sizing question, the opposite operator, because a fixed line
+    #: budget is dangerous on the SMALL PR and a fixed growth allowance on the tiny one.
+    #: The first round's `pr_chars` at or above which the whole budget applies; below it
+    #: :meth:`budget_for` scales it pro rata and spends the smaller of the two, so this
+    #: can only ever tighten. In CHARS because that is the unit the comparison happens
+    #: in and the only first-round size a baseline records. Carried on this object for
+    #: its siblings' reason: the fixer's brief, the report and the payload's measurement
+    #: have to read ONE number.
+    low_severity_fix_full_chars: int | None = DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS
     unrefereed_line_weight: int = DEFAULT_UNREFEREED_LINE_WEIGHT
     max_fix_growth: float | None = DEFAULT_MAX_FIX_GROWTH
     max_fix_growth_chars: int | None = DEFAULT_MAX_FIX_GROWTH_CHARS
+    #: #664's floor under the MULTIPLE, and the one field on this object that loosens a
+    #: check rather than tightening one: the ratio half fires only where the growth also
+    #: clears this. Carried here for its siblings' reason — the stop rule, the report
+    #: and the payload have to be reading ONE number.
+    min_fix_growth_chars: int | None = DEFAULT_MIN_FIX_GROWTH_CHARS
+    #: #618's per-PASS guard ceiling, and the one dial here whose shipped value is
+    #: `None` because nobody has calibrated it rather than because off is the right
+    #: answer. Carried on this object for its siblings' reason: the stop rule, the
+    #: report and the payload have to be reading ONE number.
+    max_fix_guard_lines: int | None = DEFAULT_MAX_FIX_GUARD_LINES
     reviewer_scope: str = DEFAULT_REVIEWER_SCOPE
+    next_door_days: int = DEFAULT_NEXT_DOOR_DAYS
     require_failing_test: bool = DEFAULT_REQUIRE_FAILING_TEST
     max_rounds: int = DEFAULT_MAX_ROUNDS
+    #: #78's corroboration threshold, band by band. Carried here for its siblings'
+    #: reason — the report, the payload and the fixer's list have to be reading ONE
+    #: mapping — and as a plain dict rather than a frozen mapping because nothing
+    #: hashes a `Dials` and pretending otherwise would cost a type nobody reads.
+    threshold_by_severity: dict[str, int] = field(
+        default_factory=lambda: dict(DEFAULT_THRESHOLD_BY_SEVERITY))
 
     def as_dict(self) -> dict:
         """For the payload. Every key present on every round, so a consumer never has
@@ -2012,12 +2930,22 @@ class Dials:
                 "fix_severity_floor": self.fix_severity_floor,
                 "round_trigger_floor": self.round_trigger_floor,
                 "low_severity_fix_lines": self.low_severity_fix_lines,
+                "low_severity_fix_full_chars": self.low_severity_fix_full_chars,
                 "unrefereed_line_weight": self.unrefereed_line_weight,
                 "max_fix_growth": self.max_fix_growth,
                 "max_fix_growth_chars": self.max_fix_growth_chars,
+                "min_fix_growth_chars": self.min_fix_growth_chars,
+                "max_fix_guard_lines": self.max_fix_guard_lines,
                 "reviewer_scope": self.reviewer_scope,
+                "next_door_days": self.next_door_days,
                 "require_failing_test": self.require_failing_test,
-                "max_rounds": self.max_rounds}
+                "max_rounds": self.max_rounds,
+                # A COPY, not the object this round is applying. `as_dict` is the
+                # payload's view and a payload is serialised, posted and stored; the
+                # other fourteen are immutable scalars and cannot be edited through it,
+                # and a mapping handed out by reference could be — which would make
+                # the recorded policy and the applied policy the same mutable thing.
+                "threshold_by_severity": dict(self.threshold_by_severity)}
 
     @property
     def budgeted_band(self) -> bool:
@@ -2032,6 +2960,94 @@ class Dials:
         return (self.low_severity_fix_lines is not None
                 and not severity_at_least(self.fix_severity_floor,
                                           self.round_trigger_floor))
+
+    def budget_for(self, first_chars: int | None) -> int | None:
+        """The churned lines this round may actually spend on the 💸 band — #297's
+        absolute and #551's pro-rata share of the cycle's first round, whichever is
+        SMALLER, and never less than one honest one-line fix.
+
+        The one number the fixer's brief states and the payload measures against, so it
+        is computed here rather than at either site: two derivations of one budget is
+        how a report and a payload come to disagree about the policy a round ran under.
+
+        ``first_chars`` is the size the cycle's FIRST round read the PR at — the same
+        denominator `max_fix_growth` divides by (`Baseline.first_reviewed`), and on
+        round 1 the round's own size, because round 1 IS the first round. It is
+        measured there and not against the current diff for `max_fix_growth`'s reason: a
+        budget that grows as the PR grows pays for the growth it is supposed to bound.
+
+        **Chars in, lines out, and nothing converts between them.** The pro-rata term is
+        `written x first_chars / low_severity_fix_full_chars` — a ratio of two char
+        counts multiplied by a line count — so the units cancel and no chars-per-line
+        rate appears anywhere in this arithmetic. That is why the dial is a SIZE and not
+        a percentage: a percentage calibrated in lines would need such a rate at every
+        call. The claim is about THIS FUNCTION and not about the default's calibration,
+        which does anchor on a churned-line count (`harness_rules`).
+
+        **The outer `min` is the safety property and must stay outermost.** Both terms
+        are ceilings and the written value is the outer bound, so no setting of the size
+        and no value of the clamp can ever hand back more than the file wrote — a repo
+        at `low_severity_fix_lines: 3` gets 3 even where the clamp is 4. #664's floor
+        one dial over is a `max` and loosens; writing a `max` here on the strength of
+        that symmetry is the version that reintroduces #188, because the two dials'
+        dangerous ends are opposite.
+
+        **The clamp, and why a starved budget is not an acceptable outcome.** Pro rata
+        alone reaches 1 line at 359 chars and 3 at 1,075, and a budget of one or two
+        lines is not a small budget — it is "fix nothing" written so that it reads like
+        a budget. (Two, because `git diff --numstat` reports aggregate insertions and
+        deletions rather than edits, and a one-line replacement commonly arrives as one
+        of each — see :data:`MIN_HONEST_FIX_CHURN`.) Since #674 that costs something concrete: a fix the budget cannot pay
+        for is declared `--declined <key>:budget`, the declaration appends a veto, the
+        veto costs the round its `stop_confident`, and `preland --require-earned-stop`
+        turns that into a failed check — so a starved budget holds the PR out of a
+        strict landing for the rest of the cycle. So the floor is
+        :data:`MIN_HONEST_FIX_CHURN` times `unrefereed_line_weight`: one one-line
+        correction priced wherever it might land, 4 at the shipped weight, moving with
+        the weight because the weight is the unit the budget is counted in.
+
+        Below 1,791 chars of first round the clamp IS the budget, that being simply
+        where the pro-rata share first rises above it, at 5. It is not where a SECOND
+        such fix becomes affordable — that is 2,865. That is a concession and is written down as one: on a PR that
+        small there is no proportional answer that is also a workable one, and #674's
+        price is why it concedes toward the workable.
+
+        **Three cases hand back the written value untouched**, and each is a case where
+        a proportion would be inventing something:
+
+        * ``low_severity_fix_full_chars: null`` — the half is off, and off is the exact
+          pre-#551 behaviour.
+        * **no budget at all** (`low_severity_fix_lines: null`) — there is no ceiling
+          for a proportion to be the smaller of, and a size must not BECOME a budget on
+          a repo that wrote it off. `resolve_dials` says so in `config_notes`.
+        * **an unknown first-round size** — round 2 with an unreadable baseline, or one
+          written before `pr_chars`. `max_fix_growth` declines to run there too; a
+          guessed denominator is worse than none.
+
+        **A first round MEASURED at zero chars is not that case and gets the opposite
+        answer**: the clamp, not the whole budget. Unknown and zero are different claims
+        — the first says nothing was read, the second says something was read and it was
+        nothing — and the smallest measurement there is must not buy the largest budget
+        there is. No guard is needed for it: `written x 0 // size` is 0, which the clamp
+        lifts to one honest fix. A guard against it is what an earlier draft had, and it
+        failed open.
+
+        A written ``0`` also comes back as ``0``: that is an operator saying "fix none
+        of the band", it already moves :attr:`fix_floor` to the trigger cut, and this
+        key may lower a budget and may never raise one. The clamp does not reach it, for
+        the same reason — a floor that turned a written zero into four would be this
+        key deciding what the file meant."""
+        written = self.low_severity_fix_lines
+        # `first_chars is None` and not `<= 0`: a size of zero is a MEASUREMENT and is
+        # handled by the arithmetic below, which floors it at the clamp. Excluding it
+        # here returned the whole budget for the smallest reading there is.
+        if (written is None or written == 0
+                or self.low_severity_fix_full_chars is None
+                or first_chars is None):
+            return written
+        pro_rata = written * first_chars // self.low_severity_fix_full_chars
+        least = MIN_HONEST_FIX_CHURN * self.unrefereed_line_weight
+        return min(written, max(least, pro_rata))
 
     @property
     def fix_floor(self) -> str:
@@ -2071,6 +3087,89 @@ class Dials:
         return (self.round_trigger_floor if self.budgeted_band
                 else self.fix_severity_floor)
 
+    def corroboration_applies(self, severity: str) -> bool:
+        """May a corroboration threshold stand a finding at this severity down AT ALL?
+
+        **This is the safety property of #78 and it is a property of the MECHANISM,
+        not of the shipped default.** A threshold suppresses work on the strength of a
+        head count, which points the opposite way from every other brake in this
+        system: the rest of them decline to spend, and this one declines to look. A
+        single seat finding a genuine P1 nobody else spotted is the case the panel
+        exists for — #78's own table has one, `32-F01`, solo and real — so the answer
+        cannot be left to whoever writes the mapping.
+
+        Two conditions, and both are about ``round_stop`` rather than about taste:
+
+        * **Below ``round_trigger_floor``.** #621's decided rule is that a repeated
+          finding keeps a cycle going only if it would have bought a round in the
+          first place. A finding at or above the trigger floor buys rounds — under
+          rule 1 when it is new and rule 3 when it repeats — so standing it down would
+          leave a finding no fix pass may touch and every rule still demanding, which
+          is the jam ``escalated`` was added to break. Below the floor there is
+          nothing to jam: rules 1 and 3 already ignore it.
+        * **Not one of :data:`panel_core.BLOCKING_SEVERITIES`.** Rule 2 blocks on
+          ``P1``/``P2`` whatever the floors say, so the first condition alone is not
+          enough: at ``round_trigger_floor: P1`` a ``P2`` is below the floor and rule 2
+          still demands it every round, for ever, on a finding the threshold has taken
+          out of the fixer's list. The tuple is read from where rule 2 reads it, so the
+          two cannot drift.
+
+        The two together make the guarantee mechanical: **anything a threshold stands
+        down is a finding rules 1, 2 and 3 all ignore already**, so the cycle cannot be
+        held open by one, ``round_stop`` needs no new parameter, and no round can end
+        with a blocker suppressed for want of a second opinion.
+        """
+        return (not severity_at_least(severity, self.round_trigger_floor)
+                and severity not in BLOCKING_SEVERITIES)
+
+    def threshold_for(self, severity: str) -> int:
+        """Seats a finding at this severity needs before it is this round's work.
+
+        `1` — one seat, which is every band's requirement before #78 and every band's
+        requirement at the shipped `{}` — for a band the mapping does not name AND for
+        a band :meth:`corroboration_applies` refuses. The refusal is expressed as a
+        threshold of one rather than as a separate flag so that every reader asks one
+        question and gets one number; a repo that wrote `{"P1": 3}` gets a round that
+        applies 1 and a `config_notes` line saying the key was ignored, never a round
+        that quietly honours it.
+        """
+        if not self.corroboration_applies(severity):
+            return 1
+        return max(1, self.threshold_by_severity.get(severity, 1))
+
+    def uncorroborated(self, severity: str, seats: int) -> bool:
+        """Was this finding raised by fewer seats than its band requires?
+
+        `seats` is the number of DISTINCT members that filed it — `Canonical.reviewers`
+        — which is the same count the report's `⋆consensus` notation has always shown.
+        False at every band under the shipped default, so a round of a repo that has
+        not written this key behaves exactly as it did.
+        """
+        return seats < self.threshold_for(severity)
+
+    def thresholds_applied(self) -> bool:
+        """Is a corroboration threshold in force at any band this round?
+
+        Asked of :meth:`threshold_for` rather than of the written mapping, so a repo
+        whose every written band was refused by :meth:`corroboration_applies` reads as
+        what it is — no threshold applied — and the report does not announce a policy
+        the round declined to run.
+        """
+        return any(self.threshold_for(b) > 1 for b in SEVERITIES)
+
+    def thresholds_ignored(self) -> list[str]:
+        """The bands this repo wrote a threshold for that the round will not apply.
+
+        Reported rather than silently dropped, on the rule every resolver in this
+        module follows: a policy the operator wrote and the round did not run is worse
+        than a refused value, because nothing says it did not run. Empty at the shipped
+        default and for any mapping that only names actionable bands, so the note fires
+        on a real mistake and never on a working config.
+        """
+        return [b for b in SEVERITIES
+                if self.threshold_by_severity.get(b, 1) > 1
+                and not self.corroboration_applies(b)]
+
     def budgeted(self, severity: str) -> bool:
         """Is a finding at this severity one the budget pays for — in the band, and
         with something to spend? False at a budget of `0`: there the band is below
@@ -2081,12 +3180,31 @@ class Dials:
                     and not severity_at_least(severity, self.round_trigger_floor))
 
     def files_issue(self, severity: str, escalated: bool = False,
-                    unresolvable: bool = False) -> bool:
-        """Does a deferral at this severity get a GitHub issue as well as its row?
+                    unresolvable: bool = False, shape: str = "") -> bool:
+        """Does this deferral get a GitHub issue as well as its row?
 
         The board row is not in question and never is: every deferral gets one, at
         every setting of this dial. What this answers is whether a SECOND copy is
         opened on a human's tracker (#482).
+
+        **`shape` is what the gate reads at its shipped value (#620)**, and `severity`
+        is what it reads under a band. The two are not alternatives dressed up as one
+        argument: severity is a property of a FINDING and shape is a property of the
+        TICKET the orchestrator is about to open — a category, one substantive named
+        item, or a batch of a round's leftovers (:data:`DEFERRAL_SHAPES`) — so a cut
+        anywhere on P1..P4 files some batches and blocks some single items, which is
+        the failure #620 measured. Both arguments are taken because both settings are
+        legal, and each is ignored by the setting it is not the question for.
+
+        **AN UNCLASSIFIED DEFERRAL IS A BATCH AND GETS NO ISSUE**, which is the one
+        place this function's safe direction inverts. Under a band an unreadable
+        severity files (below), because the cost of an issue nobody needed is a line
+        on a tracker. Under `shape` that IS the cost: a batch on a tracker with no
+        drain is the twenty issues carrying 345 findings and zero closures that ended
+        the severity cut. So the default is the answer that cannot mint a ticket
+        nobody reads, and it is reached by testing membership of the two shapes that
+        DO file — every caller that says nothing, and every spelling this panel does
+        not know, lands on batch without a case of its own.
 
         **An ESCALATION is exempt at every setting**, which is why this takes a second
         argument rather than reading severity alone. Two of §4b's three roads to
@@ -2110,11 +3228,14 @@ class Dials:
         one `exempt` flag because they are two different reasons and the next person
         to change one must not silently change the other.
 
-        An unreadable or absent severity files the issue. That is the safe direction
-        and the only one: the cost of an issue nobody needed is one line on a tracker,
-        and the cost of silently withholding one is the finding living solely in a row
-        whose severity nothing could read — which is the dumping ground this dial
-        exists to avoid, arriving through the back door."""
+        An unreadable or absent severity files the issue UNDER A BAND. That is the
+        safe direction there and the only one: the cost of an issue nobody needed is
+        one line on a tracker, and the cost of silently withholding one is the finding
+        living solely in a row whose severity nothing could read — which is the
+        dumping ground this dial exists to avoid, arriving through the back door.
+        Under `shape` the same reasoning points the other way, for the reason given
+        above; the two rules are allowed to disagree because they are answers to
+        different questions."""
         if escalated or unresolvable:
             return True
         gate = self.file_deferral_issues
@@ -2122,6 +3243,8 @@ class Dials:
             return True
         if gate == DEFERRAL_ISSUES_NEVER:
             return False
+        if gate == DEFERRAL_ISSUES_SHAPE:
+            return str(shape).strip().lower() in DEFERRAL_ISSUE_SHAPES
         band = _severity(severity, "")
         return not band or severity_at_least(band, gate)
 
@@ -2134,6 +3257,17 @@ class Dials:
         if self.file_deferral_issues == DEFERRAL_ISSUES_NEVER:
             return ("no deferral gets a GitHub issue — board rows only "
                     "(an escalation and an unverifiable claim still do)")
+        # Said as the SHAPE question rather than as the dial's word, on this method's
+        # own rule: the orchestrator acts on this after the round, and "shape" on its
+        # own tells it nothing about which way to act. The batch clause carries "at
+        # any severity" because that is the half a reader schooled on the bands will
+        # otherwise supply wrongly from memory.
+        if self.file_deferral_issues == DEFERRAL_ISSUES_SHAPE:
+            return ("a deferral naming a category or one substantive item gets a "
+                    "GitHub issue; a batch of leftovers gets board rows and no "
+                    "issue at any severity, and so does a deferral nobody "
+                    "classified (an escalation and an unverifiable claim always "
+                    "get one)")
         return (f"deferrals at/above {self.file_deferral_issues} get a GitHub issue, "
                 "below it a board row only (an escalation and an unverifiable claim "
                 "always get one)")
@@ -2149,10 +3283,31 @@ class Dials:
         # absolute stop, when it fires, for a bug in the arithmetic (#492). "off" only
         # where BOTH are null, since a line that vanishes at some settings is one a
         # reader cannot tell from a dial that was never applied.
-        halves = [f"{self.max_fix_growth:g}x" if self.max_fix_growth is not None else "",
+        #
+        # #664's floor rides ON the multiple's clause rather than getting one of its
+        # own, because it is not a third thing this round bounds — it is a condition on
+        # when the first clause applies, and a reader who saw "3x" alone would take a
+        # PR sitting at 4x with no stop for the same arithmetic bug. Printed only where
+        # the multiple is live: a floor under a null multiple bounds nothing, and a
+        # policy line that says otherwise is worse than one that omits it.
+        floor = (f" over +{self.min_fix_growth_chars:,}"
+                 if self.max_fix_growth is not None
+                 and self.min_fix_growth_chars is not None else "")
+        halves = [f"{self.max_fix_growth:g}x{floor}"
+                  if self.max_fix_growth is not None else "",
                   f"+{self.max_fix_growth_chars:,} chars"
                   if self.max_fix_growth_chars is not None else ""]
         growth = " or ".join(h for h in halves if h) or "off"
+        # #618's per-pass guard ceiling, appended to the same field rather than given
+        # one of its own: it is the third clause of one sentence about how much a fix
+        # pass may write, and a reader who saw it in a separate field would have to
+        # work out that it is a ceiling on the same thing. Said only when SET, which
+        # is the one exception to this line's "print it at the default too" rule and is
+        # earned: the shipped value is `None` for want of a calibration, so on every
+        # repo that has not written one the clause would report an absence rather than
+        # a policy. `guard_ratio` beside it in the report is what a reader has instead.
+        if self.max_fix_guard_lines is not None:
+            growth += (f", guard {self.max_fix_guard_lines} lines/pass")
         # Spelled as what it BOUNDS, not as its key: "below-P2 fix budget" says which
         # findings are on it without the reader holding `round_trigger_floor` in their
         # head, and it is printed even where the band is empty (`fix_severity_floor`
@@ -2166,8 +3321,22 @@ class Dials:
         # a dial that vanishes from the report at some settings is one a reader
         # cannot tell from a dial that was never applied. Suppressed only where the
         # budget is off, where there is nothing for it to be a unit of.
+        # #551's proportional half rides INSIDE the budget's clause rather than getting
+        # one of its own, on the floor's rule three keys down and for its reason: it is
+        # not a second thing this round bounds, it is the other half of one ceiling, and
+        # a reader who saw "40 lines" alone would take a round briefed at 6 for an
+        # arithmetic bug. This line states the POLICY and not the applied number — it
+        # has no PR size in front of it — so it says which two terms bind and leaves
+        # the arithmetic to the **To fix** header, which states what the round spent it
+        # on. Printed only where there IS an absolute for it to be the smaller of: a
+        # percentage under a null budget bounds nothing, and `config_notes` carries that
+        # case rather than a policy line that misdescribes it.
+        proportion = (f", in full at {self.low_severity_fix_full_chars:,}+ chars of "
+                      "round 1 and pro rata below"
+                      if self.low_severity_fix_lines is not None
+                      and self.low_severity_fix_full_chars is not None else "")
         budget = ("off" if self.low_severity_fix_lines is None
-                  else f"{self.low_severity_fix_lines} lines, unrefereed "
+                  else f"{self.low_severity_fix_lines} lines{proportion}, unrefereed "
                        f"x{self.unrefereed_line_weight}")
         return (f"fix at/above {self.fix_severity_floor} · below-"
                 f"{self.round_trigger_floor} fix budget {budget} · another round "
@@ -2181,12 +3350,22 @@ class Dials:
                 # out of this report, so "does this deferral get an issue" has to be
                 # readable from the artifact rather than from whoever remembers the
                 # repo's config (#482).
-                f"{self.deferral_gist()}")
+                f"{self.deferral_gist()}"
+                # #78's threshold, appended on `max_fix_guard_lines`' rule and for
+                # its reason: said only when SET, because the shipped value is `{}`
+                # and a clause reading "corroboration 1 seat everywhere" on every
+                # repo that never wrote the key reports an absence rather than a
+                # policy. What a reader has instead is the `⋆consensus` notation,
+                # which names the seats behind every finding at every setting.
+                + (" · corroboration " + ", ".join(
+                    f"{b} {self.threshold_for(b)} seats" for b in SEVERITIES
+                    if self.threshold_for(b) > 1)
+                   if any(self.threshold_for(b) > 1 for b in SEVERITIES) else ""))
 
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
                   notes: list[str], round_ceiling: int | None = None) -> Dials:
-    """Read, validate and report all eleven at once.
+    """Read, validate and report all sixteen at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
@@ -2202,20 +3381,63 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
     dials = Dials(
         fixer_may_defer=panel_flag(panel, "fixer_may_defer",
                                    DEFAULT_FIXER_MAY_DEFER, notes),
-        file_deferral_issues=deferral_issue_floor(panel, notes),
+        file_deferral_issues=deferral_issue_gate(panel, notes),
         fix_severity_floor=severity_floor(panel, "fix_severity_floor",
                                           DEFAULT_FIX_SEVERITY_FLOOR, notes),
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
         low_severity_fix_lines=low_severity_budget(panel, notes),
+        low_severity_fix_full_chars=low_severity_full_budget_chars(panel, notes),
         unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
         max_fix_growth_chars=fix_growth_chars_limit(panel, notes),
+        min_fix_growth_chars=fix_growth_floor_chars(panel, notes),
+        max_fix_guard_lines=fix_guard_lines_limit(panel, notes),
         reviewer_scope=reviewer_scope(panel, notes),
+        next_door_days=next_door_days(panel, notes),
         require_failing_test=panel_flag(panel, "require_failing_test",
                                         DEFAULT_REQUIRE_FAILING_TEST, notes),
         max_rounds=resolve_max_rounds(asked_max_rounds, panel, notes, round_ceiling),
+        threshold_by_severity=threshold_by_severity(panel, notes),
     )
+    # #78's one migration-shaped hazard, said out loud rather than special-cased, and
+    # it is not really a migration: `round_trigger_floor` is a SEPARATE dial that a
+    # board layer can move underneath a mapping somebody wrote months ago. A repo that
+    # wrote `{"P3": 2}` under the shipped `P2` trigger floor and later moved that floor
+    # to `P3` has a key that stopped doing anything, and nothing else in the round
+    # would say so. See `Dials.corroboration_applies` for why the bands are refused
+    # rather than honoured.
+    ignored = dials.thresholds_ignored()
+    if ignored:
+        notes.append(
+            f"`threshold_by_severity` names {', '.join(ignored)}, which this round "
+            f"will NOT apply — a corroboration threshold may only stand down a "
+            f"severity below the `{dials.round_trigger_floor}` round trigger floor "
+            f"that is also not {' or '.join(BLOCKING_SEVERITIES)}. Those findings buy "
+            "another round however few seats raised them, so suppressing them would "
+            "leave a finding no fix pass may touch and every stop rule still "
+            "demanding. Each named band is applied at 1 seat, as it was before the key")
+    # #551's one configuration hazard, said rather than refused, and it is the mirror of
+    # #664's below. A percentage with no absolute beside it bounds NOTHING: the two are
+    # halves of one ceiling and the round spends the smaller, so with
+    # `low_severity_fix_lines: null` there is no smaller to take. The obvious
+    # alternative — let the percentage become a budget on its own — is worse and is
+    # refused rather than argued for: a repo that wrote `null` meant "no budget, every
+    # finding above the fix floor is unconditional work", and handing it one back from a
+    # key it may never have touched would make a written value mean the opposite of what
+    # it names. So the percentage goes inert and the round SAYS so, naming the key that
+    # would put it back in force (#169: a dial that reads as configured and bounds
+    # nothing is the failure worth a line). Silent on the shipped defaults, where
+    # nobody wrote anything to be surprised about.
+    if (dials.low_severity_fix_lines is None
+            and dials.low_severity_fix_full_chars is not None):
+        notes.append(
+            f"`low_severity_fix_full_chars` is written at "
+            f"{dials.low_severity_fix_full_chars:,} and bounds nothing this round — it "
+            "is the PROPORTIONAL half of the low-severity budget and the round spends "
+            "whichever half is smaller, so with `low_severity_fix_lines: null` there is "
+            "no budget for it to scale. Write a line budget beside it, or null this too "
+            "and mean it")
     # The one migration hazard #492 creates, said out loud rather than special-cased.
     # A repo that wrote `max_fix_growth: null` meant "no growth check" — that key WAS
     # the whole check — and after #492 it switches off the multiple only, leaving an
@@ -2234,6 +3456,24 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
             "ceiling only — since #492 there is an absolute half beside it, and "
             f"`max_fix_growth_chars` is in force at {dials.max_fix_growth_chars:,} "
             "chars. Null that too for the pre-#492 'no growth check at all'")
+    # #664's one inversion hazard, said rather than refused. A floor at or above the
+    # absolute ceiling leaves the multiple unable to fire FIRST at any PR size: every
+    # growth that clears the floor has already crossed the absolute half, so the pair
+    # stops behaving as crossed-first and the multiple becomes a key that reads as
+    # configured and stops nothing (#169). Not a hard exit, because both values are
+    # individually legal and the combination is a policy a repo may actually want —
+    # "absolute ceiling only, and say so" — which is what makes it worth SAYING rather
+    # than guessing at. Silent where either is null: there is no pair to invert.
+    if (dials.max_fix_growth is not None
+            and dials.min_fix_growth_chars is not None
+            and dials.max_fix_growth_chars is not None
+            and dials.min_fix_growth_chars >= dials.max_fix_growth_chars):
+        notes.append(
+            f"`min_fix_growth_chars` at {dials.min_fix_growth_chars:,} is at or above "
+            f"the {dials.max_fix_growth_chars:,}-char `max_fix_growth_chars` ceiling, "
+            f"so the {dials.max_fix_growth:g}x multiple can never be the half that "
+            "stops a cycle first — any growth clearing the floor has already crossed "
+            "the absolute half. Lower the floor, or null the multiple and mean it")
     if dials.require_failing_test:
         notes.append("`require_failing_test: true` is recorded and NOT enforced — the "
                      "reviewer-emitted failing test it needs is not built (#92, #114), "
@@ -3217,7 +4457,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # and through it the coverage veto and the payload — has to follow it
             # down. Believing the intent here is how a blind seat gets recorded as
             # a sighted one and has its declarations counted against the round.
-            sandbox, reads_code = seat_checkout(code_tree, tmpdir / "cwd")
+            sandbox, reads_code = seat_checkout(code_tree, tmpdir / "seat")
             if not reads_code:
                 # The prompt was composed BEFORE this staging could be attempted —
                 # `run` decides the brief when it builds the text, and only this
@@ -3232,7 +4472,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # will otherwise go looking for a checkout it was promised.
                 prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF)
         else:
-            sandbox = member_sandbox(tmpdir / "cwd")
+            sandbox = member_sandbox(tmpdir / "seat")
         #: What that sandbox COSTS the seat, recorded at the line that causes it.
         #: An empty repo and no file tools means the diff in the prompt is the
         #: seat's entire evidence, so anything it declares about code outside the
@@ -3612,18 +4852,43 @@ def _ask_gist(reply: str, limit: int = 120) -> str:
 
 
 
-def _diff_added_lines(diff: str) -> dict[str, set[int]]:
-    """Map each changed file (repo-relative, the `b/` side) to the set of line
-    numbers it ADDS on the new-file side — the code this PR actually wrote. Used
-    to scope SonarCloud's main-branch issues down to the PR's own lines (its
-    "new code" view) rather than every pre-existing issue in a touched file, and
-    to place a finding inside (or outside) the fix range for :func:`_provenance`.
+def _diff_added_text(diff: str) -> dict[str, dict[int, str]]:
+    """Map each changed file (repo-relative, the `b/` side) to `{line number: the
+    TEXT of that line}` for every line it ADDS on the new-file side.
+
+    The same walk :func:`_diff_added_lines` has always made, keeping the line's
+    content rather than throwing it away — and the reason to keep it is #559.
+    Position says a line is new to this range; only content can say whether it is
+    new to the CYCLE. A revert-of-a-revert adds ninety lines an earlier round
+    already reviewed, and to a walk that records line numbers alone that is
+    indistinguishable from a fixer writing ninety lines. `panel_scope.restored_lines`
+    is what asks the second question, and this is what gives it something to ask it
+    with.
+
+    The `+` sign is stripped and nothing else is: no strip, no case fold, no
+    whitespace normalisation. What the restoration filter compares is bytes against
+    bytes at an earlier commit, and a normalisation here would silently widen that
+    into "looks a bit like", which is the difference between a filter that excludes
+    restorations and one that excludes any line resembling one.
+
+    `split("\\n")` rather than the `splitlines()` this walk used until #559 (found
+    by Codex). A diff's record separator is the newline and nothing else, while
+    `splitlines()` also breaks on `\\x0b`, `\\x0c` and `\\u2028` — so a form feed
+    inside a source line counted as two added lines and shifted every line number
+    after it, which places findings against the wrong lines. A `\\r` stays in the
+    text where the diff had one; whether two lines differing only in their
+    terminator are the same line is the COMPARISON's question, and
+    :func:`panel_scope._restored_in_file` answers it there rather than by having
+    this walk quietly decide it.
     """
-    out: dict[str, set[int]] = {}
+    out: dict[str, dict[int, str]] = {}
     cur = None
     newln = 0
     in_hunk = False
-    for line in diff.splitlines():
+    rows = diff.split("\n")
+    if rows and rows[-1] == "":
+        rows.pop()       # the trailing newline, not a final empty line
+    for line in rows:
         if line.startswith("diff --git "):
             cur, in_hunk = _diff_file_path(line), False
         elif line.startswith("+++ ") and not in_hunk:
@@ -3639,13 +4904,27 @@ def _diff_added_lines(diff: str) -> dict[str, set[int]]:
             m = re.search(r"\+(\d+)", line)
             newln = int(m.group(1)) if m else 0
         elif line.startswith("+"):
-            out.setdefault(cur, set()).add(newln)
+            out.setdefault(cur, {})[newln] = line[1:]
             newln += 1
         elif line.startswith("-"):
             pass  # old-side only — new-side line counter doesn't advance
         else:
             newln += 1  # context line advances the new-side counter
     return out
+
+
+def _diff_added_lines(diff: str) -> dict[str, set[int]]:
+    """Map each changed file (repo-relative, the `b/` side) to the set of line
+    numbers it ADDS on the new-file side — the code this PR actually wrote. Used
+    to scope SonarCloud's main-branch issues down to the PR's own lines (its
+    "new code" view) rather than every pre-existing issue in a touched file, and
+    to place a finding inside (or outside) the fix range for :func:`_provenance`.
+
+    One walk under both of these, since #559 gave the other caller a use for the
+    line's text: two parsers over one diff format is two places for the `+++`
+    ambiguity above to be got right, and they would drift.
+    """
+    return {f: set(lines) for f, lines in _diff_added_text(diff).items()}
 
 
 #: What a changed file counts as when the panel asks how much APPARATUS a change is
@@ -4301,9 +5580,8 @@ def _diff_files_cut(diff: str, budget: int | None) -> set[str]:
 
 # The range/provenance/scope readers and the CI + Sonar signals moved to
 # panel_scope (#129) — this module was the last one over the argv cap.
-from panel_scope import *        # noqa: F401,F403
-import panel_scope               # noqa: F401
-
+import panel_scope  # noqa: F401
+from panel_scope import *  # noqa: F401,F403
 
 #: Everything this module offers, INCLUDING the underscore names — the suites
 #: reach for several of them through `panel`, and a plain star import would drop
@@ -4315,22 +5593,29 @@ __all__ = [
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
-    "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
+    "is_deterministic_failure", "member_sandbox", "SANDBOX_ENV", "sandbox_env",
+    "run_cli", "record_run",
+    # The round-start claim (#253) and the release that ends it.
+    "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
-    "code_access_wanted", "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
+    "code_access_wanted", "pr_claim_wanted", "history_wanted",
+    "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",
-    "severity_floor", "deferral_issue_floor", "reviewer_scope",
-    "low_severity_budget",
+    "severity_floor", "deferral_issue_gate", "reviewer_scope",
+    "low_severity_budget", "low_severity_full_budget_chars",
     "distant_merge_lines", "fix_growth_limit", "fix_growth_chars_limit",
+    "fix_growth_floor_chars",
+    "fix_guard_lines_limit",
     "GUARD_KINDS", "_guard_kind", "guard_ratio",
     "REFEREE_KINDS", "_LINE_COMMENTS", "_DOCSTRING_FENCES",
-    "UNREFEREED_MIN_CHURN", "_suffix_of", "_comment_line",
+    "UNREFEREED_MIN_CHURN", "MIN_HONEST_FIX_CHURN", "_suffix_of", "_comment_line",
     "_BLOCK_COMMENTS", "_DOCSTRING_HOST_END", "_hosts_docstring",
     "_next_block",
     "_STRING_PREFIXES", "_COMMENTED_LIKE_PY", "_unescaped_find", "_fence_at_start", "_next_fence",
     "_referee_kind_lines", "referee_split", "unrefereed_line_weight",
+    "next_door_days",
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",
@@ -4341,6 +5626,6 @@ __all__ = [
     "pi_args", "grok_args", "select_reviewers", "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
     "SeatParsed", "SeatTurn", "run_seat", "review_llm",
-    "ask_llm", "_ask_gist", "_diff_added_lines", "_diff_files_cut",
+    "ask_llm", "_ask_gist", "_diff_added_text", "_diff_added_lines", "_diff_files_cut",
     "panel_scope",
 ]

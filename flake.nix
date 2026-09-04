@@ -268,6 +268,11 @@
           # application tree into this sandbox. `rm`, not --ignore, for the reason
           # above.
           rm harness/tests/test_fixer_escalation.py
+          # And test_fixer_consumers.py beside it (#616), which reads the same three briefs and
+          # harness/README.md and holds them against each other — the requirement that a fix pass
+          # name who consumes the code it changes, so that refuting a finding costs what complying
+          # with it costs. Same sandbox mismatch, same `rm` rather than `--ignore`.
+          rm harness/tests/test_fixer_consumers.py
           # And test_regression_test_redgreen.py (#257), which reads the command briefs
           # via its own parents[1] and imports panel_core out of harness/loops. Fourth
           # instance of the same mismatch, and the one that made a category check the
@@ -450,6 +455,7 @@
           # with it, and following the guard's "add an install line" advice cannot
           # produce a second, unrelated "No such file or directory".
           install -Dm644 ${./harness/tests/test_fixer_escalation.py}         repo/harness/tests/test_fixer_escalation.py
+          install -Dm644 ${./harness/tests/test_fixer_consumers.py}          repo/harness/tests/test_fixer_consumers.py
           install -Dm644 ${./harness/tests/test_regression_test_redgreen.py} repo/harness/tests/test_regression_test_redgreen.py
           install -Dm644 ${./harness/tests/test_commands_wired.py}           repo/harness/tests/test_commands_wired.py
           install -Dm644 ${./harness/tests/test_prose_sandbox.py}            repo/harness/tests/test_prose_sandbox.py

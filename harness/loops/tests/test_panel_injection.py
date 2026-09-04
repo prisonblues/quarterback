@@ -40,9 +40,9 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402
 import panel  # noqa: E402
 import panel_rounds  # noqa: E402
-import harness_rules  # noqa: E402
 
 DEFAULT_BLOCK = harness_rules.DEFAULTS["review_panel"]
 
@@ -71,7 +71,8 @@ def test_the_default_is_on_and_is_the_one_the_rules_file_documents():
                                             "premise_undecidable": True,
                                             "fix_injection": 0.5,
                                             "new_findings_not_falling": 1,
-                                            "unrefereed_fix": True}
+                                            "unrefereed_fix": True,
+                                            "guard_lines": False}
     assert panel_rounds.fix_injection_limit(DEFAULT_BLOCK, []) == 0.5
 
 
@@ -272,7 +273,7 @@ def test_a_below_floor_policy_stop_keeps_its_own_reason_and_its_confidence():
     its monopoly on ending the loop, which is the failure #165 exists to remove."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   injection=_state(9, 1))
     assert got["stop"] is True and got["confident"] is True
     assert "round trigger floor" in got["reason"]
@@ -301,7 +302,7 @@ def test_over_and_fired_are_different_questions_and_the_payload_keeps_them_apart
     round, which is the misreporting `round_stop` is organised against."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   injection=_state(9, 1))
     assert got["fix_injection"]["over"] is True
     assert got["fix_injection"]["fired"] is False
@@ -322,7 +323,7 @@ def test_a_round_going_again_for_an_unrelated_P1_is_not_cancelled_by_the_rate():
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     blocker = _finding("P1", key_from="the mirror never closes")
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], [*quiet, blocker], [],
-                                  trigger_floor="P2", fix_floor="P3",
+                                  trigger_floor="P2", cleared_floor="P3",
                                   injection=_state(3, 1))
     assert got["fix_injection"]["over"] is True
     assert got["fix_injection"]["fired"] is False
@@ -361,3 +362,146 @@ def test_a_board_dial_over_a_replaced_escalate_on_is_REPORTED_not_silent():
     # And the reader is unmoved by the board's opinion, which is the half that makes
     # the report load-bearing rather than decorative.
     assert panel_rounds.fix_injection_limit(cfg["review_panel"], []) == 0.5
+
+
+# ---- #637: the calibration this block records, and what it could not settle ----
+
+
+def _fix_injection_block() -> str:
+    """The comment block above `escalate_on` in `harness_rules.DEFAULTS`.
+
+    Read as TEXT because the artefact under test is the argument, not a value: the
+    number here has not moved and the reason it has not is the whole of #637's
+    answer. A test on `DEFAULTS["review_panel"]["escalate_on"]["fix_injection"]`
+    passes identically whether the block says "expect this to move, nobody has
+    measured it" or "it was measured, over one round, and here is why that settles
+    nothing" — and those are opposite states of the same dial.
+
+    Sliced from `#489's second brake` — the paragraph that opens the rung — to the
+    `escalate_on` literal that closes the section, so a figure moving into a
+    neighbouring dial's block cannot satisfy this by accident.
+    """
+    src = Path(harness_rules.__file__).read_text()
+    start = src.index("#489's second brake")
+    return src[start:src.index('"escalate_on": {', start)]
+
+
+def test_the_threshold_is_still_one_half():
+    """The premise of every assertion below: #637 did not move the number.
+
+    Pinned first and on its own, because a later edit that moved 0.5 and left the
+    prose alone would otherwise fail as "the comment is stale" rather than as "the
+    dial changed", and those need different answers.
+    """
+    assert (harness_rules.DEFAULTS["review_panel"]["escalate_on"]["fix_injection"]
+            == 0.5)
+
+
+def test_the_block_records_the_measurement_rather_than_asking_for_it():
+    """#637's whole complaint: the instruction to re-measure lived here and the work
+    was tracked nowhere, so the block asked for something forever.
+
+    The measurement was taken on 2026-09-02 and the answer was that the population
+    is one round. That is a poor answer and a real one, and a block that keeps
+    saying "treat the first cycles under 6 as the recalibration" says instead that
+    nobody has looked — which after #637 is false, and is the state that let the
+    instruction sit for as long as it did.
+    """
+    block = _fix_injection_block()
+    assert "EXPECT THIS NUMBER TO MOVE" not in block, \
+        "the standing instruction outlived its own answer"
+    assert "n=1" in block, "the population's size is the finding"
+    assert "#637" in block
+
+
+def test_the_block_says_no_healthy_cycle_has_ever_been_in_the_population():
+    """The number that decides the false-positive rate, and it has no denominator.
+
+    A false positive is this rung ending a cycle that was converging. 27 cycles on
+    the board carry an attributable round and `converged` is TRUE on none of them,
+    so the trade the default-on rests on — a cheap false positive against #299's
+    five-round cycle — has never been priced on one side. Saying "uncalibrated" does
+    not carry that; saying it cannot be calibrated from this population does.
+    """
+    block = _fix_injection_block()
+    assert "0 of 27" in block or "TRUE on none" in block
+    assert "no denominator" in block or "has no denominator" in block
+
+
+def test_the_founding_population_is_named_and_not_just_counted():
+    """`128 of 201 across the seven PRs` named no PR, in five files.
+
+    The figure reproduces from the board's stored rounds and identifies exactly one
+    subset of seven — but only because the arithmetic happens to be unique, and the
+    board holds fourteen PRs panelled that day. A calibration citing a population
+    nobody can enumerate is one rebase away from #692's failure mode, which is the
+    dial next door justifying itself with a chars-per-line figure that does not
+    reproduce. So the seven are written down where the number is.
+    """
+    src = Path(harness_rules.__file__).read_text()
+    for pr in ("#151", "#152", "#153", "#154", "#158", "#160", "#161"):
+        assert f"{pr}," in src or f"{pr} " in src, f"the {pr} round is unnamed"
+    assert "quarterback #151" in src
+
+
+def test_the_block_no_longer_claims_every_measured_round_was_far_above_the_line():
+    """The one sentence in the block that did not reproduce.
+
+    "Every one of those is far above 0.5" is true of the three quoted AGGREGATES and
+    false of the rounds behind the first: the seven last rounds run 0.321, 0.513,
+    0.541, 0.694, 0.824, 0.889 and 0.923, so one sits well under the threshold its
+    own pooled figure justifies. That matters to a recalibration and to nothing
+    else, which is exactly why it survived: it is the only claim in the block whose
+    truth depends on the grain the rule reads at.
+    """
+    block = _fix_injection_block()
+    assert "0.321" in block, "the round under the threshold is not shown"
+    assert "AGGREGATES" in block, \
+        "the claim has to name the grain it is true at"
+
+
+def test_the_block_states_which_unit_the_rate_is_counted_in():
+    """#692 decided on 2026-09-02 that the growth ceilings' unit is CHURNED LINES,
+    so every calibration in this file now owes a statement of what it counts.
+
+    This rung's answer is that it counts FINDINGS on both sides of the division,
+    which is why no chars-to-lines conversion appears in it and why #692's
+    correction does not reach the threshold arithmetic. The attribution UNDER each
+    finding is a line question and gets a different answer again — the added lines
+    of a net `compare/a...b` range, which is neither `pr_chars` nor cumulative
+    churn — and a block that left that unsaid is one a reader would fill in from
+    the dial next door.
+    """
+    block = _fix_injection_block()
+    assert "FINDINGS" in block, "the unit both sides are counted in"
+    assert "#692" in block
+    assert "NET DIFF" in block or "net diff" in block
+
+
+def test_the_block_keeps_559_out_of_the_churn_unit():
+    """The tension #692's decision creates with #559, named rather than smoothed.
+
+    "Every line a pass touches is surface area" says a RESTORATION is a touch.
+    This rung is not asking about surface area — it asks whether the fix pass
+    AUTHORED the defect — so #559 subtracting restored lines is right here and
+    would be wrong under a uniform churn reading. A reader applying one unit
+    across the whole block would undo #559 and rebuild the failure it was filed
+    for, which is the one outcome the note exists to prevent.
+    """
+    block = _fix_injection_block()
+    assert "#559" in block
+    assert "must not be moved into it" in block
+
+
+def test_the_block_does_not_claim_the_growth_ceilings_blind_spot():
+    """#702's case is that both growth ceilings read `pr_chars` and so cannot see
+    an in-place rewrite. This rung reads ADDED LINES and can.
+
+    Pinned because the two brakes genuinely disagree about one event, and the
+    tempting reading of #702 is that the blind spot is shared. It is not, the
+    difference is load-bearing for anyone recalibrating either dial, and #702 is
+    where the other two get fixed — so the note also says not to fix it here.
+    """
+    block = _fix_injection_block()
+    assert "#702" in block
+    assert "Do not \"fix\" it here." in block

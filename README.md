@@ -188,22 +188,42 @@ POST  /review            (panel.py --json payload)              -> {id, recorded
                                                                     [, premise_counts_unusable]
                                                                     [, needs_human_unknown]
                                                                     [, needs_human_refused]
+                                                                    [, review_panel_dropped]
+                                                                    [, rules_dropped]
+                                                                    [, provenance_restored_dropped]
+                                                                    [, since_sha_dropped]
+                                                                    [, harness_rev_dropped]
+                                                                    [, nul_replaced]
+                                                                    [, nul_dropped]
+                                                                    [, nonfinite_dropped]
                                                                     [, unreadable_fields]}
                           the bracketed keys appear only when something was dropped, and are the
                           machine-readable drift signal #65 reads; every one is logged too
 GET   /reviews           ?repo=&pr=&author=&since=&days=&limit=  (runs + scorecards,
-                                                                  unread_files as a count)
+                                                                  unread_files as a count,
+                                                                  + scope/since_sha/fix_range_source,
+                                                                  what each round measured,
+                                                                  + harness_rev/dirty/digest,
+                                                                  which harness read it)
 GET   /review/{id}                                              (scorecards + findings + accounts
                                                                  + the PR's changed_files
                                                                  + head_sha/unread_files/provenance
-                                                                 + recurrence/premise_verdict)
+                                                                 + recurrence/premise_verdict
+                                                                 + review_panel, the dials it ran under
+                                                                 + rules, which layer set each of them
+                                                                 + provenance_restored, what it did
+                                                                   not attribute
+                                                                 + harness_path, where that harness
+                                                                   ran from)
 POST  /review/outcomes   {repo, pr, outcomes:[{key, outcome, note?,               -> {recorded, changed,
                           deferred_to?, superseded_by?, attested_by?}]}              amended, unchanged,
                                                                                      rejected,
                                                                                      unattested_refutations}
                           what HAPPENED to a defect once somebody acted on it:
-                          fixed | refuted | deferred | superseded, one per (repo, pr, key).
-                          `refuted` needs its reasoning and `superseded` needs the key that
+                          fixed | narrowed | refuted | deferred | superseded, one per
+                          (repo, pr, key). `refuted` needs its reasoning, `narrowed` (#615 —
+                          real, fixed where it was raised, general form not this pass's work)
+                          needs that general form, and `superseded` needs the key that
                           replaced it; rejections are per item and named, never a 422 for the
                           batch; a repeat FILLS a field and an overwrite is an `amended`
                           revision; 201 created / 200 updated / 422 nothing accepted.
@@ -217,6 +237,49 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           (what survived the fix) — the GAP is the measurement. Read it
                           against outcomes_scored (fixed+refuted, the ratio's own
                           population) and confirmed_defects, never outcomes_recorded
+GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by_repo, by_size,
+                                                                     by_kind, by_shape, by_rounds,
+                                                                     marginal_by_round,
+                                                                     injection_by_round}
+                          the share of review CYCLES that ended in a confident dry round
+                          (#626) — the number the convergence epic is judged on. One cycle
+                          is one (repo, pr, cycle), its ending is its TERMINAL round's, and
+                          `rate` is converged / decided where decided is converged +
+                          unconverged. `open` (the loop went again) and `unmeasured` (the
+                          round predates `converged` and sent nothing) are published beside
+                          the rate and are NOT in its denominator; `rate` is **null, never
+                          0.0**, when nothing was decided. `converged` is strictly stronger
+                          than `stop_confident`: a below-floor policy stop (#165) is
+                          confident and NOT converged, which is why the review queue's
+                          `ready`/`land` gate stays the looser test. `open` holds abandoned
+                          cycles as well as live ones, so **`rate` is an upper bound** and
+                          not an estimate — #637 fits a threshold to it and has to read it
+                          that way. A caps refusal is NOT among them: it ends the cycle and
+                          counts `unconverged`, as `preland` and the review queue already
+                          call it. `by_rounds` is keyed `final_round`, the terminal round's
+                          NUMBER rather than a count of rounds recorded.
+                          `injection_by_round` (#637) is the OTHER population: per round
+                          number, the distribution of `provenance_counts.introduced` over
+                          every bucket — the quantity `escalate_on.fix_injection` divides,
+                          at the grain it divides it, which `marginal_by_round` (counts) and
+                          `/review/stats` (a ratio of sums across a window) both miss. Read
+                          `rate_min`/`rate_p25`/`rate_median`/`rate_p75`/`rate_max` and not
+                          `pooled_rate`: the rule weights a 4-finding round like a
+                          44-finding one and a pooled ratio does not. Every SUM and RATE is
+                          over `rated_runs` (a non-zero denominator existed), which is
+                          smaller than `attributed_runs` (the panel sent a tally) and
+                          smaller again than `rounds`; those three are the markers, not
+                          figures over it. `dial_runs` counts the RATED rounds carrying a
+                          `rules` record — the only field that says what the threshold WAS
+                          while the round ran — and it read 1 of 38 on 2026-09-02; it
+                          shares `rated_runs`' population deliberately, a marker over any
+                          other being worse than none. **No threshold
+                          and no minimum denominator is applied**: the dial is a repo's and
+                          `FIX_INJECTION_MIN_NEW` is the harness's, so the board publishes
+                          the population and never the verdict. **`days` defaults
+                          to 90** where the rest of `/review/*` defaults to all time: this
+                          one classifies a row per cycle in Python rather than aggregating
+                          in SQL, and the applied boundary is always in `window.since`
 GET   /review/spend      ?repo=&pr=&hours=                        -> {repo_window, fleet_window,
                                                                      pr_total}
                           what review has already COST, so a ceiling can be checked before
@@ -394,6 +457,12 @@ POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
                           claim blocks, it is not a note to read past
 POST  /plan/item/release { item_id, session? }         (idempotent)
 POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
+                          `open -> done` is a conditional UPDATE, so of two callers
+                          racing the same row exactly one transitions it. The other is
+                          answered 200 with `changed: false`, `done_by` naming who won,
+                          and its note is not appended a second time if the row already
+                          carries it — a fleet of `qb-reconcile --apply` timers writes
+                          the same receipt on every host (#723)
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
 POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← delegated
                                           (plan/state person-only)
@@ -513,6 +582,64 @@ agent can. `BROWSER_DEV_USER` is a *read* bypass and does not open that door; a 
 that wants the reorder buttons sets `BROWSER_DEV_HUMAN=true` deliberately. See
 [DEPLOY.md](DEPLOY.md) §0.
 
+### A review round claims the PR it is reviewing (#253)
+
+The claims section above is titled *what you are working on, said before you start*, and until
+#253 the review path said nothing. A lease carries `repo`, `branch` and `title` and **no work
+reference at all** — nothing that names an issue or a PR — so an agent three hours into reviewing
+`#1780` was, on every fleet surface, indistinguishable from one that had just opened the repo.
+Measured on this board while the issue was open: five live agents, three of them reviewing,
+`GET /claims` returning `[]`, and the dashboard's AGENTS rows reading `master`, `test` and
+`Panel review PR rework`.
+
+**The dashboard was never the missing half.** `qbdata._agent_row` has preferred a claim over the
+prompt title since the AGENTS table was three panels, and had nothing to join.
+
+**And the join itself was wrong, which the empty board was hiding.** `POST /claim` records the
+MACHINE as an ordinary claim's holder — `holder: "daedalus"`, session in its own field — and only a
+session-owned claim (the plan's, v2.39) records `daedalus/sable-dune`. `agent_rows` indexed by
+holder, so it matched plan claims and nothing else: every `qb-claim issue` and `qb-claim pr` became
+a claim-only row reading `machine`, one line from the agent holding it. Claims are now indexed by
+**session** where they name one and by holder where they do not, asked in that order — a machine
+runs several agents at once and they all authenticate as that machine, so the holder of an ordinary
+claim cannot say which took it and the session can. `machine` consequently stops meaning two
+things: a machine-held claim that names a session and is not live reads `gone`, and only a claim
+naming neither identity — `create-worktree`'s, taken before its agent exists — is `machine`.
+
+`panel.py` now takes the `pr` claim at the moment it dispatches its seats, and hands it back when
+the round ends. The observation point is #253's own: *"`panel.py` run start — it already POSTs at
+the end, so it knows the PR and round"*, and the rule it follows comes from #229 and #172 — the
+trigger has to be an action that already happens, never a second declaration somebody has to
+remember to make. A round dispatching its seats is that action, which is also why the claim is
+taken **there** rather than in `main()`: everything above that line could still have refused the
+round.
+
+Three properties, each of them a decision:
+
+- **It never gates the round.** Every refusal — a board that cannot be reached, a rotated token, a
+  peer already holding the PR — is a line in `config_notes` and nothing else. A review that would
+  not run because a board was down is a worse failure than a review nobody can see. The HELD case
+  is a note for the same reason and not an exit: two panels on one PR is spend twice, worth telling
+  a reader about, and not the round's call to prevent.
+- **It goes through `qb-claim`**, not a POST from `panel.py`, for the reason `record_run` gives —
+  which board this machine belongs to is site configuration, and re-deriving it in Python is how
+  one island's work lands on another island's board. It also means the key is derived by the board
+  (#172): the kind and the number go up, the key comes back.
+- **The TTL is three hours**, which is *above* the board's one-hour default (`DEFAULT_TTL`) and far
+  below `create-worktree`'s eight (#608's fuse). One hour cannot cover a round — 20-40 minutes
+  ordinarily, longer when CI or a vendor is slow — and a fuse that expires mid-round shows the PR as
+  free while four seats are still reading it. The claim is released when the round ends, so the TTL
+  only governs the paths that cannot release: an exception or an interrupt between the claim and the
+  release leaves it standing for up to that long, which is passive expiry working as designed
+  rather than a leak anything sweeps.
+
+On the dashboard the AGENTS cell now reads `PR#1780 · Panel review PR rework` — the ref in front of
+the words rather than instead of them. It was one or the other before: a claim replaced the title
+outright, so the cell answered "which PR is this?" or "what is this agent up to?" and never both.
+A prefix rather than a column because the narrow dash is 69 columns and a column costs that width
+on every row, including the ones with nothing to say. The round number is not in the cell because
+it is already in the `stage` column beside it (`R1`, `R1F`, `R2`).
+
 ### Exempting a PR from review is a human write (#335)
 
 `POST /review-queue` lets a PR leave the review backlog three ways: merged, closed, or
@@ -590,6 +717,22 @@ ambiguous; the repo is part of the comparison, because an item and a blocker tha
 about it are about two different issues numbered 42. A blocker naming a ref nobody planned
 still attaches to nothing and stays in the queue, which is correct — there is no plan row
 for it to hold up.
+
+**It is answered on the board, not on the plan page (#677).** The paragraph above is right
+about the plan, and for a while it was also the only route to an answer box — the board's
+`⛔ N waiting` chip was a link to `/plan/view`, and the plan page offers the box as a chip on
+a plan ROW. Compose the two and a blocker whose subject nothing plans is counted on the
+board, sent to the plan page by its own tooltip, and not on it. Self-perpetuating, too: the
+subject reaching a terminal state is exactly what closes the plan item, so the question
+became unanswerable at the moment it was answered in real life. The first five resolutions
+this table ever recorded were five agents withdrawing their own questions and not one
+person's answer. The chip now expands into the queue itself, with a box per row posting
+straight to `POST /blockers/resolve` — the board already reads the queue from
+`GET /blockers?open=true`, so no plan row is in the path. The plan page keeps its chip: a
+question that IS holding a row up should be answerable on the row it is holding up. The read
+asks for the endpoint's maximum of 1000 and says so when it binds — `GET /blockers` applies
+its limit before it counts, so an unlimited-looking read is a truncation reported as a
+total.
 
 ### A suggested order, and the ledger it writes to (#232)
 
@@ -1020,6 +1163,144 @@ unbelievable count, a field whose value is not the shape that field takes: each 
 `POST /review` response under its own key and goes to the service log, because a response nobody
 stores is not a record and `qb record-review` prints only the run id. That is the machine-readable
 half of the panel↔board drift check #65 asks for.
+
+**And a key the ingest has no field for at all fails the suite (#643).** The signal above can only
+speak about a value it recognised the FIELD of; `ReviewIn` is `extra="ignore"`, so a top-level key
+the panel sends and the model does not name went on the floor with nothing said anywhere. That
+happened six times — `head_sha`, `unread_files`, the provenance pair, `converged`, `review_panel`,
+and the provenance working #647 stores — each of the first five caught by a human months later.
+`tests/test_payload_key_drift.py` reads the panel's payload keys out of `harness/loops/panel.py`
+and holds whatever `ReviewIn` does not bind against a hand-written list of the keys that are
+dropped on purpose (twenty-five at #643, twenty now), so a new one has to be named — as a field, as
+a key the panel stops sending, or as a line on that list — rather than disappearing. The list is
+written out and not computed, because a computed one passes forever.
+
+`review_panel`, the dial set a round APPLIED, is stored since #643 rather than dropped: it is the
+policy `converged` was decided under, and until now that verdict sat on a row carrying none of the
+floors it was cut at. Opaque JSONB, never interpreted here, on `GET /review/{id}` only.
+
+**And the working behind a count this board already stores (#647).** The sixth instance was the
+first the list itself found: five of its twenty-five entries were the provenance behind
+`provenance_counts`, which has ridden every view since v2.26. `rules` (#305) is which LAYER
+supplied each dial — and the only field on the row carrying `escalate_on.fix_injection`, since
+`review_panel` is `Dials.as_dict()` and `escalate_on` is not in it. `provenance_restored` (#559) is
+what the round declined to attribute, the filter that moves `introduced`. `fix_range_source` (#512)
+is which range answered — `increment`, `compare` or `reconstructed`. `scope`/`since_sha` are what
+the round actually reviewed, which is what makes the stored `diff_chars` comparable across a cycle.
+
+The two objects are opaque JSONB on `GET /review/{id}`, refused whole rather than trimmed. The
+three scalars ride `GET /reviews` too, on `merge_base`'s rule: a recalibration reads a population
+and slices it on these, and detail-only would mean one fetch per run.
+
+**And which HARNESS produced the round (#112).** Everything above says how a round was configured
+and what its numbers were measured against; nothing said what RAN it. `.harness-rules` argues at
+length that an unpinned reviewer MODEL makes "codex found more than claude" unattributable and
+pins three of the four seats for it — while the harness itself was unpinned, unrecorded, and
+changes far more often than a vendor slug. On 2026-08-31 six merges changed `round_stop`,
+`converged`, the `fix_injection` accounting and `restored_lines` in a day, and the deployed panel
+on one host was rebuilt underneath a running session: two rounds of one cycle, read by different
+machinery, indistinguishable in the record that the r1 → r2 comparison is drawn from.
+
+Four fields, because from inside a running panel the question has no single true answer —
+`qb-doctor`'s `check_harness` says as much about the same problem, and settles for content as a
+PROXY because the truthful answer is in a flake pin no harness script can reach:
+
+| field | what it is | when it is null |
+|---|---|---|
+| `harness_rev` | the commit of the checkout it ran from. **Authoritative** | every installed harness — the nix store is not a checkout — and any copy the containing repo does not track |
+| `harness_dirty` | whether that checkout carried changes the rev does not | no rev, or nobody could ask |
+| `harness_digest` | `loops-sha256-1:<hex>` over the loop modules. **A proxy**: it cannot name a version, only answer "same code or not" | the directory could not be read |
+| `harness_path` | where it ran from. **A locator** — for a nix install also an exact build identity, and the only field that says a round did NOT come from the deployed harness | the panel did not say |
+
+Stored verbatim: this board has no checkout of the harness to resolve a rev against, does not
+recompute a digest and does not parse a store path. The first three ride `GET /reviews`, because
+what a recalibration groups a population by must not cost one fetch per run; the path is
+detail-only. There is deliberately no release NUMBER among them — `package.nix` ships no
+`pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
+a merge, so a running harness has none to report and a branch's harness never had one.
+
+**And the FIX PASS itself, which is the one actor here nothing recorded (#624).** Everything above
+is about a round: what it read, under which dials, with which seats, produced by which harness,
+ending in which verdict. Reviewers have scorecards, findings have keys and terminal outcomes,
+rounds have a row. The actor *between* two rounds — the fix pass, which writes the code that
+produces the next round's findings — had a paragraph in a markdown brief. On `lexray#1780` its four
+passes ran to +850/−314 across 11 files, +322/−49 across 9, +356/−41 across 12 (seven of them files
+no round had read) and +142/−31 across 7, and every one of those numbers was reconstructed from
+`git` by hand, afterwards, in order to file the issue.
+
+`fix_pass` is that record, and it is an **assembly** rather than a new measurement: the churn split
+(#554), the surface (#619), the range and the brief's fate (#506), the pricing (#622) and the
+attribution (#489) were each already derived once a round and then filed under the round's *stop
+decision* as five unrelated rungs. #624's own words: the interesting field "already exists per-round
+as `introduced` — it simply is not attached to the pass that caused it".
+
+| field | what it is | authority |
+|---|---|---|
+| `range` | both ends of the commit range, which of three readers supplied the diff, how many commits and merges it holds, and `spans` — how many fix phases it actually covers | derived |
+| `brief` | which round's **To fix** list briefed it, how many findings that list held, and how many of them this round could key | derived |
+| `churn` | production / test / prose / total, over insertions plus deletions | derived |
+| `surface` | the files it touched, and which of them no earlier round of the cycle had read | derived |
+| `cleared` / `still_open` | brief entries this round no longer raises, and those it still does — keys and severities | derived |
+| `introduced` | how many of **this** round's findings were attributed to that pass | derived |
+| `declared` | the `narrowed` / `declined` / `escalated` keys the pass reported, dated to this round | **declared** |
+| `counts` | the eleven-key integer summary, which is what rides `GET /reviews` | derived |
+| `gaps` | the record's own account of what it cannot say | — |
+
+Every measurement comes from the diff, the commits and the payload the pass was given — never from
+the pass's account of itself, which is what #622 and #621 exist to remove — and the two things that
+*are* declarations sit under a key that says so and feed no count. The record is opaque JSONB on
+`GET /review/{id}`; `fix_pass_counts` is its own `counts` block, lifted rather than recomputed, and
+rides `GET /reviews` on the rule the three tallies already state.
+
+**And it is deliberately not a leaderboard**, which is the other half of #624's title. Its second
+opinion, adopted in full: every obvious ratio here is gameable in a direction worse than the
+disease — *lines per finding cleared* rewards compressed and superficial fixes, *findings introduced
+per pass* rewards weakening tests and avoiding the files most likely to be read, *new files opened*
+rewards refusing a cross-file repair that is genuinely required (a P1 left unfixed to protect a
+metric), and *share still standing a round later* is invalid under increment scope because the later
+round may never have re-read the repair. So the record carries **no actor key at all** — it names
+the pass by its range and the round that briefed it, never the agent, model or session that
+performed it, which is a stronger guarantee than a policy of not writing the query. No ratio is
+stored, nothing is indexed to invite an aggregation, `round_stop` is not passed it and does not read
+it, no dial governs it, and `GET /review/stats` — the leaderboard this table already feeds — does
+not touch it. The fixer's brief says the record is made and says it is not scored, because a
+measurement the measured party is not told about is a trap rather than a brake.
+
+**And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
+A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;
+`json.loads` accepts all four, so a round carrying one passed every validator and 500ed at the
+INSERT — which the panel records as "the board did not answer", indistinguishable from a board that
+was down. #643, #647 and #112 fixed four fields between them, each in its own validator; a probe
+found the same 500 in twenty-eight further places. It is now one pass over the whole body, before
+any coercer runs, and the per-field checks that predate it are gone rather than left beside it — a
+chokepoint with exceptions is not one. The answer differs by what the value is FOR:
+
+* a token **matched by exact string** — `unread_files`, `changed_files[].path`, a finding's `file`,
+  the removed convention files, `harness_path` and `harness_digest` — is **dropped**, because a
+  marked token is not a shorter one but a *different* one, and it answers its comparison wrongly and
+  silently forever, where NULL answers *unknown*;
+* an **opaque policy record** (`review_panel`, `rules`, `provenance_restored`) keeps its
+  **whole-object refusal** and the pass does not reach inside it: half a dial set is not a smaller
+  policy but one no round ran under — so #78's `threshold_by_severity` is refused with the dial set
+  rather than edited inside it;
+* **everything else** — prose, names, identities, vocabulary words, mapping keys — keeps its value
+  with the NUL replaced by `␦`, the mark `_echo` has always used on the way out, because storing
+  nothing loses a reviewer's account and an unmarked strip is a silent edit of evidence;
+* a **non-finite number** becomes NULL, "nobody said";
+* and **nothing is a 422**, because refusing the request loses the findings, the scorecards and the
+  accounts along with the byte. `repo` is the exception and already was one: it is the row's
+  identity, and a marked spelling would be a second repository nothing ever asks about.
+
+A marked value is not thereby believed where a coercer follows it: `head_sha`, `harness_rev`,
+`provenance` and `pr_state` meet theirs immediately after and are refused under the drop signal they
+already had. Where none follows, the marked value is stored — `scope` and `fix_range_source` are the
+deliberate case, because they are read against no vocabulary on purpose and a marked one is an extra
+group a consumer can SEE rather than a value folded into "the panel did not say".
+
+All of it is reported by dotted position under `nul_replaced`, `nul_dropped` and `nonfinite_dropped`.
+`POST /review/outcomes` has the same defect and the opposite remedy — the item is **refused** and the
+reason names the field — because its rule is that a fixer recording an outcome can simply be told,
+where the panel cannot be failed over the board being fussy.
 
 ## Releases
 
@@ -2282,7 +2563,8 @@ app/          FastAPI service
                    GET /sessions, GET /session/{key}
   api/subagents.py POST /subagent[/end], GET /active (collision index), GET /overlap
   api/reviews.py   POST /review, GET /reviews, /review/{id}, /review/stats, /review/findings,
-                   /review/needs-human, /review/collisions, /review/spend
+                   /review/needs-human, /review/collisions, /review/next-door,
+                   /review/spend, /review/convergence
   api/worktrees.py PUT/GET /worktrees (cross-worktree discovery)
   api/sync.py      GET /sync (published line vs registered checkouts)
   api/whoami.py    GET /whoami (the caller's resolved board identity)
@@ -2323,6 +2605,19 @@ tests/        end-to-end tests against real Postgres (conftest.py shared fixture
                    in harness/templates/)
   test_migration_ids.py              the frozen legacy ids and the rule that a
                    new revision is never a chain number (no database)
+  test_payload_key_drift.py          every top-level key panel.py sends against
+                   what ReviewIn binds, so a key the ingest would silently drop
+                   fails on the commit that adds it (#643; no database)
+  test_review_provenance_working.py  what a stored count was measured against —
+                   rules, provenance_restored, fix_range_source, scope,
+                   since_sha — round-tripped and refused (#647)
+  test_review_harness_identity.py    which harness produced the round —
+                   rev/dirty/digest/path, what each says and what each cannot,
+                   and the NUL a text column refuses (#112)
+  test_review_unstorable_values.py   a NUL or a NaN in every position a caller
+                   can put one, and which of mark / drop / refuse each gets (#646)
+  test_outcome_unstorable_values.py  the same class on POST /review/outcomes,
+                   where the item is refused and named instead (#646)
 harness/      step 2 of the install — the workflow the board coordinates
   loops/           panel.py (reviewer panel), epic.py, lander.py, harness_rules.py
                    needs_human.py — the one door an escalation leaves by (#274)

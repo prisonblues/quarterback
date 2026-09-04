@@ -337,13 +337,145 @@ tp=$(printf '%s'  "$IN" | jq -r '.transcript_path // empty' 2>/dev/null)
 
 repo=""; branch=""
 if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
-  # Repo identity is the origin remote's name, not the directory's: a checkout
-  # cloned to a different local name is still the same repo to everyone else, and
-  # /sync has to agree with what the MCP tools (which read origin) call it. Falls
-  # back to the directory basename when there's no origin.
+  # Repo identity is the origin remote's, not the directory's: a checkout cloned
+  # to a different local name is still the same repo to everyone else, and /sync
+  # has to agree with what the MCP tools (which read origin) call it.
+  #
+  # `owner/name`, not the basename. The basename is what every board surface that
+  # KEYS on a repo refuses (`app/claimkey.py`, #148), so a lease reporting one made
+  # `/active?repo=prisonblues/lexray` — the spelling `plan_read` had just taught the
+  # agent, and the only one it accepts — answer that the coast was clear while three
+  # agents worked the repo (#714). The reads fold both shapes now, so this is not
+  # what fixes that; it is what stops the fleet's own heartbeat being the thing that
+  # needs folding.
   _origin=$(git -C "$cwd" config --get remote.origin.url 2>/dev/null)
-  repo=$(printf '%s' "${_origin:-$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null)}" \
-         | sed -E 's#/+$##; s#\.git$##; s#.*[:/]##')
+  if [ -n "$_origin" ]; then
+    # Trailing slashes and one `.git` off the end first, so the slug pattern below
+    # need not also decide where the repository name stops. `sed -E` is POSIX ERE
+    # and has no lazy quantifier, so a name class that can match `.git` and an
+    # optional `(\.git)?` after it hands the suffix to the NAME: the first cut of
+    # this reported `prisonblues/quarterback.git`, which `canonical_repo` refuses
+    # for exactly the reason it is stripped here — GitHub allows no repository name
+    # ending in `.git`, so that spelling can only ever be a clone URL's suffix.
+    _url=$(printf '%s' "$_origin" | sed -E 's#/+$##; s#\.git$##')
+    # A GitHub remote in any of its spellings (https, ssh://, scp-style, with or
+    # without an explicit port), anchored on the host so a *path* remote cannot be
+    # read as `owner/name`: `/home/rich/source` would otherwise become `rich/source`,
+    # which is the open-domain guessing PR #152 was closed for.
+    #
+    # `(:[0-9]+)?` cannot eat the scp-style separator even for an all-digit owner
+    # (`github.com:123/repo`): ERE backtracks, and the only parse where the tail is
+    # an `owner/name` is the one where the port group matched nothing.
+    #
+    # The scheme and the host are matched CASE-INSENSITIVELY, spelled out as
+    # character classes because POSIX ERE has no `(?i)`. Both are case-insensitive
+    # by their own specs — URI schemes by RFC 3986, DNS hostnames by RFC 4343 — and
+    # git clones `https://GitHub.com/Acme/Widget` happily. A lowercase-only host
+    # dropped such a remote through to the bare-name fallback and published
+    # `Widget`, which is not wrong enough to notice and not an identity: the one
+    # spelling the write path exists to converge on is the one it would silently
+    # fail to produce. The owner and name keep whatever case they were cloned
+    # under; `app.repomatch.fold_repo` folds that on the way in, which is where a
+    # case rule belongs — GitHub preserves repository-name case and this hook is
+    # not the thing that gets to decide it.
+    repo=$(printf '%s' "$_url" | sed -nE \
+      's#^([A-Za-z0-9+.-]+://)?([^@/]+@)?[Gg][Ii][Tt][Hh][Uu][Bb]\.[Cc][Oo][Mm](:[0-9]+)?[:/]+([A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*)$#\4#p')
+    # Not a GitHub remote: the bare name is genuinely all this checkout has, and the
+    # board's reads accept it. Only the *identity* is unavailable, not the grouping.
+    [ -n "$repo" ] || repo=$(printf '%s' "$_url" | sed -E 's#.*[:/]##')
+  fi
+  # No origin at all: the directory basename is the only name this checkout has,
+  # and whether it is worth putting on the board depends on WHOSE directory it is.
+  #
+  # #714 dropped the fallback outright, for a real case: the panel's per-seat
+  # sandbox is a `git init` in a temp directory, so it put `repo: "cwd"` and
+  # `branch: "master"` on the board — read, reasonably, as an unexpanded variable.
+  # A throwaway repo nobody else can name is not a repo the fleet shares, and
+  # reporting one is worse than reporting none: it is a repo name a peer can ask
+  # `/active` about and be answered about.
+  #
+  # But "no origin" is not only the sandbox (#721). An ordinary local-only
+  # repository — never pushed anywhere, two agents, two worktrees — reported
+  # `repo: NULL` on both leases, and a repo-scoped read cannot match NULL, so
+  # `active(repo="<basename>")` answered a clean board while two agents were live
+  # in it. That is the same false clean #714 exists to abolish, arriving through
+  # the other half of the same field. It is also the opposite of what the board
+  # does one function away: `_subagents_in_repo` KEEPS a sub-agent whose parent
+  # cannot be placed, because on a collision index "unknown" must not be
+  # representable as a clean answer.
+  #
+  # So the suppression is declared rather than inferred. `QB_SANDBOX` is exported
+  # by whoever MADE the throwaway checkout — `panel_seats.run_cli`, for the seat
+  # sandboxes that are the whole of the #714 case — and only that process's
+  # children go silent. Everything else keeps the bare name, which the board's
+  # reads already accept (`app.repomatch.name_clause`): only the *identity* is
+  # unavailable there, not the grouping.
+  #
+  # Inferring it from the checkout instead was the alternative, and there is no
+  # test for it that a real repo cannot fail: a fresh `git init` and a local-only
+  # repository of ten years' commits differ in nothing the hook can see — not the
+  # remote, not the temp-dir prefix (a worktree under /tmp is legitimate), not the
+  # branch name. The process that created the directory is the only thing that
+  # knows, so it is the thing that says.
+  #
+  # The name is the REPOSITORY's directory and not this worktree's, which is what
+  # makes it an answer two agents can share. #721's whole scenario is a local-only
+  # repo with two agents in two worktrees, and `create-worktree` names those
+  # `<repo>-<branch>` — so the obvious `--show-toplevel` gives them
+  # `quarterback-fix-issue-721` and `quarterback-feat-issue-9`, two repositories on
+  # the collision index where there is one, and neither agent can be asked about
+  # under the name the other reports. `--git-common-dir` is the one path every
+  # worktree of a repo agrees about (verified: resolved absolute it answers
+  # `<repo>/.git` from the main checkout and from a linked worktree alike).
+  # `/.git` off the end gets the repository directory; the second `.git` strip is
+  # for a BARE repo, whose common dir IS the repository directory and
+  # conventionally ends in `.git`.
+  #
+  # Resolved with `cd` and `pwd` rather than asked for absolute, and there is NO
+  # fallback under it — deliberately. `--git-common-dir` answers relative to the
+  # directory git ran in (`$cwd`, via `-C`) whenever it can: `.git` from the main
+  # worktree, an absolute path from a linked one. `--path-format=absolute` would
+  # collapse that to one call but arrived in git 2.31, so on an older git it is the
+  # branch that does not run — and the only thing left to fall back TO is
+  # `--show-toplevel`, the per-worktree name this whole block exists to stop
+  # reporting. That is not a degraded answer, it is the defect: an old git would
+  # have put `checkout-wt-a` and `checkout-wt-b` on the collision index again,
+  # silently, with the test that catches it passing on the box that ran it. `cd`
+  # and `pwd` are POSIX and answer identically on every git, so the version
+  # question does not arise.
+  #
+  # `CDPATH=` is load-bearing, not hygiene. `--git-common-dir` answers the BARE
+  # relative `.git` from a main checkout, and a `cd` operand that does not begin
+  # with `/`, `./` or `..` is searched for on CDPATH first — so an agent whose
+  # shell profile exports CDPATH with any entry holding a `.git` lands in somebody
+  # else's repository, and the hook publishes a lease for a repo this session is
+  # not in. That is #714's own failure made worse: not a name nobody can resolve,
+  # a name that resolves to the wrong thing. Measured with a decoy at
+  # `$CDPATH/.git`: the substitution came back
+  # `/tmp/…/decoy/.git\n/tmp/…/decoy/.git` — wrong, and DOUBLED, because `cd`
+  # echoes the directory it landed on whenever CDPATH is what found it. Emptying
+  # CDPATH closes both halves at once (no search, so nothing to echo); the
+  # `>/dev/null` under it is belt-and-braces so no stdout from `cd` can ever reach
+  # the value, whatever a future shell decides to print.
+  #
+  # The subshell is the guard as well as the resolution. `_root` is empty when the
+  # common dir came back empty, when either `cd` fails (the checkout deleted under
+  # us, an unreadable git dir) or when `pwd` fails — every one of them short-
+  # circuits before `pwd`, so nothing partial is printed. An empty `_root` then
+  # yields an empty `repo`: `${_root%/.git}` is empty, `printf` writes nothing, and
+  # `sed` over no input outputs nothing. No repo is the safe outcome and the same
+  # one a sandbox gets.
+  if [ -z "$repo" ] && [ -z "${QB_SANDBOX:-}" ]; then
+    _gitdir=$(git -C "$cwd" rev-parse --git-common-dir 2>/dev/null)
+    _root=$(
+      [ -n "$_gitdir" ] || exit 1
+      CDPATH=
+      cd "$cwd" >/dev/null 2>&1 || exit 1
+      cd "$_gitdir" >/dev/null 2>&1 || exit 1
+      pwd
+    )
+    repo=$(printf '%s' "${_root%/.git}" | sed -E 's#/+$##; s#\.git$##; s#.*/##')
+  fi
   branch=$(git -C "$cwd" branch --show-current 2>/dev/null)
 fi
 

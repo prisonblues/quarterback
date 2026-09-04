@@ -136,11 +136,19 @@ AGE_BASES: tuple[str, ...] = (
 )
 
 #: An outcome recorded against a finding clears it from THIS PR's ledger. All
-#: four count: ``fixed`` and ``refuted`` are self-evident, ``superseded`` names
+#: five count: ``fixed`` and ``refuted`` are self-evident, ``superseded`` names
 #: the finding that replaced it, and ``deferred`` names the issue it moved to —
 #: which is precisely a decision that it does not block this PR.
+#:
+#: ``narrowed`` (#615) is the fifth and it clears for the plainest reason of the
+#: lot: the code changed and the finding as raised is answered. It is listed
+#: rather than assumed because the whole point of the word is that it is NOT a
+#: deferral — a fixer that could not say "fixed here, not everywhere" fixed the
+#: class instead, and the class-wide fix is what edits files nobody reviewed. If
+#: this set left it out, the queue would hold a PR open on a finding somebody has
+#: already repaired, which is the incentive #615 exists to remove.
 CLEARING_OUTCOMES: frozenset[str] = frozenset(
-    {"fixed", "refuted", "deferred", "superseded"}
+    {"fixed", "narrowed", "refuted", "deferred", "superseded"}
 )
 
 #: The token that turns a plan item's note into an EXEMPTION rather than a

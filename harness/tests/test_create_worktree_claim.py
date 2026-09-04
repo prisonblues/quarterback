@@ -339,7 +339,7 @@ def test_a_failed_checkout_hands_the_claim_back(tmp_path):
     nobody to talk to."""
     released = tmp_path / "released"
     got = run_stanza("feat/issue-9", tmp_path=tmp_path,
-                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     stub='echo \'{"claim_id":"claim-abc"}\'; exit 0',
                      py=f'printf "%s" "$QB_CLAIM_ANSWER" >{released}; echo released; exit 0',
                      after="false")
     assert got.returncode != 0
@@ -354,7 +354,7 @@ def test_the_rollback_does_not_change_the_exit_status(tmp_path):
     """A cleanup that rewrote the exit code would hide the real failure behind its
     own success."""
     got = run_stanza("feat/issue-9", tmp_path=tmp_path,
-                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     stub='echo \'{"claim_id":"claim-abc"}\'; exit 0',
                      py='echo released; exit 0', after="exit 7")
     assert got.returncode == 7
 
@@ -364,7 +364,7 @@ def test_a_completed_checkout_KEEPS_the_claim(tmp_path):
     work in or remove, and releasing it would be the opposite error."""
     released = tmp_path / "released"
     got = run_stanza("feat/issue-9", tmp_path=tmp_path,
-                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     stub='echo \'{"claim_id":"claim-abc"}\'; exit 0',
                      py=f'touch {released}; echo released; exit 0', after="CLAIM_KEPT=true")
     assert got.returncode == 0, got.stderr
     assert not released.exists(), "a successful checkout released its own claim"
@@ -386,7 +386,7 @@ def test_a_release_that_fails_says_what_to_release_by_hand(tmp_path):
     the rollback is best-effort — and when it cannot run, the id it could not use
     is the one thing the operator needs."""
     got = run_stanza("feat/issue-9", tmp_path=tmp_path,
-                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0',
+                     stub='echo \'{"claim_id":"claim-abc"}\'; exit 0',
                      py='exit 1', after="false")
     assert got.returncode != 0
     assert "claim NOT released" in got.stderr
@@ -405,7 +405,7 @@ def test_no_python3_is_not_a_crash(tmp_path):
     and reaching the same message by a different route (#472). The interpreter is
     now genuinely absent."""
     got = run_stanza("feat/issue-9", tmp_path=tmp_path,
-                     stub=f'echo \'{{"claim_id":"claim-abc"}}\'; exit 0', after="false")
+                     stub='echo \'{"claim_id":"claim-abc"}\'; exit 0', after="false")
     assert got.returncode != 0
     assert "claim NOT released" in got.stderr
 

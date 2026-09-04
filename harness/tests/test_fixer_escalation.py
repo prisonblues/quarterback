@@ -211,7 +211,7 @@ READS = frozenset({
 })
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def doc(relpath: str) -> str:
     # Encoding spelled out: these files are prose full of em dashes, and `read_text()` takes the
     # platform default, which under a C/POSIX locale is ASCII. A nix build and a minimal CI
@@ -378,12 +378,16 @@ def test_the_summary_counts_use_the_recorded_vocabulary_and_state_their_invarian
         "permitted fixer outcome under `review_panel.fixer_may_defer` (#165), and a permitted "
         "outcome missing from the counts is a finding that can leave the table without the "
         "arithmetic below noticing")
-    assert "Fixed + Deferred + Escalated + Refuted = Findings" in flat, (
-        "the counts state no invariant, so nothing tells a reader that the four must sum to "
+    assert "Narrowed: N" in counts, (
+        f"the counts line ({counts.strip()!r}) no longer says `Narrowed: N` — `narrowed` (#615) "
+        "is a recorded fixer outcome and the one easiest to lose from a count, because it looks "
+        "like a fix from every angle except the general form nobody wrote")
+    assert "Fixed + Narrowed + Deferred + Escalated + Refuted = Findings" in flat, (
+        "the counts state no invariant, so nothing tells a reader that the five must sum to "
         "Findings — the one cheap check that catches a finding that fell off the table. Every "
         "permitted outcome has to be a term in it: one left out is exactly the note-and-move-on "
         "the permission was granted to replace")
-    for empty in ("Escalated: none", "Deferred: none"):
+    for empty in ("Escalated: none", "Deferred: none", "Narrowed: none"):
         assert empty in flat, (
             f"step 6 no longer spells the empty case {empty!r}; a missing block reads as "
             "forgotten, and the run where that matters is the run where a reader has to be sure")
@@ -692,7 +696,7 @@ def outcomes() -> set[str]:
 def test_the_vocabulary_is_the_one_this_suite_thinks_it_is(outcomes: set[str]):
     """A guard on the guard. Every assertion below is "the docs stay inside this set", which
     passes trivially if the set is read wrong — and reading it wrong is silent."""
-    assert outcomes == {"fixed", "refuted", "deferred", "superseded"}
+    assert outcomes == {"fixed", "narrowed", "refuted", "deferred", "superseded"}
 
 
 def test_the_constraint_the_docs_name_exists(outcomes: set[str]):
@@ -720,7 +724,7 @@ def test_the_constraint_the_docs_name_exists(outcomes: set[str]):
             "which app/api/reviews.py declares — the two spellings of the vocabulary have "
             f"drifted. It reads: {' '.join(check.split())!r}")
     assert _VOCAB_CONSTRAINT in doc(REVIEW_PR), (
-        f"{REVIEW_PR} §2b no longer names the constraint that makes 'there is no fifth outcome' "
+        f"{REVIEW_PR} §2b no longer names the constraint that makes 'there is no sixth outcome' "
         "a fact rather than a convention")
 
 
@@ -770,8 +774,8 @@ def test_an_escalation_is_recorded_as_deferred(name: str, outcomes: set[str]):
     assert relevant, f"{name} never says what an escalated finding is recorded as"
     assert any("`deferred`" in b for b in relevant), (
         f"{name} discusses recording an escalation without naming `deferred` in the same "
-        f"paragraph or bullet; the four values it could be naming instead are {sorted(outcomes)}, "
-        "and three of them would be wrong")
+        f"paragraph or bullet; the five values it could be naming instead are {sorted(outcomes)}, "
+        "and four of them would be wrong")
 
 # ---- the reads this suite declares (#251, #257) ------------------------------
 #

@@ -48,18 +48,27 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 import harness_rules  # noqa: E402
+
 # stderr_gist and cli_outcome live with the shared plumbing — how headless CLIs
 # fail is not a panel question, and the loops that run headless agents with no
 # panel in sight need the same reading of a CLI's complaint (#31). They are
 # re-exported here because they read as part of run_cli's contract at every call
 # site in this file.
-from harness_rules import (DENIAL_MARKERS, REJECTION_MARKERS,  # noqa: E402
-                           RULES_FILENAME, SAMPLE_FILENAME,
-                           RepoNotFound, cli_outcome, describe,
-                           resolve_repo, stderr_gist)
+from harness_rules import (  # noqa: E402
+    DENIAL_MARKERS,
+    REJECTION_MARKERS,
+    RULES_FILENAME,
+    SAMPLE_FILENAME,
+    RepoNotFound,
+    cli_outcome,
+    describe,
+    resolve_repo,
+    stderr_gist,
+)
+
 # #279's vocabulary, through the one module that knows where it is defined.
-from needs_human import (class_or_none as needs_human_class_or_none,  # noqa: E402
-                         reason_or_none as needs_human_reason_or_none)
+from needs_human import class_or_none as needs_human_class_or_none  # noqa: E402
+from needs_human import reason_or_none as needs_human_reason_or_none
 
 # Chars of diff handed to a model, when nothing in .harness-rules says otherwise:
 # NONE OF THEM. The whole diff goes to every reviewer unless a repo asks for a
@@ -90,13 +99,20 @@ RAW_DETAIL_CHARS = 4_000  # cap an unparsed reviewer reply kept as a fallback fi
 CLUSTER_WINDOW = 10
 ACCOUNT_CHARS = 240  # per-reviewer account shown under a merged finding in the report
 
-# Panel -> fix -> panel. Two is the default because one is provably not enough:
-# the fixer's own commit is otherwise read by nobody, and structural fixes beget
-# new interactions that no earlier round could have seen because they did not
-# exist until the fix was written. It is a cap on the CALLER's loop, used here
-# only to decide whether a round that still has work left stopped because it was
-# done or because it ran out of rounds.
-DEFAULT_MAX_ROUNDS = 2
+# Panel -> fix -> panel. One is provably not enough: the fixer's own commit is
+# otherwise read by nobody, and structural fixes beget new interactions that no
+# earlier round could have seen because they did not exist until the fix was
+# written. It is a cap on the CALLER's loop, used here only to decide whether a
+# round that still has work left stopped because it was done or because it ran out
+# of rounds.
+#
+# **6 as of 2026-08-30, from 2 (#621).** THE CAP IS A BACKSTOP AGAINST RUNNING
+# FOREVER AND NOT A CONVERGENCE MECHANISM, and 2 was being asked to be both: a cycle
+# that ends on the cap has produced a fix nobody read and a remainder handed to
+# somebody, which is the opposite of the confident dry round the cap was being
+# credited with. What ends a cycle from here is `escalate_on`, `fix_injection` first.
+# `harness_rules.DEFAULTS` carries the evidence and the way back.
+DEFAULT_MAX_ROUNDS = 6
 
 # What a round past the first REVIEWS. "increment" makes the review target the
 # diff between the previous round's head and this one's — the fix commit, which
@@ -211,14 +227,21 @@ SEVERITIES = ("P1", "P2", "P3", "P4")
 # documented default and the applied default disagreeing, silently, in the direction
 # nobody checks.
 
-#: Findings at or above this severity are what a fix round is asked to clear. P3 and
-#: not P2: severity is model-authored and wrong sometimes, and the defect class a P2
-#: floor systematically misses is correctness expressed as craft. `harness_rules`
-#: carries the argument.
-DEFAULT_FIX_SEVERITY_FLOOR = "P3"
+#: Findings at or above this severity are what a fix round is asked to clear. Not P2:
+#: severity is model-authored and wrong sometimes, and the defect class a P2 floor
+#: systematically misses is correctness expressed as craft.
+#:
+#: **P4 as of 2026-08-30, from P3 (#621).** This is not the blocking band and has not
+#: been since #297 — `round_trigger_floor` is, and it stays at P2. Admitting P4 adds
+#: no obligation: it puts the P3 AND P4 band inside `low_severity_fix_lines`' budget,
+#: where before P3 was the whole of that band and P4 sat outside every rule, so which
+#: of them a round actually takes is decided cheapest-first by a count rather than by
+#: the fixer's judgement. `harness_rules` carries the argument.
+DEFAULT_FIX_SEVERITY_FLOOR = "P4"
 #: New findings at or above this severity are what buys another round. Stays P2 while
-#: the fix floor is P3, deliberately: fixing a P3 inside a pass that is already open
-#: costs one edit; letting one buy a whole new round costs a panel plus a fix pass.
+#: the fix floor reaches to P4, deliberately: fixing a low-severity finding inside a
+#: pass that is already open costs one edit; letting one buy a whole new round costs a
+#: panel plus a fix pass. It is the gap between the two that the budget pays for.
 DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: Churned lines the whole round may spend fixing findings BELOW the trigger floor —
 #: the tier the fix floor admits and the measurement does not. 40 because the failure
@@ -227,6 +250,23 @@ DEFAULT_ROUND_TRIGGER_FLOOR = "P2"
 #: all (the pre-#297 behaviour); `0` fixes none of them. `harness_rules` carries the
 #: measurement.
 DEFAULT_LOW_SEVERITY_FIX_LINES = 40
+#: The PROPORTIONAL half of that budget (#551), and it is a SIZE rather than a rate:
+#: the first round's `pr_chars` at or above which the whole `low_severity_fix_lines`
+#: budget applies. Below it the budget is pro rata — `lines x first_chars / this` — so
+#: the round spends whichever of the two ceilings is smaller and the pair can only ever
+#: tighten. The opposite operator to #664's floor one block down, because the
+#: accumulation `low_severity_fix_lines` measures is dangerous on the SMALL PR, where a
+#: fixed 40 lines can exceed the diff it is polishing.
+#:
+#: **Denominated in chars because `pr_chars` is what a baseline records**, so the
+#: RUNTIME arithmetic converts nothing: a ratio of two char counts multiplying a line
+#: count. 14,325 is the median `pr_chars` of this repo's merged PRs scaled to the ~182
+#: churned lines at which 40 lines is the ~22% allowance #551 calls sane (n=21, range
+#: 9,538-18,604) — so the CALIBRATION is still anchored to a line count, and what it is
+#: free of is the disputed 66-versus-58 rate, not #692 as a whole. `harness_rules` says
+#: exactly how far that goes. None switches the proportional half off and restores the
+#: pre-#551 behaviour exactly.
+DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS = 14_325
 #: How much of the low-severity budget one UNREFEREED churned line costs, against a
 #: production line's 1 (#554). The budget's unit becomes exposure rather than length:
 #: a line written where nothing can check it spends more of the round than a line
@@ -267,36 +307,148 @@ DEFAULT_UNREFEREED_LINE_WEIGHT = 2
 #: which is what keeps every caller that has not heard of them on the old
 #: behaviour rather than on the new default.
 NO_SEVERITY_FLOOR = SEVERITIES[-1]
+#: The severities `panel_rounds.round_stop`'s rule 2 treats as blockers, at every
+#: setting of every floor a repo can write. Named rather than spelled twice: rule 2
+#: is where the tuple has always been hardcoded, and #78's corroboration threshold
+#: has to read the SAME set to know which findings it may never stand down. Two
+#: literals would be one refactor away from a threshold that suppresses a finding
+#: rule 2 goes on demanding, which is the jam :func:`panel_seats.Dials.threshold_for`
+#: exists to make unreachable.
+BLOCKING_SEVERITIES = ("P1", "P2")
+#: #78's corroboration threshold: how many DISTINCT seats must independently raise a
+#: finding at a given severity before it is this round's work — `{"P3": 2}` for "a
+#: solo P3 is reported, not fixed". A severity absent from the mapping needs one
+#: seat, which is today's behaviour, so `{}` is off and is what ships.
+#:
+#: **`{}`, and it is UNSET rather than off**, on `max_fix_guard_lines`' precedent
+#: (#618). The evidence that corroboration predicts a real finding is #78's own
+#: table — every finding Rich refuted on 2026-08-20 was single-seat and no
+#: multi-seat finding failed — and that is eight findings on two pull requests, with
+#: `32-F01` a genuine solo P1 sitting inside it. Eight is an observation, not a
+#: calibration, and #67's rule is that an instrument earns a gate over a few dozen
+#: cycles or not at all. So the seat count is recorded per finding every round
+#: (`reviewers` on the payload, and the `⋆consensus` notation in the report have both
+#: carried it since long before this key) and nothing is stood down until a repo
+#: writes a number it can defend.
+#:
+#: **What it may never do**, and this is a property of the mechanism rather than of
+#: the default — see :meth:`panel_seats.Dials.corroboration_applies`. A threshold can
+#: only stand down a severity BELOW `round_trigger_floor` that is also not one of
+#: :data:`BLOCKING_SEVERITIES`. A single seat finding a genuine P1 nobody else spotted
+#: is the case the panel exists for, and a count is the wrong instrument for deciding
+#: whether to act on it.
+DEFAULT_THRESHOLD_BY_SEVERITY: dict[str, int] = {}
 #: How many times the first round's reviewed size a later round may review before
 #: the cycle stops and says the change wants splitting. None disables it.
 DEFAULT_MAX_FIX_GROWTH = 3.0
 #: The ABSOLUTE half of that ceiling (#492): chars the PR may GROW past the size the
 #: cycle's first round read it at, before the same stop fires. Whichever of this and
-#: the multiple is crossed FIRST binds, so it can only ever tighten the check. A pure
+#: the multiple is crossed FIRST binds, so THIS KEY can only ever tighten the check —
+#: a claim about the pair of ceilings and not about the mechanism, which since #664 has
+#: a floor in it that loosens (see below). A pure
 #: multiple hands its rope out in proportion to the starting size — 226 lines on a
 #: 113-line PR, 4,000 on a 2,000-line one — and the second is the case most in need of
 #: a ceiling. None disables this half and leaves the multiple; `harness_rules` carries
 #: the calibration.
 DEFAULT_MAX_FIX_GROWTH_CHARS = 30_000
+#: The FLOOR under the multiple (#664), and the one term in this mechanism that
+#: LOOSENS: the ratio half fires only where the PR has also grown by more than this
+#: many chars. Proportionality bites at both ends — the ceilings above answer the top,
+#: where a multiple's rope grows with the starting size, and this answers the bottom,
+#: where a fixed per-hunk diff framing cost (~430 chars of `diff --git`, `index`,
+#: `---`/`+++`, `@@` and context) is charged against a PR too small to afford it. On a
+#: 439-char PR the 3.0x allowance is 878 chars and the smallest honest one-file fix
+#: measured 827, half of it framing. None switches the floor off and restores the
+#: pre-#664 behaviour exactly; `harness_rules` carries the calibration.
+DEFAULT_MIN_FIX_GROWTH_CHARS = 2_000
+#: The GUARD half of the same question, per PASS rather than per PR (#618): test and
+#: prose lines ONE fix pass may churn before the ceiling reports — or, where the repo
+#: arms `escalate_on.guard_lines`, ends the cycle.
+#:
+#: **`None`, and it is unset rather than off.** The only measurement anyone has is
+#: lexray#1780's five rounds, whose passes wrote 380, 205, 205 and 58 guard lines; a
+#: number drawn between the quiet round and the loud one on that single cycle would be
+#: a ceiling with its argument written afterwards, which is what #67 forbids. So the
+#: instrument ships measured and uncalibrated, and `harness_rules` carries the
+#: arithmetic and the reason a cumulative ratio could not do this job.
+DEFAULT_MAX_FIX_GUARD_LINES = None
 #: What a reviewer is asked to look for: defects in the change (`diff`), or in the
 #: change and everything it touches (`repo` — the pre-#165 posture).
 DEFAULT_REVIEWER_SCOPE = "diff"
+#: How far back a next-door hint may be drawn from, in days, and `0` to send none
+#: (#508). Seven, matching the board's own default, because the signal this carries
+#: decays fast: the measured case is a defect shape confirmed in one PR and shipped
+#: in another ONE HOUR later, and a confirmed finding from six weeks ago in a file
+#: that has since been rewritten is noise wearing the same clothes.
+#:
+#: A dial rather than a constant because the block costs prompt budget on every
+#: round of every PR, and the seat it costs most is the one that cannot read a
+#: prompt off stdin. `0` is the whole off switch: no board call, no slot fill, and a
+#: prompt byte-identical to the pre-#508 one.
+DEFAULT_NEXT_DOOR_DAYS = 7
+#: The widest window `GET /review/next-door` will accept, mirrored here so the dial
+#: cannot ask for one the board refuses. Ten years, i.e. "everything this board
+#: holds".
+#:
+#: Mirrored rather than discovered, because the alternative is worse in the one
+#: direction that matters: a repo writing `next_door_days: 5000` would send
+#: `days=5000`, the board would answer **HTTP 422**, and the round would get a note
+#: and no hints — the operator having asked for a WIDER window and silently
+#: received none. A duplicated constant that drifts costs a note; the version
+#: without it costs the feature.
+NEXT_DOOR_DAYS_MAX = 3650
 REVIEWER_SCOPES = ("diff", "repo")
 #: May a fixer answer "real, and not this change's job"? See `harness_rules`.
 DEFAULT_FIXER_MAY_DEFER = True
 #: Which deferrals get a GitHub ISSUE as well as their board row (#482). Every
 #: deferral is recorded either way — this decides only whether a second copy is
-#: opened on a human's tracker. `P2` because the board row and the issue coincide
-#: for a P1/P2 deferral and do not for the P3/P4 tail, which is where the volume is.
-#: `harness_rules` carries the measurement.
-DEFAULT_FILE_DEFERRAL_ISSUES = "P2"
-#: The two ends of that dial, which are not severities: `always` is the pre-#482
-#: behaviour (an issue for every deferral) and `never` files none at all. Spelled as
-#: words rather than as `P4`/`P0` because a floor "below P4" has no band to name and
-#: `P0` is deliberately not a severity this panel has (see `SEVERITIES`).
+#: opened on a human's tracker.
+#:
+#: **`shape` since 2026-08-30 (#620), and it is not a floor.** The question is no
+#: longer how severe the deferral is but what shape the TICKET would be, because
+#: severity is a property of a finding and batchness is a property of the ticket —
+#: so a cut anywhere on P1..P4 files some batches and blocks some single items,
+#: which is backwards. The count that ended the severity cut: twenty open issues on
+#: this repo were panel deferred-finding exhaust carrying 345 findings, every one of
+#: them a BATCH, and not one had ever been closed. The bands still work and are the
+#: documented way back; `harness_rules` carries the measurement and the argument.
+DEFAULT_FILE_DEFERRAL_ISSUES = "shape"
+#: The three WORDS this dial takes beside the P1..P4 bands, none of which a band can
+#: spell. `shape` is the rule above. `always` is the pre-#482 behaviour (an issue for
+#: every deferral) and `never` files none at all — spelled as words rather than as
+#: `P4`/`P0` because a floor "below P4" has no band to name and `P0` is deliberately
+#: not a severity this panel has (see `SEVERITIES`).
+#:
+#: Two tuples and not one, mirroring `harness_rules._DEFERRAL_GATE_WORDS`: the ends
+#: are the off and on extremes, `shape` is a policy, and it is the JOINED tuple every
+#: reader here checks against — so a word added to either reaches all of them.
+DEFERRAL_ISSUES_SHAPE = "shape"
 DEFERRAL_ISSUES_ALWAYS = "always"
 DEFERRAL_ISSUES_NEVER = "never"
 DEFERRAL_ISSUE_ENDS = (DEFERRAL_ISSUES_ALWAYS, DEFERRAL_ISSUES_NEVER)
+DEFERRAL_ISSUE_WORDS = (DEFERRAL_ISSUES_SHAPE,) + DEFERRAL_ISSUE_ENDS
+#: The three shapes a deferral can have under `shape`, and the two of them that earn
+#: an issue. A CATEGORY is one standing item for a recurring class ("the ingest
+#: layer's error paths are untested"), which a human can work as a batch. An ITEM is
+#: one named defect, decision owed or piece of complexity with real substance behind
+#: it, and it earns an issue whatever severity it carries. A BATCH is a round's
+#: leftovers swept into one ticket — board rows and never an issue, whatever its
+#: severity mix, a P1 in the pile included: twenty P3s in one issue is not a
+#: deferral, it is a transfer of the problem to a human.
+#:
+#: **AN UNCLASSIFIED DEFERRAL IS A BATCH**, which is where this parts company with
+#: every band above it and is the whole direction of the rule. Under a band an
+#: unreadable severity FILES the issue, because the cost of one issue nobody needed
+#: is a line on a tracker. Here that cost is the failure — a ticket nobody reads is
+#: what the twenty were — so the safe direction inverts and the answer that cannot
+#: mint one is the default. Membership is tested rather than batchness, so every
+#: spelling this panel does not recognise arrives at it without a special case.
+DEFERRAL_SHAPE_CATEGORY = "category"
+DEFERRAL_SHAPE_ITEM = "item"
+DEFERRAL_SHAPE_BATCH = "batch"
+DEFERRAL_SHAPES = (DEFERRAL_SHAPE_CATEGORY, DEFERRAL_SHAPE_ITEM,
+                   DEFERRAL_SHAPE_BATCH)
+DEFERRAL_ISSUE_SHAPES = (DEFERRAL_SHAPE_CATEGORY, DEFERRAL_SHAPE_ITEM)
 #: Off, because the artefact it needs is not built (#92, #114). See `harness_rules`.
 DEFAULT_REQUIRE_FAILING_TEST = False
 #: Lines an integration merge may put into a PR's OWN files and still leave the
@@ -459,6 +611,73 @@ REVIEWER_SCOPE_SLOT = "<<<REVIEWER_SCOPE>>>"
 #: it likes.
 RELATED_CODE_SLOT = "<<<RELATED_CODE>>>"
 
+#: Where #508's next-door hints land in the reviewer's brief. A literal token
+#: swapped with `str.replace`, for the reason :data:`JUDGE_CODE_SLOT` is one and
+#: then some: `REVIEW_PROMPT` is rendered by `.format()` in `panel.py`, and this
+#: block is built from **model-authored finding titles**, so a `{}` field would
+#: turn every stray brace a reviewer ever wrote into a `KeyError` on a round that
+#: has nothing to do with it. The swap therefore happens AFTER the `.format`, the
+#: way `panel_rounds` swaps :data:`JUDGE_CODE_SLOT` after rendering the judge —
+#: the token survives `.format` untouched because it contains no braces.
+#:
+#: Swapped for the empty string whenever there is nothing next door, which is the
+#: common case, so a round with no hints sends a prompt BYTE-IDENTICAL to the one
+#: it has always sent. Same discipline as :data:`JUDGE_RECURRENCE_SLOT`, and it
+#: exists so that comparing two rounds is not also comparing two prompts.
+#:
+#: It sits on a line of its own and the brief supplies its own trailing newline,
+#: so an empty fill leaves no blank paragraph behind.
+NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"
+
+#: The heading of a rendered next-door block, and the sentence that keeps it a
+#: hint. Split out as a constant because two things must agree on it: the
+#: renderer, and the test that asserts a hint cannot be reported unaltered.
+NEXT_DOOR_HEADING = "CONFIRMED NEXT DOOR — context, not findings"
+
+#: The instruction that asks for the one property #508 wants kept: *a hint cannot
+#: become a finding on its own*.
+#:
+#: **It is an instruction and not a mechanism, and the difference is worth saying
+#: plainly** — an earlier draft of this comment called it "the enforcement", which
+#: is the exact substitution #183 is about. Nothing downstream checks that a
+#: finding cites a line in this diff, carries evidence independent of the hint, or
+#: differs from the text the seat was shown. A seat that copies a hint back
+#: produces a finding nothing here can tell from a found one. What this paragraph
+#: buys is that the instruction is at least present, unambiguous and adjacent to
+#: the list; what it does not buy is any assurance that it was followed.
+#:
+#: :func:`_one_line` is the part that IS mechanical, and it is deliberately narrow:
+#: it removes the structural attack (a hint forging a bullet or occupying a line of
+#: its own), not the semantic one.
+#:
+#: The failure it guards against is specific and cheap to fall into: a reviewer
+#: handed "this was confirmed an hour ago in this file" reports it back as its
+#: own finding without checking, the judge confirms it, and the next round's
+#: hints include it. The chain then eats its own tail and a seat is rewarded for
+#: repeating what it was told. So the block says, in order, what the lines are,
+#: what they are not, and what the seat must do before any of them may appear in
+#: its reply.
+_NEXT_DOOR_BRIEF = """{heading}. These defects were confirmed by a panel on OTHER pull
+requests in this repository, recently, in files THIS diff also touches. They are given to you
+because a defect shape that just landed next door is the one most likely to be in front of you
+and the least likely to be noticed — an agent copying an ordering out of a shared helper ships
+the same bug in the same file an hour later, and that is a real measurement on this repo, not a
+hypothetical.
+
+They are NOT findings about this diff, and NOT a checklist to report back. Nobody has looked for
+any of them here. Each one may be irrelevant, already handled, or about code this change does not
+contain.
+
+**Report one ONLY if you find it yourself in the material below, and describe it as you found it
+here — the file and line in THIS diff.** Never cite a line below as evidence, never report one
+because it is listed, and if the same shape is genuinely absent from this change, say nothing
+about it at all. A finding that exists only because it was listed here is a false positive with a
+citation, and it is worse than a missed defect: it survives review.
+
+{lines}
+
+"""
+
 REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
 senior reviewer whose bar is "nothing left to improve". Report EVERYTHING you spot, across every
 dimension below — do NOT self-censor a finding because it seems "minor" or "just style". A later
@@ -466,7 +685,7 @@ master judge filters false positives; your job is breadth, not triage.
 
 <<<REVIEWER_SCOPE>>>
 
-Review for:
+<<<NEXT_DOOR>>>Review for:
 - Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
 - Security: injection, auth bypass, secrets in code, path traversal, SSRF, unsafe deserialization
 - Error handling: swallowed errors, missing validation, silent failures, unhelpful messages
@@ -478,11 +697,23 @@ Review for:
   cannot fail, a mock that satisfies itself. Absence of a test is the easy half; a passing
   assertion that the bug is gone is worse than no test, because it keeps passing when it returns
 - Documentation: behaviour changes that leave CLAUDE.md, docs, README, or docstrings stale
+- Load-bearing comments: a comment or docstring the diff WRITES that states a checkable property of
+  the code — "this is the only caller", "nothing between here and there returns", "this re-reads X
+  rather than trusting the earlier read", "this cannot be reached" — is a claim, and a claim in the
+  diff is reviewable. Staleness above is the easy half: nothing ever EXECUTES a comment, so a wrong
+  one survives every round, every CI run and every rebase. Price it by what RESTS on it — a claim
+  the change's own correctness argument leans on (a guard's justification, an ordering or
+  concurrency property, the reason no `try/finally` was needed) is P2 when false, because the next
+  change is made on the strength of it; a claim nothing depends on is P3, priced like any other
+  documentation defect. Checking is usually LABORIOUS rather than impossible — grep the
+  callers, read the enclosing scopes — so do that first: `could_not_assess` is for a claim the
+  material cannot settle, after you have looked, and never for one you did not open a file about
 - Related code: <<<RELATED_CODE>>>
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
 
 Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
-logic flaws) · P3 should fix (style, naming, simplifications) · P4 polish (minor consistency).
+logic flaws, a false comment claim the correctness argument rests on) · P3 should fix (style,
+naming, simplifications, a false comment claim nothing rests on) · P4 polish (minor consistency).
 Report all of them.
 
 """ + _FINDINGS_ENVELOPE
@@ -553,6 +784,164 @@ def reviewer_brief(scope: str = DEFAULT_REVIEWER_SCOPE, reads_code: bool = True)
         para = _REPO_SCOPE_NO_TOOLS
     return (REVIEW_PROMPT.replace(REVIEWER_SCOPE_SLOT, para)
             .replace(RELATED_CODE_SLOT, related))
+
+
+#: How many next-door hints a round will actually send, whatever the board is
+#: willing to serve. `GET /review/next-door` caps at 20 and takes a `limit`; this
+#: is smaller because the two caps answer different questions. The board's bounds
+#: a *response*; this bounds a **reviewer's attention**, which is the scarce thing
+#: — every line here is a line not spent on the diff, and #508 asks for "a handful
+#: of lines in a prompt, not a second review". Eight is a handful.
+NEXT_DOOR_MAX = 8
+
+
+#: The longest a hint's title may be in a prompt, and the longest its detail.
+#: The board caps `detail` too; this caps both again for `NEXT_DOOR_MAX`'s reason —
+#: the far cap bounds a response and this one bounds a reviewer's attention, and a
+#: caller trusting only the far one is trusting a number it does not control.
+NEXT_DOOR_TITLE_CHARS = 200
+NEXT_DOOR_DETAIL_CHARS = 400
+
+#: Anything that could end a hint's line or start a new one. Collapsed to a single
+#: space by :func:`_one_line`.
+_HINT_BREAK = re.compile(r"\s+")
+#: Control characters, which no finding title has a use for and which can move a
+#: terminal's cursor or a model's attention. Deleted rather than escaped.
+_HINT_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def _one_line(text: object, cap: int) -> str:
+    """Untrusted text flattened to ONE line and cut to `cap`.
+
+    **The thing this prevents is not a crash.** A hint's title and detail are
+    written by the reviewers of OTHER pull requests — model output, quoted into a
+    prompt that instructs a model. Interpolated raw, a title carrying newlines
+    escapes its bullet and becomes free text at the same indent as the brief above
+    it, so it can:
+
+    * emit a line of its own that reads as an instruction ("IGNORE THE ABOVE …"),
+      arriving inside a block whose whole purpose is to be read as instruction;
+    * forge further `- P1 file:line — …` bullets **indistinguishable from the real
+      ones**, since the renderer is the only thing that knows how many there were.
+
+    That is prompt injection with a short path: any seat on any PR can write the
+    payload into a finding title, the judge confirms the finding for unrelated
+    reasons, and it is quoted at every PR touching that file for the next week. It
+    needs no attacker either — a legitimate multi-line detail mangles the block on
+    its own.
+
+    So the text is flattened, not escaped: a hint is one line by construction, and
+    a title that wanted two was already wrong. Control characters go entirely.
+    Truncation says so, for `_cut_detail`'s reason on the board side — a sentence
+    ending mid-clause reads to a model as the sentence.
+
+    Not a claim to have solved prompt injection. It removes the structural half —
+    a hint can no longer forge a bullet or occupy a line of its own — and what
+    remains is one bounded, clearly-attributed span of prose inside a bullet, which
+    is the same exposure the diff itself already carries.
+    """
+    flat = _HINT_BREAK.sub(" ", _HINT_CONTROL.sub("", str(text or ""))).strip()
+    if len(flat) <= cap:
+        return flat
+    return flat[:cap].rstrip() + "…"
+
+
+def _hint_line(h: dict) -> str:
+    """One hint as one line, with the evidence to check it and nothing else.
+
+    Deliberately terse and deliberately complete: the PR number and the age are
+    what let a reviewer decide the line is stale or irrelevant WITHOUT taking it
+    on trust, and a hint a reviewer cannot dismiss on its own evidence is one it
+    will report to be safe.
+    """
+    # The path is flattened with everything else: it is a string off the wire, and
+    # "no path has a newline in it" is an assumption rather than a guarantee.
+    where = _one_line(h.get("file"), NEXT_DOOR_TITLE_CHARS) or "?"
+    line_no = h.get("line")
+    # `isinstance` rather than truthiness: a line number arriving as "3\n- P1 …"
+    # would otherwise be formatted straight into the bullet, which is the same
+    # escape by a quieter door.
+    if isinstance(line_no, int) and not isinstance(line_no, bool) and line_no > 0:
+        where = f"{where}:{line_no}"
+    age = h.get("age_hours")
+    when = f"{age:g}h ago" if isinstance(age, int | float) else "recently"
+    # `fixed` is worth saying and the rest are not: it means somebody confirmed
+    # this AND acted on it, which is the strongest form the hint takes. A bare
+    # `deferred` or `superseded` would read as a verdict on THIS diff, which is
+    # the one thing the block must never imply.
+    fixed = " and fixed there" if h.get("outcome") == "fixed" else ""
+    # A severity outside the vocabulary is not echoed. `SEVERITIES` is a closed set
+    # and anything else is either drift or a payload; `P?` says "the board sent
+    # something this does not recognise" without quoting it.
+    sev = h.get("severity") if h.get("severity") in SEVERITIES else "P?"
+    pr = h.get("pr")
+    pr_txt = pr if isinstance(pr, int) and not isinstance(pr, bool) else "?"
+    title = _one_line(h.get("title"), NEXT_DOOR_TITLE_CHARS) or "(untitled)"
+    line = (f"- {sev} {where} — {title} "
+            f"[confirmed on PR #{pr_txt} {when}{fixed}]")
+    detail = _one_line(h.get("detail"), NEXT_DOOR_DETAIL_CHARS)
+    if detail:
+        line += f"\n    {detail}"
+    return line
+
+
+def next_door_brief(hints: list[dict]) -> str:
+    """#508's block for :data:`NEXT_DOOR_SLOT`, or `""` when there is nothing.
+
+    The empty return is the important one and is not a degenerate case: most
+    rounds have no confirmed finding next door, and on those the slot is swapped
+    for nothing at all, leaving the reviewer prompt byte-identical to the one this
+    panel has always sent. A block saying "no recent findings nearby" would be a
+    new sentence on every round in exchange for no information — and it would make
+    every round's prompt differ from every archived round's.
+
+    Capped at :data:`NEXT_DOOR_MAX` here as well as at the board, because the two
+    caps are different promises and a caller that trusted only the far one would
+    be trusting a number it does not control.
+    """
+    rows = [h for h in hints if isinstance(h, dict)][:NEXT_DOOR_MAX]
+    if not rows:
+        return ""
+    return _NEXT_DOOR_BRIEF.format(heading=NEXT_DOOR_HEADING,
+                                   lines="\n".join(_hint_line(h) for h in rows))
+
+
+def next_door_note(hints: list[dict]) -> str:
+    """What this round actually SHOWED its seats, for the record (#508).
+
+    :class:`Dials` records `next_door_days` — the window the round asked through —
+    and that is the setting, not the answer. Two rounds at the same window can be
+    handed different hints an hour apart, and the block that carries them is the
+    one thing in the reviewer prompt that varies between rounds of the same PR.
+    #508 leans on the prompt being byte-identical "so that comparing two rounds is
+    not also comparing two prompts"; the moment there ARE hints that stops being
+    true, and without this line nothing in the payload says by how much or from
+    where. So the round records the count and the rival PRs it quoted — enough to
+    go and read the same findings back, and cheap enough to sit in `config_notes`.
+
+    Only the two facts that are structurally safe to print, and that is a
+    deliberate omission rather than an oversight: the note lands in `config_notes`,
+    which `--post` publishes as a PUBLIC pull-request comment, and a hint's title,
+    file and key are all model-authored text off the wire. PR numbers are `int` or
+    they are not repeated at all, so no flattening is needed and none is relied on.
+    The titles are in the prompt, which is where a reader looking for them is.
+
+    `""` when there is nothing to say, on :func:`next_door_brief`'s rule: a round
+    with no hints must add no line, or the note is on every round of every PR and
+    is the kind that gets trained away.
+    """
+    rows = [h for h in hints if isinstance(h, dict)][:NEXT_DOOR_MAX]
+    if not rows:
+        return ""
+    # `sorted(set(...))` rather than payload order: the note is read by a person
+    # comparing two rounds, and a list whose order tracks recency ranking would
+    # differ between rounds that quoted the same PRs.
+    prs = sorted({h["pr"] for h in rows
+                  if isinstance(h.get("pr"), int) and not isinstance(h["pr"], bool)})
+    where = (" from " + ", ".join(f"#{n}" for n in prs)) if prs else ""
+    plural = "" if len(rows) == 1 else "s"
+    return (f"next-door context: {len(rows)} confirmed finding{plural}{where} "
+            f"shown to this round's reviewers (#508)")
 
 
 MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
@@ -1077,6 +1466,213 @@ def rules_record(cfg: dict) -> dict:
         "dials": {path: said for path, said in (cfg.get("_dials") or {}).items()
                   if path.startswith(_REVIEW_BLOCKS)},
     }
+
+
+#: How a ``harness_digest`` is computed, carried as a PREFIX on the value rather
+#: than left in this docstring (#112).
+#:
+#: The digest's whole job is to answer "were these two rounds read by the same
+#: machinery", and that answer only means anything between two values computed the
+#: same way. A bare hex digest would go on comparing equal to itself after somebody
+#: changed what goes INTO it — silently splitting one harness version into two
+#: groups, or merging two into one — which is this issue's own bug one layer down
+#: and in the direction nobody would notice. So the scheme rides on the value:
+#: `loops-sha256-1:<hex>`, a consumer groups on the whole string, and a change to
+#: what is digested bumps the trailing number instead of reusing it.
+HARNESS_DIGEST_SCHEME = "loops-sha256-1"
+
+#: Seconds for either `git` call behind `harness_rev`. Short on purpose: this is
+#: bookkeeping on a payload nothing gates on, and a `git` that has not answered in
+#: ten seconds leaves the rev null — which is the same answer an INSTALLED harness
+#: gives anyway, that being the common case rather than the exotic one.
+HARNESS_GIT_TIMEOUT_S = 10
+
+
+
+def _harness_git(loops: Path, *args: str) -> str | None:
+    """stdout of ``git -C <loops> <args>``, or None if it could not run or failed.
+
+    `panel_scope._git`'s contract and its reasons, for a caller that cannot import
+    it: `sh` raises on a non-zero exit, and every non-zero exit here is an ANSWER —
+    "this directory is not inside a git checkout" is what an installed harness says
+    and is the commonest outcome this function has. `sh` is also what the suites
+    replace with a `gh` double, so routing local git through it would put these
+    calls in front of a stub that knows only the forge.
+    """
+    try:
+        out = subprocess.run(["git", "-C", str(loops), *args],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=HARNESS_GIT_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _harness_digest(loops: Path) -> str | None:
+    """A content digest of the loop modules in ``loops``, or None if unreadable.
+
+    **The one field that is always available and never lies about SAMENESS.** A
+    rev is null on every installed harness and a path says only where the code sat;
+    this says whether two rounds ran the same code, which is the question every
+    r1 -> r2 comparison in this system silently assumes the answer to.
+
+    What goes in, and each exclusion is a claim:
+
+    * ``*.py`` in this directory and no deeper. `loops/tests/` ships with the
+      package and does not run a round, so a release that only changed tests must
+      not read as different machinery.
+    * The SHEBANG of each file is dropped. `package.nix`'s `postFixup` runs
+      `patchShebangs`, so every installed file differs from the checkout it was
+      built from by its first line — counting it would give every deployed harness
+      a digest that matches no checkout anywhere, which is `qb-doctor`'s
+      `_same_but_for_shebang` and the 24 files it once called drift.
+    * Names and lengths are hashed beside the bodies, so two files cannot be
+      renamed into each other's contents or shifted across a boundary without the
+      digest moving.
+
+    ``None`` where the directory could not be read, and where it does not hold this
+    very module: home-manager links some harness files in individually, and a
+    ``__file__`` resolved through a flat symlink would put ``parent`` at
+    ``/nix/store`` — where this would otherwise cheerfully digest a few thousand
+    unrelated packages and call it a harness. A digest of the wrong directory is
+    worse than no digest, because nothing downstream can tell it is wrong.
+    """
+    if not (loops / "panel_core.py").is_file():
+        return None
+    try:
+        files = sorted(p for p in loops.glob("*.py") if p.is_file())
+        if not files:
+            return None
+        h = hashlib.sha256()
+        for p in files:
+            body = p.read_bytes()
+            if body.startswith(b"#!"):
+                body = body.partition(b"\n")[2]
+            h.update(f"{p.name}\0{len(body)}\0".encode())
+            h.update(body)
+    except OSError:
+        return None
+    return f"{HARNESS_DIGEST_SCHEME}:{h.hexdigest()}"
+
+
+def _harness_checkout(loops: Path) -> tuple[str | None, bool | None]:
+    """``(rev, dirty)`` for the checkout this harness runs from, or ``(None, None)``.
+
+    The AUTHORITATIVE half of the identity when it answers, and it does not answer
+    often: an installed harness lives in the nix store, which is not a checkout, so
+    a null rev is the ordinary case rather than a failure.
+
+    **A rev is only reported when the containing repository actually tracks this
+    file.** Without that test the answer is worse than absent: `panel-review-pr.md`
+    tells you to run the panel from a scratchpad copy, and a copy dropped inside
+    some OTHER checkout would take that repository's HEAD and record it as the
+    harness's own — a plausible 40-hex commit id, in the right column, belonging to
+    the wrong repository. `ls-files --error-unmatch` is the cheapest question that
+    separates "the harness's own checkout" from "some checkout the harness happens
+    to be sitting in".
+
+    ``dirty`` is scoped to exactly what :func:`_harness_digest` reads and to
+    nothing else — ``:(glob)*.py``, which is the top level of this directory and
+    not ``tests/`` below it — and it counts untracked files, because an untracked
+    module here is in the digest and is running. The scopes agreeing is the whole
+    point: ``dirty`` then means precisely "the digest above is not what that rev
+    would produce", where a plain ``-- .`` would have said "somebody edited a test"
+    in the same words (found by Codex).
+    """
+    if _harness_git(loops, "ls-files", "--error-unmatch", "panel_core.py") is None:
+        return None, None
+    head = _harness_git(loops, "rev-parse", "HEAD")
+    if not head or not head.strip():
+        return None, None
+    status = _harness_git(loops, "status", "--porcelain", "--", ":(glob)*.py")
+    # `status` is None only where git answered the two calls above and failed this
+    # one, which leaves the rev true and its cleanliness unknown. Null, not False:
+    # "nobody checked" must not read as "checked and clean" — that is the whole of
+    # #112's complaint about a version field that is sometimes a lie.
+    return head.strip(), None if status is None else bool(status.strip())
+
+
+def harness_identity(loops: Path | None = None) -> dict:
+    """WHICH HARNESS PRODUCED THIS ROUND — #112, four fields and no single answer.
+
+    A payload described the electorate and the decision in detail and said nothing
+    about the code that ran the panel. So a leaderboard aggregated across runs whose
+    prompts, budget arithmetic and seat-loss behaviour differed, and — the sharp
+    end — an r1 -> r2 comparison, which every stop argument in this system rests on,
+    assumed both rounds were read by the same machinery with nothing in the record
+    able to check it. That is not hypothetical: on 2026-08-31 six PRs changed
+    `round_stop`, `converged`, the `fix_injection` accounting and `restored_lines`,
+    and the deployed harness was rebuilt underneath a running session.
+
+    **Four fields and not one, because no single one of them is true in every
+    case.** `qb-doctor`'s `check_harness` reached the same conclusion from the other
+    side and wrote it down: the truthful answer lives in the flake pin's rev, which
+    a running harness cannot reach, so content stands in as a PROXY. This records
+    both, and says which is which:
+
+    * ``rev`` — the commit of the checkout this code is in. AUTHORITATIVE where it
+      is not null: it names something you can `git show`. Null on every installed
+      harness, which is most of them.
+    * ``dirty`` — whether the digested directory has changes that rev does not
+      carry, untracked files included. `true` is what makes a rev honest rather
+      than merely present; null is "no rev, or nobody could ask".
+    * ``digest`` — :data:`HARNESS_DIGEST_SCHEME` over the loop modules. A PROXY:
+      it cannot name a version, and two digests being different does not say which
+      is newer. It is the only field that is always there and never wrong about the
+      one question that matters most — same code, or not.
+    * ``path`` — the directory it all ran from. A LOCATOR, and machine-scoped: for
+      a nix install it is also an exact identity of the build (the store path is a
+      hash of everything that went into it), and for a scratchpad copy it is the
+      only field that says the round did not come from the deployed harness at all.
+
+    A round carries all four or the honest absence of each. A round that carried one
+    field which is sometimes a lie would be worse than a round that carried nothing,
+    because a reader cannot see which of the two it has.
+
+    ``loops`` is for the tests. The real call takes no argument and returns
+    :data:`_HARNESS_IDENTITY`, which was resolved AT IMPORT — see there for why the
+    timing is part of the answer rather than an implementation detail.
+    """
+    if loops is None:
+        return _HARNESS_IDENTITY
+    loops = Path(loops)
+    rev, dirty = _harness_checkout(loops)
+    return {"rev": rev, "dirty": dirty, "digest": _harness_digest(loops),
+            # The directory the other three are ABOUT, so a reader never has to
+            # guess whether a digest describes the deployed harness or a copy.
+            "path": str(loops)}
+
+
+def _loops_dir() -> Path:
+    """This module's own directory, symlinks resolved, or unresolved if it cannot be.
+
+    Resolved because an installed harness is reached through ``~/.claude/loops``,
+    which home-manager points at a store path: the symlink is what gets re-pointed
+    by a rebuild, and the store path underneath it is the identity worth recording.
+    Never raises — a ``resolve()`` that fails on an exotic filesystem must cost the
+    identity's precision and not the round.
+    """
+    try:
+        return Path(__file__).resolve().parent
+    except OSError:
+        return Path(__file__).parent
+
+
+#: This process's answer, resolved AT IMPORT and never again.
+#:
+#: **The timing is the point, and it was wrong in the first cut** (found by Codex).
+#: Computing it lazily meant computing it when `_payload_defaults()` ran, which is
+#: when a round WRITES its payload — after the review. A harness rebuilt in between
+#: would then be recorded as the harness that produced the round, and the rebuild
+#: lands on the symlink `~/.claude/loops`, so even the resolution of `__file__`
+#: would have followed it to the new store path. That is #112's own scenario, and a
+#: field that reported the NEW harness for a round the OLD one produced would hide
+#: precisely the event it exists to expose.
+#:
+#: Import is as close to "the code this process loaded" as a running program can
+#: get, and it costs about 8 ms — two `git` calls and a hash of the directory —
+#: against a round measured in minutes.
+_HARNESS_IDENTITY: dict = harness_identity(_loops_dir())
 
 
 def board_dial_notes(cfg: dict) -> list[str]:
@@ -2536,16 +3132,27 @@ __all__ = [
     "RAW_DETAIL_CHARS", "CLUSTER_WINDOW", "ACCOUNT_CHARS", "DEFAULT_MAX_ROUNDS",
     "DEFAULT_ROUND_SCOPE", "ROUND_SCOPES", "CLI_TIMEOUT", "BLANK_RETRY_MAX_S",
     "DEFAULT_FIX_SEVERITY_FLOOR", "DEFAULT_ROUND_TRIGGER_FLOOR", "NO_SEVERITY_FLOOR",
+    "BLOCKING_SEVERITIES", "DEFAULT_THRESHOLD_BY_SEVERITY",
     "DEFAULT_LOW_SEVERITY_FIX_LINES",
+    "DEFAULT_LOW_SEVERITY_FIX_FULL_CHARS",
     "DEFAULT_UNREFEREED_LINE_WEIGHT",
     "DEFAULT_MAX_FIX_GROWTH", "DEFAULT_MAX_FIX_GROWTH_CHARS",
+    "DEFAULT_MIN_FIX_GROWTH_CHARS",
+    "DEFAULT_MAX_FIX_GUARD_LINES",
     "DEFAULT_REVIEWER_SCOPE", "REVIEWER_SCOPES",
     "DEFAULT_FIXER_MAY_DEFER", "DEFAULT_REQUIRE_FAILING_TEST",
     "DEFAULT_FILE_DEFERRAL_ISSUES", "DEFERRAL_ISSUES_ALWAYS",
     "DEFERRAL_ISSUES_NEVER", "DEFERRAL_ISSUE_ENDS",
+    "DEFERRAL_ISSUES_SHAPE", "DEFERRAL_ISSUE_WORDS",
+    "DEFERRAL_SHAPE_CATEGORY", "DEFERRAL_SHAPE_ITEM", "DEFERRAL_SHAPE_BATCH",
+    "DEFERRAL_SHAPES", "DEFERRAL_ISSUE_SHAPES",
     "DEFAULT_DISTANT_MERGE_LINES",
     "severity_at_least", "REVIEWER_SCOPE_SLOT", "RELATED_CODE_SLOT",
     "_SCOPE_BRIEF", "reviewer_brief",
+    "NEXT_DOOR_SLOT", "NEXT_DOOR_HEADING", "_NEXT_DOOR_BRIEF",
+    "NEXT_DOOR_MAX", "_hint_line", "next_door_brief", "next_door_note",
+    "NEXT_DOOR_TITLE_CHARS", "NEXT_DOOR_DETAIL_CHARS", "_one_line",
+    "DEFAULT_NEXT_DOOR_DAYS", "NEXT_DOOR_DAYS_MAX",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
@@ -2558,6 +3165,9 @@ __all__ = [
     "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
+    "HARNESS_DIGEST_SCHEME", "HARNESS_GIT_TIMEOUT_S", "_harness_git",
+    "_harness_digest", "_harness_checkout", "harness_identity", "_loops_dir",
+    "_HARNESS_IDENTITY",
     "board_dial_notes",
     "RULES_FILENAME", "SAMPLE_FILENAME", "_spans",
     "ENVELOPE_KEYS", "DECLARATION_KEYS", "_scalar", "_Tok",

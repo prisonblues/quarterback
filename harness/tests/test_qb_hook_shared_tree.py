@@ -48,8 +48,8 @@ import os
 import shutil
 import subprocess
 import time
-from urllib.parse import quote
 from pathlib import Path
+from urllib.parse import quote
 
 import pytest
 

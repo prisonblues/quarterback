@@ -66,15 +66,38 @@ standard is not "good enough" — it's "nothing left to improve".
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
 report prints them on its **Panel dials** line). Five of them define this pass:
 
-- **`fix_severity_floor`** (default `P3`) — the severity at or above which a
+- **`fix_severity_floor`** (default `P4`) — the severity at or above which a
   finding gets fixed. Below it a finding is reported and recorded and **not** fixed
-  by this pass. A panel report puts those under their own heading, *Reported, not
-  this round's work*, marked 🔽; do not lift them into your list.
+  by this pass. **At the shipped default there is nothing below it**: `P4` is the
+  bottom rank, so a panel's **To fix** list carries the P4s too and the list you were
+  handed is the list you clear. Where a repo has raised the floor, a panel report puts
+  what falls below it under its own heading, *Reported, not this round's work*, marked
+  🔽; do not lift those into your list.
+- **`threshold_by_severity`** (default `{}` — off) — how many members must
+  independently have raised a finding before the round asks for it to be fixed (#78).
+  Where a repo has written it, a panel report puts what fell short under a second
+  *Reported, not this round's work* heading, marked 👥, with the seat count beside each
+  one; do not lift those into your list either. It can never apply to a P1 or a P2, nor
+  to anything at or above `round_trigger_floor` — a blocker reaches you however few
+  seats raised it.
 - **`low_severity_fix_lines`** (default `40`) — the churned lines the WHOLE pass may
-  spend on findings below `round_trigger_floor` (`P2` by default, so this is the P3
-  band). A panel report marks those 💸. Step 3 has how to spend it; what matters here
+  spend on findings below `round_trigger_floor` (`P2` by default, so at the shipped
+  floors this band is the P3s and the P4s together),
+  **and on the test and doc work no finding asked for, at every severity**
+  (step 3). A panel report marks the low-severity findings 💸. Step 3 has how to spend
+  it; what matters here
   is that it is a budget for the round and not a cap per fix, because the failure it
   answers was 408 lines of individually reasonable small fixes on a 185-line PR.
+- **`low_severity_fix_full_chars`** (default `14325`) — the proportional half of that
+  same budget: the chars of the cycle's FIRST round at or above which the whole line
+  budget applies, with a smaller PR getting it pro rata and the round spending whichever
+  half is SMALLER (#551). **The report states the number this round actually got, and
+  that number is the one to spend** — on a small PR it is less than 40, because a fixed
+  budget is a bigger share of a smaller change and the failure this budget answers was
+  74% of one PR being review-response code. It never goes below one honest one-line fix
+  (`2 x unrefereed_line_weight`), so there is always something to spend. Nothing here
+  changes which findings are on the budget or the order they are spent in; it changes
+  how many lines there are.
 - **`unrefereed_line_weight`** (default `2`) — what ONE churned line of test or prose
   costs that budget, against a line of production code at 1. The budget's unit is
   exposure, not length. Step 3 has the arithmetic; what matters here is that it is
@@ -115,15 +138,57 @@ tired of, or one whose fix you have not worked out, is not a deferral. With
 `fixer_may_defer` off, the first two are the whole list and "not now" is not
 available to you.
 
-Those three are the whole list for **you**. The orchestrator records what became of
-every finding afterwards, from the same vocabulary — `fixed | refuted | deferred |
-superseded`. `fixed` is its reading of your work and `superseded` is bookkeeping for
-a finding a later one replaced; neither is yours to assign. `refuted` is yours —
-it is your false positive, it goes in step 6's table, and it is deliberately the
-same word the board records. `deferred` is where an escalation lands, and while
-`fixer_may_defer` is on it is **also yours to return**, for a deferral you made.
-There is no fifth value to reach for: the vocabulary is a database constraint, not
-a convention.
+**Those three are all about WHETHER to act. `narrowed` is about how far.** A finding
+names a symptom at a line; the general form of that symptom is a class; and every
+instruction on this page — "fix everything you find", "never note a problem and move
+on", "nothing left to improve" — points at the class. Fixing the class is what makes a
+pass touch files the finding never named, and that is where the next round's findings
+come from. So there is a fourth outcome, and it is a **fix**, not a refusal:
+
+> **`narrowed`** — the finding is real, this pass fixed it **at the point it was
+> raised**, and the general form is not this pass's work.
+
+It **clears**: the round-stop machinery counts a narrowed finding as answered, not as
+outstanding, exactly as it counts a fixed one. It costs the same two lines a deferral
+costs — **why the narrow fix is complete for the finding as raised**, and **what the
+general form would be** — plus a board row the orchestrator writes. It owes a GitHub
+issue **only** where the general form is itself a claim-miss (step 2's classification):
+if the class-wide gap means the change does not do what it set out to do, that is a work
+item; every other general form is an observation, and the row is the record.
+
+Three from one cycle (lexray#1780), because this is easier to recognise than to define:
+
+- One endpoint served 4.65 MB uncompressed because `/api/` had no `gzip` in scope. The
+  fix put `gzip` at nginx **server** level, explicitly "so no proxy stanza has to be
+  duplicated" — and the next round's P1 was that it weakened ETags server-wide and broke
+  an unrelated endpoint's conditional requests. The narrow fix was `gzip` in the one
+  location block the finding named.
+- Four server-side readers of a column did not merge a shared glossary. The fix wrote a
+  helper and called it from all four — and the next round found two more readers, as a
+  new P2. The helper **created** the expectation of exhaustiveness that made
+  incompleteness a defect; while the four were the finding, it was not one.
+- A merge had been applied to a dict whose docstring says it feeds the renderer. The
+  minimal fix was to move it one layer down to the indexing site, and nothing in the
+  vocabulary let the fixer say *"the minimal fix is here, the class-wide version is a
+  separate change"* — so the class-wide version is what got written.
+
+**`narrowed` is not a smaller deferral and it is not licence to fix badly.** The narrow
+fix has to answer the finding as raised, with its test, verified exactly as any other fix
+is. A fix that leaves the reported symptom reproducible is not narrowed; it is unfinished,
+and there is no outcome for that.
+
+Those four are the whole list for **you** — three ways to leave a finding unfixed, and
+one way to bound a fix you are making. The orchestrator records what became of
+every finding afterwards, from the same vocabulary — `fixed | narrowed | refuted |
+deferred | superseded`. `fixed` is its reading of your work and `superseded` is
+bookkeeping for a finding a later one replaced; neither is yours to assign. `refuted` is
+yours — it is your false positive, it goes in step 6's table, and it is deliberately the
+same word the board records. `narrowed` is yours too, and it is the one that is a fix:
+"I fixed this" and "I did not fix this" are different facts, which is why it is a
+first-class outcome and not a flavour of deferral. `deferred` is where an escalation
+lands, and while `fixer_may_defer` is on it is **also yours to return**, for a deferral
+you made. There is no sixth value to reach for: the vocabulary is a database constraint,
+not a convention.
 
 #### 0. Set up the workspace
 
@@ -171,7 +236,18 @@ assertion that the defect is gone, and it will keep passing when the defect retu
 On PR #90 a deliberate, docstring'd regression test passed because its fixture
 happened to list two baselines in the working order, and the defect it was written
 for had to be found a round later in code that was already "covered". Docs that describe changed behaviour
-(CLAUDE.md, docs/, README, docstrings) get updated. Related code — callers,
+(CLAUDE.md, docs/, README, docstrings) get updated. And the comments the diff WRITES
+are read as claims, not as scenery: "this is the only caller", "nothing between here
+and there returns", "this re-reads X" are checkable properties of the code beside them.
+Nothing ever executes a comment, so a wrong one survives every round, every CI run and
+every rebase. Price it by what RESTS on it — a claim the change's own correctness
+argument leans on (a guard's justification, an ordering or concurrency property, the
+reason no `try/finally` was needed) is P2 when false; one nothing depends on is P3, an
+ordinary documentation defect. And checking is usually laborious rather than
+impossible: grep the callers, read the enclosing scopes, and only then decide you
+cannot settle it. What is left after looking goes on the summary's `Unverified claims`
+line — that residue is the measurement that decides whether a reviewer needs more than
+Read, Grep and Glob, and a line nobody looked before writing corrupts it. Related code — callers,
 siblings, parallel implementations — is governed by **`reviewer_scope`**: under
 `repo` it gets made consistent (search the codebase, don't just review the diff);
 under `diff`, the default, you read it to judge the change and file work only where
@@ -205,26 +281,165 @@ decides which of them this pass fixes, and `low_severity_fix_lines` decides how 
 of the low tier it can afford.** At or above the floor they get fixed. Below
 it they are reported in step 6 with `Deferred` against them and left alone — that
 is the setting's judgement, already made, and re-making it by fixing them anyway is
-the growth it exists to stop. At `P4` it is all of them, which is the pre-#165
-behaviour.
+the growth it exists to stop. **At the shipped `P4` it is all of them**, and nothing
+is below the floor at all: the floor lets the whole list through, and
+`low_severity_fix_lines` is then the only thing deciding how far down the pass
+actually reaches — which is why the counting in step 3 is not optional.
+
+**Then say what each finding IS, because that is what decides whether it can BLOCK.**
+Severity says how bad; this says what kind, and the two are orthogonal:
+
+- **claim-miss** — the change does not do what it set out to do. Read the PR's own claim
+  and the issue behind it, and check it. On lexray#1780 the P1 that cost an extra round
+  was one of these: the PR existed to stop ~3,743 error cards being re-baked, the
+  glossary merge landed in the renderer path and re-baked them anyway, and issue #1696
+  had said so before a line was written. Nobody asserted it, so three vendor seats and a
+  judge had to rediscover it a round later, as an opinion.
+- **regression** — something that worked no longer works, and you can **demonstrate**
+  it: the failing command, the diff of outputs, the assertion that goes red.
+- **observation** — everything else. True of the code, and equally true before this
+  change: generality, exhaustiveness, test style, naming, a tuple that ought to be
+  cross-checked. This is where fix passes spend their lines and where the next round's
+  findings come from.
+
+**An observation is recorded, relayed, and blocks nothing** — at every severity,
+including one somebody ranked P1. **Reclassifying an observation as a regression takes a
+demonstrated observable failure, not an argument that one is possible.** "This could
+break if X" is an observation with a story attached. "Here is the command, here is the
+output, here is what it used to be" is a regression, and it blocks.
+
+This does not overrule the floors and it is not another floor: **the floors decide what
+may be TOUCHED, this decides what may BLOCK.** A P3 observation above
+`fix_severity_floor` still gets fixed if the budget reaches it; what it may never do is
+hold the cycle open on its own.
 
 #### 3. Fix everything
 
-Fix every finding at or above `fix_severity_floor` (`P3` by default, so P1, P2 and
-P3; `P4` means all of them). Write the missing tests (edge + error paths) — don't just
-note them. Update the stale docs. Propagate renames/patterns to
-sibling code. After fixing, re-read the full diff of your fixes and fix any new
-issues they introduce.
+Fix every finding at or above `fix_severity_floor` — `P4` by default, which is the
+bottom rank, so at the shipped setting **every finding you were handed gets fixed** and
+none of them is below the floor. Only a repo that has raised the floor has a below-floor
+tier, and those findings are reported and left alone.
+
+**Before you fix a finding, write one line naming who consumes the code the fix would
+change.** The callers, from a search you actually ran rather than from memory — and where
+that code reaches a response or a stored artefact, the entitlement tier it is served to.
+Every finding on the list gets one, before its patch, and it goes in the **Consumers**
+column of step 6's table.
+
+It is there to make refuting a finding cost the same as complying with it. This page
+allows a false positive — "a genuine false positive you re-examined and confirmed
+correct" — and asks nothing whatever in support of a fix, so the entire burden of proof
+sits on refusal. That asymmetry has a direction: when a finding is wrong, complying is
+cheaper than disproving it, so the pass complies, and the result is unnecessary churn that
+reads as diligence, invisible to every guard on this page because a fix for a non-defect
+looks exactly like a fix for a defect. One line owed either way removes the difference,
+and it is usually the refutation itself.
+
+lexray#1780, round 3, is what it costs to skip it. A P2 said an ingest-time preview
+permanently lost its Definitions section. A seat verified it, the master judge confirmed
+it, and it was **wrong**: `html_preview` is the free teaser, built inside
+`if not viewer_has_full_content_access():`, and an empty definitions panel is what it is
+for. The fix merged the paid glossary into it, and round 4 caught the result as a P2 —
+paid Handbook meanings rendered to anonymous viewers. A confirmed false positive became an
+entitlement leak in one pass. Disproving the original was one `grep` for the callers of
+`generate_preview_html` plus one docstring, ninety seconds, and nobody asked for it. The
+consumer line is that `grep`, owed before the patch instead of discovered after it.
+
+**Every finding, and not only the ones whose fix you judge to touch a response path.**
+The narrow rule asks the fixer to classify its own work before doing the work that would
+tell it — the actor policing itself, which is the failure this whole requirement is about
+— and round 3's fixer would have answered "no response path here", correctly by its own
+model of the code and wrongly in fact. The line is one sentence; the classification that
+would save you writing it is the judgement it exists to replace.
+
+**`unknown` is a permitted answer and it is not a free one.** Write it when you searched
+and the consumers are genuinely not determinable — dynamic dispatch, a public API with
+callers outside this repo — and say which it was. Then fix that finding at the point it
+was raised and no further: `unknown` plus a widened fix is the shape that produced the
+leak above.
+
+**It is not charged to `low_severity_fix_lines`.** That budget prices churn in the diff,
+and this line lands in your summary rather than in a file. A budget that has run out stops
+you fixing a finding; it never stops you saying who consumes the code, and a finding the
+budget did not reach still gets its line, because the line is what tells a later reader
+whether the finding was worth reaching.
+
+**The bar is unchanged: no finding on the list is noted and walked past.** What the
+rest of this section bounds is not how well you fix them — it is **where the work is
+allowed to land**. Thoroughness is spent inside the change under review, not around
+it, and the three commonest ways a pass leaks outside it each have an answer:
+
+- **The assertion that demonstrates the fix is part of the fix — write it.** The
+  finding's defect has to go red without your change and green with it; that is the
+  fix's own evidence and step 4 is where it is proved. **Every other line of test
+  work is an observation**: a path no finding asked about, a neighbouring assertion
+  you would strengthen, a fixture the suite would be better for. Real work, worth
+  recording, and **budgeted** — item 3 below prices it — so it **never blocks**, and
+  where the budget will not pay for it you write it up in step 6 instead of writing
+  it. That is not a finding left unfixed.
+- **A doc this change makes wrong is part of the fix — correct it.** A doc that was
+  already stale before this change is not: nothing in this diff made it wrong, so it
+  is an observation like any other, on the same budget and the same terms.
+- **A pattern repeated elsewhere is a finding to REPORT, not a licence to edit the
+  siblings.** Fix the instance the finding names. Then either say in step 6 that the
+  class exists and where it lives, or — where the narrow fix is complete but the
+  general form is not written — record it `narrowed` with that general form as its
+  note. Propagating a rename or a pattern into sibling code is fixing the class, and
+  **the surface rule immediately below governs it**: a file no round has read is a
+  declared decision, not a detail, and "the same shape is over there too" is not the
+  justification that declaration takes. Measured on lexray#1780, that propagation is
+  what pulled ten unreviewed files into the PR and wrote 848 lines of test and doc
+  nobody's finding had asked for.
+
+After fixing, re-read the full diff of your fixes and fix any new issues they
+introduce.
+
+**The blocking band has no line budget, and its constraint is SURFACE instead.**
+Findings at or above `round_trigger_floor` — P1 and P2 by default — get fixed however
+many lines that takes, because a P1 the pass cannot afford is worse than the churn it
+would cost. What bounds that band is not how many lines you write but **where they
+land**: a fix stays inside the files the change under review already touches. Touching a
+file no round has read is a **decision, not a detail** — it puts unreviewed code into the
+PR under a finding's cover, and the earliest anyone reads it is as part of a fix commit.
+
+Measured on lexray#1780: round 3's fix pass touched 12 files and **7 of them had never
+been in front of a reviewer** — two nginx templates, four europa modules and a new test
+file. Round 4's added two more. Ten of the PR's files arrived from a fix pass rather than
+from the change, and **both of the cycle's later P1s were in exactly that new surface**.
+None of the three numbers watching a fix pass could see it: `max_fix_growth`,
+`max_fix_growth_chars` and `fix_injection` all count lines or findings, and fifteen lines
+added to two templates nobody had reviewed is small by every one of them.
+
+So when a fix genuinely needs a file outside the change under review, **declare it in
+your step 6 summary and justify it there**: which file, why the finding cannot be
+answered inside the change, and what you did to keep the edit small. That is the whole
+obligation — it is a declaration, not a refusal. And check the two exits you already
+have before you take it: a finding whose only honest fix is a wholesale expansion of the
+change is either an escalation (step 3a) or a `narrowed` fix — the narrow one inside the
+change, the general form recorded — and reaching for a new file is often the tell that
+you are fixing the class rather than the finding.
+
+The harness measures this and reports it: `fix_surface` in the round payload names the
+files the fix range touched and how many of them no earlier round had seen. It **gates
+nothing** today — instrumented, printed and read, per #67's instrument-before-gate rule
+— so there is no threshold here for you to apply and none for you to invent.
 
 **The low-severity band is on a budget, and you spend it by COUNTING.** Findings
 below `round_trigger_floor` — the ones a panel report marks 💸 — share
-`low_severity_fix_lines` churned lines for the whole round (40 by default). Findings
-at or above the cut are not on the budget and none of this touches them.
+`low_severity_fix_lines` churned lines for the whole round (40 by default, and LESS on
+a small PR, where `low_severity_fix_full_chars` scales the same budget to the size of
+the cycle's first round — take the number the report states, never the default). Findings
+at or above the cut are not on the budget; what IS on it whatever their severity is the
+test and doc work no finding asked for, which is the split in item 3 below.
 
 Spend it like this, and do not improvise around it:
 
-1. Do the unbudgeted findings first and commit them. The budget pays for the budgeted
-   fixes alone, so they need a clean tree to be measured against.
+1. Do the unbudgeted findings first and commit them, so the budgeted ones have a clean
+   tree to be measured against. **Before you commit, count the unasked-for test and doc
+   lines in that work and subtract them from the budget** — the split is in item 3, and
+   those lines are on the budget wherever they were written. If you skip this the
+   measurement below is exact about the cheap half of the pass and blind to the
+   expensive one, which is the failure #618 measured.
 2. **Measure before you spend.** You cannot know what a fix costs until you have made
    it, so find out rather than guessing: make each budgeted fix on its own, run `git
    diff --numstat` for it, write down insertions + deletions, and put it back
@@ -262,13 +477,64 @@ Spend it like this, and do not improvise around it:
    the work risks ballooning. You classify each line by the file it is in and whether
    it is a comment, and you multiply. At `unrefereed_line_weight: 1` every line costs
    1 and this step is the plain count.
+
+   **The assertion that DEMONSTRATES a fix is part of that fix; every other line you
+   write in a test file is an observation, and observations are on the budget.** That
+   split holds at every severity, including the unbudgeted band above:
+
+   - **The demonstrating assertion** — the test that goes red against the defect the
+     finding named and green with your fix, which step 4's red/green is what proves. It
+     is the fix's evidence and it travels with the fix: it is **not** charged to
+     `low_severity_fix_lines`. A P1's regression test rides with the P1; a budgeted P3's
+     rides with the P3 rather than having to be afforded separately.
+   - **Additional test work** — strengthening a neighbouring assertion, covering a path
+     the finding did not ask about, a fixture that tidies the suite, a docstring that
+     explains the module rather than the fix. No finding required it, so it is an
+     **observation**: it is **charged to the budget** at `unrefereed_line_weight`, and
+     it **never blocks**. When the budget will not pay for it, it does not get written,
+     and that is not a finding left unfixed.
+
+   Without that line an unbudgeted blocking band is a licence, because every test line a
+   pass wants to write can ride in under a P1 priced at zero. On lexray#1780 the fix
+   passes after round 1 wrote **1,313 lines, of which 848 — 64.6% — were test and doc**,
+   while rounds 3-5 ran at a P2 floor with a P2 trigger. Every finding was therefore
+   unbudgeted, and `unrefereed_line_weight` — the one dial that knows a test line has no
+   referee — exists only as a multiplier against a budget, so the pricing switched itself
+   off in exactly the place the churn was.
 4. **Spend cheapest first, and stop when it runs out.** Re-apply them in ascending
    order of that WEIGHTED cost, subtracting each from the budget as you go. Stop at
    the first one that does not fit — in ascending order, nothing after it fits either.
    If the whole list fits, the whole list gets fixed and the budget never binds.
 5. Everything the budget did not reach goes into step 6 exactly as a below-floor
-   finding does: reported, recorded `deferred` against the issue you open for the
-   batch, and **not** fixed. It is not dropped and it is not yours to sneak in.
+   finding does: reported, recorded `deferred` by the orchestrator as a board row with
+   its one-line note, and **not** fixed. It is not dropped and it is not yours to sneak
+   in, and it is not yours to file either — a batch of sub-floor findings gets board
+   rows and no GitHub issue at all, which is the orchestrator's call and not yours
+   (#620).
+
+**Land each budgeted fix as its own commit, and name the finding in the commit body.**
+You are already making them one at a time and re-applying them cheapest-first, so the
+ordering exists; what this adds is that each one stays its **own commit**, whose body
+carries the finding's id exactly as the **To fix** list prints it — the `[1609-F03]`
+form. Nothing else is required and the format is not fussy: the id anywhere in the
+message is enough, in a sentence like `Answers 1609-F03.` if you want one. The finding's
+16-character key works too if you have it, but the id is what the report gives you, so
+the id is the expected spelling.
+
+**One finding per commit, and no other finding's id in that body.** A commit naming two
+findings is read as a mixed one and is left alone, which is the same outcome as leaving
+no seam at all: the harness refuses to remove a commit that also carries a fix nobody
+attributed a finding to.
+
+The reason is #627: when a later round attributes a new finding to a fix that answered a
+below-`round_trigger_floor` finding, the response is to **excise that fix** rather than
+repair it — and an excision needs something to excise, aimed by something better than a
+guess. A sub-floor fix smeared through a pass with three others cannot be removed without
+taking them too, and when the cheap correction is unavailable somebody writes a patch
+instead, which is the round this whole page is about. The next round works out which
+commit answered which finding by blaming the line each new finding sits on, publishes
+what it found at `round_stop.excision`, and the orchestrator runs the command; you only
+have to leave the seam and name it.
 
 **A pass that is ALL test and prose ends the cycle, so make the production change
 where there is one to make.** `escalate_on.unrefereed_fix` stops a cycle whose last
@@ -433,6 +699,22 @@ python3 ~/.claude/loops/panel.py --premise "$premise" --pr <n> --round <r> \
     --premise-decidable yes|no \
     --premise-for <each finding key the premise explains>
 ```
+
+**If nobody briefed you — because you are running the panel and the fix yourself —
+the moment is still there and it is yours to take.** Read `round_stop`, decide what
+the next pass will do, declare it, *then* make the first edit. Choose the register
+path yourself (one file per PR, alongside the payloads) and pass the same path to
+every round's `--premise-file`, because a register the round cannot read counts
+nothing. Declaring after the pass is written is not a late brake, it is no brake:
+exit 4 means *do not write the patch*, and there is no patch left to refuse. Each
+declaration records the commit the tree was on, and a later round names in
+`config_notes` any premise stamped with a head that arrived after the round it answers
+(#560) — a fix pass already committed and pushed when its premise was stated. **That
+check does not cover you for the common case and is not meant to read as if it does:**
+a patch written into the working tree and not yet committed moves no `HEAD`, so a
+premise declared halfway through one is indistinguishable from a premise declared
+before the first edit, and no reading taken in your own environment tells them apart
+(#622). There the ordering is your discipline and nothing else.
 
 `--premise-decidable` is **test 4, answered where it can brake something**. Pass
 `no` when the runtime the assertion runs in cannot observe the property the fix
@@ -695,14 +977,37 @@ the branch from step 0. Wrong branch → STOP and report; do not commit.
 Return this table as your final message:
 ```
 ## Review Summary — PR #<n> (<repo>)
-Files reviewed: N | Findings: N | Fixed: N | Deferred: N | Escalated: N | Refuted: N
+Files reviewed: N | Findings: N | Fixed: N | Narrowed: N | Deferred: N | Escalated: N | Refuted: N
 
-| # | Severity | Finding | Resolution |
-|---|----------|---------|------------|
-| 1 | P1 | ... | Fixed: ... |
-| 2 | P2 | ... | Escalated — see the block below |
-| 3 | P3 | ... | Deferred — see the block below |
-| 4 | P3 | ... | Refuted: <the evidence it was not a defect> |
+| # | Severity | Kind | Consumers | Finding | Resolution |
+|---|----------|------|-----------|---------|------------|
+| 1 | P1 | regression | `sync_row` — 2 callers, both the admin task | ... | Fixed: ... |
+| 2 | P2 | claim-miss | `plan_next` — the CLI and the MCP tool | ... | Escalated — see the block below |
+| 3 | P2 | observation | `render_card` — one caller, served to signed-in members | ... | Narrowed — see the block below |
+| 4 | P3 | observation | `unknown` — dynamic dispatch, callers not determinable | ... | Deferred — see the block below |
+| 5 | P3 | observation | `generate_preview_html` — one caller, the anonymous teaser branch | ... | Refuted: <the evidence it was not a defect> |
+
+(`Kind` is step 2's classification — `claim-miss`, `regression` or `observation`.
+It is what a reader needs to tell a finding that blocks from one that does not,
+and it is not derivable from the severity column beside it.)
+
+(`Consumers` is step 3's line: who calls the code this finding's fix would change,
+and — where that code reaches a response or a stored artefact — the entitlement tier
+it is served to. Every row carries one, whatever became of the finding, because the
+column exists to make refuting cost what complying costs. Row 5 is the shape it was
+built for: the line and the refutation are the same sentence. `unknown` is allowed
+where a search could not settle it, and row 4 says what to write with it.)
+
+Narrowed — fixed where it was raised; the general form is not this pass's work
+- Finding: <the number above>
+  ID: <the panel's finding ID for it, verbatim — same rule as the Deferred block
+       below, and `none` for a finding you found yourself>
+  Narrow fix complete because: <one line — why the finding AS RAISED is answered,
+       and how you verified it>
+  General form: <one line — what fixing the class would have taken, and what it
+       would have touched>
+  Goes to: the orchestrator records it — a board row always, and a GitHub issue only
+       where the general form is itself a claim-miss. You open nothing
 
 Deferred — real, and not this change's job
 - Finding: <the number above>
@@ -730,6 +1035,18 @@ Escalated — the approach, not the code
   Patch not written: <the special case you declined to add>
   Premise check: fails / holds / unresolved / unchallenged / not run
 
+Surface — files touched outside the change under review: <none, or one line per
+  file: the path, why the finding could not be answered inside the change, and what
+  kept the edit small. This is the declaration step 3 requires; `none` is the
+  expected answer and is written out rather than omitted>
+
+Unverified claims — load-bearing comments in the diff this pass could not settle:
+  <none, or one line per claim: the `file:line`, the claim, and what would settle it.
+  Written out rather than omitted, for `Surface`'s reason, and `none` is the expected
+  answer — checking one of these is usually laborious rather than impossible, so a
+  claim you did not grep for is not one of them. This line is the residue AFTER
+  looking, and it is what says whether a reviewer needs more than Read, Grep and Glob>
+
 Tests added: ...
 Docs updated: ... (or "none needed")
 Verification — Tests: pass (N passed, M added) | Red/green: N of M went red
@@ -738,19 +1055,22 @@ Verification — Tests: pass (N passed, M added) | Red/green: N of M went red
 Commit: <sha> <subject>
 ```
 
-`Fixed + Deferred + Escalated + Refuted = Findings`, always. That sum is the one
-cheap check a reader — or `epic.md`'s relay scan — can apply to catch a finding that
+`Fixed + Narrowed + Deferred + Escalated + Refuted = Findings`, always. That sum is the
+one cheap check a reader — or `epic.md`'s relay scan — can apply to catch a finding that
 fell off the list, and it is why the counts replaced the old `All fixed: Yes`, which
 had no way to say anything but yes and so had to be read as covering findings nobody
 fixed. `Deferred` is in the sum for exactly that reason: a permitted outcome missing
 from the invariant is a finding that can leave the list without the arithmetic
 noticing, which is the note-and-move-on this brief opens by forbidding, arriving
-through the permission granted to replace it. `Refuted` and `Deferred` are the words
-the board records, not other names for the same things: the summary's labels and the
-board's outcomes are deliberately the same tokens.
+through the permission granted to replace it. `Narrowed` is in it for the same reason
+and it is the one that would be easiest to lose, because it looks like a fix from every
+angle except the one that matters — the general form nobody wrote. `Refuted`,
+`Narrowed` and `Deferred` are the words the board records, not other names for the same
+things: the summary's labels and the board's outcomes are deliberately the same tokens.
 
 **Escalated nothing?** Replace the whole block with the single line
-`Escalated: none`. **Deferred nothing?** The same, `Deferred: none`. One spelling of
+`Escalated: none`. **Deferred nothing?** The same, `Deferred: none`. **Narrowed
+nothing?** `Narrowed: none`. One spelling of
 each empty case, and they are written out rather than omitted: a missing section
 reads as forgotten, and the one run where it matters is the run where a reader has
 to be sure. With `fixer_may_defer` off, `Deferred: none` is the only honest answer
@@ -763,8 +1083,9 @@ and `Deferred: 0` is the count.
 If the findings you handed the fixer came from a recorded panel round — i.e. the
 board has them, with a `key` each — say what became of them, per the **4b**
 section of `panel-review-pr.md`. The `Resolution` column of the summary table
-above is exactly this information in prose: `fixed`, or `refuted` with the reason
-it was not a defect, or `deferred` with where it went.
+above is exactly this information in prose: `fixed`, or `narrowed` with the general
+form it did not take, or `refuted` with the reason it was not a defect, or `deferred`
+with where it went.
 
 **The fixer reports finding IDs; you supply the keys.** The report it was briefed
 from prints `[236-F01]` and never the 16-character key — deliberately, since a
@@ -786,31 +1107,74 @@ are what that record looks like — a human applying exactly this judgement by h
 at the round cap, which is the thing the setting exists to let a fixer reach on
 round 1 instead.
 
+**A `narrowed` finding is a fourth thing and it is not one of those three.** The fixer
+DID fix it, at the point it was raised, and its `Narrowed` block carries the two lines
+that say why the narrow fix is complete and what the general form would be. Record it
+`narrowed` — a board row always, carrying the general form as the row's `note`, because
+that sentence is the whole reason the outcome exists. It gets a GitHub issue **only**
+where the general form is itself a claim-miss: the class-wide gap means the change does
+not do what it set out to do, which is a work item. A general form that is an
+observation gets the row and nothing else. This does **not** read
+`file_deferral_issues`: that dial gates **deferrals**, and a narrowed finding is not
+one. Both tests happen to be about shape rather than severity now, but they are separate
+tests and only one of them is a dial.
+
 **The row is the record; the issue is a work item, and they are not the same thing
-(#482).** `review_panel.file_deferral_issues` is a severity gate — at or above it a
-deferral gets a GitHub issue named in `deferred_to` as it always did; below it the
-deferral is a board row with **no `deferred_to`** and **a one-line `note`** saying
-what the defect is and why it was not fixed. `deferred_to` is nullable, the API takes
-a `deferred` outcome without one, and `/panel` renders such a row with no target
+(#482).** `review_panel.file_deferral_issues` decides which a deferral gets. Where it
+calls for an issue, that issue is named in `deferred_to` as it always was; where it does
+not, the deferral is a board row with **no `deferred_to`** and **a one-line `note`**
+saying what the defect is and why it was not fixed. `deferred_to` is nullable, the API
+takes a `deferred` outcome without one, and `/panel` renders such a row with no target
 rather than as broken. The note is what makes that row worth having: it is the thing
 somebody reads later, and `GET /review/findings?repo=<owner/name>&pr=<n>` is where
 they read it. A row with neither an issue nor a note is the markdown list this
 replaced, wearing a database.
 
+**It is not a severity gate any more (#620).** The shipped value is the word `shape`, and
+the question it asks is what the ticket would BE: a **category** or a substantive
+**single named item** may become an issue; a **batch** gets board rows and never one,
+whatever its severity mix. `panel-review-pr.md`'s §4b carries the rule and the argument
+for it; what matters here is the direction it fails in. **The gate tests whether a
+deferral IS a category or a single item, so anything unclassified — no shape given, an
+empty one, a word the panel does not know — falls through to `batch` and files nothing.**
+Under the old severity bands the fall-through went the other way, because a spare line on
+a tracker was the cheap error; under `shape` that spare line is the failure being fixed.
+`always` and `never` are the two ends, and any of `P1`..`P4` is the documented way back
+to the severity cut.
+
+**Nothing classifies for you, so the gate's silence is not a verdict.** No seat, no
+judge and no round payload emits a shape, and neither of the harness's two automatic
+deferral paths supplies one — a below-floor remainder is gated on severity alone, an
+unverifiable claim on its own exemption. Under `shape` every deferral the machine
+raises by itself therefore lands on `batch` and files nothing, which is right for a
+remainder (it IS a batch) and is **not** the harness telling you no issue is
+warranted. The category and single-item roads exist only where YOU classify a deferral
+and open the issue by hand — that judgement is yours, here and in §4b, and nothing
+upstream will have made it for you.
+
 Measured on this repo on 2026-08-26, roughly twenty open issues were panel
-deferred-finding exhaust and nothing else. The default is `P2`; `always` restores the
-pre-#482 "an issue for every deferral" and `never` files none. **An escalation is
+deferred-finding exhaust and nothing else. **An escalation is
 exempt at every setting** — its issue asks a question rather than filing a task, and
 it is what carries that question past the end of the session. And if the board write
-fails, file the issue whatever the gate says and say so in the relay: below the gate
-the row is the only record, so losing both loses the finding.
+fails, file the issue whatever the gate says and say so in the relay: where the gate
+files nothing the row is the only record, so losing both loses the finding.
 
 A finding the panel reported **below the round's `fix_severity_floor`** is the one
 that needs no judgement from anybody: the floor already decided. Those arrive marked 🔽 under *Reported, not this round's work*, they were
-never in the fixer's brief, and they are recorded `deferred` — as board rows alone at
-the default gate, which is precisely the tier it exists for. Where the gate does call
-for an issue, one issue for the batch is fine and is usually right, since filing nine
-issues for nine P3s is the overflow this floor exists to stop (#165).
+never in the fixer's brief, and they are recorded `deferred` — as board rows alone
+under the default gate, which is precisely the tier it exists for.
+
+**A batch of them is exactly what the shape rule above forbids an issue for**, and this
+is the tier it was written for. Nine sub-floor findings get nine rows with nine notes,
+never one issue with nine bullets: twenty P3s in a ticket is not a deferral, it is a
+transfer, and the findings leave this cycle for a place with no owner and no next action.
+Measured on this repo: twenty issues existed only because a panel round found something
+and the cycle did not clear it, carrying 345 findings between them, created over six
+days, and **not one has ever been closed** in either sense — worked or abandoned. This
+knowingly amends #42, which said a capped round's findings must be handed to somebody:
+they still are, and for a batch that somebody is the board. If the batch contains
+something that IS a category or a real single item, lift that one out and file it on its
+own terms — what is forbidden is the dump, not the issue.
 
 The one that matters is `refuted`. A judge-confirmed finding that turns out to be
 wrong is recorded nowhere today, so the leaderboard rewards a reviewer for being
@@ -819,8 +1183,9 @@ that table. `qb record-outcome` is the two lines that keep it.
 
 An **escalated** finding (the brief's step 3a) is recorded as `deferred`. It is not
 `refuted`: the defect the finding names is real, and only the *fix* is in dispute.
-It is not `fixed` either, and there is no fifth value to reach for —
-`fixed | refuted | deferred | superseded` is constrained in the database as well
+It is not `fixed` either, and it is not `narrowed` — no patch was written at all, narrow
+or otherwise. There is no sixth value to reach for:
+`fixed | narrowed | refuted | deferred | superseded` is constrained in the database as well
 as at ingest (`app/api/reviews.py`, `app/models/review.py`, the
 `ck_review_finding_outcomes_vocabulary` CHECK), so an invented `escalated` costs
 the row and records nothing.
@@ -863,10 +1228,20 @@ its `Deferred` block, or the panel reported anything below the fix floor, say so
 plainly with the count and the one-line reason for each: those are defects this pass
 knowingly did not fix, and a relay that omits them tells the user a PR is finished
 when the record says otherwise. Then follow §2b in order — record the row, and open
-an issue only where `file_deferral_issues` calls for one. Below the gate the relay is
+an issue only where `file_deferral_issues` calls for one. Where it files nothing —
+which, under `shape`, is every batch — the relay is
 where a human hears about it at all, so the count and the reasons are not optional
 there; that is the half of the deal that keeps a board row from being a place things
 go to be forgotten.
+
+**A narrowed finding is relayed as what it is — a fix, with a general form nobody
+wrote.** Give the count, and for each one the general form in the fixer's own line.
+Relaying it as `Fixed` is the failure this outcome was created to stop: the finding
+really was answered where it was raised, so the temptation to round it up to a fix is
+strong, and the sentence the user needs is precisely the one that gets lost. Say the
+same about anything in the summary's **Surface** line: a file the fix pass touched that
+no round has read is a decision the user is entitled to hear about, not a detail of the
+diff.
 
 **An escalation is the headline, not a footnote.** If the sub-agent escalated
 anything (the brief's step 3a), lead with it: the premise, what it explains,

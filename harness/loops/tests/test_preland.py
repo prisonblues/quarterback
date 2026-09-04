@@ -14,9 +14,9 @@ The three properties worth defending, in the order they get broken:
    spent to reach a wall.
 """
 
+import inspect
 import json
 import subprocess
-import inspect
 import sys
 from pathlib import Path
 
@@ -211,7 +211,7 @@ def test_untracked_files_only_warn(monkeypatch):
 #: `harness/package.nix` on why that is the one library there. The loops suite does
 #: not otherwise import it, so the path goes on here rather than in conftest.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "bin"))
-import qbdata as qd                                       # noqa: E402
+import qbdata as qd  # noqa: E402
 
 
 @pytest.fixture
@@ -362,6 +362,162 @@ def test_pr_131_holds_on_two_independent_counts(board):
                                     confirmed=41)], "")
     c = preland.check_review("o/r", pr())
     assert len(c.reasons) == 2
+
+
+# ---- #717: the round's own severity split ----------------------------------
+#
+# `preland` had no notion of severity at all — grep the pre-#717 file for `floor`
+# or `P3` and there are no matches — so every judge-confirmed finding was a HOLD.
+# That contradicts `review_panel.fix_severity_floor`, whose whole content is that
+# findings below it are reported and not fixed here (#165), and it made READY
+# unreachable for a repo running a raised floor: a round asked to find problems
+# almost always finds a P3. These pin the new reading and, more importantly, the
+# three ways it must NOT have become a laxer gate.
+
+
+def disposal(fixable=0, below_floor=0, escalated=0, **over):
+    """`round_stop.outstanding` as the board stores it: counts, not keys.
+
+    The three buckets are disjoint on the panel's side — `round_stop` takes the
+    escalated and narrowed keys out before splitting the rest at the cleared floor
+    — which is what makes `fixable + escalated` a sum rather than a double count.
+    `harness/loops/tests/test_panel_outstanding.py` is where that is pinned.
+    """
+    return {"fixable": fixable, "below_floor": below_floor, "escalated": escalated,
+            "narrowed": 0, "declined": 0, **over}
+
+
+def test_a_round_whose_every_finding_is_below_the_floor_no_longer_holds(board):
+    """The issue, in one assertion. lexray#1631: a round that stopped with
+    `handed_to: "nobody"` and eleven below-floor findings, every one recorded
+    `deferred` on the board, held the merge on "11 judge-confirmed finding(s) are
+    unresolved" — a verdict the repo's own policy had already answered."""
+    board["reviews"] = ([review_row(confirmed=11, handed_to="nobody",
+                                    outstanding=disposal(below_floor=11))], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "passed" and c.reasons == []
+
+
+def test_the_below_floor_findings_are_warned_about_and_not_dropped(board):
+    """The repo's policy is that they are not this round's work; it is not that they
+    do not exist. A payload that read clean by saying nothing about eleven of them
+    would be the same silence one direction over."""
+    board["reviews"] = ([review_row(confirmed=11,
+                                    outstanding=disposal(below_floor=11))], "")
+    c = preland.check_review("o/r", pr())
+    assert len(c.warnings) == 1
+    assert "11 finding(s)" in c.warnings[0]
+    assert "below this repo's cleared severity floor" in c.warnings[0]
+
+
+def test_a_finding_a_fix_pass_can_take_still_holds(board):
+    """Above the floor is work, and work holds the merge exactly as before."""
+    board["reviews"] = ([review_row(confirmed=4, handed_to="fixer",
+                                    outstanding=disposal(fixable=3, below_floor=1))], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "failed"
+    assert "3 judge-confirmed finding(s) are unresolved" in c.reasons[0]
+    assert "handed them to fixer" in c.reasons[0]
+    # ...and the one under the floor is still reported beside it.
+    assert c.warnings and "1 finding(s)" in c.warnings[0]
+
+
+def test_an_escalated_finding_holds_at_any_severity(board):
+    """#221: no fix round may touch an escalated finding, and a human owes an answer
+    on it whatever its severity. It is ADDED to the fixable count rather than
+    compared against a floor, which is the one thing a severity-aware gate could
+    most easily get wrong."""
+    board["reviews"] = ([review_row(confirmed=9, handed_to="human",
+                                    outstanding=disposal(below_floor=8,
+                                                         escalated=1))], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "failed"
+    assert "1 judge-confirmed finding(s) are unresolved" in c.reasons[0]
+    assert "1 escalated to a human" in c.reasons[0]
+
+
+def test_the_count_is_a_sum_and_never_a_subtraction_from_confirmed(board):
+    """`confirmed` counts every confirmed finding on the round; the disposal is
+    computed over a smaller population (the keys an outcome already cleared are gone
+    from it). A difference between the two is a number about neither — and it is the
+    shape in which an escalated below-floor finding quietly stops counting."""
+    board["reviews"] = ([review_row(confirmed=2,
+                                    outstanding=disposal(fixable=1, below_floor=40,
+                                                         escalated=1))], "")
+    c = preland.check_review("o/r", pr())
+    assert "2 judge-confirmed finding(s) are unresolved" in c.reasons[0]
+
+
+def test_a_round_that_recorded_no_disposal_holds_on_the_raw_count(board):
+    """Every producer older than #42, and every block the board refused whole. The
+    old reading, unchanged — which is the strict one, so silence buys nothing."""
+    board["reviews"] = ([review_row(confirmed=20)], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "failed" and "20 judge-confirmed" in c.reasons[0]
+    assert c.warnings == []
+
+
+@pytest.mark.parametrize("block", [
+    # A bucket missing: a disposal short one looks complete and reads as a zero in
+    # it, which is why it is not read at all rather than read with a gap.
+    {"fixable": 0, "below_floor": 3},
+    # A bucket that is not a count.
+    {"fixable": 0, "below_floor": 3, "escalated": "none"},
+    # `True` is an `int` in Python, and one escalation is not what it means.
+    {"fixable": 0, "below_floor": 3, "escalated": True},
+    # Negative, and a value this gate cannot believe is not a value it may round.
+    {"fixable": -1, "below_floor": 3, "escalated": 0},
+    # Not a block at all.
+    [], "nothing", 0,
+])
+def test_a_disposal_this_gate_cannot_read_whole_falls_back_to_the_raw_count(board, block):
+    board["reviews"] = ([review_row(confirmed=7, outstanding=block)], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "failed" and "7 judge-confirmed" in c.reasons[0]
+
+
+@pytest.mark.parametrize("confirmed", [None, "many", 1.5])
+def test_an_unknown_confirmed_count_still_holds_beside_a_clean_disposal(board, confirmed):
+    """The clause this change does not touch, tested against the value most likely
+    to erode it: a round whose disposal says nothing is owed, and whose count the
+    board never sent. Unknown is not zero, and a disposal cannot supply it."""
+    board["reviews"] = ([review_row(confirmed=confirmed, handed_to="nobody",
+                                    outstanding=disposal())], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "failed"
+    assert "unknown is not zero" in c.reasons[0]
+
+
+def test_a_round_whose_findings_were_all_answered_says_so_rather_than_nothing(board):
+    """`confirmed` is nonzero and the disposal holds none of them: every one was
+    cleared by a recorded outcome or narrowed where it was raised. A reader comparing
+    the two numbers against the verdict is owed the sentence that reconciles them."""
+    board["reviews"] = ([review_row(confirmed=6, handed_to="nobody",
+                                    outstanding=disposal())], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "passed"
+    assert "cleared, narrowed or answered" in c.warnings[0]
+
+
+def test_a_dry_round_says_nothing_at_all_about_findings(board):
+    """Nothing confirmed and nothing outstanding is not an occasion for a warning."""
+    board["reviews"] = ([review_row(confirmed=0, handed_to="nobody",
+                                    outstanding=disposal())], "")
+    c = preland.check_review("o/r", pr())
+    assert c.status == "passed" and c.warnings == [] and c.reasons == []
+
+
+def test_the_disposal_is_in_the_audit_trail_whether_or_not_it_was_read(board):
+    """A payload that reads READY has to say WHICH reading of the findings produced
+    it. A null `outstanding` beside a HOLD on the raw count is the whole explanation
+    of that HOLD."""
+    board["reviews"] = ([review_row(confirmed=1)], "")
+    assert preland.check_review("o/r", pr()).detail["outstanding"] is None
+    board["reviews"] = ([review_row(confirmed=1, handed_to="fixer",
+                                    outstanding=disposal(fixable=1))], "")
+    c = preland.check_review("o/r", pr())
+    assert c.detail["outstanding"]["fixable"] == 1
+    assert c.detail["handed_to"] == "fixer"
 
 
 def test_a_failing_sonar_gate_holds(board):

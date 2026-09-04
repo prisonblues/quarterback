@@ -135,7 +135,7 @@ def test_a_worktree_of_that_same_repo_agrees(repo, tmp_path):
 def test_a_jungle_repo_is_content_in_its_shared_checkout(repo):
     (repo / ".worktree.json").write_text("{}\n")
     declare(repo, {"name": "jungle"})
-    
+
     r = run(cwd=repo)
     assert r.returncode == AGREES
     assert "~ JUNGLE" in r.stdout

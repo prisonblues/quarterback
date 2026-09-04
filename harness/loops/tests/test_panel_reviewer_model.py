@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
-import panel_seats  # noqa: E402  — run_cli lives here since #129
 import panel_core  # noqa: E402  — ReviewerRun/SeatAnswer live here
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 
 TOO_OLD = (
     'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'

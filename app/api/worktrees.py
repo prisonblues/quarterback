@@ -4,9 +4,9 @@
 
 ``worktrees.repo`` is a **repository**, not a label. It is written from
 ``mcp_server.gitctx.repo_slug`` — ``owner/name`` read off ``remote.origin.url``,
-or NULL where the remote is not one — so unlike ``leases.repo`` (a bare name the
-lifecycle hook derives, and deliberately a topic rather than an identity) it can
-and should be canonical. It was not: the column stored whatever the device sent
+or NULL where the remote is not one — so unlike ``leases.repo`` (a *report*, from
+a heartbeat that may only know a bare name; see :mod:`app.repomatch`) it can and
+should be canonical. It was not: the column stored whatever the device sent
 and ``GET /worktrees?repo=`` compared it with ``==``, so a device whose remote is
 spelled ``PrisonBlues/Quarterback`` registered a repository the board held apart
 from the same one registered as ``prisonblues/quarterback``.
@@ -23,10 +23,16 @@ about what "the same repo" means: ``/sync`` folds through
 :func:`app.sync.repo_key` (basename, lower-cased) while this endpoint compared
 exactly. That is not a stylistic difference — the board TUI locates a checkout to
 cherry-pick into by passing the ``repo`` ref off a *post*, and the lifecycle hook
-tags posts with the checkout's **basename**. So the one caller in the tree that
+tagged posts with the checkout's **basename**. So the one caller in the tree that
 uses this filter has only ever been able to spell the bare name, and this
 endpoint has been answering it with ``[]`` — the false-clean that #326 is about,
 rendered as "no registered checkout of quarterback on zeus".
+
+#714 makes the hook report ``owner/name`` where it can, so new posts carry the
+qualified spelling and hit the exact tier. The bare-name tier does not retire with
+it: a checkout whose remote is not a GitHub one has no other name, every post
+already on the board carries the old one, and a hook rolls out across a fleet
+rather than at an instant.
 
 So the filter is two-tier and the tiers cannot be confused with each other:
 ``owner/name`` is canonicalised and matched exactly, and a **bare name** — the
@@ -40,22 +46,16 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, delete, func, select
+from sqlalchemy import Select, delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
-from app.claimkey import REPO_NAME_RE, REPO_SHAPE, BadRef, canonical_repo
+from app.claimkey import BadRef, canonical_repo
 from app.db import get_session
 from app.models.worktree import Worktree
-from app.sync import repo_key
+from app.repomatch import asked_repo, canonical_clause
 
 router = APIRouter(tags=["worktree"])
-
-#: Everything after the last ``/``, as a POSIX pattern for Postgres's two-argument
-#: ``substring``. :func:`app.sync.repo_key`'s rule, over a column that is already
-#: lower case and carries no trailing slash — which is what the CHECK constraint
-#: and ``canonical_repo`` between them guarantee, so the two cannot drift.
-_BASENAME = "[^/]*$"
 
 
 def _repo_where(stmt: Select, repo: str) -> Select:
@@ -67,21 +67,13 @@ def _repo_where(stmt: Select, repo: str) -> Select:
     what counts as the same repo. Anything that is neither is a 422 rather than an
     empty list: a clone URL or a path answered with ``[]`` reads as "nothing is
     registered" when it means "I could not tell what you asked about".
+
+    The rule itself moved to :mod:`app.repomatch` with #714, unchanged, when a
+    fourth read needed it and had written none — the exact-then-basename tiering
+    here, and the gate that refuses a third spelling rather than answering it.
+    Three copies of a two-tier rule is two copies that can drift.
     """
-    try:
-        return stmt.where(Worktree.repo == canonical_repo(repo))
-    except BadRef:
-        pass
-    # The WHOLE string has to be a bare name, not merely something with a
-    # basename in it: `repo_key` is total and answers `passwd` for `/etc/passwd`
-    # and `c` for `a/b/c`, so a check on its output alone would turn every path
-    # and clone URL into a match on whatever it ends with. `REPO_NAME_RE` is the
-    # repository half of `REPO_RE` itself, so `foo.git`, `foo/`, `/foo` and
-    # anything with a space are refused here exactly as they are everywhere else.
-    asked = repo.strip()
-    if not REPO_NAME_RE.match(asked):
-        raise HTTPException(422, detail={"error": REPO_SHAPE, "repo": repo})
-    return stmt.where(func.substring(Worktree.repo, _BASENAME) == repo_key(asked))
+    return stmt.where(canonical_clause(Worktree.repo, asked_repo(repo)))
 
 
 def _canonical_repo_or_none(repo: str | None) -> str | None:

@@ -44,8 +44,16 @@ import httpx
 import pytest
 from sqlalchemy import select, update
 
+import app.api.plan as plan_api
 from app.api.claims import ClaimRequest, acquire
-from app.api.plan import CLAIM_KIND, STALE_DAYS, _item_view
+from app.api.plan import (
+    _DONE_SEP,
+    CLAIM_KIND,
+    MAX_NOTE,
+    STALE_DAYS,
+    _completion_note,
+    _item_view,
+)
 from app.config import settings
 from app.db import async_session
 from app.models.plan_item import PlanItem
@@ -954,6 +962,333 @@ async def test_the_completion_note_is_added_to_the_human_note_not_over_it(client
     assert r.status_code == 200, r.text
     assert r.json()["note"].startswith("before #53")
     assert "landed in PR #143" in r.json()["note"]
+
+
+# ------------------------- one merge, two observers, one transition (#723)
+
+#: What `qb-reconcile`'s `apply_note` renders. No host in it and no timestamp, so
+#: every machine in the fleet writes this exact string for the same merge — which
+#: is what makes "the same receipt twice" the ordinary outcome rather than a rare
+#: one, and what the endpoint now recognises.
+RECEIPT = "#182 is merged — recorded by qb-reconcile"
+
+
+async def _row(client, repo: str, item_id: str) -> dict:
+    """The item as history holds it, note and all."""
+    history = await read(client, repo, include_done=True)
+    return next(i for i in history["items"] if i["item_id"] == item_id)
+
+
+async def test_two_hosts_recording_one_merge_transition_the_row_once(client):
+    """The race as an actual race, because the defect only exists between the read
+    and the write.
+
+    `qb-reconcile --apply` runs on a fifteen-minute timer on every machine in the
+    fleet: each host reads the same open row, sees the same merged PR and sends the
+    same completion, so two writes on one item is the design's ordinary case and
+    not an unlucky one. Both requests here are in flight together, each on its own
+    database session, and the conditional UPDATE is the only thing deciding between
+    them — exactly as `test_two_machines_racing_for_one_key_produce_exactly_one_winner`
+    is written for the claims table.
+
+    Both callers get a 200: the row is done, which is what each of them wanted. What
+    they do not both get is the transition.
+
+    red/green: fails on the `changed` set — `{None} != {True, False}`, the field did
+    not exist — and, with that assertion removed, on `note.count(RECEIPT) == 1`
+    finding two.
+    """
+    repo = "acme/twohosts"
+    item = await issue(client, repo, 720)
+    write = {"item_id": item["item_id"], "note": RECEIPT}
+
+    laptop, desktop = await asyncio.gather(
+        client.post("/plan/item/done", json=write, headers=LAPTOP),
+        client.post("/plan/item/done", json=write, headers=DESKTOP),
+    )
+    assert [laptop.status_code, desktop.status_code] == [200, 200], [
+        laptop.text, desktop.text]
+    assert {laptop.json().get("changed"), desktop.json().get("changed")} == {True, False}
+
+    won = laptop if laptop.json()["changed"] else desktop
+    lost = desktop if laptop.json()["changed"] else laptop
+    assert lost.json()["done_by"] == won.json()["done_by"], (
+        "the loser reads back the winner's name, not its own")
+    row = await _row(client, repo, item["item_id"])
+    assert row["note"].count(RECEIPT) == 1, "one merge, one receipt"
+
+
+async def test_the_second_tick_records_nothing_and_says_so(client):
+    """The same collision fifteen minutes apart rather than in the same instant —
+    the shape it actually takes when two hosts' timers are out of step, and the one
+    a caller can be told about plainly.
+
+    `changed: false` is the answer `qb-reconcile` reads to decide whether its own
+    write is what finished the row; before it existed the pass compared the returned
+    timestamp against the moment it sent the write, which was correct only while the
+    two clocks agreed.
+
+    red/green: fails on `first.json().get("changed") is True`, the field being
+    absent; and on the receipt count, which was two.
+    """
+    repo = "acme/secondtick"
+    item = await issue(client, repo, 721)
+    write = {"item_id": item["item_id"], "note": RECEIPT}
+
+    first = await client.post("/plan/item/done", json=write, headers=LAPTOP)
+    second = await client.post("/plan/item/done", json=write, headers=DESKTOP)
+
+    assert first.json().get("changed") is True, first.text
+    assert second.status_code == 200, second.text
+    assert second.json().get("changed") is False
+    assert second.json()["done_by"] == "laptop", "the first holder keeps the row"
+    assert second.json()["note"].count(RECEIPT) == 1
+
+
+async def test_a_second_observer_with_something_else_to_say_is_still_heard(client):
+    """The half that must NOT change. A completion note is not only a fleet
+    receipt: a person's `plan_done` following an agent's — through their own
+    agent's credential, since this is an agent-identity path — is a sentence
+    somebody wanted on the record, and dropping every note on a no-op would be a
+    silence bought to fix a duplicate.
+
+    So the test of "do not append a second receipt" is about the receipt and not
+    about the call: identical words are recognised and dropped, different words
+    land under them, and the row still names whoever transitioned it.
+
+    red/green: fails on `person.json().get("changed") is False`. Its other three
+    assertions passed before the fix too, and that is the point of them: they are
+    here so a later tightening of the no-op path cannot take the person with it.
+    """
+    repo = "acme/twovoices"
+    item = await issue(client, repo, 722, note="before #53: its schema is what #53 queries")
+
+    await client.post("/plan/item/done",
+                      json={"item_id": item["item_id"], "note": RECEIPT}, headers=LAPTOP)
+    person = await client.post(
+        "/plan/item/done",
+        json={"item_id": item["item_id"],
+              "note": "the revert is on main; reopening this as #724"},
+        headers=DESKTOP)
+
+    assert person.status_code == 200, person.text
+    assert person.json().get("changed") is False
+    note = person.json()["note"]
+    assert note.startswith("before #53"), "the human's reasoning is still the head of it"
+    assert RECEIPT in note and "reopening this as #724" in note
+
+
+async def test_a_receipt_that_merely_reads_like_another_is_still_recorded(client):
+    """"The same sentence twice" has to mean the same sentence.
+
+    Found by Codex on this change's own diff: the first cut asked whether the note
+    CONTAINED the words, so `landed in PR #143` would have been swallowed by an
+    existing `landed in PR #143 after the schema change` — a different sentence,
+    dropped, which is the failure the no-op path exists to avoid rather than an
+    instance of the one it fixes. The predicate matches a whole receipt line now,
+    and this pins all three positions it can sit in: the head of the note, the
+    tail, and the middle.
+
+    red/green: fails on `second.json().get("changed") is False` — no such field.
+    The sentence itself landed before the fix too; it is the substring rule, which
+    never shipped, that would have lost it.
+    """
+    repo = "acme/nearlythesame"
+    item = await issue(client, repo, 726)
+    longer = "landed in PR #143 after the schema change"
+    shorter = "landed in PR #143"
+
+    first = await client.post("/plan/item/done",
+                              json={"item_id": item["item_id"], "note": longer},
+                              headers=LAPTOP)
+    second = await client.post("/plan/item/done",
+                               json={"item_id": item["item_id"], "note": shorter},
+                               headers=DESKTOP)
+
+    assert first.json().get("changed") is True, first.text
+    assert second.json().get("changed") is False
+    note = second.json()["note"]
+    assert note == f"{longer}\n— done: {shorter}", note
+
+    # A third voice with a third thing to say, so that `shorter` is no longer the
+    # last line: the middle is the position an unpadded tail-anchored test misses.
+    third = await client.post("/plan/item/done",
+                              json={"item_id": item["item_id"], "note": "reverted on main"},
+                              headers=SERVER)
+    note = third.json()["note"]
+    assert note.endswith("— done: reverted on main")
+
+    # Now each of the three again — head, middle and tail of that note. Every one
+    # is a receipt the row already carries, so none is written twice.
+    for repeat in (longer, shorter, "reverted on main"):
+        again = await client.post("/plan/item/done",
+                                  json={"item_id": item["item_id"], "note": repeat},
+                                  headers=LAPTOP)
+        assert again.json()["note"] == note, f"{repeat!r} was appended a second time"
+
+
+async def test_two_hosts_with_different_words_both_land_them(client, monkeypatch):
+    """The guarantee the SQL append exists for, raced rather than described.
+
+    The identical-receipt race above would still pass if a losing caller simply
+    threw its note away — which is the behaviour the SQL append was introduced to
+    make unnecessary, so that test cannot be the one holding it up. This one
+    sends two DIFFERENT notes through the same seam and requires both to survive:
+    the loser's append is derived from the note as the winner left it, not from
+    the copy it read a round trip earlier.
+
+    **The interleave is forced, not hoped for.** `live_claim` is awaited after the
+    row is read and before anything is written, so releasing both requests from a
+    barrier there puts them in exactly the read-read-write-write order the
+    read-modify-write lost a note in. Unsynchronised, that ordering is likely and
+    not certain, and a race test that only usually races is a test that only
+    usually holds.
+
+    red/green: the `changed` assertion fires first, as it does everywhere on this
+    branch. With it removed, the property this test is FOR goes red on its own:
+    `assert 'and the revert is on main' in 'landed in PR #143'` — the note holding
+    one caller's words and not the other's, because whichever committed second
+    wrote its copy of the row over the first. Measured, not assumed.
+    """
+    repo = "acme/twovoicesraced"
+    item = await issue(client, repo, 727)
+    barrier = asyncio.Barrier(2)
+    real_live_claim = plan_api.live_claim
+
+    async def in_step(*args, **kwargs):
+        got = await real_live_claim(*args, **kwargs)
+        # Both requests have read the row and neither has written. A deadline
+        # rather than a bare wait: if one of them fails before it arrives, the
+        # other must fail the test loudly instead of hanging the suite.
+        await asyncio.wait_for(barrier.wait(), timeout=10)
+        return got
+
+    monkeypatch.setattr(plan_api, "live_claim", in_step)
+    mine, theirs = "landed in PR #143", "and the revert is on main"
+    laptop, desktop = await asyncio.gather(
+        client.post("/plan/item/done",
+                    json={"item_id": item["item_id"], "note": mine}, headers=LAPTOP),
+        client.post("/plan/item/done",
+                    json={"item_id": item["item_id"], "note": theirs}, headers=DESKTOP),
+    )
+    # Before any further request: the barrier still wants two parties, and a read
+    # that reached it alone would sit there until the deadline.
+    monkeypatch.undo()
+
+    assert [laptop.status_code, desktop.status_code] == [200, 200], [
+        laptop.text, desktop.text]
+    assert {laptop.json().get("changed"), desktop.json().get("changed")} == {True, False}
+    note = (await _row(client, repo, item["item_id"]))["note"]
+    assert mine in note, note
+    assert theirs in note, note
+
+
+async def test_a_multi_line_note_is_never_read_as_a_repeated_receipt(client):
+    """`_note_already_says` reads a note as lines, so it must not be asked about a
+    caller that sends several.
+
+    A row carrying the receipts `foo` and `bar` stores `foo\n— done: bar`, and the
+    padded single-line test matches that against a caller sending exactly those two
+    lines as one note — a different note, suppressed. Found by an independent review
+    of this branch, and it is the same failure the substring rule had before it: only
+    the same sentence is the same sentence.
+
+    Nothing that arrives with a newline in it is the duplicate being dropped here.
+    `qb-reconcile`'s receipt is one line, which is what makes it byte-identical
+    across hosts; a multi-line note is somebody typing.
+
+    red/green: fails against this branch's own previous commit on
+    `assert note.endswith(...)` — the note came back unchanged, the second write
+    silently discarded. (Against `main` there is no dedup at all, so the assertion
+    that goes red there is `changed`.)
+    """
+    repo = "acme/multiline"
+    item = await issue(client, repo, 728)
+    for said in ("foo", "bar"):
+        await client.post("/plan/item/done",
+                          json={"item_id": item["item_id"], "note": said}, headers=LAPTOP)
+    both = f"foo{_DONE_SEP}bar"
+    assert (await _row(client, repo, item["item_id"]))["note"] == both
+
+    echoed = await client.post("/plan/item/done",
+                               json={"item_id": item["item_id"], "note": both},
+                               headers=DESKTOP)
+
+    assert echoed.json().get("changed") is False
+    note = echoed.json()["note"]
+    assert note == f"{both}{_DONE_SEP}{both}", note
+
+
+async def test_a_drop_that_lands_mid_write_is_not_finished_over(client, monkeypatch):
+    """The refusal has to be made where the write is, not where the read was.
+
+    "A human dropped this item" is the one state `done` refuses, and the check for
+    it read a row this transaction had not locked. A drop that committed in the gap
+    was then finished over: the agent's UPDATE stamped `done` on top of the person's
+    decision, which is precisely the human-only rule being routed around — quietly,
+    and in the record.
+
+    The interleave is driven rather than hoped for. `live_claim` is awaited inside
+    that gap, so the drop is issued from a separate session at that point: a real
+    second transaction committing between this request's read and its write, not a
+    fabricated clock.
+
+    red/green: fails on `assert r.status_code == 409` with a 200, and on the row
+    that is left `done` by `laptop` after a person dropped it.
+    """
+    repo = "acme/dropraced"
+    item = await issue(client, repo, 723)
+    item_uuid = uuid.UUID(item["item_id"])
+    real_live_claim = plan_api.live_claim
+
+    async def drop_it_first(*args, **kwargs):
+        async with async_session() as other:
+            await other.execute(
+                update(PlanItem).where(PlanItem.id == item_uuid).values(state="dropped"))
+            await other.commit()
+        return await real_live_claim(*args, **kwargs)
+
+    monkeypatch.setattr(plan_api, "live_claim", drop_it_first)
+    r = await client.post("/plan/item/done",
+                          json={"item_id": item["item_id"], "note": RECEIPT},
+                          headers=LAPTOP)
+
+    assert r.status_code == 409, r.text
+    assert "dropped" in r.json()["detail"]["error"]
+    async with async_session() as s:
+        row = await s.get(PlanItem, item_uuid)
+        assert row.state == "dropped" and row.done_by is None
+        assert not (row.note or ""), "and nothing of ours was written to it"
+
+
+async def test_the_sql_append_and_the_python_one_say_the_same_thing(client):
+    """An item's receipt is appended by SQL and a plan's by Python, so the rule is
+    written twice. This is what keeps the two from drifting.
+
+    The separator and the 2000-character bound are the parts that can, and the
+    truncating case is the one that would go unnoticed: `right(note, 2000)` and
+    `note[-2000:]` agree only while both are counting characters.
+
+    red/green: N-A (new code path) — `_completion_note_sql` arrived with this
+    change, and before it the endpoint called the Python one, so the equality held
+    by construction.
+    """
+    repo = "acme/notepin"
+    reasoning = "before #53: its schema is what #53 queries"
+    short = await issue(client, repo, 725, note=reasoning)
+    r = await client.post("/plan/item/done",
+                          json={"item_id": short["item_id"], "note": "landed in PR #143"},
+                          headers=LAPTOP)
+    assert r.json()["note"] == _completion_note(reasoning, "landed in PR #143")
+
+    filled = "x" * (MAX_NOTE - 5)
+    long_item = await add(client, repo, "a note with no room left", note=filled)
+    r2 = await client.post("/plan/item/done",
+                           json={"item_id": long_item["item_id"],
+                                 "note": "landed in PR #144"},
+                           headers=LAPTOP)
+    assert r2.json()["note"] == _completion_note(filled, "landed in PR #144")
+    assert len(r2.json()["note"]) == MAX_NOTE, "trimmed from the left, to the bound"
 
 
 # --------------------------------------------- order is a total order, still

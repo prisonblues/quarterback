@@ -25,7 +25,7 @@ that a value the BOARD stated becomes a ceiling rather than a default: below it,
 they do not. See :func:`round_ceiling`.
 
 **The spend ceiling** bounds everything else, and it is checked against a
-measurement rather than against a round number. Five dials, all `None` by default
+measurement rather than against a round number. Six dials, all `None` by default
 (:data:`CEILINGS`), read against `GET /review/spend`. A caller that renumbers its
 rounds escapes the round ceiling and does not escape this one: a run is a row on
 the board whatever it called itself, which is why `runs_per_pr` is here beside
@@ -52,6 +52,71 @@ that: a row is a row.
 is reported where a vendor stated it and is not a ceiling unit, because a ceiling
 in dollars that this code computed would be wrong the moment a price moved and
 would still read like a measurement.
+
+## What ONE unit of that spend is: a round, and not a PR (#483)
+
+`tokens_per_pr` is a flat lifetime-of-PR ceiling, and the panel's unit of work is a
+ROUND — `/panel-review-pr` makes round 2 the default and calls it *"not optional"*,
+and `max_rounds` went from 2 to 6 on #621 so that a cycle could stop on a decision
+rather than on a count. A flat total does not bound spend per unit of work; it bounds
+*how many units of work a PR is allowed*, which is the decision the round logic is
+supposed to make on evidence.
+
+And it binds latest and hardest on the round that matters most. It is spent on rounds
+1 and 2 — the reviews that were already happening — and refuses round 3, which is the
+first round that reads the fixer's own commit and the whole reason `/panel-review-pr`
+§5 exists. Measured over this board's own recorded history (`GET /reviews?days=365&limit=500`,
+115 recorded review
+runs): ten PRs reached round 3, and of the seven of them that recorded any tokens at
+all, rounds 1 and 2 take a **median 57%** of the PR's entire measured spend (n=7,
+0%-89%, where the 0% is a PR whose first two rounds recorded no tokens at all; the
+other three measured nothing anywhere, so they have no share to take). On the worst of
+them a flat total had 11% of itself left for the four rounds `max_rounds: 6` was raised
+to buy.
+
+So :data:`CEILINGS` carries `tokens_per_round`, and the per-PR total is **derived from
+it** rather than set beside it: `tokens_per_round × max_rounds`, which is
+:attr:`Budget.derived_tokens_per_pr`. A `tokens_per_pr` written *below* that total is a
+contradiction — a repo asking for six rounds and paying for two — and
+:func:`resolve_budget` refuses it by name, because #483's complaint is that the
+contradiction is invisible until a late round is refused.
+
+**The allowance is released one round at a time, and that is what stops a cheap round
+banking against an expensive one.** This check runs BEFORE any seat is dispatched, so
+the round about to start has spent nothing and has nothing of its own to measure. What
+there is to measure is what the rounds already recorded on this PR were entitled to.
+So the ceiling in force at the start of a round is
+
+    tokens_per_round × min(rounds already recorded + 1, max_rounds)
+
+checked against `pr_total.tokens`: this round's own allowance, plus one for every round
+that has already run, and never more than a whole cycle's worth. A round that overspent
+its allowance is refused at the next boundary — the meaningful refusal #483 asks for,
+"a round gone wrong rather than a PR that has had enough attention" — while a cycle
+whose rounds each stayed inside the allowance can run every round the cap allows. Under
+a flat total the same six rounds' worth is available to round 1 in one go, which is the
+runaway the ceiling is actually for.
+
+**Rounds are counted from the BOARD's rows, never from `--round`.** That is
+`runs_per_pr`' reason one section down — a caller that renumbers its rounds still costs
+a row — and it matters more here, because `pr_total.runs` and `pr_total.tokens` are the
+same aggregate over the same rows, so the multiplier and the measurement cannot
+disagree about which rounds they are describing. `--round` could: it restarts at 1 on a
+`--new-cycle` while `pr_total` has no time bound at all, and mixing the two would put a
+per-cycle count over a per-PR sum. The `min(…, max_rounds)` is what makes the derived
+total exact rather than conventional: however many rows a PR accumulates, the release
+stops at a whole cycle's worth, so a caller re-running rounds buys the rows and cannot
+walk the ceiling up past the total those rounds were ever entitled to.
+
+**And the epoch is the PR, not the cycle.** The second opinion on this change asked, so
+it is written down rather than left to be worked out: `pr_total` is every row this PR has
+ever had, so `--new-cycle` buys no fresh allowance. A second cycle starts against the
+first one's spend, and against a multiplier the first one's rows may already have pushed
+to `max_rounds`. The direction is the survivable one — a PR that has been reviewed six
+times over is refused rather than funded again — and it is the direction `runs_per_pr`
+already chose over the same window. An allowance that genuinely reset per cycle would
+need a spend aggregate scoped to a cycle, which `GET /review/spend` does not publish and
+which this change deliberately does not add.
 
 ## Why it cannot be raised from inside the repo being reviewed
 
@@ -112,7 +177,7 @@ round per concurrent panel is still a ceiling, and it is several orders of
 magnitude tighter than the ceiling that existed before this, which was none.
 
 **None of this fires until a person sets a number.** Every ceiling defaults to
-`None`; with all five unset the panel makes no board call at all
+`None`; with all six unset the panel makes no board call at all
 (:func:`Budget.dormant`) and behaves exactly as it did before this module existed.
 """
 
@@ -126,10 +191,15 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from harness_rules import (
-    BOARD_TIMEOUT, RULES_FILENAME, board_config, ssl_context, unattended,
+    BOARD_TIMEOUT,
+    DEFAULTS,
+    RULES_FILENAME,
+    board_config,
+    ssl_context,
+    unattended,
 )
 
-#: The five spend ceilings, mapped to the window each is measured over. The key is
+#: The six spend ceilings, mapped to the window each is measured over. The key is
 #: the name under `review_panel.budget`; the value is `(which window in the
 #: `GET /review/spend` body, which unit)`.
 #:
@@ -142,6 +212,12 @@ CEILINGS: dict[str, tuple[str, str]] = {
     "runs_per_day": ("repo_window", "runs"),
     "tokens_per_pr": ("pr_total", "tokens"),
     "runs_per_pr": ("pr_total", "runs"),
+    # #483's per-ROUND allowance. The same window and the same unit as
+    # `tokens_per_pr` — a round's spend is only ever visible as part of the PR's
+    # total — and the difference is the LIMIT rather than the measurement: what is
+    # in force is the written allowance times the rounds this PR has bought. See
+    # the module docstring, and :meth:`Budget.rounds_allowed`.
+    "tokens_per_round": ("pr_total", "tokens"),
     "fleet_tokens_per_day": ("fleet_window", "tokens"),
 }
 
@@ -150,7 +226,10 @@ CEILINGS: dict[str, tuple[str, str]] = {
 #: sibling and a string transform would confidently invent `fleet_runs_per_day` — a
 #: dial nothing reads, offered as the remedy to somebody whose ceiling has stopped
 #: binding.
-RUN_SIBLING = {"tokens_per_day": "runs_per_day", "tokens_per_pr": "runs_per_pr"}
+RUN_SIBLING = {"tokens_per_day": "runs_per_day", "tokens_per_pr": "runs_per_pr",
+               # #483's allowance measures the same rows as `tokens_per_pr`, so the
+               # ceiling that still binds an uninstrumented seat is the same one.
+               "tokens_per_round": "runs_per_pr"}
 
 #: How the two units are spelled in a refusal. A ceiling that says "3 over 2" and
 #: does not say what of is a ceiling nobody can act on.
@@ -177,6 +256,14 @@ SPEND_ENV = "QUARTERBACK_REVIEW_SPEND"
 #: a request the operator never sees. Kept equal to `app.api.reviews`'
 #: `MAX_SPEND_WINDOW_HOURS` by `tests/test_review_spend.py`.
 MAX_WINDOW_HOURS = 24 * 28
+
+#: What `max_rounds` is taken to be when a caller does not say. Read off
+#: `harness_rules.DEFAULTS` rather than spelled again here: the derived per-PR total
+#: is `tokens_per_round × max_rounds`, so a second copy of the cap would let this
+#: module quote a total the round logic would never honour. `panel.run` passes the cap
+#: actually in force (`resolve_dials`, which has already applied `--max-rounds` and
+#: the board's ceiling), and this serves the direct caller and the test that do not.
+DEFAULT_MAX_ROUNDS: int = DEFAULTS["review_panel"]["max_rounds"]
 
 #: The window a `budget_window_hours` that cannot be read falls back to. The same
 #: number as `DEFAULTS`, and it is spelled here only so the refusal path has
@@ -268,6 +355,42 @@ class Budget:
     #: person writes one.
     limits: dict[str, int] = field(default_factory=dict)
     window_hours: int = DEFAULT_WINDOW_HOURS
+    #: The round cap the per-PR total is derived against (#483). Resolved beside the
+    #: ceilings for `window_hours`' reason with more force: `tokens_per_round` states
+    #: an allowance and `max_rounds` states how many of them a cycle may have, so the
+    #: PR total is a product of the two and neither number means anything alone.
+    #: `panel.run` passes the cap in force rather than the file's wish, so a
+    #: `--max-rounds 2` run on a repo that wrote 6 derives a total for the cycle that
+    #: will actually happen.
+    max_rounds: int = DEFAULT_MAX_ROUNDS
+
+    @property
+    def derived_tokens_per_pr(self) -> int | None:
+        """`tokens_per_round × max_rounds`, or `None` when no allowance is set.
+
+        #483's proposal 2: where a per-PR total is still wanted it is DERIVED, so the
+        two dials cannot be set to contradict each other. It is not a second ceiling
+        this module checks — :func:`check` never reads it — it is what the per-round
+        release schedule adds up to over a full cycle, and it is the number
+        :func:`resolve_budget` reports and refuses a smaller `tokens_per_pr` against.
+        """
+        per_round = self.limits.get("tokens_per_round")
+        return None if per_round is None else per_round * self.max_rounds
+
+    def rounds_allowed(self, recorded: int) -> int:
+        """How many round allowances are released at the start of the next round.
+
+        One for every round already recorded on this PR, plus one for the round about
+        to run, and never more than a whole cycle's worth — the arithmetic in the
+        module docstring, in one place so the refusal sentence and the comparison
+        cannot disagree about it.
+
+        Floored at 1 rather than at 0: a round that is about to be dispatched is
+        entitled to one round's allowance, and a `max_rounds` of 0 is the ROUND
+        ceiling's refusal to make (`round_ceiling`, and `panel.run`'s `--round N is
+        past the cap`), not a spend ceiling of nothing dressed as one.
+        """
+        return max(1, min(int(recorded) + 1, self.max_rounds))
 
     @property
     def dormant(self) -> bool:
@@ -285,8 +408,19 @@ class Budget:
         return {CEILINGS[k][0] for k in self.limits}
 
 
-def resolve_budget(panel: dict, notes: list[str]) -> Budget:
+def resolve_budget(panel: dict, notes: list[str], *,
+                   max_rounds: int | None = None) -> Budget:
     """Read and validate `review_panel.budget` plus `review_panel.budget_window_hours`.
+
+    `max_rounds` is the round cap IN FORCE, which the caller has already resolved —
+    `panel.run` passes `resolve_dials`' answer, after `--max-rounds` and the board's
+    ceiling. It is a parameter rather than a read of `panel` because the cap has four
+    layers and this module can see only one of them, and the per-PR total derived here
+    would otherwise quote a number of rounds the run was never going to have. Left
+    out, the repo's own file answers and then :data:`DEFAULT_MAX_ROUNDS` does; the
+    read is deliberately LENIENT, because a malformed `max_rounds` is a refusal
+    `resolve_dials` already owns and two refusals for one key would differ only in
+    which module's wording the operator got.
 
     A malformed value is a hard refusal, not a fallback to "no ceiling":
     `harness_rules`' standing asymmetry is that an unknown NAME is warned about and
@@ -318,7 +452,50 @@ def resolve_budget(panel: dict, notes: list[str]) -> Budget:
     if not 1 <= hours <= MAX_WINDOW_HOURS:
         _refuse("budget_window_hours", panel.get("budget_window_hours"),
                 f"a whole number of hours between 1 and {MAX_WINDOW_HOURS}")
-    budget = Budget(limits=limits, window_hours=hours)
+    # The cap the CONFIGURATION states, which is a different question from the cap in
+    # force and is the one the written pair has to be coherent against. `panel` is
+    # post-dials, so this is the repo's own file or the board's dial and never the
+    # caller's `--max-rounds`. Read leniently, for the docstring's reason.
+    said = panel.get("max_rounds")
+    written_cap = (said if isinstance(said, int) and not isinstance(said, bool)
+                   and said >= 1 else DEFAULT_MAX_ROUNDS)
+    if max_rounds is None:
+        max_rounds = written_cap
+    budget = Budget(limits=limits, window_hours=hours, max_rounds=max_rounds)
+    # Against `written_cap` and NOT `budget.max_rounds`, because the contradiction is a
+    # property of what somebody WROTE and must not appear and disappear with a flag.
+    # Judged against the cap in force it did both: `--max-rounds 7` on a coherent pair
+    # (`tokens_per_pr` 20,000,000 over `tokens_per_round` 3,333,333 × a written cap of
+    # 6) derived 23,333,331, refused the run outright with `SystemExit`, and named the
+    # rules file as the thing to fix — while the file was right and the flag was the
+    # cause. `/panel-review-pr` documents raising `--max-rounds` as the remedy when a
+    # cap is spent, so that is the ordinary path and not an exotic one. The reported
+    # total below stays the one IN FORCE, which is the number that decides what this
+    # run may spend.
+    per_round, written = limits.get("tokens_per_round"), limits.get("tokens_per_pr")
+    stated = None if per_round is None else per_round * written_cap
+    derived = budget.derived_tokens_per_pr
+    if stated is not None and written is not None and written < stated:
+        # #483, made loud at the moment it is fixable. The two dials CAN be written to
+        # contradict each other — a total that cannot afford the rounds the cap allows
+        # is exactly the arrangement the issue was filed about — and the whole
+        # complaint is that the contradiction stays invisible until a late round is
+        # refused, on the PR, in front of whoever was waiting for the review. So it is
+        # refused here, beside the other bad-value refusals and before any board call.
+        #
+        # Only ever fires on a pair a person wrote this week: both keys default to
+        # `None`, and a `tokens_per_pr` at or ABOVE the derived total is left alone —
+        # a runaway backstop over the top of a per-round allowance is a coherent thing
+        # to want, and the tighter of the two then binds on its own.
+        raise SystemExit(
+            f"{RULES_FILENAME}: `review_panel.budget.tokens_per_pr` "
+            f"({written:,}) is below the per-PR total its own per-round allowance "
+            f"adds up to — `tokens_per_round` {per_round:,} × "
+            f"`max_rounds` {written_cap} = {stated:,}. That pair asks for "
+            f"{written_cap} rounds and pays for "
+            f"{written // per_round}, and the contradiction would "
+            f"stay invisible until a late round was refused (#483). Raise the total, "
+            f"lower the allowance, or drop `tokens_per_pr` and let it be derived.")
     if not budget.dormant:
         # Said on every round that runs under one, in the list `--post` publishes to
         # the PR. #52's "never silent" cuts both ways: a run that was NOT stopped
@@ -327,6 +504,12 @@ def resolve_budget(panel: dict, notes: list[str]) -> Budget:
             "spend ceiling in force — " + ", ".join(
                 f"{key.replace('_', ' ')} {limit:,}"
                 for key, limit in sorted(budget.limits.items()))
+            # The DERIVED total, said out loud (#483). An operator who wrote one
+            # number has two in force, and the second is the one that decides whether
+            # the cycle's later rounds are affordable — leaving a reader to multiply
+            # it out is how a per-round allowance comes to be read as a per-PR one.
+            + (f", implying a per-PR total of {derived:,} over at most "
+               f"{budget.max_rounds} rounds" if derived is not None else "")
             + f" (rolling window {budget.window_hours}h)")
     return budget
 
@@ -393,6 +576,36 @@ def _window(spend: dict, name: str) -> dict | None:
     return got if isinstance(got, dict) else None
 
 
+def _whole(value) -> int | None:
+    """`value` as a whole number, or `None` when it is not one.
+
+    Every count in a `GET /review/spend` body is an `int` by construction —
+    `app.api.reviews._spend_totals` builds them that way — so this only fires on a
+    body this fleet did not build: a proxy that stringified the numbers, a
+    hand-written `$QUARTERBACK_REVIEW_SPEND`, a board of some other version.
+
+    It exists because the alternative, measured, is a TRACEBACK out of a governor.
+    `{"pr_total": {"runs": "lots"}}` raised `ValueError` from
+    :meth:`Budget.rounds_allowed`'s `int()`, and `{"tokens": "5"}` raised `TypeError`
+    from the `used >= limit_now` below — both escaping the attended/unattended fork
+    that decides what an uncheckable ceiling means, so an unattended run that would
+    have been REFUSED on an unreadable board instead died with a stack trace, and an
+    attended one lost the review it was promised. A shape this cannot read is exactly
+    what :func:`_unverified` is for. Raised by the codex second opinion on #483.
+
+    Bools are refused before the int read, for `_positive_int`'s reason: `True` is
+    `1` to Python and says nothing about a number of anything. An integral float
+    (`3.0` out of a JSON generator) is three; `2.7` rounds of review is not a
+    measurement this can compare against a ceiling, so it is unverifiable rather
+    than silently truncated.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    return int(value)
+
+
 def _measured(window: dict) -> str:
     """How much of a window's spend was actually instrumented, as a clause or `""`.
 
@@ -401,7 +614,8 @@ def _measured(window: dict) -> str:
     an UNDERCOUNT, and the honest thing is to say so in the same breath as the
     number rather than to leave a reader to assume the sum was complete.
     """
-    rows, measured = window.get("rows") or 0, window.get("measured_rows") or 0
+    rows = _whole(window.get("rows")) or 0
+    measured = _whole(window.get("measured_rows")) or 0
     if not rows or measured >= rows:
         return ""
     return (f" (measured over {measured} of {rows} reviewer runs — the real spend "
@@ -484,31 +698,92 @@ def check(cfg: dict, panel: dict, pr: int | None, notes: list[str],
         used = window.get(unit)
         if used is None:
             # Only ever the token units. Two very different cases hide behind one
-            # null, and only the second is unverifiable:
+            # null, and only the second is unverifiable — and the question that
+            # separates them is `runs`, never `rows`:
             #
-            #   `rows == 0` — nothing was reviewed in the window at all, so nothing
+            #   `runs == 0` — nothing was reviewed in the window at all, so nothing
             #     was spent. A real zero, and treating it as unverifiable would
-            #     refuse every unattended run on a quiet repo for ever.
-            #   `rows > 0`  — runs happened and none of them was instrumented. The
+            #     refuse every unattended run on a quiet repo for ever. It is the
+            #     shape `GET /review/spend` documents for an empty window.
+            #   `runs > 0`  — runs happened and none of them recorded a token. The
             #     spend is non-zero and unknown, which is the case a token-only
             #     ceiling silently stops binding on.
-            if window.get("rows"):
+            #
+            # `rows` used to ask this and got the second case wrong whenever a run
+            # recorded no scorecard AT ALL. `_spend_totals` counts runs over a LEFT
+            # join precisely so an uninstrumented run still counts as a run — "a
+            # ceiling that only counted instrumented runs would be loosened by the
+            # failure to instrument them" — so `pr_total` legitimately comes back as
+            # `{"runs": 1, "rows": 0, "tokens": null}`, and reading that as a real
+            # zero handed an unattended run a clean budget for a round it could not
+            # measure. Raised by the codex second opinion on #483; `rows` still
+            # answers the PARTIAL-coverage clause in `_measured`, which is a
+            # different question.
+            runs = _whole(window.get("runs")) or 0
+            if runs:
                 sibling = RUN_SIBLING.get(key)
                 unverifiable.append(
-                    f"`budget.{key}` — none of the {window.get('rows')} reviewer runs "
+                    f"`budget.{key}` — none of the {runs} recorded review runs "
                     f"on the {where} recorded any {UNIT_NOUN[unit]}, so what was "
                     f"spent is unknown rather than nothing"
                     + (f". `budget.{sibling}` is the ceiling that still binds a seat "
                        f"nobody instrumented" if sibling else ""))
                 continue
             used = 0
-        if used >= limit:
-            over.append(f"{key.replace('_', ' ')}: {used:,} of {limit:,} "
+        else:
+            # A count this harness cannot read is UNVERIFIABLE and not a traceback —
+            # see :func:`_whole`. It reaches the same fork as a board that could not
+            # be read at all, which is the only fork that knows the difference between
+            # an attended run and an unattended one.
+            stated, used = used, _whole(used)
+            if used is None:
+                unverifiable.append(
+                    f"`budget.{key}` — the board's `{window_name}.{unit}` is "
+                    f"{stated!r} rather than a whole number, so what was spent on the "
+                    f"{where} cannot be compared with a ceiling")
+                continue
+        # #483: the per-round allowance is the one ceiling whose limit is not the
+        # number somebody wrote down. It is RELEASED one round at a time — see the
+        # module docstring — so what is in force at this boundary is the written
+        # allowance times the rounds this PR has bought, and the sentence has to carry
+        # both halves or a reader cannot check the arithmetic that refused them.
+        #
+        # `runs` comes off the same window object as `used`, so the multiplier and the
+        # measurement are one aggregate over one set of rows. A caller's `--round` is
+        # not consulted and must not be: it restarts at 1 under `--new-cycle` while
+        # `pr_total` has no time bound at all.
+        limit_now, scaled = limit, ""
+        if key == "tokens_per_round":
+            # An ABSENT `runs` is a floor and not a guess: a body that somehow omitted
+            # it releases ONE allowance rather than many — the tightening direction,
+            # which is the only safe one for the multiplier a ceiling is released by.
+            # A `runs` that is PRESENT and unreadable is a different answer: the
+            # rounds this PR has bought cannot be counted, so the allowance in force
+            # cannot be worked out at all, and guessing one round there would invent a
+            # ceiling rather than fail to check one. Unverifiable, like the spend
+            # itself two blocks up.
+            stated = window.get("runs")
+            recorded = 0 if stated is None else _whole(stated)
+            if recorded is None:
+                unverifiable.append(
+                    f"`budget.{key}` — the board's `{window_name}.runs` is "
+                    f"{stated!r} rather than a whole number, so the rounds this PR "
+                    f"has already bought cannot be counted and the allowance released "
+                    f"at this boundary cannot be worked out")
+                continue
+            rounds = budget.rounds_allowed(recorded)
+            limit_now = limit * rounds
+            scaled = (f" — {limit:,} per round × {rounds} released "
+                      f"({recorded} round{'' if recorded == 1 else 's'} already "
+                      f"recorded on this PR, of at most {budget.max_rounds})")
+        if used >= limit_now:
+            over.append(f"{key.replace('_', ' ')}: {used:,} of {limit_now:,} "
                         f"{UNIT_NOUN[unit]} already spent on the {where}"
+                        f"{scaled}{_measured(window)}")
+        elif limit_now and used >= limit_now * 0.8:
+            near.append(f"{key.replace('_', ' ')}: {used:,} of {limit_now:,} "
+                        f"{UNIT_NOUN[unit]} on the {where}{scaled}"
                         f"{_measured(window)}")
-        elif limit and used >= limit * 0.8:
-            near.append(f"{key.replace('_', ' ')}: {used:,} of {limit:,} "
-                        f"{UNIT_NOUN[unit]} on the {where}{_measured(window)}")
 
     for line in near:
         notes.append(f"spend ceiling nearly reached — {line}")
@@ -581,7 +856,8 @@ def enabled_refusal(cfg: dict) -> str:
 
 
 __all__ = [
-    "Budget", "CEILINGS", "DEFAULT_WINDOW_HOURS", "MAX_WINDOW_HOURS", "RUN_SIBLING",
+    "Budget", "CEILINGS", "DEFAULT_MAX_ROUNDS", "DEFAULT_WINDOW_HOURS",
+    "MAX_WINDOW_HOURS", "RUN_SIBLING",
     "SPEND_ENV",
     "SPEND_PATH", "SPEND_TIMEOUT", "UNIT_NOUN", "Verdict", "check",
     "enabled_refusal", "fetch_spend", "resolve_budget", "round_ceiling",

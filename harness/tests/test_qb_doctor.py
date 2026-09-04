@@ -312,25 +312,150 @@ def _systemctl(answers: dict) -> object:
     return fake
 
 
+def _no_units(monkeypatch, stdout: str = "not-found", stderr: str = "") -> None:
+    """A host on which `qb-reconcile.timer` does not exist at all."""
+    monkeypatch.setattr(qd.shutil, "which", lambda _n: "/usr/bin/systemctl")
+    monkeypatch.setattr(qd, "run_cmd", _systemctl({
+        "is-enabled": (4, stdout, stderr), "is-active": (4, "inactive", "")}))
+
+
+def _passes(*rows: tuple[str, float, str]) -> dict:
+    """`{"passes": [...]}` from `(repo, minutes_ago, reported_by)` triples."""
+    return {"passes": [
+        {"repo": repo,
+         "at": (datetime.now(UTC) - timedelta(minutes=ago)).isoformat(),
+         "reported_by": who}
+        for repo, ago, who in rows], "count": len(rows)}
+
+
 @pytest.mark.parametrize("stdout,stderr", [
     ("", "Failed to get unit file state for qb-reconcile.timer: No such file or directory"),
     ("not-found", ""),
 ])
-def test_a_unit_that_was_never_installed_fails_and_says_where_the_units_live(
+def test_a_host_with_no_units_and_no_board_cannot_answer_and_says_where_they_live(
         monkeypatch, repo, stdout, stderr):
-    """The exact state of every host on the fleet until 2026-08-22: the units were
-    in `harness/loops/systemd/` and on no machine, and the plan went 39% stale.
+    """Absent units are no longer a fault by themselves (#695) — the pass is a fleet
+    singleton and three of five hosts hold no timer by design. With no board to ask,
+    "nothing here can tell" is the honest answer, and the remedy still names the units.
 
     Both spellings, because systemd answers `not-found` on stdout on this fleet and
     puts the same fact on stderr elsewhere. The exit code is 4 either way, and 4 for
     `inactive` too, which is why nothing here reads it as the discriminator."""
-    monkeypatch.setattr(qd.shutil, "which", lambda _n: "/usr/bin/systemctl")
-    monkeypatch.setattr(qd, "run_cmd", _systemctl({
-        "is-enabled": (4, stdout, stderr), "is-active": (4, "inactive", "")}))
+    _no_units(monkeypatch, stdout, stderr)
     check = qd.check_reconcile(host_for(repo))
-    assert check.verdict == "fail"
+    assert check.verdict == "unknown"
     assert "harness/loops/systemd/" in check.manual
     assert check.fix is None, "a unit that does not exist cannot be enabled"
+
+
+def test_a_host_without_the_units_is_ok_when_some_other_host_is_reconciling(
+        monkeypatch, landing_host):
+    """The row #695 is about. daedalus, atlas and sisyphus do not import the units and
+    were each being called NOT wired up for it — one `fail` that set the headline and
+    the exit code for every other row on the box."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, _passes(("prisonblues/quarterback", 4, "zeus/opal-vermeil")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "ok"
+    assert "zeus/opal-vermeil" in check.detail, "an ok that hides who it trusts is not an answer"
+    assert "4m" in check.detail
+
+
+def test_no_pass_recorded_anywhere_is_still_the_original_failure(monkeypatch, landing_host):
+    """#255's night survives the fix: the units in-repo and on no host at all. An empty
+    list is the one state that is genuinely a fault, and it stays a `fail`."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, {"passes": [], "count": 0})
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "fail"
+    assert "NO host" in check.detail
+
+
+def test_a_board_too_old_to_answer_is_unknown_rather_than_an_invented_outage(
+        monkeypatch, landing_host):
+    """`GET /plan/reconcile` ships with this change, so every board predating it 404s.
+    Reading that as "nobody is reconciling" would manufacture an outage out of a
+    deployment lag — `_board_by_capability`'s reasoning, in the row that meets it first."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, "Not Found", status=404)
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "unknown"
+    assert check.verdict != "fail"
+
+
+def test_a_stale_fleet_pass_warns_and_refuses_to_call_a_local_install_the_fix(
+        monkeypatch, landing_host):
+    """Nobody has run one for hours. That is worth saying, but it is not this host's
+    fault and installing a timer here would clear the row while leaving the fleet's
+    pass exactly as stopped."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, _passes(("prisonblues/quarterback", 195, "zeus/opal-vermeil")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "warn"
+    assert "3h 15m" in check.detail
+
+
+def test_the_freshest_pass_wins_not_the_first_the_board_listed(monkeypatch, landing_host):
+    """The board orders by its own column and this must not depend on that. A row whose
+    timestamp could not be read must never become the answer by being first."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, {"passes": [
+        {"repo": "a/one", "at": "not-a-timestamp", "reported_by": "ghost"},
+        {"repo": "a/two", "at": (datetime.now(UTC) - timedelta(minutes=400)).isoformat(),
+         "reported_by": "hermes/old"},
+        {"repo": "a/three", "at": (datetime.now(UTC) - timedelta(minutes=6)).isoformat(),
+         "reported_by": "zeus/fresh"},
+    ], "count": 3})
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "ok"
+    assert "zeus/fresh" in check.detail
+
+
+def test_a_pass_dated_in_the_future_is_skew_and_never_the_healthiest_state(
+        monkeypatch, landing_host):
+    """`_age_minutes` returns negative rather than clamping precisely so this stays
+    distinguishable from "just now". Clamped, a host with a bad clock would read as the
+    freshest pass on the board for as long as the skew lasted."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, _passes(("a/one", -90, "zeus/skewed")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "unknown"
+    assert "FUTURE" in check.detail
+
+
+def test_passes_that_carry_no_readable_time_are_unknown_not_ok(monkeypatch, landing_host):
+    """A board answering rows this cannot date has not said the fleet is healthy."""
+    _no_units(monkeypatch)
+    _board_says(monkeypatch, {"passes": [{"repo": "a/one", "at": None}], "count": 1})
+
+    assert qd.check_reconcile(landing_host).verdict == "unknown"
+
+
+def test_a_host_that_holds_the_timer_is_still_judged_locally(monkeypatch, landing_host):
+    """The board half is only for hosts with no units. A timer that exists HERE and is
+    dead is this host's fault, the board cannot see it, and a fleet that is otherwise
+    reconciling must not excuse it."""
+    monkeypatch.setattr(qd.shutil, "which", lambda _n: "/usr/bin/systemctl")
+    monkeypatch.setattr(qd, "run_cmd", _systemctl({
+        "is-enabled": (1, "disabled", ""), "is-active": (3, "inactive", "")}))
+    _board_says(monkeypatch, _passes(("a/one", 2, "zeus/opal-vermeil")))
+
+    check = qd.check_reconcile(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.fix == ["systemctl", "--user", "enable", "--now", "qb-reconcile.timer"]
 
 
 @pytest.mark.parametrize("broken", ["is-enabled", "is-active"])
@@ -711,7 +836,7 @@ def test_a_wrapprogram_wrapper_is_compared_against_the_file_it_wraps(tmp_path):
     it. The honest comparison is against `.qb-dash-wrapped`, which is the script."""
     src, installed = tmp_path / "src", tmp_path / "installed"
     src.mkdir(), installed.mkdir()
-    body = 'exec "$QB_DASH_PYTHON" qb-dash.py "$@"\n'
+    body = 'exec "$QB_DASH_PYTHON" qb-dash-tui.py "$@"\n'
     (src / "qb-dash").write_text(f"#!/bin/sh\n{body}")
     _wrapper(installed, "qb-dash", body)
 
@@ -725,8 +850,8 @@ def test_a_stale_wrapped_script_is_still_reported_through_its_wrapper(tmp_path):
     goes stale like any other, and the whole row exists to say so."""
     src, installed = tmp_path / "src", tmp_path / "installed"
     src.mkdir(), installed.mkdir()
-    (src / "qb-dash").write_text('#!/bin/sh\nexec "$QB_DASH_PYTHON" qb-dash.py --new "$@"\n')
-    _wrapper(installed, "qb-dash", 'exec "$QB_DASH_PYTHON" qb-dash.py "$@"\n')
+    (src / "qb-dash").write_text('#!/bin/sh\nexec "$QB_DASH_PYTHON" qb-dash-tui.py --new "$@"\n')
+    _wrapper(installed, "qb-dash", 'exec "$QB_DASH_PYTHON" qb-dash-tui.py "$@"\n')
 
     differ, _ = qd._harness_drift(src, installed)
     assert differ == {"qb-dash"}
@@ -776,7 +901,7 @@ def test_an_install_that_matches_through_both_artefacts_is_ok_and_still_sees_abs
     installed.mkdir(parents=True)
     (src / "qb-thing").write_text("#!/bin/sh\nexec qb \"$@\"\n")
     (installed / "qb-thing").write_text(f"{STORE_SHEBANG}\nexec qb \"$@\"\n")
-    body = 'exec "$QB_DASH_PYTHON" qb-dash.py "$@"\n'
+    body = 'exec "$QB_DASH_PYTHON" qb-dash-tui.py "$@"\n'
     (src / "qb-dash").write_text(f"#!/bin/sh\n{body}")
     _wrapper(installed, "qb-dash", body)
 
@@ -2062,19 +2187,54 @@ def _stuck(n: int, minutes: float = 5) -> tuple[int, list]:
     They carry a `ts` because the row dates them itself: `window_min` is a request the
     board is free to over-answer, so a post with no readable timestamp is not evidence
     about any window. See `_aged_stuck`.
+
+    Each names a DISTINCT issue in its refs, because #737 made the subject the join:
+    post `i` is about issue `i`, so `_stored` can vouch for a chosen prefix of them and
+    a test can say which posts are accounted for rather than only how many.
     """
-    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes)} for i in range(n)]
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes),
+                  "refs": [{"kind": "issue", "value": str(i)}]} for i in range(n)]
 
 
 def _aged_stuck(*minutes: float) -> tuple[int, list]:
     """Stuck posts at named ages — for the floor, which serves them regardless of age."""
-    return 200, [{"id": i, "type": "stuck", "ts": _ago(m)}
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(m),
+                  "refs": [{"kind": "issue", "value": str(i)}]}
                  for i, m in enumerate(minutes)]
 
 
+def _unsubjected_stuck(n: int, minutes: float = 5) -> tuple[int, list]:
+    """`n` stuck posts whose refs name no subject — announced and NOT stored by design.
+
+    #523: a row whose subject is "something, somewhere" answers "what is waiting on me"
+    with noise, so `_subject_from` returns None and `announce` posts without storing.
+    These are the posts that must stay out of the denominator.
+    """
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes), "refs": []}
+                 for i in range(n)]
+
+
 def _stored(*ages: float) -> tuple[int, dict]:
-    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(a)}
+    """Open blocker rows at the named ages, vouching for `_stuck`'s posts in order.
+
+    Row `i` carries issue `i` as its subject, so `_stored(10)` accounts for the first of
+    `_stuck(5)`'s posts and no others. The ages are kept as parameters even though #737
+    stopped matching on them, because two tests still turn on age: the future-dated row,
+    and the guarantee that an OLD row still vouches.
+    """
+    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(a),
+                               "subject": {"kind": "issue", "value": str(i)},
+                               "resolved_at": None}
                               for i, a in enumerate(ages)]}
+
+
+def _stored_about(*subjects: str, age: float = 9000) -> tuple[int, dict]:
+    """Open rows about NAMED subjects — for the mismatch cases, where the count is
+    right and the subjects are wrong."""
+    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(age),
+                               "subject": {"kind": "issue", "value": s},
+                               "resolved_at": None}
+                              for i, s in enumerate(subjects)]}
 
 
 def test_posts_with_no_rows_is_the_severed_producer(monkeypatch, landing_host):
@@ -2088,7 +2248,7 @@ def test_posts_with_no_rows_is_the_severed_producer(monkeypatch, landing_host):
 
     assert check.verdict == "fail"
     assert "4 stuck post(s)" in check.detail
-    assert check.extra["posts"] == 4 and check.extra["rows"] == 0
+    assert check.extra["storable"] == 4 and check.extra["accounted"] == 0
 
 
 def test_a_quiet_day_is_not_a_severed_producer(monkeypatch, landing_host):
@@ -2113,7 +2273,8 @@ def test_fewer_rows_than_posts_is_the_designed_behaviour_and_not_a_finding(
     check = qd.check_escalations(landing_host)
 
     assert check.verdict == "ok"
-    assert check.extra == {"posts": 5, "rows": 1, "window_minutes": 1440}
+    assert check.extra == {"posts": 5, "storable": 5, "accounted": 1,
+                           "open_rows": 1, "window_minutes": 1440}
 
 
 def test_rows_without_posts_is_not_a_fault_either(monkeypatch, landing_host):
@@ -2126,21 +2287,141 @@ def test_rows_without_posts_is_not_a_fault_either(monkeypatch, landing_host):
     assert check.verdict == "ok"
 
 
-def test_rows_older_than_the_window_do_not_answer_for_todays_stuck(
+def test_a_row_older_than_the_window_STILL_answers_for_todays_stuck(
         monkeypatch, landing_host):
-    """The two counts have to describe the same span. A table full of last month's
-    blockers would otherwise vouch for a producer that has been severed since."""
+    """#737, and this test is the inversion of the one that shipped the bug.
+
+    Its predecessor asserted that rows aged 4000 and 9000 minutes could not answer for
+    today's posts, on the reasoning that the two counts have to describe the same span.
+    That reasoning is right about counts and wrong about these two writes.
+    `_raise_blocker` stores a standing question ONCE — re-raising is a no-op on the
+    partial unique index — so the row is written the first time and every announcement
+    after it returns "already an open blocker". Requiring a row inside the window makes
+    the verdict a function of how long a human has left the question unanswered, and it
+    was FAIL on a healthy live board for days.
+    """
     _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": _stored(4000, 9000)})
 
     check = qd.check_escalations(landing_host)
 
+    assert check.verdict == "ok"
+    assert check.extra["accounted"] == 2
+
+
+def test_rows_about_OTHER_subjects_do_not_vouch_for_todays_stuck(
+        monkeypatch, landing_host):
+    """The concern the age check was reaching for, kept and made exact.
+
+    A table full of last month's blockers must not vouch for a producer severed since —
+    but what makes it fail to vouch is that the rows are about something else, not that
+    they are old. Matching on subject keeps the guarantee and drops the false alarm; an
+    age test could only have had one or the other.
+    """
+    _board_paths(monkeypatch, {"/board": _stuck(3),
+                               "/blockers": _stored_about("91", "92", age=30)})
+
+    check = qd.check_escalations(landing_host)
+
     assert check.verdict == "fail"
-    assert check.extra["rows"] == 0
+    assert check.extra["accounted"] == 0 and check.extra["open_rows"] == 2
+
+
+def test_a_resolved_row_cannot_account_for_a_post_still_being_made(
+        monkeypatch, landing_host):
+    """An answered question is not a standing one. If the producer went on announcing
+    after a row was resolved, the row behind those posts is gone and the escalation is
+    once again unrecorded — which is the fault, not the history."""
+    body = {"blockers": [{"id": "0", "raised_at": _ago(400),
+                          "subject": {"kind": "issue", "value": "0"},
+                          "resolved_at": _ago(100)}]}
+    _board_paths(monkeypatch, {"/board": _stuck(1), "/blockers": (200, body)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.extra["open_rows"] == 0
+
+
+def test_posts_that_name_no_subject_are_excluded_and_never_the_fault(
+        monkeypatch, landing_host):
+    """#523's by-design exclusion, in the denominator rather than in prose.
+
+    These posts could never have had a row, so counting them against the row half would
+    trade #737's false alarm for a fresh one — a producer working exactly as designed,
+    reported as severed because it declined to store noise.
+    """
+    _board_paths(monkeypatch, {"/board": _unsubjected_stuck(6),
+                               "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert "storable by design" in check.detail
+    assert check.extra["posts"] == 6 and check.extra["storable"] == 0
+
+
+def test_a_subjectless_post_does_not_mask_a_severed_producer(
+        monkeypatch, landing_host):
+    """The other half of the exclusion: it takes posts out of the denominator, and it
+    must not take them out of the fault. A run carrying both shapes still fails on the
+    storable ones."""
+    subjectless = _unsubjected_stuck(4)[1]
+    both = 200, subjectless + _stuck(2)[1]
+    _board_paths(monkeypatch, {"/board": both, "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.extra["posts"] == 6 and check.extra["storable"] == 2
+
+
+def test_the_subject_preference_matches_the_producers(monkeypatch, landing_host):
+    """The copied tuple, held to the one `announce` actually uses.
+
+    `qb-doctor` imports nothing from `harness/loops`, so `ESCALATION_SUBJECT_PREFERENCE`
+    is a second spelling of `needs_human._SUBJECT_PREFERENCE` — and a second spelling is
+    how a matcher silently stops matching, which is the reasoning `headline` is factored
+    out under. Divergence here would leave every post looking unaccounted for: #737's
+    false alarm, arriving by a different route.
+    """
+    source = (Path(qd.__file__).resolve().parent.parent / "loops" / "needs_human.py")
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    declared = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", "") == "_SUBJECT_PREFERENCE" for t in node.targets))
+
+    assert declared == qd.ESCALATION_SUBJECT_PREFERENCE
+
+
+def test_a_pr_ref_outranks_the_issue_beside_it(monkeypatch, landing_host):
+    """Preference order is load-bearing, not decoration: `_raise_blocker` files the row
+    under the most specific subject the refs name, so a reader picking a different one
+    would look up a row that exists under another key and report it missing."""
+    post = {"id": 1, "type": "stuck", "ts": _ago(5),
+            "refs": [{"kind": "issue", "value": "10"},
+                     {"kind": "pr", "value": "20"}]}
+    row = {"blockers": [{"id": "0", "raised_at": _ago(900),
+                         "subject": {"kind": "pr", "value": "20"},
+                         "resolved_at": None}]}
+    _board_paths(monkeypatch, {"/board": (200, [post]), "/blockers": (200, row)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert check.extra["accounted"] == 1
 
 
 def test_a_row_raised_in_the_future_is_not_evidence_of_health(monkeypatch, landing_host):
     """Clock skew or bad data. `_age_minutes` returns it negative rather than clamping,
-    and this row discards it — the same rule the queue row applies to arrivals."""
+    and this row discards it — the same rule the queue row applies to arrivals.
+
+    Deliberately survives #737. That change drops the window's UPPER bound, because a
+    row legitimately outlives the posts it accounts for; it keeps this floor, because a
+    row dated after the moment it is read is not a fact about anything. Losing this
+    guarantee would have been a silent cost of the fix rather than part of it.
+    """
     _board_paths(monkeypatch, {"/board": _stuck(2), "/blockers": _stored(-90)})
 
     check = qd.check_escalations(landing_host)
@@ -2198,7 +2479,8 @@ def test_a_board_answering_nonsense_elements_is_reported_not_raised(
     check = qd.check_escalations(landing_host)
 
     assert check.verdict == "ok"
-    assert check.extra == {"posts": 0, "rows": 0, "window_minutes": 1440}
+    assert check.extra == {"posts": 0, "storable": 0, "accounted": 0,
+                           "open_rows": 0, "window_minutes": 1440}
 
 
 def test_a_board_without_blockers_deployed_has_not_severed_anything(
@@ -2667,6 +2949,224 @@ def test_a_refspec_that_does_not_bring_back_every_branch_is_unknown(pushed):
 
     assert check.verdict == "unknown"
     assert "refs/heads/*" in check.detail
+
+
+# ------------------------------- the other three refspec guards, and the ref audit (#611)
+#
+# `qb-catchup` grew four guards on this same question for #573 and this row grew none of
+# them, so on the configurations below the sweep refused and the doctor answered — two
+# tools disagreeing about whether the work on one disk exists anywhere else. Each test
+# here is a row of #611's table, and its sibling in `test_qb_catchup.py` runs the same
+# configuration through the sweep; `test_the_two_tools_refuse_the_same_configurations`
+# there executes both against one checkout, which is what stops these drifting apart.
+#
+# Every one of them back-dates an unpushed commit, so a guard that failed to fire would
+# not merely answer — it would answer `fail`, and the assertion would read the difference.
+
+
+def test_a_negative_refspec_is_unknown_even_though_a_positive_one_covers_every_head(pushed):
+    """`^refs/heads/private/*` alongside `refs/heads/*` fetches everything except those,
+    and the positive spec still satisfies a source-only check. The branches it holds back
+    are exactly the ones this row would then call work that exists nowhere else."""
+    _git(pushed, "config", "--add", "remote.origin.fetch", "^refs/heads/private/*")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "excludes `refs/heads/private/*`" in check.detail
+
+
+def test_a_refspec_whose_destination_is_outside_refs_remotes_is_unknown(pushed):
+    """`refs/heads/*:refs/cache/origin/*` brings back every head and puts none of it where
+    `--not --remotes` looks — full coverage to a check that reads only the source half."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/cache/origin/*")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "which is not under `refs/remotes/`" in check.detail
+
+
+def test_a_second_refspec_that_does_land_in_refs_remotes_is_coverage(pushed):
+    """The two refspec faults are not the same kind of fault. An exclusion holds branches
+    back whatever else is configured; a destination outside `refs/remotes/` only matters
+    when nothing ELSE brought the heads to where the question looks. Refusing over the
+    first of two legal refspecs would be a false refusal on a working configuration."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/cache/origin/*")
+    _git(pushed, "config", "--add", "remote.origin.fetch",
+         "+refs/heads/*:refs/remotes/origin/*")
+    _git(pushed, "fetch", "-q", "origin")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "fail", check.detail
+    assert "not under `refs/remotes/`" not in check.detail
+
+
+def test_an_orphaned_namespace_under_refs_remotes_is_not_trusted(pushed):
+    """The mirror image of the refspec check. The query trusts every ref under
+    `refs/remotes/`; only what a configured refspec writes is ever refreshed. A ref left
+    by a removed remote never self-corrects, because nothing will fetch it again — so it
+    is a permanent licence for whatever it reaches to read as safely elsewhere."""
+    _git(pushed, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/ghost/main` is under `refs/remotes/`" in check.detail
+    assert "no remote's fetch refspec writes there" in check.detail
+
+
+def test_a_ref_written_directly_at_refs_remotes_is_not_missed(pushed):
+    """`refs/remotes/ghost` is a legal ref layout with no `<remote>/<branch>` shape to it
+    at all, and `--not --remotes` trusts it exactly like any other ref under
+    `refs/remotes/`. An enumeration that counted path segments dropped it on the floor."""
+    _git(pushed, "update-ref", "refs/remotes/ghost", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/ghost` is under `refs/remotes/`" in check.detail
+
+
+def test_a_ref_no_refspec_writes_to_is_not_trusted_because_the_remote_name_matches(pushed):
+    """OWNERSHIP IS A REFSPEC DESTINATION AND NEVER A REMOTE NAME.
+
+    `origin` fetches every head into `refs/remotes/origin/branches/*` — legal, still under
+    `refs/remotes/`, so coverage is satisfied and nothing refuses for that reason. It does
+    not write `refs/remotes/origin/old` and nothing here ever will. Inferring ownership
+    from the top path segment matching a configured NAME trusts that ref anyway, and
+    `--not --remotes` then subtracts a ref nothing refreshes."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/remotes/origin/branches/*")
+    _git(pushed, "fetch", "-q", "origin")
+    _git(pushed, "update-ref", "-d", "refs/remotes/origin/main")
+    _git(pushed, "update-ref", "refs/remotes/origin/old", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/origin/old` is under `refs/remotes/`" in check.detail
+
+
+def test_an_orphaned_namespace_that_merely_shares_a_prefix_is_not_trusted(pushed, tmp_path):
+    """The looser half of the same fault. A remote name may itself contain a slash, and a
+    guard that accepted any namespace a configured name merely BEGAN with would read an
+    orphaned `refs/remotes/team/bob/` as covered because `team/alice` starts with `team/`.
+    Nothing will ever refresh it; asking the refspecs where they write tells them apart."""
+    _git(pushed, "remote", "add", "team/alice", str(tmp_path / "origin.git"))
+    _git(pushed, "fetch", "-q", "team/alice")
+    _git(pushed, "update-ref", "refs/remotes/team/bob/main", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`refs/remotes/team/bob/main` is under `refs/remotes/`" in check.detail
+
+
+def test_a_destination_of_exactly_a_star_vouches_for_nothing(pushed):
+    """A bare `*` names no namespace, so it establishes ownership over none.
+
+    Found by review, and it was a divergence in the one direction this change exists to
+    close. `dst[:-1]` on a destination of `*` is the empty string, and `ref.startswith("")`
+    is True for every ref — so a single such refspec would vouch for the whole
+    `refs/remotes/` namespace, orphans included, and this row would answer where the sweep
+    refuses. The shell reaches the opposite answer (`${ref#""}` equals `$ref`, owning
+    nothing) and the shell is right.
+
+    Git accepts `+refs/tags/*:*` beside a normal refspec, and `git remote` does not object,
+    so this is a configuration a person can actually be running.
+    """
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/*:refs/remotes/origin/*")
+    _git(pushed, "config", "--add", "remote.origin.fetch", "+refs/tags/*:*")
+    _git(pushed, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown", check.detail
+    assert "`refs/remotes/ghost/main` is under `refs/remotes/`" in check.detail
+
+
+def test_a_refusal_states_the_fault_once_and_not_twice(pushed):
+    """Every refusal here is rendered by the caller as "<reason>, so what exists only on
+    this disk was not asked", so a reason closing on its own version of that clause said it
+    twice. The single-branch case is the likeliest of the five to be met in the wild — any
+    single-branch clone — and the older test asserted only that `refs/heads/*` appeared,
+    which is why nothing caught it."""
+    _git(pushed, "config", "--replace-all", "remote.origin.fetch",
+         "+refs/heads/main:refs/remotes/origin/main")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert check.detail.count("exists only on this disk") == 1, check.detail
+    assert check.detail.count("exists nowhere else") == 1, check.detail
+
+
+def test_a_refspec_read_that_failed_is_not_a_remote_that_maps_nothing(pushed, monkeypatch):
+    """An inspection that did not happen must not be reported as one that found nothing.
+
+    `git config --get-all` exits 1 for "no such key", which is a FACT about the
+    configuration; anything else is a git that would not answer. Conflating them names a
+    configuration fault that may not exist and sends the reader to fix the wrong thing."""
+    real = qd.run_cmd
+
+    def refuses_config(argv, **kwargs):
+        if argv[:1] == ["git"] and "--get-all" in argv:
+            return 4, "", "boom"
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", refuses_config)
+    _commit(pushed, "mine-only", days_ago=19)
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "would not read `remote.origin.fetch` (exit 4)" in check.detail
+    assert "does not fetch" not in check.detail, "it named a fault it had not established"
+
+
+def test_a_remote_with_no_fetch_refspec_at_all_says_which_fault_it_is(pushed):
+    """The clean-but-empty answer, told apart from the failed read above. Both would
+    otherwise print the same sentence about `refs/heads/*`, and only one of them is true."""
+    _git(pushed, "config", "--unset-all", "remote.origin.fetch")
+    _commit(pushed, "mine-only", days_ago=19)
+
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "`origin` has no fetch refspec at all" in check.detail
+
+
+def test_an_inventory_of_refs_that_failed_refuses_rather_than_finding_nothing(
+        pushed, monkeypatch):
+    """The one guard here that could fail OPEN. A `for-each-ref` that died on a corrupt
+    ref or a permission yields no lines, and an audit that iterates nothing finds nothing
+    — so the question would be answered out of refs that were never checked."""
+    real = qd.run_cmd
+
+    def refuses_inventory(argv, **kwargs):
+        if argv[:1] == ["git"] and "for-each-ref" in argv and "refs/remotes/" in argv:
+            return 128, "", "boom"
+        return real(argv, **kwargs)
+
+    monkeypatch.setattr(qd, "run_cmd", refuses_inventory)
+    _commit(pushed, "mine-only", days_ago=19)
+    check = qd.check_unpushed(host_for(pushed))
+
+    assert check.verdict == "unknown"
+    assert "would not list the refs under `refs/remotes/`" in check.detail
 
 
 def test_a_log_line_that_did_not_parse_is_not_read_as_nothing_stranded(pushed, monkeypatch):

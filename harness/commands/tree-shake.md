@@ -18,9 +18,28 @@ cleans their DB, containers, nginx block, port, and dir in one go):
 
 - List live worktrees: `git worktree list`.
 - For each linked worktree (not the main checkout), check whether its branch is
-  done — e.g. its PR is merged (`gh pr view <branch> --json state,mergedAt` or
-  `gh pr list --head <branch> --state merged`) or the branch is fully merged
-  into the default branch (`git branch --merged`).
+  done — its PR is merged (`gh pr view <branch> --json state,mergedAt` or
+  `gh pr list --head <branch> --state merged`).
+- **Do not judge "done" against the default branch.** `git branch --merged main`
+  is only meaningful where PRs actually target the default branch, and in at
+  least one repo here they do not: lexray merges into `fca` and `test` while
+  `main` sits frozen, so that check calls every branch unmerged.
+- **A merged PR does not mean the branch holds nothing.** Commits added *after*
+  the PR — the post-merge tweak nobody pushed — die with the branch, and
+  `remove-worktree` deletes the branch unless `--keep-branch`. Compare against
+  the PR's own head SHA, which is base-independent:
+  ```bash
+  head=$(gh pr list --head "$br" --state all --json headRefOid -q '.[0].headRefOid')
+  git cat-file -e "$head" || echo "cannot verify — treat as in-progress"
+  git log --oneline "$head".."$br" --not --remotes    # non-empty => do not reap
+  ```
+  `--not --remotes` is what makes this about loss rather than tidiness:
+  `remove-worktree` deletes only the *local* branch, so a post-PR commit already
+  pushed somewhere survives the teardown and must not block it.
+  The `cat-file` guard is load-bearing: with the object absent `git log` fails and
+  a bare `| wc -l` reads 0, i.e. "nothing to lose" on exactly the branch you
+  cannot vouch for. `remove-worktree` refuses these itself, but classify them as
+  in-progress here so the user is not offered them in the first place.
 - **A merged PR does not mean nobody is in there.** Run
   `worktree-holder <path>` on every candidate before offering it for teardown,
   and treat exit 3 as in-progress no matter what its PR says — an agent can be
@@ -41,14 +60,38 @@ finished worktrees.
 ## 2. Dry-run the orphan sweep
 
 Run `prune-worktrees` with **no flags** (dry-run) and show the user the full
-report verbatim. It reports five categories:
+report verbatim. It reports six categories:
 - Orphan databases
 - Stale port entries
 - Leftover directories
 - Orphan containers
 - Orphan nginx blocks
+- Orphan board claims
 
 If it says "Nothing to prune. Clean.", report that and stop — you're done.
+
+### A `NOT CHECKED` line is not a clean one
+
+Each category has a fourth state (#735), and it is yellow rather than green:
+
+```
+? Orphan board claims: NOT CHECKED — `qb-claimed` exited 2 (no board configured,
+                                     or it could not be reached)
+```
+
+That category has **no answer** — not an empty one — so relay it as unresolved
+rather than folding it into "nothing found", and do not report the sweep as
+complete. `Nothing to prune. Clean.` is withheld from such a run for the same
+reason; what prints instead names which categories went unchecked, and the sweep
+is worth re-running once the cause is fixed.
+
+It matters most for claims. Everything else here is recoverable by sweeping
+again — a leftover directory is still there next time — but a claim sits on an
+8h TTL and this sweep is what hands it back early, so a category silently
+skipped is a plan item held for the rest of the day.
+
+This is the same rule as step 2a and as `worktree-holder`'s exit 4: a check
+nobody made must not read as a check that passed.
 
 ### 2a. Independently verify the destructive categories (MANDATORY)
 
@@ -99,7 +142,8 @@ a rebuild on the next test run.
 
 Show the user exactly which categories are non-empty and ask whether to apply.
 The flags map to categories:
-- `--prune` — drop orphan DBs + rewrite `.worktree-ports`
+- `--prune` — drop orphan DBs + rewrite `.worktree-ports`, and hand back the
+  orphan board claims
 - `--remove-dirs` — `rm -rf` the leftover directories
 - `--remove-containers` — `docker rm -f` the orphan containers
 - `--remove-nginx` — strip the orphan nginx blocks and restart nginx

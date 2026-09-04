@@ -49,7 +49,7 @@ def repo(tmp_path, monkeypatch):
 
     bare = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
-    git(work, "remote", "add", "origin", f"https://github.com/acme/myrepo.git")
+    git(work, "remote", "add", "origin", "https://github.com/acme/myrepo.git")
     git(work, "remote", "set-url", "origin", str(bare))
     git(work, "push", "-q", "origin", "main")
     git(work, "remote", "set-head", "origin", "main")

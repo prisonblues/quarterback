@@ -729,18 +729,26 @@ def test_a_repository_with_no_remote_says_nothing_about_stranded_work(fleet):
 # and these tests are what keep the duplicate honest — because two tools disagreeing
 # about "does this work exist elsewhere" is worse than either being wrong on its own.
 #
-# AND ON EXACTLY THREE THINGS, WHICH IS NOT THE SAME AS AGREEING. Pinned here: the QUERY,
-# the GRACE WINDOW, and the age verdict both reach about one ordinary checkout. The
-# refspec and ref-ownership guards this sweep grew for #573 are `qb-catchup`-ONLY —
-# `qb-doctor`'s `_maps_every_head` reads the SOURCE half of a refspec and nothing else,
-# so on a negative refspec, a destination outside `refs/remotes/`, an orphaned ref under
-# `refs/remotes/` or a `config` read that failed, the doctor answers where the sweep
-# refuses. Nothing below catches that, deliberately: closing it means changing
-# `qb-doctor`. Do not read these as a general agreement invariant.
+# AND ON WHAT IS PINNED HERE, WHICH IS STILL NOT THE SAME AS AGREEING IN GENERAL. Pinned:
+# the QUERY, the GRACE WINDOW, the age verdict both reach about one ordinary checkout, and
+# — since #611 — the four refspec and ref-ownership guards this sweep grew for #573.
+#
+# THOSE FOUR USED TO BE `qb-catchup`-ONLY, and the note here said so. `qb-doctor`'s
+# `_maps_every_head` read the SOURCE half of a refspec and nothing else, so on a negative
+# refspec, a destination outside `refs/remotes/`, an orphaned ref under `refs/remotes/` or
+# a `config` read that failed, the doctor ANSWERED where the sweep refused — two tools
+# reaching opposite verdicts about whether the work on one disk existed anywhere else.
+# #611 ported them into `_refspec_coverage` and `_unowned_remote_ref`, and
+# `test_the_two_tools_refuse_the_same_configurations` below executes both against one
+# checkout per row, which is the only thing that keeps two implementations in two
+# languages from drifting back apart.
+#
+# What is still NOT pinned: everything else either tool decides. These are four named
+# configurations and three named properties, not a general agreement invariant.
 
 
 def test_both_tools_ask_git_the_same_question():
-    """The query only — not the guards around it, which are qb-catchup-only."""
+    """The query itself. The guards around it are pinned separately, and by execution."""
     catchup = (BIN / "qb-catchup").read_text()
     doctor = (BIN / "qb-doctor").read_text()
     assert '"$tip" --not --remotes --' in catchup, (
@@ -1304,12 +1312,10 @@ def test_the_two_tools_reach_the_same_verdict_about_the_age_of_unpushed_work(
     things about the same branch in front of a user. So this runs each of them against
     one checkout and compares the answers rather than the text.
 
-    ON THE AGE/GRACE-WINDOW PATH AND NOTHING WIDER. The repository here has one ordinary
-    remote fetching `refs/heads/*` into `refs/remotes/origin/*` and no stray refs, which
-    is the only configuration on which the two tools are known to agree. Point either of
-    them at a negative refspec, a destination outside `refs/remotes/`, or an orphaned
-    ref under `refs/remotes/` and they part company, because those guards live in the
-    sweep alone — see the note above the section.
+    ON THE AGE/GRACE-WINDOW PATH. The repository here has one ordinary remote fetching
+    `refs/heads/*` into `refs/remotes/origin/*` and no stray refs, so nothing either tool
+    guards against is in play and what is compared is the verdict about the age. The
+    configurations that used to part them are the next test's business (#611).
     """
     commit(fleet.main, "mine-only", days_ago=days_ago)
 
@@ -1321,6 +1327,55 @@ def test_the_two_tools_reach_the_same_verdict_about_the_age_of_unpushed_work(
     assert ("if this disk failed that work is gone" in done.stdout) is loud, done.stdout
     assert ("work in flight, which is the ordinary state" in done.stdout) is not loud, done.stdout
     assert ("work in flight, which is the ordinary state" in check.detail) is not loud, check.detail
+
+
+def _configure(fleet, row):
+    """One of #611's table rows, applied to the checkout both tools are about to read."""
+    if row == "negative-refspec":
+        git(fleet.main, "config", "--add", "remote.origin.fetch", "^refs/heads/private/*")
+    elif row == "destination-outside-refs-remotes":
+        git(fleet.main, "config", "remote.origin.fetch", "+refs/heads/*:refs/cache/origin/*")
+    elif row == "orphaned-namespace":
+        git(fleet.main, "update-ref", "refs/remotes/ghost/main", "HEAD")
+    elif row == "no-fetch-refspec":
+        git(fleet.main, "config", "--unset-all", "remote.origin.fetch")
+    else:                                   # pragma: no cover - guards the parametrize list
+        raise AssertionError(f"unknown row {row}")
+
+
+@pytest.mark.parametrize("row,phrase", [
+    ("negative-refspec", "excludes `refs/heads/private/*`"),
+    ("destination-outside-refs-remotes", "which is not under `refs/remotes/`"),
+    ("orphaned-namespace", "no remote's fetch refspec writes there"),
+    ("no-fetch-refspec", "`origin` has no fetch refspec at all"),
+])
+def test_the_two_tools_refuse_the_same_configurations(fleet, row, phrase):
+    """#611, and the reason it was worth doing rather than documenting.
+
+    Each row is a configuration on which the sweep refused the question and `qb-doctor`
+    answered it — the same disk, the same commits, two opposite verdicts about whether
+    the work on it existed anywhere else. A reader who ran the tool that answered got a
+    number computed from tracking refs it had no business trusting.
+
+    EXECUTING BOTH, for the reason the age test above gives: a grep over two sources
+    proves a literal is present in a file, never that it is on the live code path. Two
+    implementations in two languages cannot share code, so this is what holds them
+    together — and it fails the moment either side grows a guard the other has not.
+
+    The commit is nineteen days old, so a guard that failed to fire would not merely
+    answer: it would answer LOUDLY, which is the difference these assertions read.
+    """
+    _configure(fleet, row)
+    commit(fleet.main, "mine-only", days_ago=19)
+
+    done = fleet.run()
+    check = _doctor_unpushed(fleet.main)
+
+    assert done.returncode == 0, done.stderr
+    assert phrase in done.stdout, done.stdout
+    assert check.verdict == "unknown", check.detail
+    assert phrase in check.detail, check.detail
+    assert "on no remote ref" not in done.stdout, done.stdout
 
 
 @pytest.mark.parametrize("kw,verdict", [

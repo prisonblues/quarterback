@@ -59,8 +59,8 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 #: The harness's own bin/, which is the authoritative list of names a sandbox
 #: PATH must not resolve. Read as a directory rather than written out here, so a

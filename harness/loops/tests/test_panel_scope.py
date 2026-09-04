@@ -28,10 +28,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
-import panel_scope  # noqa: E402  — scope/range readers moved here in #129
 import panel_core  # noqa: E402  — `sh` is defined here since #129
-import panel_seats  # noqa: E402  — these seats moved here in #129
 import panel_preflight as pf  # noqa: E402  — the pre-flight verdict (#138)
+import panel_scope  # noqa: E402  — scope/range readers moved here in #129
+import panel_seats  # noqa: E402  — these seats moved here in #129
 
 
 def chunk(path: str, body: str) -> str:
@@ -1063,7 +1063,16 @@ SCOPED = panel.ReviewScope(scope="increment", diff=PR, increment=INCREMENT,
 def budget_for_partial_context() -> int:
     """A budget that buys the frame, the markers and the whole target, and then
     runs out part way through the context — the case the whole priority order
-    exists for, and the one the short-context note and veto are about."""
+    exists for, and the one the short-context note and veto are about.
+
+    It is the number that reaches `material` as well as the number a repo would write,
+    which is worth saying because #550 puts the PR's own claim in the same slot and
+    charges it to the same budget. It costs nothing here, and since #631 charged the
+    JUDGE for the claim too the reason is worth spelling out: the block may take at
+    most a quarter of the budget it is charged to, and this one is far under that — so
+    the judge's rounds here send no claim and the assertions below are about the
+    priority order alone. A change that made the claim bite would arrive as a
+    `config_notes` line rather than as silently shorter material."""
     want = overhead(SCOPED) + 250 + len(INCREMENT)
     target, context = SCOPED.material(want)[1:]
     assert target == len(INCREMENT), "the budget must not cut the target"

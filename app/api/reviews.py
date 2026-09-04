@@ -189,12 +189,13 @@ object has", refuted by a transcript carrying it in all 801 assistant usage
 blocks — and that refutation is recorded nowhere.
 
 ``POST /review/outcomes`` records the terminal state whoever ACTED on the finding
-puts on it: ``fixed | refuted | deferred | superseded``. ``refuted`` is what pays
+puts on it: ``fixed | narrowed | refuted | deferred | superseded``. ``refuted`` is what pays
 for the release and is the cheapest to capture, because the refutation is already
 being written in the PR comment and the fix commit's message, in prose that
 nothing can count. ``deferred`` gives the parked backlogs a state instead of a
 markdown list; ``superseded`` is what a later round marks a finding as when it
-re-derives it.
+re-derives it; ``narrowed`` (#615) is the one that is a FIX — real, repaired at
+the point it was raised, general form left unwritten and named in the note.
 
 Three properties hold the thing up:
 
@@ -323,6 +324,252 @@ Three rules make the number worth reading:
   and ``human_refuted``, which is what makes the declaration falsifiable rather
   than free. ``scripts/needs_human_labels.py`` projects the vocabulary onto the
   ``needs-human/*`` GitHub labels, so #63's stated signal is real.
+
+**#643 — a fifth dropped key, and the check that stops there being a sixth.** The
+v2.26 note above records three fields the panel sent and this model discarded
+without a word; #626 added ``converged`` as the fourth. Each was found by a human
+noticing a number was missing, months apart, and nothing ever failed. The reason
+is at the top of :class:`ReviewIn`: ``extra="ignore"`` is pydantic's default and
+this model does not override it, so a key the panel sends and this model does not
+name goes on the floor.
+
+``tests/test_payload_key_drift.py`` is the check that was missing. It reads every
+top-level key the panel's payloads carry out of ``harness/loops/panel.py`` — by
+``ast``, not by import, for the reason ``tests/test_post_type_drift.py`` gives —
+and compares them against this model's field names **and aliases**. What is left
+over is what ingest drops, and the test holds it against a hand-written list of
+the keys that are dropped **on purpose**. So a key added to the payload fails the
+suite on the commit that adds it, and the only way past is to name it: as a field
+here, or as a line on that list. Neither is silence, which is the whole point.
+
+The list is written out rather than computed. A computed one would pass forever,
+which is the failure mode of every check this class of bug has survived.
+
+``review_panel`` is the one key that came off that list rather than going onto
+it. It is the dial set a round APPLIED — the twelve #165/#297 settings — and it
+is what ``converged`` was decided under: two of that flag's conjuncts are cut at
+``cleared_floor``, which is a function of three dials in this object, so a reader
+handed ``converged`` had no way to check it against anything. It is stored
+opaquely and nothing here reads a dial out of it (``app/api/dials.py`` argues why
+this board must not learn the vocabulary), carried on ``GET /review/{id}`` beside
+the verdict, and refused whole rather than trimmed when it is too big to store —
+half a policy record is not a smaller policy, it is one no round ran under.
+
+**#647 — the working behind a number this board already stores.** #643 stored
+the dial VALUES and left five keys on that list which are the working behind
+numbers this model already binds — ``provenance_counts`` since v2.26,
+``diff_chars`` since before it. All five are stored now, and the argument is one
+sentence: a stored answer whose denominator is not on the row is an answer nobody
+can recalibrate against.
+
+* ``fix_range_source`` (#512) — WHICH range answered: ``increment`` (the diff the
+  round reviewed), ``compare`` (the separate API fetch) or ``reconstructed``
+  (#504's rebuild after a rewritten history). The three are not one measurement:
+  the increment drops a base-branch merge's files and the compare range does not.
+* ``provenance_restored`` (#559) — how much of the fix range the round declined
+  to attribute because the cycle had already seen it, which earlier rounds it
+  compared against, and ``why`` where the comparison could not be made at all.
+* ``rules`` (#305) — which LAYER supplied each dial, with the reason and expiry
+  for a board dial. ``review_panel`` is ``Dials.as_dict()`` and does **not**
+  carry ``escalate_on``; this does, which makes it the only field on the row that
+  records the threshold a round ran under.
+* ``scope`` and ``since_sha`` — what the round actually reviewed. ``diff_chars``
+  is stored and is scope-dependent, so a consumer comparing it across a cycle's
+  rounds without these is comparing two different measurements.
+
+Two of them are objects and are stored the way ``review_panel`` is — opaque,
+whole-or-not-at-all, size-bounded, on ``GET /review/{id}`` only. Three are
+scalars and ride ``_run_view``, so every view carries them: they are exactly what
+a consumer slicing a POPULATION needs, and the rule ``merge_base`` and
+``base_sha`` already state is that a scalar whose whole point is cross-run
+comparison must not cost one fetch per run.
+
+The remaining twenty are listed in that test with the reasoning for each
+tier. None of them shares a name with a ``review_runs`` column, which the test
+also asserts: that pairing — a column that wants a value, and a payload sending
+it into ``extra="ignore"`` — is exactly the shape ``converged`` had.
+
+**#112 — and which HARNESS produced the round.** Everything above says how a
+round was configured and what its numbers were measured against. Nothing said
+what RAN it. ``.harness-rules`` argues at length that an unpinned reviewer MODEL
+makes "codex found more than claude" unattributable, and pins three of the four
+seats for that reason; the harness itself was unpinned and unrecorded, and it
+changes far more often than a vendor slug. Four fields close that, and there are
+four because no ONE of them is true in every case:
+
+* ``harness_rev`` — the commit of the checkout the panel ran from. The only
+  AUTHORITATIVE one, and null on every installed harness, the nix store being no
+  checkout. The panel refuses to report a rev it cannot prove is the harness's
+  own, so a scratchpad copy inside some other repository sends null rather than
+  that repository's HEAD.
+* ``harness_dirty`` — whether that checkout carried changes the rev does not.
+  What makes a rev honest rather than merely present.
+* ``harness_digest`` — a scheme-tagged content hash of the loop modules. A
+  PROXY, in ``qb-doctor``'s own words about the same problem: the truthful answer
+  is the flake pin's rev and no running harness can reach it, so content stands
+  in. It cannot name a version; it is the only field always present and never
+  wrong about "same code, or not", which is the question an r1 -> r2 comparison
+  actually asks.
+* ``harness_path`` — where it ran from. A LOCATOR, machine-scoped, and the only
+  field that says a round did not come from the deployed harness at all.
+
+Stored verbatim and never interpreted: this board has no checkout of the harness
+to resolve a rev against, does not recompute a digest and does not parse a store
+path. The first three ride every view because a recalibration slices a
+population on them; the path is detail-only, on ``unread_files``' rule.
+
+**#624 — and the fix pass itself, which is the one actor here nothing recorded.**
+Everything above is about a ROUND: what it read, under which dials, with which
+seats, produced by which harness, ending in which verdict. Reviewers have
+scorecards, findings have keys and terminal outcomes, rounds have this row. The
+actor BETWEEN two rounds — the fix pass, which writes the code that produces the
+next round's findings — had a paragraph in a markdown brief and nothing else. On
+``prisonblues/lexray#1780`` its four passes ran to +850/-314 across 11 files,
++322/-49 across 9, +356/-41 across 12 (seven of them files no round had read) and
++142/-31 across 7, and every one of those numbers was reconstructed from ``git`` by
+hand, afterwards, in order to file the issue.
+
+* ``fix_pass`` — the record, verbatim and opaque
+  (:func:`_fix_pass_or_none`): the commit range and which of the three readers
+  supplied the diff, which round's To fix list briefed it and how big that list
+  was, the production / test / prose churn split, the files it touched and which of
+  them no earlier round of the cycle had read, which of the brief's findings this
+  round no longer raises, how many of this round's findings were attributed to it,
+  the ``narrowed``/``declined``/``escalated`` keys the pass declared, and ``gaps``
+  — the record's own account of what it cannot say. Detail-only on ``rules``' rule,
+  since it carries the file list and the finding keys.
+* ``fix_pass_counts`` — the record's own integer summary, LIFTED rather than
+  computed (:func:`_fix_pass_counts_or_none`), riding every view for the reason the
+  three tallies do: #624's instruction is to calibrate against real cycles before
+  anything is scored, and a calibration reads a population. Lifted off the value AS
+  SENT, so a record refused for its size still leaves its eleven integers — a pass
+  wide enough to blow the cap is wide because its file list is long, which is the
+  runaway #619 and #624 exist to expose, and coupling the two would have left that
+  row as the one with no numbers on it.
+
+Every value in the record was derived by the panel from the diff, the commits and
+the payload the pass was given — never from the pass's account of itself, which is
+what #622 and #621 exist to remove — so this board derives none of them.
+
+**And it is deliberately not a leaderboard**, which is half of #624's title and a
+constraint on the schema rather than a note above it. Its second opinion is that
+every obvious ratio over a fix pass is gameable in a direction worse than the
+disease: lines per finding cleared rewards compressed and superficial fixes,
+findings introduced per pass rewards weakening tests and avoiding the files most
+likely to be read, new files opened rewards refusing a cross-file repair that is
+genuinely required, and share still standing a round later is invalid under
+increment scope. So the record carries **no actor key at all** — it names the pass
+by its range and the round that briefed it, never the agent, model or session that
+performed it, which is a stronger guarantee than a policy of not writing the query
+— there is no ratio column, nothing is indexed to invite an aggregation, and
+``GET /review/stats``, the leaderboard this table already feeds, does not read
+either field.
+
+**#646 — a value Postgres will not store, anywhere in the body, and the round is
+still recorded.** Every note above fixed the instance it created: ``review_panel``
+refused a NUL and a ``NaN`` in its own validator, #647's two blocks joined it, and
+#112 found the same 500 on ``scope`` while adding two fields that would have had
+it. A probe found it in twenty-eight further places — every free-text field, every
+path list, the ``reviewers`` mapping's own KEYS, every finding title, every
+per-reviewer account. Postgres holds a NUL in neither ``text`` nor a ``JSONB``
+string and holds no non-finite number at all; ``json.loads`` accepts all four. So
+the refusal happened at the INSERT: a 500 on a round that had passed every check
+this module makes, which the panel records as "the board did not answer" and
+nothing distinguishes from a board that was down.
+
+So it is ONE pass over the whole body — :func:`_storable_body`, called first thing
+in :meth:`ReviewIn._count_files_sent`, the only place that sees every nested value
+while it is still a plain mapping. Thirty coercers each remembering is not a rule,
+and the per-coercer checks that predate it are removed rather than left beside it
+(see :func:`_word_or_none`): a chokepoint with exceptions is not one.
+
+The decision the issue was filed to settle is what to do with each value, and it
+is three answers rather than one, each decided on what a wrong one would silently
+assert.
+
+* A value whose whole purpose is to be **MATCHED** is dropped
+  (:data:`_MATCHED_KEYS`) — the path lists, a finding's ``file``, ``harness_path``
+  and ``harness_digest``. Each is compared with ``==`` somewhere nothing reports
+  the miss: an unread path against the next round's diff, a changed file against
+  another PR's, a digest against the previous round's to answer "same code, or
+  not". A marked token is not a shortened one, it is a DIFFERENT token, and it
+  answers that comparison wrongly forever.
+* An **opaque policy record** keeps its whole-object refusal and the pass does not
+  reach it (:data:`_OPAQUE_FIELDS`), so #78's ``threshold_by_severity`` inside
+  ``review_panel`` is refused with the dial set rather than edited inside it.
+* **Everything else** — prose, names, identities, vocabulary words, mapping keys —
+  keeps its value with the NUL replaced by :data:`UNPRINTABLE`, because the
+  alternative for a reviewer's account is to store nothing, and the mark is what
+  keeps it from being a silent edit.
+
+A marked value is not thereby believed **where a coercer follows**: ``head_sha``,
+``harness_rev``, ``provenance`` and ``pr_state`` meet theirs immediately afterwards
+and are refused there, under the drop signal they already had. Where none follows,
+the marked value is STORED, and ``scope``/``fix_range_source`` are the deliberate
+case: :func:`_word_or_none` argues at length that those two must be read against no
+vocabulary, and its own conclusion — that a value outside the set gives a consumer
+"an extra group it can SEE, rather than a value folded into a group it cannot" — is
+the argument for marking them rather than nulling them.
+
+Nothing is a **422**: refusing the request loses the findings, the scorecards and
+the accounts along with the byte, which is the loss the issue is about. ``repo`` is
+the one exception, and it was already refusing.
+
+All of it reported, in ``nul_replaced`` / ``nul_dropped`` / ``nonfinite_dropped``,
+by dotted position. ``POST /review/outcomes`` has the same defect and the opposite
+remedy — per-item refusal, see :meth:`OutcomeIn._no_nul` — because that endpoint's
+rule, stated in :func:`_outcome_reason`, is that a fixer can simply be told where
+the panel cannot.
+
+**#732 — the same silent drop, one tier in.** Every drop above is a TOP-LEVEL key
+the panel sent and this model did not name, and ``tests/test_payload_key_drift.py``
+(#643) was written so the next one would fail the suite on the commit that added
+it. That check reads the payload's top level. ``round_stop`` is a nested object,
+:class:`StopIn` binds it, and nothing compared that model's fields against what
+``panel_rounds.round_stop`` nests inside it: the producer returned **24** keys, the
+model declared **6**, and the other eighteen went on the floor by exactly the
+mechanism this whole note is about — ``populate_by_name=True`` with no ``extra=``,
+one indent further in than anybody was looking. #717 is the proof it was live:
+``outstanding`` was sent from #42, bound by nothing, and found by a human noticing
+a number was missing while the drift check stood green.
+
+Eighteen keys, each decided once, and the decision written where a nineteenth
+cannot slip past it. Twelve are bound:
+
+* ``cleared_floor`` — the floor the round was required to clear, and the cut
+  ``outstanding_counts`` is SPLIT at. Storing a split without its cut left a reader
+  holding ``{"fixable": 2, "below_floor": 11}`` unable to say what either number
+  meant. It is derivable from three dials in ``review_panel`` and is deliberately
+  not derived here: a board-side derivation is a second reading of the policy that
+  produced the verdict stored beside it, which is what ``converged`` refuses to be.
+* ``new_below_trigger_floor`` and ``repeated_below_trigger_floor`` — how many
+  findings this round raised, and how many an earlier round had, that fell under
+  the trigger floor and so bought no round. Counted, never carried, on
+  ``outstanding_counts``' rule. Two columns and not a sum: one says the floor is
+  turning work away at the door and the other says work already inside the cycle
+  never gets done, and #710 had to reassemble both by hand.
+* ``stop_rungs`` — the eight ``escalate_on`` rungs and the premise brake's state
+  (:data:`STOP_RUNGS`), verbatim and opaque. #712's complaint is that every rung
+  "is a claim about a cycle's series, and no endpoint serves one"; part of why is
+  that none of them ever reached a row. ONE column and not nine, because each block
+  is a measurement beside its own ``over``/``fired`` verdict and which scalar out
+  of each matters is what #710 has yet to answer — a column per rung now would be
+  this board deciding that from a position of never having held the numbers.
+
+The other six get no column and a written reason each, in that test file:
+``escalated_outstanding``, ``declined_outstanding`` and ``narrowed`` are
+``outstanding``'s own buckets under flatter names, off the same locals, already
+stored as lengths; ``round`` arrives at the top level too; ``max_rounds`` and
+``trigger_floor`` are ``Dials`` attributes ``review_panel`` has held verbatim since
+#643.
+
+**Not ``extra="forbid"`` on ``StopIn``**, and that is the standing rule rather than
+a preference here. A payload is never refused over one field —
+:func:`_outstanding_or_none` makes the argument at length — and
+:class:`OutcomeIn` is deliberately the only ``extra="forbid"`` on this path. A
+misspelled key must not take the findings, the scorecards and the accounts down
+with it. What ends a silent drop is a check that fails in CI on the commit that
+adds the key, not a gate that 500s a producer in the field.
 """
 
 from __future__ import annotations
@@ -335,6 +582,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from math import isfinite
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
@@ -614,6 +862,12 @@ MAX_BUCKET_ECHO = 64
 #: escapes as well as ESC itself. See :func:`_echo`.
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
+#: What stands in for a character that arrived and cannot be shown. One spelling,
+#: used by :func:`_echo` on the way OUT and by :func:`_storable` on the way IN
+#: (#646), because a reader meeting it in a stored ``detail`` and in a drop signal
+#: naming that same field should not have to learn that they are two marks.
+UNPRINTABLE = "␦"
+
 #: How many distinct unrecognised names one response will list. ``MAX_BUCKET_ECHO``
 #: bounds each name and nothing bounded the COUNT, so a tally with ten thousand
 #: junk keys — or a payload whose findings each spell a different one — was sorted
@@ -666,13 +920,42 @@ del _no_column
 #: ``deferred`` gives the parked backlogs (#66, #69, #72, #74 and the ones after
 #: them) a state instead of a markdown list. ``superseded`` is what a later round
 #: marks a finding as when it re-derives it.
-OUTCOMES = ("fixed", "refuted", "deferred", "superseded")
+#:
+#: ``narrowed`` is #615, and it is a FIX rather than a way out of one: the finding
+#: is real, this pass fixed it **at the point it was raised**, and the general
+#: form is not this pass's work. The other three all answer *whether* to act and
+#: none of them answered *how far*, so a fixer that could not answer a finding
+#: partially answered it maximally — measured on lexray#1780, rounds 3-5: one
+#: finding about one nginx location block became server-level ``gzip``, and the
+#: next round's P1 was that it had weakened ETags on an unrelated endpoint. The
+#: maximal answer is what makes a pass edit files the finding never named, and
+#: those files are where the next round's findings come from. So it sits with
+#: ``fixed`` and never with ``deferred`` wherever the two are read apart: it
+#: CLEARS (:data:`app.review_queue.CLEARING_OUTCOMES`, and ``round_stop``'s own
+#: filter one directory over), and it owes a note the way ``refuted`` does — the
+#: general form the fix did not take, which is the entire reason the word exists.
+#: A bare ``narrowed`` is a ``fixed`` that has lost the only thing telling the two
+#: apart.
+OUTCOMES = ("fixed", "narrowed", "refuted", "deferred", "superseded")
 
 #: The two outcomes that are a judgement about whether the finding was RIGHT, and
 #: therefore the only two in the precision-after-the-fact ratio. ``deferred`` and
 #: ``superseded`` are decisions about what to do next and say nothing about
 #: correctness — counting either as a success would make "we did not get to it"
 #: read as "it was real", which is the direction that flatters.
+#:
+#: ``narrowed`` is the value that rule does NOT settle, and it is held out anyway
+#: (#615). It IS a judgement that the finding was right — the fixer says the
+#: defect is real and repaired where it was raised — so on the sentence above it
+#: belongs here, and holding it out means a reviewer whose real findings were all
+#: narrowly fixed has no ``precision_after`` at all. What decides it is which way
+#: the error runs. Folding ``narrowed`` in moves the numerator and the
+#: denominator together and RAISES every ratio it touches: 1 fixed, 1 refuted and
+#: 8 narrowed reads 50% held out and 90% folded in. An unsettled measurement is
+#: taken on the unflattering side here, so the word is published as its own bucket
+#: in ``by_outcome``, where a reader can see it and count it, and is not yet spent
+#: on a headline percentage. Widening this tuple is a decision about a published
+#: figure and wants its own one; it is not a consequence of adding the word.
 OUTCOMES_SCORED = ("fixed", "refuted")
 
 #: The longest note this endpoint stores. Long enough for the refutation itself —
@@ -876,7 +1159,7 @@ def _echo(v: object) -> str:
     of a drift signal should see that it did.
     """
     s = v.strip() if isinstance(v, str) else str(v)
-    s = _CONTROL_RE.sub("␦", s)
+    s = _CONTROL_RE.sub(UNPRINTABLE, s)
     return s[:MAX_BUCKET_ECHO] + "…" if len(s) > MAX_BUCKET_ECHO else s
 
 
@@ -1353,7 +1636,107 @@ class StopIn(BaseModel):
     #: reviewer was truncated / absent / unparsed / declaring a gap — the cases
     #: where "no new findings" is a fact about the panel, not about the code.
     confident: bool = False
+    #: Whether the stop was a **clean finish** (#626) — the number the convergence
+    #: epic is judged on. Strictly stronger than ``confident``: the panel builds it
+    #: from that flag and then subtracts everything the cycle was still holding, so
+    #: a below-floor policy stop is ``confident: true`` and ``converged: false``.
+    #:
+    #: ``None``, not ``False``, when the caller did not send it — and this is the
+    #: one field on this model where that split is load-bearing rather than tidy.
+    #: ``confident`` may default to ``False`` because a payload that never said
+    #: must not buy a landing, and there is a reader (``preland
+    #: --require-earned-stop``) for whom silence and denial are the same answer.
+    #: Nothing gates on ``converged``; its only reader is a RATE, and a default of
+    #: ``False`` would put every round from a producer too old to send the field
+    #: into the denominator as a failure to converge. So silence stays silence, and
+    #: ``GET /review/convergence`` counts it under ``unmeasured``.
+    converged: bool | None = None
     veto: list[str] = Field(default_factory=list)
+    #: WHAT THE CYCLE LEFT BEHIND and who it went to (#42, stored by #717): the
+    #: ``fixable`` / ``below_floor`` / ``escalated`` / ``narrowed`` / ``declined``
+    #: key lists and the ``handed_to`` verdict over them.
+    #:
+    #: Taken raw and reduced by :func:`_outstanding_or_none` and
+    #: :func:`_handed_to_or_none` rather than modelled field by field, because
+    #: what is stored is five lengths and one word and a per-field model would
+    #: publish an opinion about the keys themselves — which are the panel's and
+    #: belong to the findings, not to this row.
+    #:
+    #: ``None`` when the caller nested a ``round_stop`` and sent no disposal,
+    #: which is every producer older than #42. The consumer that matters — the
+    #: merge gate in ``preland`` — falls back to holding on the raw confirmed
+    #: count there, so silence costs a strict verdict and never a lax one.
+    #:
+    #: Typed ``Any`` and not ``dict``, on this module's standing rule that a
+    #: payload is never refused over one field: ``outstanding: []`` from a
+    #: hand-rolled caller would be a 422 under a dict annotation, taking the
+    #: findings, the scorecards and the accounts down with it. The coercers below
+    #: turn it into NULL and the response names the drop.
+    outstanding: Any = None
+    #: THE FLOOR THIS ROUND WAS REQUIRED TO CLEAR (#732) — ``P1``..``P4`` or the
+    #: panel's own no-floor token, verbatim.
+    #:
+    #: Bound because ``outstanding`` above is SPLIT at it. A reader holding
+    #: ``outstanding_counts`` cannot say what ``below_floor`` means without
+    #: re-deriving ``Dials.cleared_floor``, which is a function of three separate
+    #: dials inside ``review_panel`` — and a board-side derivation would be a
+    #: second reading of the policy that produced the verdict stored beside it,
+    #: which is what :attr:`converged` refuses to be. One word from the producer
+    #: is the producer's answer, not a second reading.
+    #:
+    #: ``trigger_floor`` is deliberately NOT bound here. It is
+    #: ``Dials.round_trigger_floor`` unchanged and ``review_panel`` has held it
+    #: since #643; a second copy would be one dial in two places, free to
+    #: disagree. It is on ``DROPPED_BY_DESIGN``'s nested half in
+    #: ``tests/test_payload_key_drift.py`` with that reason written out.
+    cleared_floor: str | None = None
+    #: The findings that fell under ``review_panel.round_trigger_floor`` and so
+    #: bought no round, split by whether this round was the first to raise them
+    #: (#621, bound by #732). Stored as LENGTHS — see :func:`_below_floor_count`.
+    #:
+    #: Typed ``Any`` and not ``list``, on this module's standing rule that a
+    #: payload is never refused over one field: ``new_below_trigger_floor: 3``
+    #: from a hand-rolled caller would be a 422 under a list annotation, taking
+    #: the findings, the scorecards and the accounts down with it.
+    new_below_trigger_floor: Any = None
+    repeated_below_trigger_floor: Any = None
+    #: THE ESCALATION RUNGS, as this round measured them (#732). Nine fields and
+    #: not one nested block, because the panel nests nine — and the drift check
+    #: this issue extended compares field names against the keys the producer
+    #: sends, so a field per key is what makes each of them a decision somebody
+    #: made rather than a key nobody looked at.
+    #:
+    #: Every one is typed ``Any`` for ``outstanding``'s reason and reduced by
+    #: :func:`_stop_rungs_or_none`, which stores the set as one JSONB column: what
+    #: they have in common is that #712 wants a cycle's SERIES of them and #710
+    #: has yet to say which scalar out of each matters, so lifting a column per
+    #: rung now would be this board answering that from a position of never having
+    #: held the numbers.
+    #:
+    #: Nothing here reads a rung's name, compares a limit or derives one field
+    #: from another. Each block keeps its own ``over``/``fired`` split — the
+    #: measurement crossed a limit, versus this rung is why the cycle stopped —
+    #: and collapsing the two is the misreading ``round_stop``'s own docstrings
+    #: are organised against.
+    fix_injection: Any = None
+    revert: Any = None
+    excision: Any = None
+    new_findings_not_falling: Any = None
+    unrefereed_fix: Any = None
+    guard_churn: Any = None
+    fix_budget: Any = None
+    fix_surface: Any = None
+    #: #489's premise-brake state. In :data:`STOP_RUNGS` with the eight above
+    #: rather than beside them, because ``premises.repeated`` is what
+    #: ``PREMISE_REPEATED_EXIT`` stops a cycle on — it is a rung's evidence under
+    #: a different name — and ``undeclared_rounds`` is the honest half a
+    #: calibration needs: those fix passes could not have been braked whatever the
+    #: round's stop says.
+    #:
+    #: Not to be confused with the top-level ``premise_counts``, which is a tally
+    #: of FINDINGS by premise verdict and has had its own column since #490. The
+    #: two share a stem and nothing else.
+    premises: Any = None
 
     @field_validator("veto", mode="before")
     @classmethod
@@ -1361,6 +1744,33 @@ class StopIn(BaseModel):
         """Coerced, not rejected — ``veto: "capped"`` from a hand-rolled caller
         must not cost it the whole run (see :func:`_phrases`)."""
         return _phrases(v)
+
+    @field_validator("cleared_floor", mode="before")
+    @classmethod
+    def _cleared_floor(cls, v: object) -> str | None:
+        """One word, verbatim, against no vocabulary — :func:`_word_or_none`.
+
+        Deliberately not checked against ``P1``..``P4``. A severity floor is a
+        repo dial this board holds as opaque JSON and does not interpret
+        (``app/api/dials.py`` argues that at length), the panel's own no-floor
+        token is a value outside that set today, and a floor spelling that
+        changed would silently become NULL — "the panel did not say" about a round
+        that did — under a vocabulary test. An unrecognised value stored verbatim
+        gives a consumer grouping on it an extra group it can SEE, which is
+        :func:`_word_or_none`'s whole argument.
+        """
+        return _word_or_none(v)
+
+    def rungs(self) -> dict[str, Any]:
+        """The nine :data:`STOP_RUNGS` blocks as they arrived, keyed by name.
+
+        A method rather than a comprehension at the one call site, so the fields
+        declared above and the object that reaches the column cannot drift apart:
+        a tenth rung added to :data:`STOP_RUNGS` without a field here yields
+        ``None`` and is dropped by :func:`_stop_rungs_or_none`, and
+        ``tests/test_payload_key_drift.py`` fails on the same commit.
+        """
+        return {name: getattr(self, name, None) for name in STOP_RUNGS}
 
 
 #: A path longer than this is not a path. Bounded because ``ReviewRunFile.path``
@@ -1373,6 +1783,815 @@ MAX_CHANGED_FILES = 5000
 #: The states GitHub reports for a PR. Anything else is recorded as NULL rather
 #: than verbatim — see :meth:`ReviewIn._state`.
 PR_STATES = frozenset({"OPEN", "MERGED", "CLOSED"})
+#: How big a stored ``review_panel`` may be, serialised. The panel sends twelve
+#: scalars — a few hundred characters — and this leaves room for the block to grow
+#: several times over while still bounding what one authenticated-but-unbounded
+#: sender can put in a JSONB column it never has to justify the contents of.
+#:
+#: The bound REFUSES rather than trims, unlike ``MAX_CHANGED_FILES`` one constant
+#: up, and the difference is the point: a truncated file list is a shorter true
+#: list, whereas half a policy record is a false one. A reader holding a round's
+#: verdict against six of its twelve dials would be checking it against a policy
+#: that never ran. See :func:`_dials_or_none`.
+MAX_DIALS_CHARS = 8192
+#: How big a stored ``rules`` may be, serialised (#647). Two orders larger than
+#: :data:`MAX_DIALS_CHARS` above because the object is: ``review_panel`` is twelve
+#: scalars, and ``rules`` is one entry per REVIEW DIAL — fifty-two of them on this
+#: repository, at 7,299 characters — each carrying the value, the layer that
+#: supplied it, and for a board dial its source, scope, reason, setter and expiry.
+#:
+#: Measured rather than picked. ``app/models/dial.py`` bounds a board dial's
+#: ``reason`` at 2,000 characters and its path at 200, so a repository whose every
+#: review dial came from the board with a maximal reason produces a record of about
+#: 148,000 characters — a configuration THIS board lets somebody create through
+#: ``POST /dial``. A bound under that would refuse a legitimate record, and the
+#: refusal is whole-object, so one long argument would cost the layer for all
+#: fifty-two dials.
+MAX_RULES_CHARS = 262144
+#: How big a stored ``provenance_restored`` may be, serialised (#647). Small, and
+#: it stays small: the block is two integers, two lists of ROUND NUMBERS and one
+#: sentence. ``files`` is a COUNT and not a list of paths, which is what keeps it
+#: from scaling with the size of the fix range it describes.
+MAX_RESTORED_CHARS = 8192
+#: How long ``scope`` or ``fix_range_source`` may be (#647). Both are one word out
+#: of the panel's own vocabulary, and anything past this is not a word — see
+#: :func:`_word_or_none`, which refuses rather than truncating for the reason every
+#: other refusal in this module does.
+MAX_SCOPE_CHARS = 64
+#: How long a ``harness_digest`` may be (#112). The panel sends a scheme tag and a
+#: sha256 — 79 characters — and this leaves room for a longer scheme name without
+#: leaving room for a field whose whole contract is "one opaque token" to become a
+#: place to put prose.
+MAX_HARNESS_DIGEST_CHARS = 128
+#: How long a ``harness_path`` may be (#112). A nix store path is around 120
+#: characters and a checkout path around 60; Linux's own ``PATH_MAX`` is 4096, which
+#: is the bound a sender could actually reach and is four hundred times what an
+#: honest value needs. This sits between the two: generous against real paths,
+#: closed against a locator used as a text field.
+MAX_HARNESS_PATH_CHARS = 512
+#: How big a stored ``fix_pass`` may be, serialised (#624). Measured against the
+#: worst pass this fleet has actually seen rather than picked: on
+#: ``prisonblues/lexray#1780`` round 3's pass touched 12 files and its round's To fix
+#: list held 12 findings, which is a record of about 3,500 characters. What can grow
+#: is the two path lists and the two key lists, and both are bounded by real limits
+#: on the producer — ``MAX_CHANGED_FILES`` files in a PR and a To fix list a round
+#: has to print — so this leaves room for a pass an order of magnitude wider than
+#: any observed and still refuses a record being used as a text field.
+#:
+#: REFUSED WHOLE rather than trimmed, on :func:`_opaque_or_none`'s rule and with a
+#: reason of its own: half a fix-pass record is not a smaller pass, it is a
+#: different one. Drop the new-file list and the pass reads as having opened nothing
+#: — the flattering direction on the one claim this record was filed to make.
+MAX_FIX_PASS_CHARS = 65536
+#: How big a stored ``stop_rungs`` may be, serialised (#732). Measured rather than
+#: picked, and the two blocks that can actually grow are the ones measured: a
+#: ``fix_surface`` naming every file a fix pass opened is bounded by the same real
+#: limit ``MAX_FIX_PASS_CHARS`` is bounded by, and ``premises`` carries a cycle's
+#: declared premise keys plus a list of round numbers. The other seven are limits,
+#: counts and two booleans each. A round of the widest cycle this fleet has run
+#: serialises to about 3,000 characters, so this leaves room for one an order of
+#: magnitude wider and still refuses a measurement block used as a text field.
+#:
+#: REFUSED WHOLE rather than trimmed, on :func:`_opaque_or_none`'s rule and with
+#: this block's own reason: a rung set short one rung does not read as a smaller
+#: measurement, it reads as a round on which that rung did not fire — the
+#: flattering direction, on the eight fields #712 wants a cycle's series of.
+MAX_STOP_RUNGS_CHARS = 65536
+
+#: The keys a ``fix_pass.counts`` block may carry, and the vocabulary
+#: :func:`_fix_pass_counts_or_none` reads it against. It mirrors
+#: ``panel_rounds.FIX_PASS_COUNTS`` — the panel is the producer and this is the same
+#: list, written out here because the two halves cannot import each other
+#: (``harness/loops`` is installed without ``app/`` beside it) and
+#: ``tests/test_review_fix_pass.py`` is the place both are readable at once, which is
+#: where the drift check lives.
+#:
+#: **Every one is a COUNT, and there is deliberately no share, rate, ratio, score or
+#: rank among them** — #624's "do not leaderboard it", expressed as a vocabulary. The
+#: numerators and the denominators are all here; a consumer that wants a quotient has
+#: to write it down in its own code, where somebody can argue with which one it means.
+FIX_PASS_COUNTS = ("briefed", "placed", "cleared", "still_open",
+                   "production", "test", "prose", "churn",
+                   "files", "new_files", "introduced")
+
+#: The disposal buckets ``round_stop.outstanding`` publishes, each as a list of
+#: finding keys (#42). This board stores their LENGTHS — see
+#: :func:`_outstanding_or_none` — and never asks which finding is in which.
+#:
+#: ``panel_rounds.round_stop`` is the producer and this is the same list, written
+#: out here for :data:`FIX_PASS_COUNTS`' reason: the two halves cannot import each
+#: other, and ``tests/test_review_outstanding.py`` is where both are readable at
+#: once, which is where the drift check lives.
+OUTSTANDING_COUNTS = ("fixable", "below_floor", "escalated", "narrowed", "declined")
+#: The three of those a merge gate rules on, and therefore the three a stored
+#: disposal must carry to be stored at all (#717).
+#:
+#: ``fixable + escalated`` is what a round is owed and ``below_floor`` is what its
+#: repository has already said it is not; a block missing one of them cannot answer
+#: either question. It is refused whole rather than stored short, on
+#: :func:`_opaque_or_none`'s rule and with the sharpest version of it: a disposal
+#: with ``escalated`` dropped does not read as a smaller remainder, it reads as a
+#: round with no escalations — the one class of finding no fix pass may touch, gone
+#: in the flattering direction on the field that decides whether a PR may merge.
+#:
+#: ``narrowed`` and ``declined`` are counted when they arrive and not required.
+#: They are #615's and #665's, they postdate the block, and neither is read by a
+#: gate — so requiring them would refuse a #42-era producer's whole disposal over
+#: two numbers nothing consults.
+OUTSTANDING_REQUIRED = ("fixable", "below_floor", "escalated")
+#: Who a round that ENDED a cycle handed its remainder to (#42). Null on a round
+#: that went again, which is a different fact and not a fourth word.
+HANDED_TO = ("fixer", "human", "nobody")
+
+#: The measurement blocks ``round_stop`` publishes beside its verdict, stored
+#: together as ``review_runs.stop_rungs`` (#732). Eight of them are the
+#: ``escalate_on`` rungs — each a number, the limit it was held against, whether
+#: it crossed (``over``) and whether it is why the cycle stopped (``fired``) —
+#: and ``premises`` is #489's brake state, which is a rung's evidence under a
+#: different name.
+#:
+#: ``panel_rounds.round_stop`` is the producer and this is the same list, written
+#: out here for :data:`OUTSTANDING_COUNTS`' and :data:`FIX_PASS_COUNTS`' reason:
+#: the two halves cannot import each other, and ``tests/test_payload_key_drift.py``
+#: is where both are readable at once, which is where the drift check lives.
+#:
+#: **Nothing here reads a rung's name.** The order is the panel's own and the
+#: stored object keys by it; a block that is not an object is left out and the
+#: whole set is refused if what is left will not store. See
+#: :func:`_stop_rungs_or_none`.
+STOP_RUNGS = ("fix_injection", "revert", "excision", "new_findings_not_falling",
+              "unrefereed_fix", "guard_churn", "fix_budget", "fix_surface",
+              "premises")
+
+#: The two ``round_stop`` keys that publish a LIST of finding keys and are stored
+#: as its length (#732) — findings that fell under the round's trigger floor and
+#: so bought no round, split by whether this round was the first to raise them.
+#:
+#: Counted and not stored, on :func:`_outstanding_or_none`'s rule: ``len()`` of a
+#: published list cannot disagree with that list, whereas a sibling tally can, and
+#: the keys themselves are already on the round's own findings.
+BELOW_TRIGGER_FLOOR = ("new_below_trigger_floor", "repeated_below_trigger_floor")
+
+
+def _outstanding_or_none(v: object) -> tuple[dict[str, int] | None, str]:
+    """``round_stop.outstanding`` as this board will store it, and why it did not.
+
+    **A COUNT, NOT A SPLIT** — the distinction is the whole of #717's design.
+    ``panel_rounds.round_stop`` decides which finding is fixable, which is under
+    the repository's ``cleared_floor`` and which is escalated; this reads the
+    length of each list it published. Nothing here compares a severity against a
+    floor, and nothing may: the floors are repo dials this board holds as opaque
+    JSON and does not interpret (``app/api/dials.py`` argues that at length), so a
+    board-side split would be a second reading of the policy that produced the
+    verdict stored beside it — what ``m6bc45ff1`` refuses for ``converged``.
+
+    **Lengths rather than a ``counts`` block the panel sends beside the lists**,
+    which was the other way to get the same numbers. ``len()`` of a list cannot
+    disagree with that list; a sibling tally in the same payload can, and a
+    consumer holding a count against the keys it is supposed to describe has no
+    way to tell which of the two is wrong. The keys themselves stay off the row on
+    ``unread_files``' rule — one round's worth is a fair payload and
+    ``GET /reviews?limit=500`` would serialise five hundred finding lists — and
+    they are already on the round's own findings.
+
+    Refused whole where any of :data:`OUTSTANDING_REQUIRED` is missing or is not a
+    list. A number that is *absent* leaves the consumer knowing it does not know;
+    a disposal short one bucket looks complete and reads as a zero in it.
+
+    **The second return value names what was not stored, and that is not the same
+    question as whether anything was.** An unreadable OPTIONAL bucket —
+    ``narrowed: 5`` from a producer sending a count where the contract is keys —
+    leaves the other four stored and still earns a sentence, because the stored
+    disposal is then missing a key, and a missing key here means "the producer
+    sent none". Silently omitting it would file a value this board refused under
+    the shape a #42-era producer legitimately sends, which is the
+    absent-versus-refused collapse this module argues at length one field over. So
+    a caller reads ``(counts, "")`` as stored whole, ``(counts, why)`` as stored
+    without the buckets ``why`` names, and ``(None, why)`` as refused entire.
+
+    ``{}`` never survives as ``{}`` here, unlike :func:`_tally_or_none`'s three
+    tallies, and the asymmetry is deliberate: those have a state that means "the
+    question does not arise", and a round always has a disposal — ``round_stop``
+    sends all five lists empty for a dry stop, which lands here as five honest
+    zeros. An empty object is a producer that sent no disposal at all.
+    """
+    if not isinstance(v, Mapping):
+        return None, ("" if v is None else
+                      "round_stop.outstanding was not an object, so what the round "
+                      "left behind could not be read")
+    out: dict[str, int] = {}
+    unusable: list[str] = []
+    for bucket in OUTSTANDING_COUNTS:
+        keys = v.get(bucket)
+        if isinstance(keys, list):
+            out[bucket] = len(keys)
+        elif bucket in OUTSTANDING_REQUIRED:
+            return None, (f"round_stop.outstanding carried no list of {bucket!r} "
+                          "keys — the disposal is refused whole rather than stored "
+                          "short, because a missing bucket reads as an empty one")
+        elif keys is not None:
+            unusable.append(bucket)
+    if unusable:
+        return out, ("round_stop.outstanding carried no list of keys for "
+                     f"{', '.join(unusable)} — the disposal is stored without "
+                     "them, and an absent bucket here means the producer sent "
+                     "none rather than that it counted zero")
+    return out, ""
+
+
+def _handed_to_or_none(v: object) -> str | None:
+    """Who the round handed its remainder to, out of :data:`HANDED_TO`, or None.
+
+    **Against a vocabulary, where** :func:`_word_or_none` **deliberately is not**,
+    and the two arguments do not conflict. That helper refuses a closed set
+    because its fields name things whose spellings grow — ``fix_range_source``
+    gained ``reconstructed`` a release after it shipped — and an unknown value
+    there reclassifies nothing, because a consumer grouping by it gets an extra
+    group it can see.
+
+    This one is a three-valued verdict computed in one function, in one branch
+    each, and its consumers branch on the three. A fourth word stored verbatim
+    would not appear as a fourth group; it would fall through every branch and be
+    read as whichever the ``else`` is. So an unrecognised disposal becomes NULL —
+    "the panel did not say", which is a state this column already has and which no
+    reader may take for an answer.
+
+    NULL is also what a round that is going again sends, and that is not a defect
+    to be coerced away: the counts are true of a round either way and the verdict
+    belongs only to a round that is ending a cycle (#42). The row's own ``stopped``
+    is what tells the two silences apart.
+    """
+    if not isinstance(v, Mapping):
+        return None
+    word = v.get("handed_to")
+    return word if isinstance(word, str) and word in HANDED_TO else None
+
+
+def _has_nul(node: object) -> bool:
+    """Is there a NUL in any string anywhere in this parsed JSON value?
+
+    Postgres refuses ``\u0000`` inside a JSONB string — the one escape sequence
+    its JSON type cannot represent — so a value carrying one is a 500 at INSERT
+    unless ingest catches it first. Keys as well as values: a dial PATH with a NUL
+    in it fails the same way, and only a walk reaches both.
+
+    Bounded by the same recursion the JSON parser already survived to hand this
+    value over, so a payload deep enough to overflow here never got parsed.
+    """
+    if isinstance(node, str):
+        return "\x00" in node
+    if isinstance(node, Mapping):
+        return any(_has_nul(k) or _has_nul(x) for k, x in node.items())
+    if isinstance(node, (list, tuple)):
+        return any(_has_nul(x) for x in node)
+    return False
+
+
+#: The blocks :func:`_storable` does not walk into, because they are refused
+#: WHOLE and a whole-body normalisation would quietly make them storable (#646).
+#:
+#: This is the exception the rest of that pass exists to justify. ``review_panel``
+#: (#643), ``rules`` and ``provenance_restored`` (#647) are policy records kept
+#: verbatim and never interpreted, and ``fix_pass`` (#624) is a measurement record
+#: kept the same way; :func:`_opaque_or_none` argues at length
+#: that half a dial set is not a smaller policy but one no round ran under. A
+#: normalisation that reached inside one would produce exactly that: a stored
+#: policy differing by a character from the policy that ran, with the row saying
+#: it was stored intact. So they keep their own refusal and their own
+#: ``*_dropped`` signal, and the walk leaves them alone.
+_OPAQUE_FIELDS = frozenset({"review_panel", "rules", "provenance_restored",
+                            "fix_pass"})
+
+#: Keys whose value is a token MATCHED BY EXACT STRING — the one class
+#: :func:`_storable` drops rather than marks.
+#:
+#: The test is not "is this a path", it is **"is this compared with ``==`` somewhere
+#: that will not report the miss"**, and every member fails that test the same way.
+#: ``unread_files`` is matched against the next round's diff to fill the
+#: ``missed-unread`` bucket; ``changed_files`` is what ``GET /review/collisions``
+#: joins two pull requests on; a finding's ``file`` is half of :func:`_derive_key`;
+#: ``harness_digest`` is held against the previous round's to answer "same code, or
+#: not", which the module note above calls the one thing that field is never wrong
+#: about; ``harness_path`` is a locator a reader follows to a directory.
+#:
+#: A marked token is not a shortened one, it is a DIFFERENT one — it sits in the
+#: column looking like data and answers its comparison wrongly, silently, forever.
+#: A dropped one lands on NULL, and a comparison against NULL is *unknown* rather
+#: than *unequal*, which is the honest answer and the only difference that matters.
+#: That is the argument :func:`_unread_paths` already makes for dropping an
+#: over-long path rather than truncating it, and #112's :func:`_word_or_none` makes
+#: in the same words about a truncated store path naming a directory that does not
+#: exist; this is that rule one character along.
+#:
+#: ``scope`` and ``fix_range_source`` are deliberately NOT here even though a
+#: population is grouped on them. :func:`_word_or_none` reads them against no
+#: vocabulary on purpose and argues that an out-of-set value gives a consumer "an
+#: extra group it can SEE" — so a marked one is a visible extra group rather than a
+#: silent mismatch, which is the whole distinction this set is drawn on.
+#:
+#: Written out rather than inferred from the field type, because "is this string
+#: matched" is not a property of ``str``, and each place it is true is a place a
+#: wrong answer costs a comparison nobody would see fail.
+_MATCHED_KEYS = frozenset({"unread_files", "convention_files_removed", "path",
+                           "file", "harness_digest", "harness_path"})
+
+#: The three answers :func:`_storable` can give, as the response keys that report
+#: them. Written out so :meth:`ReviewIn._count_files_sent` and
+#: :func:`record_review` cannot disagree about which signals exist.
+_STORABLE_SIGNALS = ("nul_replaced", "nul_dropped", "nonfinite_dropped")
+
+
+def _blank_report() -> dict[str, list[str]]:
+    return {name: [] for name in _STORABLE_SIGNALS}
+
+
+def _storable(v: object, *, at: str, report: dict[str, list[str]],
+              is_path: bool = False, in_list: bool = False) -> object:
+    """One caller-supplied value as Postgres will take it, and where it was (#646).
+
+    Postgres refuses two things this endpoint's own parser accepts. A NUL cannot
+    live in a ``text`` column (``invalid byte sequence for encoding "UTF8": 0x00``)
+    nor inside a ``JSONB`` string (``unsupported Unicode escape sequence``), and
+    ``NaN``/``Infinity``/``-Infinity`` — which ``json.loads`` accepts as
+    non-standard literals, so starlette hands them straight through — are neither a
+    JSON number nor an ``INTEGER``. Either one, anywhere in the body, was a 500 at
+    INSERT: a round that had passed every check this module makes, reported by the
+    panel as "the board did not answer" and left out of the cycle's record.
+
+    **One pass over the whole body rather than a check in each coercer.** #643
+    fixed ``review_panel``, #647 fixed two more, #112 fixed ``scope`` in passing,
+    and the probe behind #646 found the same 500 in twenty-eight further places —
+    every free-text field, every path list, the reviewer keys, the finding titles.
+    A rule that has to be remembered thirty times is not a rule, so the per-coercer
+    checks that predate this are removed rather than left beside it: a chokepoint
+    with exceptions is not one, and :func:`_word_or_none` records what was taken out
+    of it and why.
+
+    **Three answers, because a matched token and a policy record do not want the
+    same one.**
+
+    * A token **MATCHED BY EXACT STRING** (:data:`_MATCHED_KEYS`) is dropped —
+      a path, and ``harness_digest``. Marking it would invent a different token
+      that answers its comparison wrongly and silently, where NULL answers
+      *unknown*. See that constant.
+    * An **opaque policy block** (:data:`_OPAQUE_FIELDS`) is not reached at all and
+      keeps :func:`_opaque_or_none`'s whole-object refusal.
+    * **Everything else** — prose, names, identities, vocabulary words, mapping
+      KEYS — keeps its value with the NUL replaced by :data:`UNPRINTABLE`. This is
+      the choice this issue existed to make, and it is made on consequence. The
+      alternative for a reviewer's ``account`` or a stop's ``veto`` is to store
+      nothing, and a lost account is a worse record than a marked one; the
+      alternative for the request is a 422, which loses the round, the findings,
+      the scorecards and the accounts over one byte — the exact loss this whole
+      issue is about. The mark is what keeps it from being a silent edit: a reader
+      of a stored reason can see that a character arrived and could not be shown,
+      which a stripped one could not. It is deliberately NOT ``_echo``'s full
+      C0/C1 replacement: a ``detail`` legitimately holds newlines, and normalising
+      those on the way into a column would rewrite text nobody objected to.
+
+    A marked value is not thereby believed **where a coercer follows it**.
+    ``head_sha``, ``harness_rev``, ``provenance`` and ``pr_state`` meet theirs
+    immediately afterwards and are refused there, under the drop signal they
+    already had — which is why this pass adds no per-field cleverness for them.
+    Where no coercer follows, the marked value is STORED, and ``scope`` /
+    ``fix_range_source`` are the deliberate case: :func:`_word_or_none` reads them
+    against no vocabulary on purpose, and its own conclusion — an out-of-set value
+    gives a consumer "an extra group it can SEE, rather than a value folded into a
+    group it cannot" — is the argument for marking them rather than nulling them.
+
+    A non-finite number becomes ``None`` — "nobody said", the value
+    :func:`_count_or_none` and :func:`_cost_or_none` already give an unbelievable
+    figure. That also closes a second 500 the probe found and the issue did not
+    name: ``changed_lines: NaN`` reaches a plain ``int`` field, and FastAPI renders
+    the resulting 422 by quoting the input back, so the *refusal* fails to
+    serialise and the request 500s having never touched the database.
+
+    ``at`` is the dotted position, for the response to name back — rendered
+    through :func:`_echo` like every other value this endpoint quotes, so a
+    reviewer name that is itself hostile cannot forge a log line out of the
+    position it appears at, and a very long one is cut and marked ``…`` rather
+    than handed back whole.
+
+    ``in_list`` decides what a dropped path becomes: ``""`` inside a list, where
+    a ``None`` entry would 422 ``convention_files_removed``'s ``list[str]`` and
+    blank is already what :func:`_unread_paths` counts as unusable, and ``None``
+    for a scalar, which every model here turns into its own no-path state.
+
+    Bounded by the recursion the JSON parser already survived to hand this value
+    over, exactly as :func:`_has_nul` above is.
+    """
+    if isinstance(v, str):
+        if "\x00" in v:
+            if is_path:
+                report["nul_dropped"].append(_echo(at))
+                return "" if in_list else None
+            report["nul_replaced"].append(_echo(at))
+            return v.replace("\x00", UNPRINTABLE)
+        return v
+    # `isfinite` and not `!= v`, so an infinity is caught beside a NaN. A bool is
+    # not a float and an int cannot be non-finite, so this reaches exactly the
+    # values `json.loads` produced from the three non-standard literals.
+    if isinstance(v, float) and not isfinite(v):
+        report["nonfinite_dropped"].append(_echo(at))
+        return None
+    if isinstance(v, Mapping):
+        out: dict[Any, Any] = {}
+        for k, val in v.items():
+            key = k
+            # A KEY reaches a column too: `reviewers` is keyed by vendor name and
+            # that name is `review_reviewers.name`, so a NUL in a key was the same
+            # 500 as a NUL in a value. `_has_nul` learned this in #647 for the
+            # opaque blocks; this is the writing half of it.
+            if isinstance(k, str) and "\x00" in k:
+                report["nul_replaced"].append(_echo(f"{at}.{k}" if at else k))
+                key = k.replace("\x00", UNPRINTABLE)
+            where = f"{at}.{key}" if at else str(key)
+            # Last one wins where marking makes two keys one — `{"a\x00b": …,
+            # "a␦b": …}`, which nothing real sends. It is what a dict
+            # comprehension over the same coercion does everywhere else in this
+            # module, and `_prov_counts` states the rule for `Introduced` beside
+            # `introduced`: inventing a merge here would be composing a value
+            # nobody stated. The mark is reported either way, so a sender is not
+            # told its payload arrived intact.
+            out[key] = _storable(val, at=where, report=report,
+                                 is_path=isinstance(key, str) and key in _MATCHED_KEYS)
+        return out
+    if isinstance(v, list):
+        return [_storable(x, at=f"{at}[{i}]", report=report, is_path=is_path,
+                          in_list=True)
+                for i, x in enumerate(v)]
+    return v
+
+
+def _storable_body(v: Mapping) -> tuple[dict[str, Any], dict[str, list[str]]]:
+    """The whole ``POST /review`` body as Postgres will take it, and what was done.
+
+    Top level only in one respect: :data:`_OPAQUE_FIELDS` is checked here rather
+    than inside :func:`_storable`, because those three keys are refused whole where
+    they sit and a ``rules`` nested under something else is not that field.
+    """
+    report = _blank_report()
+    out: dict[str, Any] = {}
+    for k, val in v.items():
+        if k in _OPAQUE_FIELDS:
+            out[k] = val
+            continue
+        key = k
+        if isinstance(k, str) and "\x00" in k:
+            report["nul_replaced"].append(_echo(k))
+            key = k.replace("\x00", UNPRINTABLE)
+        out[key] = _storable(val, at=str(key), report=report,
+                             is_path=isinstance(key, str) and key in _MATCHED_KEYS)
+    return out, {name: sorted(set(names)) for name, names in report.items()}
+
+
+def _opaque_or_none(v: object, *, field: str, cap: int,
+                    why_whole: str) -> tuple[dict[str, Any] | None, str]:
+    """A block this board stores VERBATIM and never interprets, or why it did not.
+
+    Three fields share this. ``review_panel`` (#643) is the dials a round applied;
+    ``rules`` (#305, stored by #647) is which LAYER supplied each of them;
+    ``provenance_restored`` (#559, stored by #647) is what a round declined to
+    attribute and against which earlier rounds. Every other coercer in this module
+    reads its value against a vocabulary the two sides share — :data:`PROVENANCE`,
+    :data:`PR_STATES` — and these deliberately have none: the board does not know
+    what a dial means and must not learn, which is the argument
+    ``app/api/dials.py`` makes at length and the drift #305 was filed over. So a
+    key is not checked, a value is not coerced, and nothing here derives one from
+    another.
+
+    One function and not three copies, because the three have to agree. They are
+    stored on one row and read together — a reader holding ``review_panel``'s
+    ``escalate_on.fix_injection`` against ``rules``' layer for the same dial is
+    reading a PAIR — and two implementations of "was this storable" eventually
+    disagree about which half of that pair survived.
+
+    What is left to refuse is shape and size, and both refuse the WHOLE object
+    rather than part of it — the same collapse :func:`_unread_paths` refuses when
+    it returns ``None`` for a declaration it could read nothing out of.
+    ``why_whole`` is the caller's one-line statement of what a trimmed version of
+    ITS block would falsely assert, because that is the part that is not generic.
+
+    Returns the pair ``(stored, why)``: ``why`` is ``""`` when nothing was refused,
+    and otherwise the one-line reason :func:`record_review` reports back to the
+    sender. Two answers from one function for :func:`_unread_paths`'s reason — the
+    validator stores and the response explains, and two implementations of "was
+    this usable" eventually disagree about a payload nobody looked at twice.
+    """
+    if v is None:
+        return None, ""
+    if not isinstance(v, Mapping):
+        # Named in `unreadable_fields` beside the other wrong-shaped values, not
+        # here: that list is the coarsest drop signal and this one belongs on it.
+        return None, ""
+    # `allow_nan=False`, which is NOT the default and is the whole reason this
+    # goes through `json.dumps` rather than a length estimate. Python's JSON
+    # reader accepts the non-standard `NaN`, `Infinity` and `-Infinity` literals,
+    # so starlette parses a body containing one and hands this validator a float
+    # Postgres will not take in a JSONB column. Without the flag the refusal
+    # happens at INSERT, as a 500 on a request that had already passed every
+    # check this module makes — a stored record turning a panel round into a
+    # failed POST, which is the opposite of "a dropped field says so".
+    try:
+        dumped = json.dumps(v, allow_nan=False)
+    except (TypeError, ValueError):
+        return None, (f"{field} held a value this board cannot store as JSON "
+                      f"— NaN, an infinity, or something that is not JSON at all")
+    # The other value Postgres refuses in JSONB, and it survives every check above:
+    # a NUL inside a string. Found by WALKING the parsed value rather than by
+    # scanning the dump for `\u0000`, which is what #643 did and which cannot tell
+    # the two apart: `json.dumps` writes a real NUL as the six characters
+    # `\u0000`, and it writes a string that literally CONTAINS those six characters
+    # as seven, with the backslash doubled — and the seven contain the six. So a
+    # board dial whose reason quoted an escape sequence had its whole rules record
+    # refused for holding a NUL it did not hold. The walk reaches keys and nested
+    # values, which was the dump's only advantage.
+    if _has_nul(v):
+        return None, (f"{field} held a NUL inside a string, which Postgres "
+                      f"refuses in a JSONB value")
+    if len(dumped) > cap:
+        return None, (f"{field} was {len(dumped)} characters, over the {cap} a "
+                      f"stored record may be — refused whole rather than trimmed, "
+                      f"because {why_whole}")
+    return dict(v), ""
+
+
+def _dials_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``review_panel`` as this board will store it, and why it did not (#643).
+
+    The dials a round APPLIED. See :func:`_opaque_or_none` for what is refused and
+    why nothing here reads a dial's name; the one thing specific to this field is
+    what a trimmed dial set would assert, which is a policy no round ran under —
+    a reader checking a round's verdict against six of its twelve dials would be
+    checking it against a fiction.
+    """
+    return _opaque_or_none(v, field="review_panel", cap=MAX_DIALS_CHARS,
+                           why_whole=("half a dial set is not a smaller policy, "
+                                      "it is one no round ran under"))
+
+
+def _rules_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``rules`` as this board will store it, and why it did not (#305, #647).
+
+    WHICH LAYER supplied each dial — ``defaults``, ``sample``, ``overlay`` or
+    ``board`` — beside the value ``review_panel`` carries. It is the half of #305
+    that #643 did not store, and it is where ``escalate_on.fix_injection`` appears
+    at all: ``review_panel`` is ``Dials.as_dict()``, twelve settings, and
+    ``escalate_on`` is not among them.
+
+    Opaque for the same reason and then some. This board would have to learn the
+    resolution ORDER as well as the vocabulary to interpret a layer, and a second
+    implementation of "which file answered" is the drift #305 was filed over
+    rather than a convenience.
+
+    A trimmed record is worse here than anywhere else this rule applies: the whole
+    content of the field is a mapping from dial to source, so dropping half of it
+    leaves a reader with dials whose layer is absent and no way to tell that from
+    a dial the resolver never saw.
+    """
+    return _opaque_or_none(v, field="rules", cap=MAX_RULES_CHARS,
+                           why_whole=("a rules record with half its dials dropped "
+                                      "cannot be told from one whose resolver "
+                                      "never saw them"))
+
+
+def _restored_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``provenance_restored`` as this board will store it, and why not (#559, #647).
+
+    What the round declined to attribute because the cycle had already seen it:
+    ``count`` and ``files`` (a count, not a list), the ``rounds`` it compared
+    against, the ``unread`` rounds it could not read, and ``why`` where the
+    comparison could not be made at all.
+
+    Opaque on the rule above, and the reason is sharper than usual: this is the
+    filter that moves ``provenance_counts.introduced``, the number #637
+    recalibrates ``escalate_on.fix_injection`` against. A board that read a key out
+    of here would be a second implementation of #559's filter, free to disagree
+    with the panel about the same round — which is exactly what ``m6bc45ff1``
+    refuses for ``converged``.
+    """
+    return _opaque_or_none(v, field="provenance_restored", cap=MAX_RESTORED_CHARS,
+                           why_whole=("a restored count without the rounds it was "
+                                      "measured against is a number with no "
+                                      "denominator"))
+
+
+def _fix_pass_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """``fix_pass`` as this board will store it, and why it did not (#624).
+
+    The record of the fix pass the round read: its commit range, the round whose To
+    fix list briefed it, its churn split, the surface it opened, which of the brief's
+    findings the round no longer raises, how many of the round's own findings were
+    attributed to it, the declarations the pass made, and the record's own account of
+    what it cannot say.
+
+    Opaque on :func:`_opaque_or_none`'s rule and for a reason that is sharper here
+    than for the three policy records. Every value in this block was derived by the
+    panel from the diff, the commits and the payload the pass was given — never from
+    the fix pass's own account of itself, which is the constraint #622 and #621 rest
+    on. A board that re-derived one of them would be a second implementation of "how
+    much did this pass churn", free to disagree with the panel about the same pass:
+    what ``m6bc45ff1`` refuses for ``converged`` and what #305 was filed over.
+
+    What a trimmed record would falsely assert is its own thing. Half a dial set is a
+    policy no round ran under; half a fix-pass record is a DIFFERENT PASS — drop the
+    new-file list and it reads as a pass that opened nothing, which is the flattering
+    direction on the one claim #624 was filed to make.
+    """
+    return _opaque_or_none(v, field="fix_pass", cap=MAX_FIX_PASS_CHARS,
+                           why_whole=("a fix-pass record with its file or finding "
+                                      "lists dropped is not a smaller pass, it is "
+                                      "one that reads as having opened nothing"))
+
+
+def _fix_pass_counts_or_none(v: object) -> dict[str, int] | None:
+    """The integer summary lifted out of a stored ``fix_pass``, or None (#624).
+
+    **A LIFT, NOT AN INTERPRETATION**, and the distinction is the whole reason this
+    is three lines. The panel computes the ``counts`` block itself, as a projection
+    of the record it sits inside — one producer, one derivation, pinned on that side
+    by ``test_every_count_is_the_records_own_number``. This reads the named
+    sub-object, checks its keys against :data:`FIX_PASS_COUNTS` and its values
+    against :func:`_count_or_none`, and stores what survives. Nothing here sums,
+    divides, compares or fills in a missing key.
+
+    It exists because of where the two halves are read. The record carries path lists
+    and finding keys, so it is deferred and detail-only (``rules``' argument, at
+    ``GET /reviews?limit=500``); the counts are eleven integers, and #624's own
+    instruction — "calibrate against real cycles before anything is scored" — is a
+    question about a population, which detail-only would have made one fetch per run
+    to ask.
+
+    ``None`` rather than ``{}`` on a record with no readable ``counts``: an empty
+    tally would say a pass was measured and every answer came back zero, which is the
+    absent-versus-zero collapse the panel's own null discipline exists to prevent.
+    :func:`_tally_or_none` already returns ``{}`` only for a caller that sent ``{}``,
+    and the panel never does — so that shape is passed through as the honest record of
+    a producer this board has not met.
+    """
+    if not isinstance(v, Mapping):
+        return None
+    counts = v.get("counts")
+    if not isinstance(counts, Mapping) or not counts:
+        return None
+    return _tally_or_none(counts, FIX_PASS_COUNTS)
+
+
+def _stop_rungs_or_none(v: object) -> tuple[dict[str, Any] | None, str]:
+    """The rungs a round measured, as this board will store them, and why it did
+    not (#732).
+
+    ``v`` is the whole nested ``round_stop`` object as it arrived, not one rung:
+    the nine blocks are stored as ONE column, so the size bound and the refusal
+    are properties of the set rather than of any member, and a helper handed one
+    block at a time could not enforce either.
+
+    **Assembled from the payload rather than read off** :class:`StopIn`. The
+    model is the shape of a verdict and this is a report about what the sender's
+    payload could keep — every other drop signal in this module is gathered the
+    same way, in :meth:`ReviewIn._count_files_sent`, off the raw body.
+
+    **A block that is not an object is left out and SAID OUT LOUD**,
+    which is the one place this departs from :func:`_opaque_or_none`'s
+    whole-object rule, and it is a different question: that rule is about a
+    refusal — a SIZE or a shape this board cannot store — and reaching a wrong
+    shape into the stored object would be storing something the column's contract
+    says is nine measurement blocks. A producer sending ``guard_churn: 4`` has one
+    bug in one rung, and refusing the other eight over it would lose eight true
+    measurements to report one false one. It is named back to the sender all the
+    same, on :func:`_outstanding_or_none`'s rule about a block stored short: the
+    stored object is then missing a key, an absent rung means "the producer sent
+    none", and omitting it in silence would file a value this board refused under
+    the shape a producer too old to send that rung legitimately sends.
+
+    What is left is then refused whole if it will not store, on
+    :func:`_opaque_or_none`'s terms and for this block's reason: a rung set short
+    a rung reads as a round on which that rung did not fire.
+
+    Returns ``(stored, why)`` on :func:`_opaque_or_none`'s contract — ``why`` is
+    ``""`` when nothing was refused, and otherwise the line :func:`record_review`
+    reports back to the sender. ``(None, "")`` is a producer that nested no rung
+    at all, which is every producer older than this column.
+    """
+    if not isinstance(v, Mapping):
+        return None, ""
+    rungs: dict[str, Any] = {}
+    unusable: list[str] = []
+    for name in STOP_RUNGS:
+        block = v.get(name)
+        if isinstance(block, Mapping):
+            rungs[name] = block
+        elif block is not None:
+            unusable.append(name)
+    if not rungs:
+        return None, ("" if not unusable else
+                      f"round_stop carried {', '.join(unusable)} as something "
+                      "other than an object, and no rung this board could read")
+    stored, why = _opaque_or_none(
+        rungs, field="round_stop rungs", cap=MAX_STOP_RUNGS_CHARS,
+        why_whole=("a rung set short a rung does not read as a smaller "
+                   "measurement, it reads as a round on which that rung did not "
+                   "fire"))
+    if why:
+        return None, why
+    if unusable:
+        return stored, (f"round_stop carried {', '.join(unusable)} as something "
+                        "other than an object — the rungs are stored without "
+                        "them, and an absent rung here means the producer sent "
+                        "none rather than that the rung did not fire")
+    return stored, ""
+
+
+def _below_floor_count(v: object) -> int | None:
+    """How many findings one ``*_below_trigger_floor`` list holds, or None (#732).
+
+    A LENGTH, on :func:`_outstanding_or_none`'s rule: the panel publishes the
+    finding keys, ``len()`` of that list cannot disagree with it, and the keys are
+    already on the round's own findings.
+
+    None — never zero — for anything that is not a list. "No new finding fell
+    under the floor" and "this producer does not measure it" are opposite
+    readings of the same round, and only one of them argues for lowering the
+    floor.
+
+    **What is NOT checked, said out loud.** The OUTER shape is checked and the
+    MEMBERS are not: ``[None]``, ``[True]``, ``[{}]`` and ``["k", "k"]`` are
+    stored as 1, 1, 1 and 2. So "the keys cannot disagree with their count" is a
+    property of a well-formed producer and not something this coercer enforces,
+    and a reader calibrating against these counts is trusting the panel, not the
+    board. That is deliberate and it is not a decision taken here:
+    :func:`_outstanding_or_none` counts ``round_stop.outstanding``'s five buckets
+    the same way and shipped one hour earlier, and two adjacent count fields
+    validating to different depths would be worse than both being lax — the
+    reader would have to know which was which. Tightening belongs to both at once,
+    behind one shared coercer, which is a change to a contract that has already
+    shipped and wants its own review rather than a rider on this one. Raised by
+    codex on #734 and deferred on those grounds, not dismissed.
+    """
+    return len(v) if isinstance(v, list) else None
+
+
+def _word_or_none(v: object, *, cap: int = MAX_SCOPE_CHARS) -> str | None:
+    """One word, verbatim, or nothing — ``scope`` and three others (#647, #112).
+
+    **Stored against no vocabulary, and this is the coercer in this module that
+    has to justify NOT having one.** :meth:`ReviewIn._state` coerces anything
+    outside :data:`PR_STATES` to NULL, and the argument there is sound: GitHub's
+    states are a foreign, stable set, and a variant spelling stored verbatim
+    silently reclassifies a PR in the direction that hides work.
+
+    Neither half of that holds here. The set is not stable — ``fix_range_source``
+    was ``increment``/``compare`` when #512 published it and #504 added
+    ``reconstructed``, so a frozen set written in this file would have dropped the
+    third source on the release that introduced it, which is #647's own bug one
+    layer down and in the harder-to-notice direction. And a value outside the set
+    reclassifies nothing: a consumer grouping a population by this field gets an
+    extra group it can SEE, rather than a value folded into a group it cannot.
+
+    So the refusals are about being a WORD and not about which word. A non-string,
+    a blank and an over-long value all become NULL and are named back under
+    ``unreadable_fields`` — one signal rather than two, because unlike
+    ``review_panel`` there is only one way to get a one-word field wrong, and a
+    size refusal and a shape refusal here want the same fix.
+
+    Refused rather than truncated, on this module's standing rule: a truncated
+    ``increment`` is ``incre``, which is not a shorter true answer but a different
+    false one. And a truncated store path names a directory that does not exist,
+    which is the same fault one field over.
+
+    ``cap`` is a parameter and not a constant because #112's two fields are the
+    same KIND of value at a different size — a digest and a filesystem path are one
+    opaque token each, refused for the same three reasons — and the alternative was
+    a second copy of this function differing in one integer. See
+    :data:`MAX_HARNESS_DIGEST_CHARS` and :data:`MAX_HARNESS_PATH_CHARS`.
+
+    **The NUL check that was here is gone, and where it went matters** (#112,
+    #646). #112 found the real 500 this function had — Postgres cannot store
+    ``\u0000`` in a ``text`` column any more than in a JSONB string, Python's
+    ``str`` holds one happily, so ``scope: "pr\u0000"`` passed every check made here
+    and took the round down at the INSERT — and fixed it with an ``"\x00" in s``
+    test on this line. #646 then found the same 500 in thirty places and moved the
+    answer to :func:`_storable_body`, one pass over the whole body that runs before
+    any coercer on this model. By the time this function is called there is no NUL
+    left to find, so the test was dead, and a dead check in ONE of thirty coercers
+    is worse than none: it reads as though this were a place NUL is handled, which
+    is the per-field habit #646 exists to end.
+
+    What replaced it is not weaker and is not the same answer. ``scope`` and
+    ``fix_range_source`` are MARKED rather than nulled — ``pr\u0000`` is stored as
+    ``pr␦`` — and the argument is this docstring's own, four paragraphs up: a value
+    outside the set reclassifies nothing here, because a consumer grouping a
+    population by this field gets an extra group it can SEE rather than one folded
+    into a group it cannot. NULL would fold it into "the panel did not say", which
+    is a claim about the payload's AGE. ``harness_digest`` and ``harness_path`` go
+    the other way and are DROPPED, because both are matched with ``==`` and a marked
+    token answers that comparison wrongly forever — see :data:`_MATCHED_KEYS`. Each
+    is named back to the sender either way.
+    """
+    if not isinstance(v, str):
+        return None
+    s = v.strip()
+    return s if s and len(s) <= cap else None
 
 
 def _unread_paths(v: object) -> tuple[list[str] | None, int]:
@@ -1544,6 +2763,30 @@ class CodeAccessIn(BaseModel):
     convention_files_removed: list[str] | None = None
 
 
+class PrClaimIn(BaseModel):
+    """Whether this round was primed by the PR's own words (#550).
+
+    A nested object rather than two flat fields because the panel sends it as one,
+    and on :class:`CodeAccessIn`'s precedent directly above: the two answer one
+    question at different grains — what was ASKED for (``setting``) and what the
+    seats actually got (``sent``), which differ whenever the block is dropped to a
+    seat's diff budget.
+
+    Both are stored, and that is the difference from ``CodeAccessIn.seats``: there is
+    no other row carrying either. They are what lets a population of rounds be
+    partitioned by arm at all — #550's measurement compares finding counts with and
+    without the block, and before these the arm was a sentence in ``config_notes``.
+    A round that asked and dropped is in neither arm; ``setting`` and ``sent``
+    together are what say so."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: What the repo (or `--no-pr-claim`) asked for. None = the panel didn't say.
+    setting: bool | None = None
+    #: What the seats got. None = the panel didn't say.
+    sent: bool | None = None
+
+
 class ReviewIn(BaseModel):
     """The panel's ``--json`` payload, accepted verbatim.
 
@@ -1600,6 +2843,117 @@ class ReviewIn(BaseModel):
     #: against some other denominator would silently invent.
     recurrence_counts: dict[str, int] | None = None
     premise_counts: dict[str, int] | None = None
+    #: The review dials this round APPLIED, stored verbatim and never interpreted
+    #: — #643, and the fifth field the panel has been sending into ``extra=
+    #: "ignore"``. It is the policy ``converged`` was decided under, which is the
+    #: one thing a reader could not check the stored verdict against.
+    #:
+    #: Absent / ``null`` is "the panel did not say", which is also every skip and
+    #: refusal path: those resolve a policy and never apply one, so the panel sends
+    #: null there deliberately. ``{}`` is a caller that sent an empty object, and
+    #: the two stay apart on this model for the reason every other three-state
+    #: field here does. See :func:`_dials_or_none` for what is refused and why the
+    #: refusal is whole-object.
+    review_panel: dict[str, Any] | None = None
+    #: WHICH LAYER supplied each of those dials (#305, stored by #647) — and, for a
+    #: board dial, the reason somebody gave and when it lapses. Stored opaquely on
+    #: :func:`_rules_or_none`'s terms.
+    #:
+    #: A separate field from ``review_panel`` and not folded into it, because the
+    #: panel sends them separately and they are not co-extensive: ``review_panel``
+    #: is ``Dials.as_dict()``, the twelve #165/#297 settings, and ``rules.dials``
+    #: covers every dotted path under ``review_panel.`` and ``reviewers.`` — fifty
+    #: -two of them, ``escalate_on.fix_injection`` among them. Merging the two here
+    #: would be this board composing a record the panel never sent.
+    #:
+    #: Present on EVERY payload including the skips, unlike ``review_panel``: a
+    #: round that refused still resolved a policy, and "which rules did this repo
+    #: have when it refused" is exactly the question a refusal raises.
+    rules: dict[str, Any] | None = None
+    #: What the round declined to attribute because the cycle had already seen it
+    #: (#559, stored by #647): ``count``, ``files`` (a count), the ``rounds`` it
+    #: compared against, the ``unread`` rounds it could not read, and ``why`` where
+    #: the comparison could not be made at all. Opaque — :func:`_restored_or_none`.
+    #:
+    #: ``null`` is "the question did not arise", which covers a round outside a
+    #: cycle and round 2, whose only prior round IS the anchor. It is not the same
+    #: as a round that looked for restored lines and found none, and this model
+    #: keeps the two apart for the reason ``provenance_counts`` beside it does.
+    provenance_restored: dict[str, Any] | None = None
+    #: THE FIX PASS THIS ROUND READ (#624) — the record of the loop's one unrecorded
+    #: actor, stored verbatim on :func:`_fix_pass_or_none`'s terms.
+    #:
+    #: Everything on this model above describes a ROUND: what it reviewed, under
+    #: which dials, with which seats, produced by which harness, ending in which
+    #: verdict. The pass BETWEEN two rounds writes the code that produces the next
+    #: round's findings and had no field at all. #624 filed it after four passes on
+    #: one PR had to be reconstructed from ``git`` by hand in order to be described.
+    #:
+    #: ``null`` is "there was no pass to record": round 1, a run outside a cycle, and
+    #: every skip and refusal path — those reviewed nothing, so they measured nothing,
+    #: and a record of zeros there would attribute an unread pass's silence to the
+    #: pass. Never ``{}``: a pass that HAPPENED and could not be read arrives as a
+    #: record with nulls in it, because "opened no file and churned no line" is the
+    #: flattering direction on every claim it makes.
+    #:
+    #: **Nothing on this board ranks, scores or gates on it**, which is a requirement
+    #: of the feature and not an omission — see
+    #: :attr:`app.models.review.ReviewRun.fix_pass` for the four gameable ratios that
+    #: argument comes from, and note that the record carries no actor key at all.
+    fix_pass: dict[str, Any] | None = None
+    #: The record's own ``counts`` block, lifted from the submitted value by
+    #: :meth:`_count_files_sent` rather than sent as a key of its own — DERIVED here
+    #: and never taken from the sender, which is why it is spread after ``**v``.
+    #:
+    #: Lifted off the RAW value, so it survives a record :func:`_fix_pass_or_none`
+    #: refused. See that spread for why the two are deliberately decoupled.
+    fix_pass_counts: dict[str, int] | None = None
+    #: WHICH range the attribution read (#512, stored by #647): ``increment``,
+    #: ``compare`` or ``reconstructed``. Stored verbatim against no vocabulary —
+    #: :func:`_word_or_none` argues why this field of all fields must not have one.
+    #:
+    #: ``null`` where the question does not arise. The three are not one
+    #: measurement, so a consumer reading ``provenance_counts`` across a cycle's
+    #: rounds without this is comparing counts over denominators that changed.
+    fix_range_source: str | None = None
+    #: What this round actually REVIEWED — ``pr`` (the whole diff) or ``increment``
+    #: (the commits since ``since_sha``) — and the commit that increment starts
+    #: from. #647.
+    #:
+    #: Recorded rather than inferred from the round number, because the panel falls
+    #: back to ``pr`` whenever the anchor is missing or the fetch failed: "round 2"
+    #: does not imply "increment". ``diff_chars`` is stored and is scope-dependent,
+    #: which makes this the field that says whether two rounds' ``diff_chars`` are
+    #: the same measurement.
+    #:
+    #: ``since_sha`` goes through :func:`_sha_or_none` with the other three commit
+    #: ids, so the round's own anchor and the PR's base end are normalised by one
+    #: rule — a range assembled from them at read time must not compare a
+    #: normalised value against a raw one.
+    scope: str | None = None
+    since_sha: str | None = None
+    #: WHICH HARNESS produced this round (#112). Four fields because no one of them
+    #: is true in every case, and the model docstring on
+    #: :attr:`app.models.review.ReviewRun.harness_rev` says which is authoritative
+    #: and which are proxies. In short: ``harness_rev`` names a commit and is null
+    #: on every installed harness; ``harness_digest`` is a content hash that is
+    #: always there and can only answer "same code or not"; ``harness_path`` says
+    #: where it ran from; ``harness_dirty`` says whether the rev is the whole truth.
+    #:
+    #: Stored verbatim and never interpreted here — this board has no checkout of
+    #: the harness to resolve a rev against, does not recompute a digest and does
+    #: not parse a store path. What is refused is being STORABLE, which is
+    #: :func:`_word_or_none` for the two strings and :meth:`_harness_flag` for the
+    #: boolean.
+    #:
+    #: ``harness_rev`` goes through :meth:`_commit_id` with the other commit ids,
+    #: for the normalisation and NOT because it is an end of any range: it names a
+    #: commit in a DIFFERENT repository — the harness's own — and nothing may
+    #: assemble ``harness_rev...head_sha``.
+    harness_rev: str | None = None
+    harness_dirty: bool | None = None
+    harness_digest: str | None = None
+    harness_path: str | None = None
     #: Set by the validators, never by the caller: what was trimmed, what could
     #: not be read, and which bucket names this board did not recognise. All of it
     #: reported in the response, none of it storable by the sender.
@@ -1619,6 +2973,66 @@ class ReviewIn(BaseModel):
     #: refused has to guess which field to go and look at.
     merge_base_dropped: str | None = None
     base_sha_dropped: str | None = None
+    #: ...and the round's own anchor (#647), on exactly that argument: a producer
+    #: that sends a good merge base and a garbled ``since_sha`` has one bug, and
+    #: ``since_sha`` is the one of the three whose loss silently changes what
+    #: ``scope: increment`` means.
+    since_sha_dropped: str | None = None
+    #: ...and the harness's own rev (#112), on that argument again and one more: a
+    #: refused ``harness_rev`` leaves the round with a digest and no name for it,
+    #: which is exactly the state this issue exists to end. Told to the sender,
+    #: because the sender is the only party that can look at what it sent.
+    harness_rev_dropped: str | None = None
+    #: Why a ``review_panel`` that arrived was not stored, or ``""``. Its own
+    #: signal rather than a line in ``unreadable_fields``: that list means "this
+    #: value was not the SHAPE its field takes", and an object refused for its SIZE
+    #: is a different sender fault wanting a different remedy.
+    review_panel_dropped: str = ""
+    #: The same for the two blocks #647 stores, and their own fields for
+    #: ``base_sha_dropped``'s reason: a producer whose ``rules`` was refused for
+    #: its size and whose ``provenance_restored`` arrived intact has one bug, and a
+    #: reader told only that *something* was refused has to guess which.
+    #:
+    #: ``scope`` and ``fix_range_source`` have no such field on purpose. They are
+    #: one word each, there is only one way to get a one-word field wrong, and both
+    #: refusals want the same fix — so they are named in ``unreadable_fields`` and
+    #: nowhere else. See :func:`_word_or_none`.
+    rules_dropped: str = ""
+    provenance_restored_dropped: str = ""
+    #: Why a ``round_stop.outstanding`` that arrived was not stored, or ``""``
+    #: (#717). Its own signal for ``review_panel_dropped``'s reason and one more:
+    #: a disposal refused in silence lands on the NULL that means "this producer
+    #: is older than #42", so a panel that measured its remainder and sent it
+    #: would be told nothing while the row said it had none to send.
+    outstanding_dropped: str = ""
+    #: Why a round's rungs arrived and were not stored, or ``""`` (#732). Its own
+    #: signal on ``outstanding_dropped``'s rule and read out of the same nested
+    #: block: a rung set refused for its size lands on the NULL that means "this
+    #: producer does not send rungs", so a panel that measured all nine and sent
+    #: them would be told nothing while the row said it had sent none. Named apart
+    #: from ``outstanding_dropped`` because the two are bounded differently and a
+    #: producer told only that something inside ``round_stop`` was refused has to
+    #: guess which half.
+    stop_rungs_dropped: str = ""
+    #: Why a fix-pass record arrived and was not stored (#624). Its own key beside
+    #: the three above rather than folded into them, on `rules_dropped`'s rule: they
+    #: are bounded differently and a producer told only "something you sent was too
+    #: big" cannot tell which field the board refused.
+    fix_pass_dropped: str = ""
+    #: #646, and set by :func:`_storable_body` rather than by any one field's
+    #: coercer: where in this body a NUL arrived and was replaced by
+    #: :data:`UNPRINTABLE`, where a matched token was dropped for holding one, and
+    #: where a number was not finite. Dotted positions (``to_fix[0].detail``),
+    #: because a whole-body pass is the only thing that knows where it was and a
+    #: sender told only "something was marked" has to re-read its own payload.
+    #:
+    #: Three lists and not one, on ``base_sha_dropped``'s standing rule here: the
+    #: three have different remedies. A marked value was stored and can be read
+    #: back; a dropped token was not stored at all; a non-finite number means the
+    #: producer's arithmetic went wrong upstream of this request.
+    nul_replaced: list[str] = Field(default_factory=list)
+    nul_dropped: list[str] = Field(default_factory=list)
+    nonfinite_dropped: list[str] = Field(default_factory=list)
     #: Tally keys that are not a bucket this board knows.
     provenance_counts_unknown: list[str] = Field(default_factory=list)
     #: Tally keys that ARE a known bucket and whose count could not be believed —
@@ -1695,7 +3109,17 @@ class ReviewIn(BaseModel):
         defence against a large body.
         """
         if not isinstance(v, Mapping):
-            return v
+            # Not a body this model can bind, so FastAPI is about to 422 it — and
+            # it renders that refusal by quoting the input back, which cannot be
+            # serialised if a non-finite number is in there. Walked anyway, so the
+            # refusal is a 422 and not a 500 (#646).
+            return _storable(v, at="", report=_blank_report())
+        # FIRST, before every count and drop signal below, so all of them are
+        # computed on the values that will actually be stored (#646). A NUL'd path
+        # dropped here lands on the blank `_unread_paths` already counts as
+        # unusable, and a marked bucket name is reported under the spelling the
+        # column will not hold rather than under one nothing can print.
+        v, unstorable = _storable_body(v)
         files, unread = v.get("changed_files"), v.get("unread_files")
         counts = v.get("provenance_counts")
         recurs, premise = v.get("recurrence_counts"), v.get("premise_counts")
@@ -1705,6 +3129,35 @@ class ReviewIn(BaseModel):
         _, unusable = _unread_paths(unread)
         head = v.get("head_sha")
         merge_base, base_sha = v.get("merge_base"), v.get("base_sha")
+        dials = v.get("review_panel")
+        # #647's five. `since` is read here beside the other commit ids because it
+        # goes through the same `_sha_or_none` and earns the same drop signal.
+        rules, restored = v.get("rules"), v.get("provenance_restored")
+        # #624's record, read here with the other opaque blocks because it is
+        # refused on the same terms and earns the same named drop signal.
+        fix_pass = v.get("fix_pass")
+        scope, range_source = v.get("scope"), v.get("fix_range_source")
+        since = v.get("since_sha")
+        # #112's four. `harness_rev` is read here with the other commit ids because
+        # it goes through the same `_sha_or_none` and earns the same drop signal —
+        # not because it is an end of any range on this row.
+        h_rev, h_dirty = v.get("harness_rev"), v.get("harness_dirty")
+        h_digest, h_path = v.get("harness_digest"), v.get("harness_path")
+        # #717's disposal lives inside the nested stop record, so the drop signal
+        # has to reach in for it. Read here with the rest rather than in `StopIn`,
+        # because that model is the shape of a verdict and this is a report about
+        # what the sender's payload lost — which every other field's drop signal is
+        # gathered in this one place.
+        stop = v.get("round_stop")
+        # #732's three scalars, out of that same nested block and read here for
+        # that same reason. One word and two key lists, so they earn a line in
+        # `unreadable_fields` rather than a signal of their own — `_word_or_none`
+        # states the rule for a one-word field (one way to get it wrong, one
+        # remedy) and `unread_files` states it for a list. Dotted, unlike the
+        # top-level entries beside them, because a sender told `cleared_floor` has
+        # to know which of the payload's two tiers this board was looking at.
+        nested = stop if isinstance(stop, Mapping) else {}
+        floor = nested.get("cleared_floor")
         return {**v,
                 "changed_files_sent": len(files) if isinstance(files, list) else 0,
                 # A bare string is one path — a shape `_unread_paths` explicitly
@@ -1724,6 +3177,16 @@ class ReviewIn(BaseModel):
                                        and _sha_or_none(merge_base) is None else None),
                 "base_sha_dropped": (_echo(base_sha) if base_sha is not None
                                      and _sha_or_none(base_sha) is None else None),
+                # ...and the round's own anchor (#647). Third of three and not a
+                # merged flag, for the reason directly above.
+                "since_sha_dropped": (_echo(since) if since is not None
+                                      and _sha_or_none(since) is None else None),
+                # ...and the harness's own (#112). Fourth of four and still not a
+                # merged flag: a producer that sends a good head and a garbled
+                # harness rev has one bug, in a field a reader would otherwise read
+                # as "this round came from an installed harness".
+                "harness_rev_dropped": (_echo(h_rev) if h_rev is not None
+                                        and _sha_or_none(h_rev) is None else None),
                 # Keys this board has no column for. Named rather than dropped: a
                 # bucket the panel has started sending and the board silently
                 # ignores is #93 happening again, one release later.
@@ -1754,17 +3217,131 @@ class ReviewIn(BaseModel):
                 "recurrence_counts_unusable": recurs_unusable,
                 "premise_counts_unknown": premise_unknown,
                 "premise_counts_unusable": premise_unusable,
+                # Why a dial set was refused — its own key, because
+                # `unreadable_fields` below can only say "that was not the shape
+                # this field takes" and the commonest refusal here is a shape that
+                # IS a mapping and is too big to store.
+                "review_panel_dropped": _dials_or_none(dials)[1],
+                # #647's two blocks, on the same rule and for the same reason. Each
+                # named on its own: `rules` is bounded two orders higher than the
+                # other two, so "one of them was too big" would send a producer to
+                # the wrong field.
+                "rules_dropped": _rules_or_none(rules)[1],
+                "provenance_restored_dropped": _restored_or_none(restored)[1],
+                # #717, on that rule and read out of the NESTED block rather than
+                # the top level, because that is where the panel puts it. A
+                # disposal refused in silence is indistinguishable from a producer
+                # that predates #42 — and the field it lands on is the one a merge
+                # gate reads, so the sender is the party that has to hear about it.
+                "outstanding_dropped": _outstanding_or_none(
+                    stop.get("outstanding") if isinstance(stop, Mapping) else None)[1],
+                # #732, on that same rule and out of that same nested block. A
+                # rung set refused for its size would otherwise land on the NULL
+                # that means "this producer sends no rungs", which is a claim
+                # about the payload's AGE rather than about this round — the
+                # absent-versus-refused collapse this model argues at length.
+                "stop_rungs_dropped": _stop_rungs_or_none(stop)[1],
+                # #624, on that same rule. A fix-pass record refused for its size
+                # would otherwise land on the NULL that means "there was no pass",
+                # which is a true statement about round 1 and a false one about a
+                # round that measured one and sent it.
+                "fix_pass_dropped": _fix_pass_or_none(fix_pass)[1],
+                # …and the eleven integers, lifted from the value AS SENT rather than
+                # from the field after coercion — which is what keeps them when the
+                # record itself is refused.
+                #
+                # **That decoupling is the point and it took a second look.** Read off
+                # the coerced field, an over-cap record would take the counts down with
+                # it: a pass wide enough to blow `MAX_FIX_PASS_CHARS` is wide because
+                # its file list is long, and that is exactly the runaway #619 and #624
+                # exist to make visible — so the one row a population most needs would
+                # be the one row with no numbers on it, and the loss would read as a
+                # round with no pass. The counts cannot carry an unstorable value by
+                # construction (`_bucket_or_none` matches a fixed vocabulary and
+                # `_count_or_none` admits only counts), so lifting them early trades
+                # nothing away.
+                #
+                # After `**v`, so a sender that spells this key itself has its own
+                # account overwritten — `FindingIn._keep_provenance_sent`'s rule:
+                # evidence the sender can write is not evidence.
+                "fix_pass_counts": _fix_pass_counts_or_none(fix_pass),
                 "unreadable_fields": sorted(
                     name for name, val, ok in (
                         ("unread_files", unread, isinstance(unread, (str, list))),
                         ("provenance_counts", counts, isinstance(counts, Mapping)),
+                        # `review_panel: "P2"` is a producer sending the wrong
+                        # SHAPE for a policy record, and without this it would land
+                        # on the NULL that means "this round applied no policy" —
+                        # which is a true statement about a skip and a false one
+                        # about a reviewed round.
+                        ("review_panel", dials, isinstance(dials, Mapping)),
+                        # #647's two blocks, on that same rule: a `rules` that is
+                        # not an object would land on the NULL that means "the
+                        # panel did not say", which is a claim about the payload's
+                        # AGE rather than about this round.
+                        ("rules", rules, isinstance(rules, Mapping)),
+                        ("provenance_restored", restored,
+                         isinstance(restored, Mapping)),
+                        # #624, on that same rule: a `fix_pass` that is not an object
+                        # would land on the NULL that means "there was no pass to
+                        # record", which is a claim about the cycle rather than about
+                        # a producer sending the wrong shape.
+                        ("fix_pass", fix_pass, isinstance(fix_pass, Mapping)),
+                        # ...and #647's two words. One signal covers all three
+                        # ways to get them wrong — a non-string, a blank and an
+                        # over-long value — because a one-word field has one
+                        # remedy. `_word_or_none` says why there is no vocabulary
+                        # test in here as well.
+                        ("scope", scope, _word_or_none(scope) is not None),
+                        ("fix_range_source", range_source,
+                         _word_or_none(range_source) is not None),
+                        # ...and #112's three non-commit fields, on that same rule
+                        # and at their own bounds. A refused digest or path would
+                        # otherwise land on the NULL that means "recorded before
+                        # these columns", which is a claim about the payload's AGE
+                        # and not about this round's machinery.
+                        ("harness_digest", h_digest,
+                         _word_or_none(h_digest, cap=MAX_HARNESS_DIGEST_CHARS)
+                         is not None),
+                        ("harness_path", h_path,
+                         _word_or_none(h_path, cap=MAX_HARNESS_PATH_CHARS)
+                         is not None),
+                        # `harness_dirty: "yes"` is a producer sending the wrong
+                        # shape for a three-state flag, and the state it would
+                        # land on — NULL, "nobody could ask" — is the one this
+                        # field exists to keep apart from `false`.
+                        ("harness_dirty", h_dirty, isinstance(h_dirty, bool)),
                         # #67's two, on the same rule: `recurrence_counts:
                         # ["revisited"]` is a producer sending the wrong SHAPE, and
                         # it would otherwise land on NULL indistinguishable from a
                         # producer that sent nothing at all.
                         ("recurrence_counts", recurs, isinstance(recurs, Mapping)),
                         ("premise_counts", premise, isinstance(premise, Mapping)),
-                    ) if val is not None and not ok)}
+                        # #732's three, nested one tier in. Each would otherwise
+                        # land on the NULL that means "this producer is too old to
+                        # send it" — a claim about the payload's AGE rather than
+                        # about this round — and all three are what #710 reads to
+                        # calibrate a floor, where a silent NULL is a round quietly
+                        # left out of the denominator.
+                        ("round_stop.cleared_floor", floor,
+                         _word_or_none(floor) is not None),
+                        # A COUNT where the contract is keys is the commonest way
+                        # to get these two wrong, and it is the one that looks
+                        # right: `new_below_trigger_floor: 3` is a producer sending
+                        # the number this board is about to compute for itself.
+                        #
+                        # Over `BELOW_TRIGGER_FLOOR` rather than written out
+                        # twice, so the two keys this signal names and the two
+                        # `StopIn` binds are one list with one place to change it.
+                        *((f"round_stop.{name}", nested.get(name),
+                           isinstance(nested.get(name), list))
+                          for name in BELOW_TRIGGER_FLOOR),
+                    ) if val is not None and not ok),
+                # #646's three, spread last so a caller that spells one of them
+                # itself has its own account overwritten. They are evidence about
+                # what arrived, and evidence the sender can write is not evidence —
+                # the rule `FindingIn._keep_provenance_sent` states.
+                **unstorable}
 
     @field_validator("repo")
     @classmethod
@@ -1772,14 +3349,25 @@ class ReviewIn(BaseModel):
         """One repository, one stored spelling — :func:`_stored_repo`, and #326."""
         return _stored_repo(v)
 
-    @field_validator("head_sha", "merge_base", "base_sha", mode="before")
+    @field_validator("head_sha", "merge_base", "base_sha", "since_sha",
+                     "harness_rev", mode="before")
     @classmethod
     def _commit_id(cls, v: object) -> str | None:
         """Every commit id on this model, coerced by one rule.
 
-        Listed on one validator rather than three copies: the head end and the
-        base end have to agree about what a commit id IS, or a range assembled
-        from them at read time compares a normalised value against a raw one."""
+        Listed on one validator rather than four copies: the head end and both
+        base ends have to agree about what a commit id IS, or a range assembled
+        from them at read time compares a normalised value against a raw one.
+        ``since_sha`` (#647) joined them for exactly that reason — under increment
+        scope the round's target is ``since_sha...head_sha``, so it is the other
+        end of a range whose head end is already normalised here.
+
+        ``harness_rev`` (#112) joined for the normalisation and for NOTHING ELSE.
+        It names a commit in a different repository — the harness's own — so it is
+        not an end of any range on this row, and nothing may assemble
+        ``harness_rev...head_sha``. It is here because "what a commit id is" should
+        have one answer on this model, and a second copy of that answer is how two
+        spellings of the same 40 hex digits end up in one table."""
         return _sha_or_none(v)
 
     @field_validator("unread_files", mode="before")
@@ -1790,6 +3378,85 @@ class ReviewIn(BaseModel):
         empty list. What it could not read is counted in ``unread_files_unusable``
         and named back by :func:`record_review`."""
         return _unread_paths(v)[0]
+
+    @field_validator("review_panel", mode="before")
+    @classmethod
+    def _dials(cls, v: object) -> dict[str, Any] | None:
+        """The dials verbatim, or None. See :func:`_dials_or_none` for why a
+        refusal takes the whole object and why nothing here reads a dial's name."""
+        return _dials_or_none(v)[0]
+
+    @field_validator("rules", mode="before")
+    @classmethod
+    def _rules(cls, v: object) -> dict[str, Any] | None:
+        """Which layer supplied each dial, verbatim or not at all — #305, #647.
+        See :func:`_rules_or_none`."""
+        return _rules_or_none(v)[0]
+
+    @field_validator("provenance_restored", mode="before")
+    @classmethod
+    def _restored(cls, v: object) -> dict[str, Any] | None:
+        """What the round declined to attribute, verbatim or not at all — #559,
+        #647. See :func:`_restored_or_none`."""
+        return _restored_or_none(v)[0]
+
+    @field_validator("fix_pass", mode="before")
+    @classmethod
+    def _fix_pass(cls, v: object) -> dict[str, Any] | None:
+        """The fix-pass record verbatim, or not at all — #624. See
+        :func:`_fix_pass_or_none` for what a trimmed one would falsely assert."""
+        return _fix_pass_or_none(v)[0]
+
+    @field_validator("scope", "fix_range_source", mode="before")
+    @classmethod
+    def _word(cls, v: object) -> str | None:
+        """One word, verbatim, or None (#647).
+
+        Both on one validator for :meth:`_commit_id`'s reason: they are read
+        together — ``fix_range_source: increment`` is only meaningful beside
+        ``scope: increment`` — and two coercions of "is this a word" would let one
+        of the pair survive a payload the other did not."""
+        return _word_or_none(v)
+
+    @field_validator("harness_digest", mode="before")
+    @classmethod
+    def _harness_digest(cls, v: object) -> str | None:
+        """One opaque token, verbatim, or None (#112).
+
+        Its own validator rather than joining ``scope``'s only because the bound
+        differs: a scheme-tagged sha256 is 79 characters and would not survive
+        :data:`MAX_SCOPE_CHARS`. The coercion is the same one and deliberately
+        knows nothing about the scheme — the tag is ON the value precisely so that
+        this board never has to learn one."""
+        return _word_or_none(v, cap=MAX_HARNESS_DIGEST_CHARS)
+
+    @field_validator("harness_path", mode="before")
+    @classmethod
+    def _harness_path(cls, v: object) -> str | None:
+        """Where the harness ran from, verbatim, or None (#112).
+
+        Not parsed. A nix store path carries a hash this board could read and must
+        not: doing so would make it a second implementation of "which build is
+        this", which is the drift #305 exists to end, and it would silently
+        classify a checkout path as unknown rather than as what it is."""
+        return _word_or_none(v, cap=MAX_HARNESS_PATH_CHARS)
+
+    @field_validator("harness_dirty", mode="before")
+    @classmethod
+    def _harness_flag(cls, v: object) -> bool | None:
+        """A three-state flag, or None — never a 422 (#112).
+
+        Tolerant on this module's standing rule, which the bare ``bool | None``
+        fields beside it predate: recording is best-effort, and a payload is never
+        refused over one field because refusing it loses the findings, the
+        scorecards and the accounts along with the bad value. Without this,
+        ``harness_dirty: "yes"`` is a 422 and a round's whole record is gone.
+
+        ``isinstance`` and not truthiness. JSON has real booleans, so a ``1`` here
+        is a producer sending the wrong shape and lands on NULL with
+        ``unreadable_fields`` saying so — rather than on ``true``, which would be
+        this board guessing about the one distinction the field carries."""
+        return v if isinstance(v, bool) else None
 
     @field_validator("provenance_counts", mode="before")
     @classmethod
@@ -1898,6 +3565,11 @@ class ReviewIn(BaseModel):
     #: nothing. Reported rather than stored, and reported rather than 500ing on
     #: the CHECK that would otherwise refuse the row.
     stop_confidence_dropped: bool = False
+    #: Set by the validator: a ``converged: true`` this board refused to believe,
+    #: because the same ``round_stop`` said the round did not stop, or that its
+    #: stop was not earned. Reported rather than stored, and reported rather than
+    #: 500ing on ``ck_review_runs_converged_implies_earned_stop``.
+    converged_dropped: bool = False
 
     judged: bool = False
     judge_model: str | None = None
@@ -1933,6 +3605,11 @@ class ReviewIn(BaseModel):
     #: Whether the seats could read the code (#113). Optional: a panel that predates
     #: the setting sends none, and every field inside it is independently nullable.
     code_access: CodeAccessIn | None = None
+    #: Whether the seats were shown the PR's own title and body (#550). Optional: a
+    #: panel that predates the block sends none, and both fields inside it are
+    #: independently nullable — a round that asked and dropped says so with the two
+    #: disagreeing.
+    pr_claim: PrClaimIn | None = None
 
     to_fix: list[FindingIn] = Field(default_factory=list)
     dismissed: list[FindingIn] = Field(default_factory=list)
@@ -2001,6 +3678,41 @@ class ReviewIn(BaseModel):
                 and self.round_stop.confident):
             self.round_stop.confident = False
             self.stop_confidence_dropped = True
+        return self
+
+    @model_validator(mode="after")
+    def _converged_cannot_outrun_the_stop(self) -> ReviewIn:
+        """A clean finish that its own stop record does not support (#626).
+
+        ``round_stop`` computes ``converged`` FROM ``confident``, which is itself
+        ``stop and not capped and not veto and baseline_ok``. So a converged round
+        is a stopped, earned round by construction — the panel cannot emit the
+        pair this drops, and a payload carrying it was not produced by the panel
+        or has been edited on the way.
+
+        Declared **after** :meth:`_no_review_claims_nothing_else` and not beside
+        it, because pydantic runs ``mode="after"`` validators in declaration order
+        and that one can take the confidence away: a ``reviewed: false`` payload
+        sending ``confident: true, converged: true`` has to lose both, and a check
+        that ran first would read a confidence that is about to be revoked and
+        keep the clean finish resting on it.
+
+        ``False`` and not ``None``, on this file's standing rule about which half
+        of an incoherent pair is the unbelievable one. Here the stop record is the
+        concrete half — it carries a reason, a veto list and a boolean the landing
+        gate already reads — and ``converged`` is one derived flag contradicting
+        it. ``None`` would say the panel never answered, and this payload's did;
+        it answered in a way its own evidence refuses, which is a ``False`` about
+        a clean finish rather than a silence.
+
+        Not a 422, like every coercion on this path: refusing the payload would
+        lose the findings, the scorecards and the accounts along with the flag.
+        The drop is named in the response instead.
+        """
+        stop = self.round_stop
+        if stop is not None and stop.converged and not (stop.stop and stop.confident):
+            stop.converged = False
+            self.converged_dropped = True
         return self
 
 
@@ -2391,6 +4103,49 @@ async def record_review(
         # carries a fact — "the question does not arise" — that no derivation
         # from findings could express.
         provenance_counts=body.provenance_counts,
+        # Verbatim, `{}` included, on `provenance_counts`' rule one line up: an
+        # empty object is a caller that sent one, and `or None` would rewrite it
+        # into "no panel ever said". Nothing on this board reads a dial out of it
+        # — see `_dials_or_none` for why that is deliberate rather than pending.
+        review_panel=body.review_panel,
+        # #647's four, on that same rule and stored beside the dial VALUES they
+        # explain. `rules` is the only field on this row that records the
+        # threshold a round ran under — `review_panel` is `Dials.as_dict()` and
+        # `escalate_on` is not in it — which is why a round that ran before this
+        # column cannot be recalibrated against, and why nothing here waits for a
+        # consumer to ask for it first.
+        rules=body.rules,
+        provenance_restored=body.provenance_restored,
+        # #624: the fix pass this round read, stored AS SENT and never interpreted —
+        # every value in it was derived by the panel from the diff, the commits and
+        # the payload the pass was given, and a second derivation here would be free
+        # to disagree with the panel about the same pass.
+        #
+        # `fix_pass_counts` is the record's own `counts` block, LIFTED rather than
+        # computed (`_fix_pass_counts_or_none`), so that a run LIST can carry the
+        # numbers without the path lists riding with them. Both from one object, so
+        # the flat copy and the block it came from cannot describe two passes.
+        fix_pass=body.fix_pass,
+        fix_pass_counts=body.fix_pass_counts,
+        fix_range_source=body.fix_range_source,
+        # What the round reviewed, and the anchor it reviewed from. Both stored
+        # even where they restate the default (`scope: "pr"` on a round 1), for
+        # `provenance_counts`' reason: NULL has to keep meaning "recorded before
+        # this column", and a board that only stored the interesting value would
+        # make every ordinary round indistinguishable from a pre-#647 one.
+        scope=body.scope,
+        since_sha=body.since_sha,
+        # #112: which harness produced the round, stored AS SENT and never
+        # interpreted. Four fields rather than one because the question has no
+        # single true answer from inside a running panel — `harness_rev` is
+        # authoritative and usually absent, `harness_digest` is a proxy and always
+        # present, `harness_path` says whether the round came from the deployed
+        # harness at all. A board that folded them into one would be choosing which
+        # of the three to be wrong about.
+        harness_rev=body.harness_rev,
+        harness_dirty=body.harness_dirty,
+        harness_digest=body.harness_digest,
+        harness_path=body.harness_path,
         recurrence_counts=body.recurrence_counts,
         premise_counts=body.premise_counts,
         changed_lines=body.changed_lines,
@@ -2422,6 +4177,14 @@ async def record_review(
         code_access=body.code_access.setting if body.code_access else None,
         convention_files_removed=(body.code_access.convention_files_removed
                                   if body.code_access else None),
+        # #550's two, flattened from their nested object on the same terms as the
+        # pair above — and BOTH kept, unlike `code_access.seats`, because neither has
+        # another row to live on. NULL where the panel sent no block at all, which is
+        # every producer older than #631 and every skip path: a round that dispatched
+        # no seat did not decline to prime one, and a guessed `false` would put it in
+        # the unprimed arm of a comparison it was never in.
+        pr_claim=body.pr_claim.setting if body.pr_claim else None,
+        pr_claim_sent=body.pr_claim.sent if body.pr_claim else None,
         round=body.round,
         cycle=body.cycle or None,
         new_findings=body.new_findings,
@@ -2433,6 +4196,17 @@ async def record_review(
         stopped=body.round_stop.stop if body.round_stop else None,
         stop_reason=(body.round_stop.reason if body.round_stop else body.stop_reason) or None,
         stop_confident=body.round_stop.confident if body.round_stop else None,
+        # #626, and NULL by three separate routes that mean the same thing: no
+        # nested verdict at all, a nested verdict from a producer too old to carry
+        # the field, and a flat `stop_reason` (which cannot express it). All three
+        # are "the panel did not say", which is what the rate this feeds excludes.
+        #
+        # `body.round_stop.converged` unmasked rather than `or False`: the whole
+        # reason `StopIn.converged` defaults to None instead of False is that a
+        # silence folded into a denial puts every pre-#626 producer's rounds into
+        # the denominator as failures to converge, and doing it here would undo
+        # that one line later.
+        converged=body.round_stop.converged if body.round_stop else None,
         # The reasons, not just the verdict. Accepting the list and dropping it
         # left the board able to say a stop was not convergence and unable to say
         # why — which is the half an operator is told to relay.
@@ -2443,6 +4217,42 @@ async def record_review(
         # happen to `could_not_assess`, one field over — and `_run_view` passes
         # it through unmasked, so a reader of the API sees the distinction too.
         stop_veto=body.round_stop.veto if body.round_stop else None,
+        # #717. The round's own disposal, counted — five lengths and the verdict
+        # over them. NULL by the same three routes `converged` above lists, plus a
+        # fourth: a block that arrived without one of `OUTSTANDING_REQUIRED` and
+        # was refused whole. All four mean "how much this round is owed is not
+        # recorded", which is what `preland` falls back to holding on the raw
+        # confirmed count for — the strict reading, never the lax one.
+        outstanding_counts=(_outstanding_or_none(body.round_stop.outstanding)[0]
+                            if body.round_stop else None),
+        # Beside the counts and not folded into them: it is a verdict about a
+        # remainder and not a measurement of one, and it is null on a round that is
+        # going again while the counts are still true of it (#42).
+        handed_to=(_handed_to_or_none(body.round_stop.outstanding)
+                   if body.round_stop else None),
+        # #732. The cut the counts above are SPLIT at, which they did not carry —
+        # NULL by the same routes `converged` lists, plus a producer too old to
+        # nest the key. Never derived here from `review_panel`: that would be a
+        # second reading of the policy that produced the verdict stored beside it.
+        cleared_floor=body.round_stop.cleared_floor if body.round_stop else None,
+        # ...and the two counts the trigger floor turned away, from the key lists
+        # the panel publishes. NULL and never zero for a producer that sent
+        # neither: "nothing fell under the floor" and "this producer does not
+        # measure it" are opposite readings, and only one argues for moving it.
+        new_below_trigger_floor=(
+            _below_floor_count(body.round_stop.new_below_trigger_floor)
+            if body.round_stop else None),
+        repeated_below_trigger_floor=(
+            _below_floor_count(body.round_stop.repeated_below_trigger_floor)
+            if body.round_stop else None),
+        # #732's nine measurement blocks, verbatim and refused whole. Read off the
+        # bound model here and off the raw body for the drop signal, exactly as
+        # `outstanding` above is: both are pass-through `Any` fields, so the two
+        # reads cannot disagree, and the signal has to be computed where every
+        # other signal is (`ReviewIn._count_files_sent`, which cannot reach a
+        # response) while the value has to be computed where the row is built.
+        stop_rungs=(_stop_rungs_or_none(body.round_stop.rungs())[0]
+                    if body.round_stop else None),
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
         reviewers_selected=body.reviewers_selected or None,
@@ -2623,6 +4433,63 @@ async def record_review(
     if body.stop_confidence_dropped:
         dropped["stop_confidence_dropped"] = (
             "a confident stop was sent with reviewed: false")
+    # #626's own pair, named apart from the one above rather than folded into it:
+    # they are refused by different rules and a producer told only "something about
+    # your stop was dropped" cannot tell which of its fields the board disbelieved.
+    if body.converged_dropped:
+        dropped["converged_dropped"] = (
+            "converged: true was sent with a round_stop that did not stop, or "
+            "whose stop was not confident")
+    # #643. A dial set that arrived and was not stored, with the reason: a policy
+    # record refused in silence reads exactly like a round that applied no policy,
+    # which is what the skip paths legitimately send, so the sender would have no
+    # way to tell its payload was disbelieved.
+    if body.review_panel_dropped:
+        dropped["review_panel_dropped"] = body.review_panel_dropped
+    # #647's two blocks, on that same argument. `rules` refused in silence reads as
+    # "the panel did not say which layer answered", which is a statement about a
+    # payload's age; `provenance_restored` refused in silence reads as "the
+    # question did not arise", which is what round 2 legitimately sends.
+    if body.rules_dropped:
+        dropped["rules_dropped"] = body.rules_dropped
+    if body.provenance_restored_dropped:
+        dropped["provenance_restored_dropped"] = body.provenance_restored_dropped
+    # #717, on the same argument and with its own version of the sharp end: a
+    # disposal refused in silence reads as "this producer predates #42", which is
+    # a statement about a payload's age, on the one field a merge gate rules on.
+    if body.outstanding_dropped:
+        dropped["outstanding_dropped"] = body.outstanding_dropped
+    # #732, out of the same nested block and on the same argument: a rung set
+    # refused in silence reads as "this producer does not send rungs", which is
+    # true of every panel older than the column and false about one that measured
+    # all nine. Named apart from `outstanding_dropped` because the two are bounded
+    # differently — a producer told only that something inside its `round_stop`
+    # was refused would have to guess which half to go and look at.
+    if body.stop_rungs_dropped:
+        dropped["stop_rungs_dropped"] = body.stop_rungs_dropped
+    # #624, on the same argument again and with the sharpest version of it: a
+    # fix-pass record refused in silence reads as "there was no pass to record",
+    # which is what round 1 and every skip legitimately send — so a producer that
+    # measured a pass and sent it would be told nothing, and the row would say the
+    # pass did not exist.
+    if body.fix_pass_dropped:
+        dropped["fix_pass_dropped"] = body.fix_pass_dropped
+    # #646. Where in this payload a value arrived that Postgres would not have
+    # taken, and what this board did with it. Reported for the reason every drop on
+    # this path is, and with one extra: these are the only signals whose absence
+    # would leave a sender reading a MARKED value back as the one it sent. A
+    # `detail` holding `␦` and a `detail` whose author typed `␦` are the same row,
+    # and only this says which of the two was recorded.
+    #
+    # Bounded like the bucket echoes above and with the same `_total` companion: a
+    # payload can be wrong in five hundred places, and naming all of them costs one
+    # enormous log line to say what the first twenty-five already said.
+    for signal in _STORABLE_SIGNALS:
+        names = getattr(body, signal)
+        if names:
+            dropped[signal] = names[:MAX_UNKNOWN_BUCKETS]
+            if len(names) > MAX_UNKNOWN_BUCKETS:
+                dropped[f"{signal}_total"] = len(names)
     # ...and the base end, each named rather than one flag for "a commit id was
     # refused". These two are what a pre-land verdict resolves against the repo,
     # so a producer sending a base it thinks was stored has to be told it was not.
@@ -2630,6 +4497,16 @@ async def record_review(
         dropped["merge_base_dropped"] = body.merge_base_dropped
     if body.base_sha_dropped is not None:
         dropped["base_sha_dropped"] = body.base_sha_dropped
+    # ...and the third, #647's. A `since_sha` the board refused leaves a round
+    # whose `scope` says `increment` with no anchor to say increment of WHAT.
+    if body.since_sha_dropped is not None:
+        dropped["since_sha_dropped"] = body.since_sha_dropped
+    # ...and the fourth, #112's. A refused `harness_rev` leaves a round carrying a
+    # digest nobody can put a name to, which reads exactly like a round from an
+    # installed harness — the commonest case, and therefore the one a wrong value
+    # hides in best.
+    if body.harness_rev_dropped is not None:
+        dropped["harness_rev_dropped"] = body.harness_rev_dropped
     # Every provenance bucket this board did not recognise, from the findings and
     # from the run's own tally, named rather than swallowed.
     #
@@ -2801,7 +4678,8 @@ class OutcomeIn(BaseModel):
     key: str = Field(min_length=1, max_length=MAX_REF_CHARS,
                      validation_alias=AliasChoices("key", "finding_key"))
     outcome: str = Field(min_length=1, max_length=MAX_REF_CHARS)
-    #: Why. Required for ``refuted`` — see :func:`record_outcomes`.
+    #: Why. Required for ``refuted`` and for ``narrowed`` — see
+    #: :func:`record_outcomes`.
     note: str | None = None
     deferred_to: str | None = None
     superseded_by: str | None = None
@@ -2843,6 +4721,36 @@ class OutcomeIn(BaseModel):
         if long:
             caps = ", ".join(f"{f} over {OUTCOME_FIELDS[f]} characters" for f in long)
             raise ValueError(f"too long: {caps}")
+        return self
+
+    @model_validator(mode="after")
+    def _no_nul(self) -> OutcomeIn:
+        """A NUL is refused here, where ``POST /review`` marks it (#646).
+
+        Postgres will not hold a NUL in a ``text`` column, so an item carrying one
+        was a 500 at INSERT that took the whole batch with it — every sibling
+        outcome lost to one byte in one ``note``.
+
+        **Refused rather than marked, and the difference is the endpoint's own
+        stated rule** one class down (:func:`_outcome_reason`): the panel must
+        never fail a review because the board was fussy, so ingest takes what it
+        can read; a fixer recording an outcome can simply be told, and a rejection
+        here costs that item and nothing else. Marking would be worse than useless
+        on ``key``, which is a defect identity matched with ``==`` — a marked key
+        names no finding — and on ``note``, which is the evidence behind a
+        refutation and is the last thing this board should edit silently.
+
+        Named field by field, on ``_bounds``' rule directly above: a caller told
+        only that *something* held a NUL has to go and diff its own payload. The
+        names come FIRST in the message and the explanation after, because
+        :func:`_outcome_item` bounds each rendered error at
+        :data:`MAX_BUCKET_ECHO` and it is the explanation that can be spared.
+        """
+        bad = [f for f in ("key", "outcome", *OUTCOME_FIELDS)
+               if "\x00" in (getattr(self, f) or "")]
+        if bad:
+            raise ValueError(
+                f"NUL in {', '.join(bad)} — no text column holds one")
         return self
 
 
@@ -2889,6 +4797,37 @@ class OutcomesIn(BaseModel):
         json_schema_extra=lambda f: f.update(items=OutcomeIn.model_json_schema()),
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _finite(cls, v: object) -> object:
+        """Drop ``NaN``/``Infinity`` from this REQUEST's own fields (#646).
+
+        Not about storage — no column here takes a float. It is about the REFUSAL.
+        ``pr`` is a plain ``int`` and ``repo`` a plain ``str``, so a non-finite one
+        raises, and FastAPI renders that 422 by quoting the offending input back
+        into JSON, which cannot represent it. The request then 500s having never
+        reached the database and the caller is told nothing at all about a batch
+        that was refused before it began.
+
+        **The request's own keys only, never inside an item, and that boundary is
+        the whole care of this method.** A ``note`` is ``str | None`` where ``None``
+        is an explicit CLEAR — ``model_fields_set`` is what tells a retraction from
+        an absent key — so nulling ``note: NaN`` would turn a garbled value into a
+        deliberate erasure of the evidence already on the row. Left alone, the item
+        fails :class:`OutcomeIn` and becomes that item's rejection instead, which is
+        this endpoint's rule and the answer the caller actually wants. Nothing there
+        can 500 on the way: :func:`_outcome_item` renders an item's errors from
+        their location and message and never quotes the input.
+
+        NULs are left alone here too, for the same reason and one class up: they are
+        refused per item by :meth:`OutcomeIn._no_nul`, which can name the field, and
+        a body-wide mark would make them storable behind its back.
+        """
+        if not isinstance(v, Mapping):
+            return v
+        return {k: None if isinstance(x, float) and not isfinite(x) else x
+                for k, x in v.items()}
+
     @field_validator("repo")
     @classmethod
     def _repo(cls, v: str) -> str:
@@ -2911,6 +4850,15 @@ class OutcomesIn(BaseModel):
         s = _trimmed_or_none(v)
         if s and len(s) > MAX_REF_CHARS:
             raise ValueError(f"session over {MAX_REF_CHARS} characters")
+        # And refused for a NUL on the same terms (#646): this is a contact
+        # address a peer is meant to reach the recorder on, so a marked one
+        # resolves to nothing while looking like the real thing — the argument
+        # directly above, one character along. A 422 rather than a per-item
+        # rejection because the field is the request's, not an item's, and it
+        # would otherwise be a 500 at INSERT that lost the whole batch anyway.
+        if s and "\x00" in s:
+            raise ValueError("session holds a NUL, which Postgres refuses in a "
+                             "text column")
         return s
 
 
@@ -2959,6 +4907,13 @@ def _outcome_reason(item: OutcomeIn, known: set[str], stored: ReviewFindingOutco
 
     if item.outcome == "refuted" and not item.note and not inherits("note"):
         return "refuted needs a note: the refutation is the evidence for it"
+    # ...and `narrowed` owes one at the same cost for a different reason (#615):
+    # the note IS the general form — what fixing the class would have taken — and
+    # a `narrowed` with nothing in it is a `fixed` wearing another word. The two
+    # lines are the price of not writing the class-wide change; a `narrowed` that
+    # costs nothing is the maximal-fix habit back with a label on it.
+    if item.outcome == "narrowed" and not item.note and not inherits("note"):
+        return "narrowed needs a note: the general form this fix did not take"
     # ...and the same rule for `superseded`, which was asymmetric: the key of the
     # finding that replaced this one is the entire content of that outcome, and
     # it was optional, so `superseded` alone recorded "replaced by something".
@@ -3369,6 +5324,51 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # first fetching each run one at a time.
         "merge_base": r.merge_base,
         "base_sha": r.base_sha,
+        # #647's three scalars, and they ride here for exactly the reason the two
+        # above do. `scope` says WHAT this round reviewed, so it is what makes
+        # `diff_chars` beside it comparable across a cycle's rounds at all;
+        # `since_sha` is the other end of that range; `fix_range_source` says which
+        # range the attribution behind `provenance_counts` actually read.
+        #
+        # A consumer recalibrating a threshold reads a POPULATION — #637 reads
+        # thousands of rounds — and the whole point of these three is to slice it.
+        # Detail-only would have meant one fetch per run to learn which rounds were
+        # measured the same way, which is the trade `merge_base` and `base_sha`
+        # already refused. The two OBJECTS #647 stores do not ride here, on
+        # `unread_files`' rule two keys down: `rules` is bounded at
+        # `MAX_RULES_CHARS` and `GET /reviews?limit=500` would serialise five
+        # hundred of them.
+        "scope": r.scope,
+        "since_sha": r.since_sha,
+        "fix_range_source": r.fix_range_source,
+        # #112's three identity fields, here for #647's reason exactly. A
+        # recalibration reads a POPULATION and the whole point of these is to slice
+        # it: "were these rounds read by the same machinery" is a question about
+        # thousands of rows, and detail-only would have meant one fetch per run to
+        # ask it. `harness_digest` is the field that answers it — `harness_rev` is
+        # null on every installed harness — and `harness_dirty` is what stops a rev
+        # being read as more than it is.
+        #
+        # `harness_path` does NOT ride here, and the cut is between a GROUPING key
+        # and a LOCATOR. The path changes exactly when the digest does on a nix
+        # install, so it buys a population nothing the digest has not already
+        # bought; what it is for is a reader who has picked one round and wants to
+        # go and look at the machinery, which is a one-run question. It is bounded
+        # at `MAX_HARNESS_PATH_CHARS` and `GET /reviews?limit=500` would carry five
+        # hundred of them for that.
+        "harness_rev": r.harness_rev,
+        "harness_dirty": r.harness_dirty,
+        "harness_digest": r.harness_digest,
+        # #550's two, here for #112's reason with the emphasis turned up: these are
+        # GROUPING KEYS and nothing else. Their whole existence is a comparison over
+        # a population — finding counts on rounds that were primed by the PR's own
+        # words against rounds that were not — and a field a reader has to fetch one
+        # round at a time cannot partition one. Both, because a round that ASKED for
+        # the block and dropped it to a seat's budget belongs to neither arm and only
+        # the pair says so. Two booleans, so the `limit=500` size argument that keeps
+        # `harness_path` and `unread_files` off this view does not arise.
+        "pr_claim": r.pr_claim,
+        "pr_claim_sent": r.pr_claim_sent,
         # The COUNT, not the paths — the same trade `changed_files_total` makes
         # two lines down, and for the same reason. The cost `changed_files` was
         # kept out of this view for is response SIZE: `unread_files` is bounded
@@ -3398,6 +5398,19 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "provenance_counts": r.provenance_counts,
         "recurrence_counts": r.recurrence_counts,
         "premise_counts": r.premise_counts,
+        # #624's integer summary of the fix pass this round read — eleven keys at
+        # most, so it rides everywhere the three tallies above do and for their
+        # reason. The RECORD itself does not: it carries the file list and the
+        # finding keys, so it is deferred and detail-only on `rules`' argument, and
+        # `GET /review/{id}` is what carries it.
+        #
+        # It is here because #624's own instruction is to calibrate against real
+        # cycles before anything is scored, and a calibration reads a POPULATION —
+        # "how big were the passes on rounds that then attributed nothing to them" is
+        # a question about thousands of rows, which detail-only would have made one
+        # fetch per run to ask. Counts and no arithmetic over them: nothing on this
+        # board divides one of these by another (see the column's docstring).
+        "fix_pass_counts": r.fix_pass_counts,
         "changed_lines": r.changed_lines,
         # The count only — the paths themselves are per-run children and would
         # turn every page of `GET /reviews` into a file dump. `GET /review/{id}`
@@ -3427,11 +5440,49 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "stopped": r.stopped,
         "stop_reason": r.stop_reason,
         "stop_confident": r.stop_confident,
+        # #626. Read with an identity test, never for truthiness: NULL is "the
+        # panel did not say", which is every round recorded before the column and
+        # is neither a clean finish nor a failure to reach one. Beside
+        # `stop_confident` and not instead of it — the pair that is worth seeing
+        # together is a below-floor policy stop, which is confident and NOT
+        # converged, and either field alone loses it.
+        "converged": r.converged,
         # Unmasked, like `could_not_assess` two fields down: ingest stores this
         # AS SENT so that "the stopping rule ran and vetoed nothing" ([]) and "no
         # panel ever said" (NULL) stay apart, and masking it on read handed every
         # consumer exactly the collapse the storage side argues against.
         "stop_veto": r.stop_veto,
+        # #717: what the round left behind, counted, and who it went to. On every
+        # view rather than detail-only, because the reader this exists for is
+        # `preland`, and `preland` fetches the run LIST for a PR and rules on the
+        # newest row — the same cut `provenance_counts` is on and for its reason.
+        #
+        # Unmasked, both. NULL on the counts is "how much is owed is not recorded"
+        # — every round predating the column, and every block this board refused
+        # whole — and a consumer that read it as zero would wave through exactly
+        # the PRs this gate exists to stop. NULL on `handed_to` is either that or a
+        # round that went again and made no disposal, told apart by `stopped`.
+        "outstanding": r.outstanding_counts,
+        "handed_to": r.handed_to,
+        # #732: the floor those counts are SPLIT at, and the two the trigger floor
+        # turned away. On every view rather than detail-only, on `outstanding`'s
+        # cut directly above and for a reason of its own: the reader these exist
+        # for is a CALIBRATION (#710), which asks "how many findings did this
+        # floor turn away across a population" — a question about thousands of
+        # rows, which detail-only would make one fetch per run to answer.
+        #
+        # Three scalars, so they ride everywhere the tallies do. `stop_rungs` is
+        # the nine objects behind them and does NOT ride: it is deferred on the
+        # model and carried by `GET /review/{id}`, on `rules`' and `fix_pass`'
+        # argument.
+        #
+        # Unmasked, all three. NULL is "the panel did not say" — every round
+        # predating the columns, and every rung set this board refused whole — and
+        # a consumer reading either count as zero would read a floor that turns
+        # away half a repo's findings as one that turns away none.
+        "cleared_floor": r.cleared_floor,
+        "new_below_trigger_floor": r.new_below_trigger_floor,
+        "repeated_below_trigger_floor": r.repeated_below_trigger_floor,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -4312,9 +6363,13 @@ async def review_stats(
         outcomes_recorded, confirmed_defects = (og["recorded"], og["defects"]) if og else (0, 0)
         # Fixed against refuted, and nothing else: `deferred` and `superseded` are
         # decisions about what to do next, so counting either would let "we never
-        # got to it" read as "it was real". None where nobody has scored one of
-        # this member's findings yet — the same rule as `precision`, where "the
-        # judge never ruled" must not render as "everything it raised was wrong".
+        # got to it" read as "it was real". `narrowed` is a judgement about
+        # correctness and is still out, on the unflattering side of a question
+        # #615 did not settle — see `OUTCOMES_SCORED`, which is where the argument
+        # is written and where the change goes if it is made. None where nobody
+        # has scored one of this member's findings yet — the same rule as
+        # `precision`, where "the judge never ruled" must not render as
+        # "everything it raised was wrong".
         #
         # Published as `outcomes_scored`, because it is the population
         # `precision_after` is actually over and `outcomes_recorded` is NOT: a
@@ -4430,7 +6485,7 @@ async def review_stats(
             # --- what happened afterwards (v2.37). Read these against
             # `outcomes_recorded` / `confirmed_defects` for the same reason
             # provenance is read against `provenance_runs`: nobody has to record
-            # an outcome, so a group with none reports four honest zeros.
+            # an outcome, so a group with none reports five honest zeros.
             #
             # PER DEFECT — every other count in this row is per observation. A
             # defect this member raised in three rounds is three `confirmed` and
@@ -4583,7 +6638,7 @@ async def review_stats(
     by_outcome = dict.fromkeys(OUTCOMES, 0)
     by_outcome_attested = dict.fromkeys(OUTCOMES, 0)
     # Confirmed defects nobody has ruled on yet. Under its own name, and reported
-    # rather than omitted, because the four buckets are a small part of the window
+    # rather than omitted, because the five buckets are a small part of the window
     # until the fix passes start recording — and a page that showed only them
     # would present today's handful as the whole picture.
     by_outcome["not_recorded"] = 0
@@ -4628,16 +6683,820 @@ async def review_stats(
         "by_premise": by_premise,
         # What became of this window's confirmed findings once somebody acted on
         # them, per DEFECT — `fixed` and `refuted` are the judgement about whether
-        # the finding was right, `deferred` and `superseded` are decisions about
-        # what to do next, and `not_recorded` is every confirmed defect nobody has
-        # ruled on. The gap between `fixed / (fixed + refuted)` here and the
-        # `precision` figures above is what a reviewer's confidence is actually
-        # worth.
+        # the finding was right, `narrowed` says it was right and was fixed only
+        # where it was raised (#615), `deferred` and `superseded` are decisions
+        # about what to do next, and `not_recorded` is every confirmed defect
+        # nobody has ruled on. The gap between `fixed / (fixed + refuted)` here
+        # and the `precision` figures above is what a reviewer's confidence is
+        # actually worth — and `narrowed` is deliberately outside that ratio while
+        # being counted in its own right, for the reason `OUTCOMES_SCORED` gives.
         "by_outcome": by_outcome,
         # The subset a human signed off, so an unattended agent's refutations
         # cannot be read as adjudicated without the reader choosing to.
         "by_outcome_attested": by_outcome_attested,
     }
+
+
+#: Size bands for a pull request, by changed lines, low edge inclusive. The
+#: bands are a REPORTING grid and not a policy: nothing gates on them, and the
+#: only property they need is that two cycles in the same band are comparable.
+#: They are wide and few on purpose — the question they exist to answer is "does
+#: a big PR converge less often than a small one", and a grid fine enough to
+#: split that question across a dozen cells answers it about nothing.
+#:
+#: A run with no ``changed_lines`` lands in ``unknown`` rather than in the
+#: smallest band. Every run recorded before that column existed has NULL there,
+#: and the smallest band is where a convergence rate looks best.
+PR_SIZE_BANDS: tuple[tuple[str, int], ...] = (
+    ("xs", 0), ("s", 50), ("m", 200), ("l", 600), ("xl", 2000),
+)
+
+#: Conventional-commit prefixes, for the "refactor vs feature vs fix" split the
+#: issue asks for. Read off the PR TITLE, which is what the board has: it does
+#: not hold PR bodies or labels, and the title is the one shape signal every
+#: producer already sends.
+#:
+#: Deliberately NOT imported from ``scripts/changelog_fragments.py``, whose
+#: ``KINDS`` is this list minus two. That tuple is the set of changelog fragment
+#: kinds **this repository** accepts and is enforced at its own boundary; this
+#: one is a classifier over pull request titles from every repository on the
+#: board, several of which use ``build`` and ``style``. Sharing the constant
+#: would mean one of the two silently acquiring the other's rules — the drift
+#: #305 exists to end — and the cost of not sharing it is that a title kind
+#: neither list knows lands in ``other``, which is where it belongs anyway.
+PR_KINDS: frozenset[str] = frozenset({
+    "feat", "fix", "perf", "refactor", "docs", "test", "chore", "ci", "revert",
+    "build", "style",
+})
+
+#: ``feat(panel)!: thing`` -> ``feat``. Scope and the breaking-change marker are
+#: both discarded: they are orthogonal to the axis this splits on, and a grid
+#: that separated ``feat`` from ``feat!`` would halve every cell to answer a
+#: question nobody asked here.
+#:
+#: Three ``\s*`` in sequence, and the middle group is optional — so on a title
+#: whose prefix never matches, *m* spaces can be split across the three stars in
+#: O(m²) ways at each of the *n* positions ``[a-z]+`` can give back. That is
+#: cubic backtracking on input a stranger controls, and the guard is on the
+#: CALLER: :func:`_pr_kind` matches a bounded prefix. Do not remove that slice
+#: without replacing this pattern with one that cannot backtrack — a possessive
+#: or atomic form loses ``feat (x) ! : spaced``, which today classifies.
+_PR_KIND_RE = re.compile(r"^\s*([a-z]+)\s*(?:\([^)]*\))?\s*!?\s*:")
+
+#: How much of a title :func:`_pr_kind` looks at. A conventional-commit subject
+#: puts its kind in the first handful of characters; nothing legitimate needs a
+#: hundred and twenty. The cap is what keeps :data:`_PR_KIND_RE`'s backtracking
+#: bounded, and it is a cap on the INPUT rather than on the pattern because
+#: every title that classifies today still classifies, spaces and all.
+_PR_KIND_SCAN = 120
+
+
+def _pr_kind(title: str | None) -> str:
+    """A PR's kind from its title, or ``unknown`` / ``other``.
+
+    Three answers and not two. ``unknown`` is "no title was recorded" — the run
+    predates ``pr_title`` or its producer sent none — and ``other`` is "a title
+    was recorded and it is not a conventional-commit subject", which is most
+    human-authored pull requests. Folding the first into the second would put
+    rows nobody classified into a bucket that claims they were.
+
+    Matched against the first :data:`_PR_KIND_SCAN` characters and not the whole
+    title, which is a DENIAL-OF-SERVICE fix and not a tidy-up. ``pr_title`` is
+    ``Text`` with no length cap at either the model or ``ReviewIn``, so any
+    holder of a write token can store one row whose title makes this regex
+    backtrack for seconds; the row is durable, ``/review/convergence`` runs the
+    classifier synchronously inside an async endpoint, and ``reviews.html`` calls
+    that endpoint on every panel page load. 4,000 letters followed by 4,000
+    spaces took 12.5s end to end and blocked the whole worker while it did.
+    """
+    if not title or not title.strip():
+        return "unknown"
+    m = _PR_KIND_RE.match(title.lower()[:_PR_KIND_SCAN])
+    if m and m.group(1) in PR_KINDS:
+        return m.group(1)
+    return "other"
+
+
+def _pr_size(changed_lines: int | None) -> str:
+    """A PR's size band from its changed-line count, or ``unknown``.
+
+    A NEGATIVE count is ``unknown`` too, on the argument the NULL case already
+    makes. ``POST /review`` accepts ``changed_lines: -5`` — nothing bounds the
+    field — and a count that cannot be a count is "nobody credibly said", not
+    "this PR was tiny". Left to fall through the loop it would keep ``band``'s
+    initialised value and land in ``xs``, the band where a convergence rate looks
+    best, which is the one direction a size classifier must not fail in.
+    """
+    if changed_lines is None or changed_lines < 0:
+        return "unknown"
+    band = PR_SIZE_BANDS[0][0]
+    for name, low in PR_SIZE_BANDS:
+        if changed_lines >= low:
+            band = name
+    return band
+
+
+#: How a cycle ended, in the order the buckets are TESTED. Every cycle in the
+#: window lands in exactly one, and only the first two are in the ratio.
+CYCLE_ENDINGS: tuple[str, ...] = ("converged", "unconverged", "open", "unmeasured")
+
+
+def _cycle_ending(stopped: bool | None, converged: bool | None) -> str:
+    """Which of :data:`CYCLE_ENDINGS` a cycle's terminal round puts it in.
+
+    The precedence is the whole of the definition, so it is one function rather
+    than a ``case`` in each of the four group-bys below:
+
+    * ``unmeasured`` first, and it is tested on ``converged IS NULL`` rather than
+      on the round's age. Every round recorded before #626 sent the field and had
+      it dropped by an ingest that did not know it, so "this cycle stopped and
+      nothing says whether it was clean" is a state a perfectly ordinary stopped,
+      confident round is in. It is not a failure to converge and must not sit in
+      the denominator as one.
+    * ``open`` next: the terminal round said go again. The cycle is either still
+      running or was abandoned, and this endpoint cannot tell those apart — the
+      board records rounds, and nothing records an abandonment. Either way it has
+      no ending to count, and putting it in the denominator would report every
+      in-flight cycle as a failure while it is in flight.
+    * then the two that are the measurement.
+
+    **``open`` biases the rate UPWARD, and the bias is not symmetric.** An
+    abandoned cycle is a cycle that did not converge, so every one of them sits
+    outside a denominator it belongs in; a cycle still running might have gone
+    either way. There is no matching bucket of hidden convergences. So the
+    published rate is an upper bound on the true one and should be read as one —
+    which matters most to #637, whose recalibration of
+    ``escalate_on.fix_injection`` is measured against exactly this number and
+    would otherwise fit a threshold to an optimistic population. ``open`` is
+    published beside the rate rather than netted into it so the size of the
+    doubt is visible; it is not an estimate of it.
+
+    Budget terminations are NOT among them, and that is a fix rather than an
+    assumption: a caps refusal used to land here — the panel wrote its refusal
+    ``round_stop`` by hand and left ``converged`` out, so the row was NULL and the
+    endpoint dropped it for having reviewed nothing, leaving "go again" as the
+    cycle's last word. The panel now says ``converged: False`` on that path and
+    this endpoint reads it, so a cycle that ended because the money ran out is
+    counted ``unconverged``, which is what ``preland`` and ``app.review_queue``
+    have always called it.
+
+    ``stopped`` is read with an identity test, never for truthiness, for the
+    reason its column docstring gives: NULL is "the panel did not say", and read
+    for truthiness that calls a finished cycle unfinished.
+    """
+    if converged is None:
+        return "unmeasured"
+    if stopped is not True:
+        return "open"
+    return "converged" if converged else "unconverged"
+
+
+def _tally() -> dict[str, int]:
+    """One group's counters, every bucket present from the start.
+
+    Zeroed rather than grown on first sight, the same discipline
+    ``review_stats`` applies to its four provenance buckets: a group with no
+    ``unconverged`` cycles must publish ``unconverged: 0`` and not omit the key,
+    because a consumer reading a missing key as zero and a missing key as
+    "not measured" are both defensible and only one of them is right.
+    """
+    return dict.fromkeys(CYCLE_ENDINGS, 0)
+
+
+def _rate(t: Mapping[str, int]) -> dict:
+    """A tally, plus the ratio and the denominator it was taken over.
+
+    ``rate`` is ``converged / decided`` and is **null when ``decided`` is 0**,
+    never 0.0. A group with nothing decided has no convergence rate, and 0.0 is
+    the answer "this repo converges never" — the single most misleading number
+    this endpoint could publish, and the one it would publish on every window
+    that predates the column.
+
+    ``cycles`` is every cycle in the group and is deliberately larger than
+    ``decided``. The gap is ``open`` plus ``unmeasured``, and it is published
+    beside the rate rather than netted out of it because the honest reading of
+    "62% converged" depends entirely on whether the other 38% were measured.
+
+    ``rate`` is an UPPER BOUND on the true rate, not an estimate of it: ``open``
+    holds abandoned cycles as well as live ones, and an abandoned cycle is a
+    non-convergence sitting outside its own denominator with nothing symmetrical
+    on the other side. :func:`_cycle_ending` has the argument.
+    """
+    decided = t["converged"] + t["unconverged"]
+    return {
+        **t,
+        "cycles": sum(t[k] for k in CYCLE_ENDINGS),
+        "decided": decided,
+        "rate": round(t["converged"] / decided, 4) if decided else None,
+    }
+
+
+#: Default lookback for ``/review/convergence`` when the caller names no window.
+#:
+#: The other ``/review/*`` reads default to all time and get away with it because
+#: they aggregate in SQL and return O(groups); this one pulls ONE ROW PER CYCLE
+#: back into Python and classifies each in a loop, so its cost is O(cycles) on
+#: the event loop. Measured at 200k rows: 1.32s unfiltered against 0.05s for
+#: `/review/stats` over the same table, growing linearly — ~7s at a million. The
+#: panel page calls it with no filters on every load.
+#:
+#: A window rather than a row cap, and the difference is what the response can
+#: honestly say. `window.since` states the boundary in terms a reader can
+#: reason about and reproduce; a cap would truncate on whatever order the rows
+#: came back in, so `by_repo` and `by_shape` would report rates over an
+#: arbitrary subset that nobody could name or repeat. All time is still
+#: reachable — pass `since` — and it is then the caller's own choice.
+CONVERGENCE_DEFAULT_DAYS = 90
+
+#: The three quantiles ``injection_by_round`` publishes, and the keys they are
+#: published as. ``rate_min`` and ``rate_max`` sit beside them and are plain
+#: aggregates, so they are not in here.
+#:
+#: A shape rather than a mean, because the question this distribution is asked is
+#: where a THRESHOLD should sit and a mean answers a different one. Rounds
+#: distributed 0.0/0.0/1.0/1.0 and rounds distributed 0.5/0.5/0.5/0.5 have the
+#: same mean and give opposite evidence about a cut at 0.5.
+INJECTION_QUANTILES: tuple[tuple[str, float], ...] = (
+    ("rate_p25", 0.25), ("rate_median", 0.5), ("rate_p75", 0.75),
+)
+
+
+def _provenance_sum():
+    """Every ``provenance_counts`` bucket added up, in SQL — the DENOMINATOR the
+    panel's own attribution rate divides by.
+
+    Four buckets and not one, and the three that are not ``introduced`` are here
+    on ``panel_rounds.injection_state``'s argument rather than on this module's:
+    ``missed`` is the other half of the same question, and ``unknown`` /
+    ``missed-unread`` DEPRESS the rate, which is the direction a stop should fail
+    in. This is a second implementation of that sum and it is allowed to be one,
+    because a sum over a published vocabulary is not a rule — see
+    :func:`_injection_rate` for the line this file does not cross.
+
+    A missing key reads 0 and a NULL or ``{}`` column therefore sums to 0, which
+    :func:`_injection_rate` turns into a NULL rate rather than into ``0.0``.
+    """
+    total = None
+    for bucket in PROVENANCE:
+        term = func.coalesce(ReviewRun.provenance_counts[bucket].as_integer(), 0)
+        total = term if total is None else total + term
+    return total
+
+
+def _injection_rate():
+    """One round's attribution rate — ``introduced`` over every bucket — in SQL,
+    NULL where there is nothing to divide.
+
+    **This is a distribution and never a verdict, and that boundary is the whole
+    of why the board may compute it at all.** ``escalate_on.fix_injection`` is a
+    repo dial and ``app/api/dials.py`` argues at length that this board must not
+    learn what one means; ``panel_rounds.FIX_INJECTION_MIN_NEW`` is the floor
+    under the same rule and is a harness constant. So nothing here applies either.
+    What is published is the quantity the rule reads — ``introduced`` over the sum
+    of ``PROVENANCE``, which is this module's own vocabulary — at the grain the
+    rule reads it, which is one ROUND. A consumer holding the threshold applies
+    the threshold.
+
+    NULL and not ``0.0`` where the denominator is 0, on :func:`_rate`'s rule and
+    ``injection_state``'s: zero is a claim about a fix pass, and a round that was
+    never asked is the absence of one. NULL also keeps such rounds out of the
+    quantiles below, since ``percentile_cont`` ignores them — which is what stops
+    "attribution did not arise" being read as "the fix pass introduced nothing".
+
+    **What lands there is exactly ``{}``, jsonb ``null``, SQL NULL and an all-zero
+    tally** — a round 1, a round outside a cycle, a round of pure repeats. A round
+    whose FIX RANGE could not be read does NOT: ``panel.py`` marks a round 2+
+    attributable on the strength of there being a prior round, and
+    ``panel_scope._provenance`` answers ``unknown`` for every finding when it has
+    no range, so such a round arrives as an all-``unknown`` tally with a positive
+    denominator and rates ``0.0``. That is ``injection_state``'s answer for the
+    same row and this endpoint exists to publish that quantity, so it is not a bug
+    to be fixed here — but it is a trap for the reader this key was added for, and
+    the reason ``panel_rounds.attributed()`` refuses those rounds a number in the
+    trend block. On 2026-09-02 three of the board's 38 rated rounds were of that
+    shape (quarterback #480 r3, #188 r2, #87 r2, 41/37/34 findings all
+    ``unknown``) and they are the ONLY zeros in the population, so ``rate_min``
+    read 0.000 off three measurements that did not happen. A recalibration reading
+    the low tail has to check ``provenance_counts`` for it; ``fix_range_source``
+    on ``/reviews`` is the field that names it.
+    """
+    introduced = func.coalesce(
+        ReviewRun.provenance_counts["introduced"].as_integer(), 0)
+    return introduced * 1.0 / func.nullif(_provenance_sum(), 0)
+
+
+def _attribution_ran():
+    """Whether the panel sent a tally at all — the coverage marker's predicate.
+
+    ``review_stats.provenance_runs``' test, verbatim and for its reason: coverage
+    is a fact about the RUN, and ``{}`` is excluded because a round 1 has no
+    earlier round to attribute against, so it is not a round that found nothing —
+    it is a round that was never asked. The empty object is built server-side
+    because a Python ``{}`` bound to a JSONB parameter is a different thing from
+    the jsonb ``{}`` this compares against.
+    """
+    return sa_and(func.jsonb_typeof(ReviewRun.provenance_counts) == "object",
+                  ReviewRun.provenance_counts != func.jsonb_build_object())
+
+
+@router.get("/review/convergence")
+async def review_convergence(
+    _reader: str = Depends(reader),
+    repo: str | None = Query(None),
+    author: str | None = Query(None),
+    since: str | None = Query(None, description="ISO timestamp"),
+    days: int = Query(CONVERGENCE_DEFAULT_DAYS, ge=1, le=3650),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """The share of review CYCLES that ended in a confident dry round (#626).
+
+    This is the number the convergence epic is judged on, and until this endpoint
+    nothing reported it. The panel has computed it per round since #631 —
+    ``round_stop.converged`` — and the board dropped it on ingest; ``review_runs``
+    now stores it and this aggregates it.
+
+    ## The definition, exactly
+
+    A **cycle** is one ``(repo, pr, cycle)``: the panel mints an opaque cycle id
+    and every round of the loop carries it, which is why this can be counted at
+    all. Runs with no cycle id are excluded and counted under
+    ``window.runs_without_cycle`` — they are pre-v2.15 rounds and one-shot reads,
+    neither of which is a loop that could converge, and inventing a cycle per PR
+    for them would merge a year of unrelated reads into one.
+
+    A cycle's **terminal round** is its highest ``round``, ties broken by ``ts``
+    then ``id``. The cycle's ending is that round's ending, and nothing else in
+    the cycle is consulted: convergence is a property of how the loop finished.
+
+    Four endings, and only two of them are in the ratio — see
+    :func:`_cycle_ending`. ``rate`` is ``converged / (converged + unconverged)``,
+    published as ``decided``, and it is **null rather than 0.0** where nothing was
+    decided.
+
+    ## What ``converged`` is, and what it is not
+
+    Stronger than ``stop_confident``, and the difference is the point. A stop
+    under the cleared floor (#165) is ``stopped``, ``stop_confident`` **and**
+    ``converged: false``: the repo's own policy says those findings are reported
+    and not fixed here, so the cycle ended legitimately with real work
+    outstanding. It is a landable PR — ``app.review_queue`` gates ``ready``/
+    ``land`` on the looser test and rightly still does — and it is not a clean
+    finish. A metric that counted it would count configured unfinished work as
+    convergence, which is the direction this whole epic is trying not to drift in.
+
+    Not derived here, and that is a decision rather than an omission. The panel
+    computes ``converged`` FROM ``confident`` in one expression so the two cannot
+    disagree, and the rest of it is cut at repo dials this board holds as opaque
+    JSON and does not interpret. See the column's docstring and migration
+    ``m6bc45ff1``.
+
+    ## The splits
+
+    ``by_repo`` is the first question the issue asks. ``by_size`` and ``by_kind``
+    are "PR shape": size in changed lines, kind from the title's
+    conventional-commit prefix — the two shape signals the board actually holds,
+    since it stores no PR bodies and no labels. ``by_shape`` is the pair together,
+    for the reading the issue is really after ("round 3 pays for itself on feature
+    work and never on refactors"); it is a grid and will be sparse until the
+    population grows, which is why the two margins are published beside it rather
+    than left to be summed out of it.
+
+    **``by_kind`` splits on an author's own declaration, not on a measurement.**
+    The kind is free text the PR's author typed, and nothing checks it: a
+    refactor titled ``feat:`` is indistinguishable here from a feature, and a
+    fleet whose agents prefix by habit rather than by content will produce a
+    clean-looking split of nothing. That matters because this cell is meant to
+    inform a policy decision — how many rounds to buy for which kind of work —
+    and the confidence a grid invites is not available from this signal. Read it
+    as a hypothesis to check against the diffs, never as the finding.
+    (``unknown`` versus ``other`` is a different distinction and a real one: see
+    :func:`_pr_kind`.)
+
+    ``by_rounds`` is keyed by ``final_round``, the terminal round's own NUMBER,
+    and is the successor to this issue's original headline. It is what says
+    whether a cap of 6 buys anything a cap of 3 did not: if no cycle in the
+    window ever converged at round 5, the rounds after 4 are being paid for and
+    not used. It is not a count of the rounds the cycle took — the two differ
+    wherever a round went unrecorded or fell outside this window — and the key
+    says which of the two it is, because a cap is set in round numbers and that
+    is the question being asked.
+
+    ``marginal_by_round`` is the original ask kept intact, and it is measured per
+    ROUND rather than per cycle: for round N across the window, how many rounds
+    ran, how many findings they raised that no earlier round had
+    (``new_findings``), and how many cycles ENDED there having converged. Read
+    ``new_findings`` against ``new_findings_runs`` and never against ``rounds``:
+    the column is nullable and NULL means the panel did not say, so a window with
+    older rounds in it reports an honest sum over a fraction of the population.
+
+    ``injection_by_round`` is the OTHER population, and #637 is why it exists.
+    ``marginal_by_round`` counts findings; ``escalate_on.fix_injection`` divides
+    them — ``provenance_counts.introduced`` over the sum of every bucket, per
+    ROUND — and until this key nothing on this board published that quantity at
+    that grain. ``/review/stats`` sums the four buckets across a window per
+    reviewer, which is a different number: a fleet-wide ratio of sums is not the
+    distribution of per-round ratios, and it is the per-round ratio a threshold is
+    compared against. So a recalibration had to fetch ``/reviews`` and do the
+    arithmetic by hand, which is the reason the paragraph below stood unanswered
+    for as long as it did.
+
+    Per round number N it publishes ``rounds``, two coverage markers, the two sums,
+    and the shape:
+
+    * ``attributed_runs`` — rounds whose tally is a non-empty object, i.e. rounds
+      where attribution RAN (``review_stats.provenance_runs``' own test).
+    * ``rated_runs`` — of those, the ones with a non-zero denominator, so a rate
+      exists. This is the denominator of every SUM and every RATE beside it, and
+      of nothing else: ``rounds``, ``attributed_runs`` and ``dial_runs`` are the
+      markers a reader divides BY it. A round that attributed and summed to zero
+      is real and is not a rate.
+    * ``introduced`` / ``new`` and ``pooled_rate`` — the sums, and their ratio.
+      **Not the quantity the rule reads**, and published because a reader wants
+      the volume. It weights each round BY ITS FINDING COUNT — a 44-finding round
+      pulls it eleven times as hard as a 4-finding one — where the rule gives
+      every round one verdict and so weights the two alike. That is the whole
+      reason the quantiles below are published beside it and not instead of it.
+    * ``rate_min`` / ``rate_p25`` / ``rate_median`` / ``rate_p75`` / ``rate_max``
+      — the distribution of the PER-ROUND rate, which is the quantity the rule
+      reads. Where a cut belongs is a question about this row and not the one
+      above it.
+    * ``dial_runs`` — of the rated rounds, the ones carrying a NON-EMPTY ``rules``
+      record, which is the only field on the row that says what the threshold WAS
+      during that round. A threshold fitted across rounds that do not say what
+      they ran under is fitted across a denominator that moved underneath it, and
+      on 2026-09-02 this read 1 of 38. It is an upper bound: a record present but
+      naming no dial counts, because telling that apart needs the dial vocabulary
+      this board does not hold.
+
+    No threshold and no minimum denominator is applied here, and both omissions
+    are the point rather than an unfinished edge. See :func:`_injection_rate`.
+
+    ## The window
+
+    Unlike the other ``/review/*`` reads this one defaults to a lookback
+    (:data:`CONVERGENCE_DEFAULT_DAYS` days) rather than to all time, and the
+    reason is cost rather than taste: every other endpoint on this router
+    aggregates in SQL and returns one row per group, while this one fetches one
+    row per cycle and classifies each in Python on the event loop. Unfiltered
+    over 200k rows that is 1.32s against 0.05s for ``/review/stats``, and it
+    grows linearly. The applied boundary is always in ``window.since``, and
+    ``since`` overrides ``days``, so a caller who wants all of it can ask for all
+    of it and own the wait.
+
+    ## What this does not do
+
+    It does not recalibrate ``escalate_on.fix_injection`` (#637), and after that
+    issue's measurement it still does not. Publishing the population is this
+    endpoint's job; deciding a threshold over it is a repo's, and where the
+    population is too small to decide from — it was n=1 on 2026-09-02, one round
+    since ``max_rounds`` went to 6 — an endpoint that fitted a number anyway would
+    be laundering a guess through a query. ``injection_by_round`` is that
+    measurement's instrument and ``harness_rules.py``'s ``fix_injection`` block
+    records what it said.
+
+    Every figure comes from three statements against one connection, so under
+    READ COMMITTED each sees its own snapshot and a round recorded between them
+    can appear in one and not another. Same trade ``review_stats`` states at
+    length: a window measured in days does not pay for a repeatable-read
+    transaction to make a sub-second boundary exact.
+    """
+    filters = []
+    if repo is not None:
+        # Rebound and echoed back, exactly as `review_stats` does it: a response
+        # that filtered on one spelling and reported another leaves a caller
+        # unable to tell which repository it was answered about (#326).
+        repo = _asked_repo(repo)
+        filters.append(ReviewRun.repo == repo)
+    if author is not None:
+        author = await _authored_as(session, author)
+        filters.append(ReviewRun.author == author)
+    cutoff = _since_clause(since, days)
+    if cutoff is not None:
+        filters.append(ReviewRun.ts >= cutoff)
+    # A title-skipped merge carries the cycle id it inherited and no stop fields,
+    # so it qualifies as "the newest run of this cycle" and would supply the
+    # cycle's ending from a stopping rule that never ran — reporting every cycle
+    # whose PR later had a merge panelled as `unmeasured`. `/review/findings`
+    # excludes them from its own newest-run selection for exactly this reason,
+    # and the argument is the same one.
+    #
+    # ...but `reviewed IS NOT FALSE` alone throws out the CAPS REFUSAL with it,
+    # and that one is an ending. The panel refuses a round whose diff is past
+    # every seat's budget, reviews nothing (`reviewed: False`) and records
+    # `stop: True, confident: False, converged: False`: the ceiling ended the
+    # cycle. Dropped, the cycle's terminal round became the last round that said
+    # "go again" and the whole cycle was filed `open` — outside the denominator,
+    # counted as maybe-still-running, in the flattering direction. So the test is
+    # widened by exactly one clause: a run that reviewed nothing is still read
+    # when it PUBLISHED A CONVERGENCE VERDICT. A title skip does not (its
+    # `round_stop` is None, so `converged` is NULL) and stays excluded, which is
+    # the property the paragraph above needs. `_review_happened()` itself is
+    # untouched — six other queries mean "a review happened" by it and this one
+    # means "a round that can end a cycle".
+    filters.append(sa_or(_review_happened(), ReviewRun.converged.isnot(None)))
+
+    # Cycles that are cycles. Counted rather than silently dropped: a window made
+    # entirely of one-shot reads would otherwise answer `cycles: 0` — which is
+    # indistinguishable from a window with no runs in it at all, and this repo's
+    # standing complaint about its own data is answers that read safer than the
+    # evidence supports.
+    in_cycle = [*filters, ReviewRun.cycle.isnot(None)]
+    runs_total, without_cycle, first_ts, last_ts = (
+        await session.execute(
+            select(
+                func.count(ReviewRun.id),
+                func.count(ReviewRun.id).filter(ReviewRun.cycle.is_(None)),
+                func.min(ReviewRun.ts),
+                func.max(ReviewRun.ts),
+            ).where(*filters)
+        )
+    ).one()
+
+    # One row per cycle: its terminal round, picked in SQL by a window function
+    # rather than by `max(round)` and a second query to fetch that row, which
+    # cannot break the tie two rounds numbered the same would produce.
+    #
+    # Ordered on `round` FIRST and `ts` second, not the other way round. Two
+    # agents can loop the same PR concurrently, and a re-review recorded late —
+    # a retry, a board that was down and caught up — has a later `ts` than the
+    # round after it. The panel numbers the rounds and that numbering is the
+    # cycle's own account of its order; `ts` is when the board heard about it.
+    #
+    # `marginal_by_round` reads this same subquery rather than the table, so
+    # "terminal" is defined once. Two definitions of the cycle's last round in
+    # one endpoint is the drift this issue exists to end, one query down.
+    ranked = (
+        select(
+            ReviewRun.id.label("id"),
+            ReviewRun.repo.label("repo"),
+            ReviewRun.stopped.label("stopped"),
+            ReviewRun.converged.label("converged"),
+            ReviewRun.round.label("final_round"),
+            ReviewRun.new_findings.label("new_findings"),
+            ReviewRun.changed_lines.label("changed_lines"),
+            ReviewRun.pr_title.label("pr_title"),
+            func.row_number()
+            .over(
+                partition_by=(ReviewRun.repo, ReviewRun.pr, ReviewRun.cycle),
+                order_by=(ReviewRun.round.desc(), ReviewRun.ts.desc(),
+                          ReviewRun.id.desc()),
+            )
+            .label("rn"),
+        )
+        .where(*in_cycle)
+        .subquery()
+    )
+    # Bucketed in PYTHON and not in SQL, which is where this parts company with
+    # `review_stats`' half-dozen grouped selects. The grain here is one row per
+    # CYCLE — bounded by the pull requests this board has ever panelled, not by
+    # findings or scorecards — and the four groupings are four passes over the
+    # same small list. Doing it in SQL would mean four selects that each restate
+    # the ending precedence and the shape bands in a `case`, and the failure that
+    # invites is four expressions drifting apart about what `converged` means,
+    # which is the failure this whole issue is about.
+    cycles = list(
+        (await session.execute(select(ranked).where(ranked.c.rn == 1))).all()
+    )
+
+    overall = _tally()
+    by_repo: dict[str, dict[str, int]] = {}
+    by_size: dict[str, dict[str, int]] = {}
+    by_kind: dict[str, dict[str, int]] = {}
+    by_shape: dict[tuple[str, str], dict[str, int]] = {}
+    by_rounds: dict[int, dict[str, int]] = {}
+    for c in cycles:
+        ending = _cycle_ending(c.stopped, c.converged)
+        size, kind = _pr_size(c.changed_lines), _pr_kind(c.pr_title)
+        overall[ending] += 1
+        for table, key in ((by_repo, c.repo), (by_size, size), (by_kind, kind),
+                           (by_shape, (size, kind)), (by_rounds, c.final_round)):
+            table.setdefault(key, _tally())[ending] += 1
+
+    # This issue's original headline, per round rather than per cycle: over the
+    # window, how many rounds numbered N ran and what they raised.
+    #
+    # `converged` is counted on the cycle's TERMINAL round only — `rn == 1` off
+    # the same subquery the cycle grain came from — so "how many cycles ENDED at
+    # round N having converged" is true by construction. It used to count every
+    # round with `converged IS TRUE`, on the reasoning that a cycle does not
+    # continue past a clean finish. That is a property of today's panel and of
+    # nothing else: nothing in this schema forbids a round after a converged one,
+    # and #617 exists because rounds have in fact run past a cycle's end. An
+    # unenforced invariant load-bearing in an aggregate is a wrong number waiting
+    # for a producer to change.
+    #
+    # `converged_runs` filters on the same `rn == 1`, because a coverage marker
+    # over a different population than its numerator is worse than none.
+    terminal = ranked.c.rn == 1
+    marginal = (
+        await session.execute(
+            select(
+                ranked.c.final_round,
+                func.count(ranked.c.id),
+                func.sum(ranked.c.new_findings),
+                func.count(ranked.c.id).filter(ranked.c.new_findings.isnot(None)),
+                func.count(ranked.c.id).filter(
+                    sa_and(ranked.c.converged.is_(True), terminal)),
+                func.count(ranked.c.id).filter(
+                    sa_and(ranked.c.converged.isnot(None), terminal)),
+            )
+            .group_by(ranked.c.final_round)
+            .order_by(ranked.c.final_round)
+        )
+    ).all()
+
+    # #637's population, at the ROUND grain and off the table rather than off
+    # `ranked`. The rule this instruments fires on any round from 2 onward, so
+    # restricting it to a cycle's terminal round would measure the rate on the
+    # rounds a cycle ENDED at and call it the distribution over rounds — and the
+    # rounds it would drop are precisely the mid-cycle ones a raised cap buys.
+    #
+    # Aggregated in SQL where the four group-bys above are done in Python, and
+    # the two choices are consistent rather than in tension: the reason those are
+    # in Python is that they restate one precedence rule four times, and there is
+    # no precedence here — this is a group-by returning O(round numbers), which is
+    # what `review_stats` does with every one of its reads. Doing it in Python
+    # would mean a second O(rounds) pass on the event loop, on an endpoint whose
+    # own docstring measures the first one at 1.32s over 200k rows.
+    rate = _injection_rate()
+    ran, rated = _attribution_ran(), rate.isnot(None)
+    injection = (
+        await session.execute(
+            select(
+                ReviewRun.round,
+                func.count(ReviewRun.id),
+                func.count(ReviewRun.id).filter(ran),
+                func.count(ReviewRun.id).filter(rated),
+                func.sum(func.coalesce(
+                    ReviewRun.provenance_counts["introduced"].as_integer(), 0)
+                ).filter(rated),
+                func.sum(_provenance_sum()).filter(rated),
+                func.min(rate),
+                func.max(rate),
+                *(func.percentile_cont(q).within_group(rate.asc())
+                  for _, q in INJECTION_QUANTILES),
+                # The only field on the row that records what the threshold WAS
+                # (#305/#647), so it is the coverage marker a recalibration needs
+                # and not a nicety. Tested for presence and never read into: a
+                # board that pulled `escalate_on.fix_injection` out of here would
+                # be interpreting a dial, which is the one thing this file may not
+                # do with that column.
+                #
+                # `jsonb_typeof`, NOT `rules IS NOT NULL`, and the difference is a
+                # wrong number rather than a style: a Python ``None`` bound to a
+                # JSONB column stores the jsonb scalar ``null``, which is not SQL
+                # NULL, so `IS NOT NULL` counts every round that said nothing —
+                # 38 of 38 where the honest answer was 1. Its own column
+                # docstring says "NULL = the panel did not say", and what the
+                # column actually holds is `'null'`. Same trap `provenance_runs`
+                # documents one query up for the empty OBJECT, one rung further
+                # down the type ladder; every other JSONB test in this file is
+                # already written this way.
+                #
+                # Filtered on `rated` like every figure beside it. A coverage
+                # marker over a different population than its numerator is worse
+                # than none — `converged_runs` above says so in as many words —
+                # and unfiltered this would count a round 1 that named its dials
+                # and never entered the distribution.
+                #
+                # `{}` is excluded on `_attribution_ran`'s rule: an empty rules
+                # record names no dial, so it cannot say what the threshold was.
+                # An UPPER BOUND even so, and deliberately: `{"dials": {}}` is a
+                # record with nothing in it and counts here, because telling that
+                # apart means knowing what `dials` is and then what
+                # `escalate_on.fix_injection` is — a vocabulary this board refuses
+                # at length. Emptiness is checkable without one; naming a dial is
+                # not.
+                func.count(ReviewRun.id).filter(sa_and(
+                    rated,
+                    func.jsonb_typeof(ReviewRun.rules) == "object",
+                    ReviewRun.rules != func.jsonb_build_object())),
+            )
+            .where(*in_cycle)
+            .group_by(ReviewRun.round)
+            .order_by(ReviewRun.round)
+        )
+    ).all()
+    injection_by_round = []
+    for row in injection:
+        rnd, n, ran_n, rated_n, intro, total = row[:6]
+        lo, hi = row[6:8]
+        quantiles = row[8:8 + len(INJECTION_QUANTILES)]
+        dials = row[8 + len(INJECTION_QUANTILES)]
+        injection_by_round.append({
+            "round": rnd,
+            "rounds": int(n or 0),
+            "attributed_runs": int(ran_n or 0),
+            "rated_runs": int(rated_n or 0),
+            "introduced": int(intro) if rated_n else None,
+            "new": int(total) if rated_n else None,
+            # The sums' ratio, which weights each round by how many findings it
+            # raised: a 44-finding round moves it eleven times as far as a
+            # 4-finding one. The rule weights them alike — one round, one verdict
+            # — so the quantiles below are its quantity and this is not.
+            "pooled_rate": (round(int(intro) / int(total), 4)
+                            if rated_n and total else None),
+            "rate_min": _q(lo),
+            "rate_max": _q(hi),
+            **{key: _q(v) for (key, _), v
+               in zip(INJECTION_QUANTILES, quantiles, strict=True)},
+            # Not "how many rounds could be rated" — how many could say what
+            # threshold they were rated against.
+            "dial_runs": int(dials or 0),
+        })
+
+    return {
+        "window": {
+            "since": cutoff.isoformat() if cutoff else None,
+            "repo": repo,
+            "author": author,
+            "first_run": first_ts.isoformat() if first_ts else None,
+            "last_run": last_ts.isoformat() if last_ts else None,
+            "runs": runs_total,
+            # The population this endpoint could not speak for, under its own
+            # name. A window of these answers `cycles: 0`, and a reader has to be
+            # able to tell that from an empty board.
+            "runs_without_cycle": without_cycle,
+        },
+        # The headline. `rate` is null, not 0.0, where `decided` is 0.
+        "overall": _rate(overall),
+        "by_repo": [{"repo": k, **_rate(v)} for k, v in sorted(by_repo.items())],
+        "by_size": [{"size": k, **_rate(v)}
+                    for k, v in sorted(by_size.items(), key=_size_order)],
+        "by_kind": [{"kind": k, **_rate(v)} for k, v in sorted(by_kind.items())],
+        # The grid, and it is a LIST of populated cells rather than a nested
+        # object with every combination in it: eleven kinds by six sizes is 66
+        # cells, and a response that is mostly zeroes invites a reader to compare
+        # cells holding one cycle each as though they were rates.
+        "by_shape": [{"size": s, "kind": k, **_rate(v)}
+                     for (s, k), v in sorted(by_shape.items(),
+                                             key=lambda kv: (_size_order((kv[0][0], None)),
+                                                             kv[0][1]))],
+        # Keyed `final_round` and not `rounds`. The number is the terminal round's
+        # own NUMBER, which is not the count of rounds the cycle took: they differ
+        # wherever a round went unrecorded or was filtered out of this window. The
+        # question this answers is about the number — a cap is set in round
+        # numbers — so the number is right and the old label was the wrong word
+        # for it.
+        "by_rounds": [{"final_round": k, **_rate(v)}
+                      for k, v in sorted(by_rounds.items())],
+        "marginal_by_round": [
+            {"round": rnd,
+             "rounds": int(n or 0),
+             # Read against `new_findings_runs`, never against `rounds`: the
+             # column is nullable and NULL is "the panel did not say", so this sum
+             # covers whatever fraction of the population was instrumented.
+             "new_findings": int(new or 0) if measured else None,
+             "new_findings_runs": int(measured or 0),
+             "converged": int(conv or 0),
+             # ...and the same coverage marker for the convergence count, which
+             # has a different denominator: `new_findings` has been recorded since
+             # v2.15 and `converged` only since #626.
+             "converged_runs": int(conv_measured or 0)}
+            for rnd, n, new, measured, conv, conv_measured in marginal
+        ],
+        # #637: the quantity `escalate_on.fix_injection` divides, at the grain it
+        # divides it. Every SUM and every RATE in a row is over `rated_runs` and
+        # not over `rounds` — the three counts beside them are the population
+        # markers themselves (`rounds` every in-cycle row, `attributed_runs` the
+        # tallies, `dial_runs` the rated rounds that can name their threshold),
+        # so a reader can see how much of the window each figure rests on.
+        "injection_by_round": injection_by_round,
+    }
+
+
+def _q(v: object) -> float | None:
+    """A rate off the database as JSON: four places, or nothing.
+
+    Four places for ``injection_state``'s reason — the payload this mirrors rounds
+    to four and takes its verdict on the rounded number, and a distribution
+    published to more places than the rule compares against invites a reader to
+    check one against the other and find them disagreeing in the last digit.
+
+    ``float(v)`` and not a bare ``round``, and it is a guard rather than a no-op:
+    :func:`_injection_rate` multiplies by ``1.0`` so SQLAlchemy types the whole
+    expression as ``Float`` and asyncpg hands back ``float`` for all five figures
+    today — but ``percentile_cont`` over a NUMERIC expression returns
+    ``Decimal``, which ``json`` will not serialise, so one edit to that
+    multiplication would 500 this endpoint. Measured rather than assumed: all
+    five come back ``float``, and this converts anyway.
+
+    ``None`` passes through as ``None``: the group had no round with a
+    denominator, which is not a rate of zero.
+    """
+    return None if v is None else round(float(v), 4)
+
+
+def _size_order(item: tuple[str, object]) -> tuple[int, str]:
+    """Size bands in band order, with ``unknown`` last.
+
+    Sorted rather than left alphabetical because ``l, m, s, unknown, xl, xs`` is
+    the wrong order for the one axis a reader scans down, and a band grid read in
+    the wrong order is read as noise.
+    """
+    names = [n for n, _ in PR_SIZE_BANDS]
+    name = item[0]
+    return (names.index(name) if name in names else len(names), name)
 
 
 def _chain_needs_human(obs: list[ReviewFinding]) -> dict:
@@ -4682,8 +7541,8 @@ async def pr_finding_history(
     * ``open`` — still raised in the most recent run.
 
     ``outcome`` is the other thing entirely (v2.37): what somebody found out by
-    acting on the finding — ``fixed`` / ``refuted`` / ``deferred`` /
-    ``superseded`` — recorded by the fixer or a human through
+    acting on the finding — ``fixed`` / ``narrowed`` / ``refuted`` / ``deferred``
+    / ``superseded`` — recorded by the fixer or a human through
     ``POST /review/outcomes``. It sits beside ``status`` and is never folded into
     it, because they answer different questions and are allowed to disagree: a
     chain reading ``gone`` (the reviewer that raised it did not run again) with an
@@ -5095,6 +7954,15 @@ async def pr_finding_history(
         "stopped": last.stopped if summarisable else None,
         "stop_reason": last.stop_reason if summarisable else None,
         "stop_confident": last.stop_confident if summarisable else None,
+        # #626, and it rides HERE for the reason the four above do: this is where a
+        # cycle is read as a cycle, and "did this one finish cleanly" is the
+        # question a reader of a whole PR's history is asking. `summarisable` gates
+        # it identically — a window holding two cycles has no one loop to answer
+        # for — and NULL is three-valued exactly as `stopped` is, with one more
+        # source: every round recorded before the column existed sent the field and
+        # had it dropped, so a long-lived PR can be summarisable and still have
+        # nothing to say here.
+        "converged": last.converged if summarisable else None,
         # WHY the stop was unearned, in the panel's words. "not convergence" with
         # no reasons attached is the question this feature exists to answer left
         # unanswered.
@@ -5167,6 +8035,13 @@ async def pr_finding_history(
              # is that field's own pin, because the summary's test counts
              # `h.stop_veto` and can never see a read of this one.
              "stop_confident": r.stop_confident, "stop_veto": r.stop_veto,
+             # #626 per round, on the same promise the four above carry: unaltered
+             # at any window size, so a caller whose summary came back
+             # unattributable can still read each round's own answer. The round a
+             # cycle converged AT is only visible here — the summary reports the
+             # newest round of the newest cycle and says nothing about which round
+             # of it was the clean finish.
+             "converged": r.converged,
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,
              # over confirmed findings only. None = no round followed it in this
@@ -5231,6 +8106,23 @@ def _has_file_list(run_id):
 #: whole one, which on this endpoint means "shares 200 files" reading as the
 #: complete overlap.
 SHARED_FILES_CAP = 200
+
+#: The default window a next-door hint may be drawn from, in days. Short on
+#: purpose: #508's whole argument is that the useful signal is "confirmed next
+#: door **this morning**", and a defect shape from six weeks ago in a file that
+#: has since been rewritten is noise wearing the same clothes. A caller that
+#: wants the wider window asks for it.
+NEXT_DOOR_DAYS = 7
+#: How many hints one call may carry. "A handful of lines in a prompt, not a
+#: second review" is the property #508 asks to keep, and it is kept HERE rather
+#: than left to each caller: this endpoint's output goes in front of a model, and
+#: an uncapped one would let a busy repo spend a reviewer's attention on a list.
+NEXT_DOOR_LIMIT = 20
+#: A hint's ``detail`` is the judge's synthesis and can run to paragraphs. The
+#: title says WHAT the defect was and the detail says how it went wrong; a
+#: reviewer needs enough of the second to recognise the shape and none of it to
+#: re-litigate the other PR.
+NEXT_DOOR_DETAIL_CHARS = 400
 
 
 def _capped(paths: list[str], total: int) -> dict:
@@ -5649,6 +8541,344 @@ async def pr_collisions(
     return out
 
 
+def _hint_view(row, now: datetime) -> dict:
+    """One next-door hint, as the panel will read it.
+
+    Every field is evidence a reviewer can go and check: which PR, which run,
+    when, and the defect's own key. A hint that could not be traced back to the
+    round that confirmed it would be an assertion, and this endpoint's whole
+    contract is that it hands over *observations somebody else already
+    adjudicated* rather than conclusions about the caller's diff.
+    """
+    return {
+        "pr": row.pr,
+        "pr_title": row.pr_title,
+        "run_id": row.run_id,
+        "ts": row.ts.isoformat(),
+        # The decay term, pre-computed because it is what the prompt line says
+        # ("confirmed 1.2h ago, next door") and because a caller rendering it
+        # from `ts` would need this endpoint's clock rather than its own.
+        "age_hours": round((now - row.ts).total_seconds() / 3600.0, 1),
+        "file": row.file,
+        "line": row.line,
+        "severity": row.severity,
+        "title": row.title,
+        "detail": _cut_detail(row.detail),
+        "finding_key": row.finding_key,
+        # What happened to it next door, where anybody has said. `fixed` is the
+        # strongest form of this hint — somebody confirmed the defect AND acted
+        # on it — and null is the ordinary case, meaning only that nobody has
+        # recorded an outcome. `refuted` never reaches here; see the handler.
+        "outcome": row.outcome,
+    }
+
+
+def _cut_detail(detail: str | None) -> str | None:
+    """``detail`` trimmed to :data:`NEXT_DOOR_DETAIL_CHARS`, saying so when it cut.
+
+    An ellipsis rather than a silent truncation, for this repo's usual reason: a
+    trimmed answer that does not announce the trim reads as the whole one, and
+    here the reader is a model that would take a sentence ending mid-clause as
+    the sentence.
+    """
+    if detail is None or len(detail) <= NEXT_DOOR_DETAIL_CHARS:
+        return detail
+    return detail[:NEXT_DOOR_DETAIL_CHARS].rstrip() + "…"
+
+
+@router.get("/review/next-door")
+async def next_door(
+    _reader: str = Depends(reader),
+    repo: str = Query(..., description="github nameWithOwner"),
+    pr: int = Query(..., ge=1),
+    since: str | None = Query(None, description="ISO timestamp"),
+    days: int = Query(NEXT_DOOR_DAYS, ge=1, le=3650,
+                      description="how far back a confirmed finding may have been made"),
+    limit: int = Query(NEXT_DOOR_LIMIT, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Defects confirmed on OTHER PRs, recently, in the files this PR touches (#508).
+
+    `finding_recurrence` (#67) chains a finding to earlier rounds of **its own
+    PR**, and that is the right table with the wrong scope for the thing this
+    fleet actually does wrong. The measured case is 2026-08-26: one panel
+    confirmed a P1 in `app.auth.delegated()` — the dev bypass consulted before the
+    credential check — and an hour later the identical shape shipped in
+    `app.auth.human()` on another PR, copied out of the same source function.
+    Codex reviewed that second diff and returned four other real defects, not that
+    one. Nothing found it but a peer who happened to read the PR with their own
+    fix an hour old in their head, and the round that missed it was a round 1, so
+    there was nothing for the per-PR chain to recur against.
+
+    This is that peer's memory, as a query: **one PR's file list, joined to every
+    confirmed finding another PR of the same repo made in those same files inside
+    the window.**
+
+    **A hint, and never a finding.** Nothing here asserts anything about the
+    caller's diff — every row is an observation about somebody else's, with the
+    run and the timestamp that produced it, and a reviewer must find the defect in
+    the diff in front of it before reporting one.
+
+    **Nothing enforces that, and it should not be described as though something
+    does.** This side refuses to publish anything shaped like a verdict, and the
+    prompt (:data:`panel_core.NEXT_DOOR_SLOT`) instructs the seat; an instruction
+    is not a mechanism. Nothing checks that a returned finding cites a line in the
+    current diff, carries evidence independent of the hint, or differs from the
+    text it was shown — so a seat that copies a hint back produces a finding this
+    endpoint cannot distinguish from one somebody found. Were that common, the
+    recurrence chain would eat its own tail and repetition would start scoring.
+
+    That is a known and deliberate gap rather than an oversight, on #67's rule
+    that the instrument comes before the gate: the measurement that would justify
+    provenance-tagging hints and refusing findings that merely echo one is the
+    measurement nobody has yet, and building the gate first is how the panel ends
+    up with a rule calibrated on nothing. What would close it is per-hint ids on
+    the wire, a textual-overlap check at judging time, and a record of which hints
+    a round was shown — which is a separate issue, and wants a few dozen cycles of
+    this shipped before anybody designs it.
+
+    **Confirmed only, and never `refuted`.** Two filters, and they are not the
+    same one. `verdict == "confirmed"` keeps out what a judge threw away — a
+    dismissed finding is not something to carry next door. The outcome join keeps
+    out the sharper case: a finding the judge confirmed and a fixer then *proved
+    wrong* (`POST /review/outcomes`, #77). That row is a known-false statement, and
+    putting a known-false statement in front of a reviewer as "this was confirmed
+    next door" is worse than sending nothing — it spends attention and it teaches
+    the wrong shape. Every other outcome rides along on the row, `fixed` included,
+    because "somebody confirmed this AND acted on it" is the strongest form this
+    hint takes.
+
+    **Other PRs only.** `pr != subject` is the whole point of the endpoint and not
+    a detail: this PR's own history is `GET /review/findings`, and folding the two
+    would make a round's own last complaint indistinguishable from a peer's.
+
+    **One row per (rival PR, finding_key), newest wins.** A rival that raised the
+    same defect in four rounds is one thing to know, not four, and four copies
+    would push the other rivals off the end of `limit`.
+
+    **The file join is exact, and that is the honest limit.** #508 asks for file,
+    symbol or key overlap; this does paths. A path is the one of the three the
+    board already stores exactly, it is what the motivating case turns on (both
+    defects were in `app/auth.py`), and `finding_key` embeds the file, so a key
+    match is a path match already. Symbol-level overlap needs the tree parsed and
+    is not attempted — an approximate join here would widen the population with
+    rows nobody can check, which is the failure mode a hint in a prompt can least
+    afford.
+
+    **Scope, said in the response because the numbers cannot show it.** This
+    answers over the PRs *this board has panelled* within the window, exactly as
+    `GET /review/collisions` does. A PR nobody ran a panel on leaves no findings
+    here and cannot contribute a hint, so an empty `hints` means "nothing among
+    the rounds I have seen", never "nothing happened". Read the subject's own
+    `files_complete` with it: if the subject's file list is a prefix, hints may
+    exist in files it never reported, and no row below can see that.
+    """
+    # Folded before anything is selected, for #326's reason: the subject lookup
+    # and the finding selection must not be asking about two spellings of one
+    # repository, or `hints: []` would be a fact about capitalisation.
+    repo = _asked_repo(repo)
+
+    # The subject's newest FILE-BEARING run, unbounded by the window — the same
+    # asymmetry `GET /review/collisions` documents, and for the same reason. A
+    # caller naming a PR is asking about that PR: `days` bounds which findings are
+    # current enough to be worth carrying, never how far back the board may look
+    # to learn what the subject itself touches.
+    subject_id = await session.scalar(
+        select(ReviewRun.id)
+        .where(ReviewRun.repo == repo, ReviewRun.pr == pr,
+               _has_file_list(ReviewRun.id))
+        .order_by(ReviewRun.ts.desc(), ReviewRun.id.desc())
+        .limit(1)
+    )
+    if subject_id is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"no run of {repo}#{pr} recorded a changed-file list — "
+            "nothing to look for next door",
+        )
+    subject = await session.get(ReviewRun, subject_id)
+    assert subject is not None  # selected by id in this same session
+
+    files_recorded = await session.scalar(
+        select(func.count()).select_from(ReviewRunFile)
+        .where(ReviewRunFile.run_id == subject_id)
+    ) or 0
+
+    cutoff = _since_clause(since, days)
+
+    # The subject's paths as a JOIN and not an `IN (...)`. A PR may carry up to
+    # `MAX_CHANGED_FILES` paths, and the ingest cap is the only thing bounding
+    # them; `ix_review_run_files_path` is on (path, run_id) precisely so this
+    # direction is the indexed one.
+    subj_files = aliased(ReviewRunFile)
+    hints = (
+        select(
+            ReviewRun.pr.label("pr"),
+            ReviewRun.pr_title.label("pr_title"),
+            ReviewRun.id.label("run_id"),
+            ReviewRun.ts.label("ts"),
+            ReviewFinding.file.label("file"),
+            ReviewFinding.line.label("line"),
+            ReviewFinding.severity.label("severity"),
+            ReviewFinding.title.label("title"),
+            ReviewFinding.detail.label("detail"),
+            ReviewFinding.finding_key.label("finding_key"),
+            # Carried so the newest-observation pick can be filtered on it AFTER
+            # the pick rather than before — see the DISTINCT ON comment below.
+            ReviewFinding.verdict.label("verdict"),
+            # The stable final tie-break. `ts` and `run_id` are both equal for
+            # every finding of one run, so without this the cap chooses between
+            # them arbitrarily and two identical calls can return different eights.
+            ReviewFinding.id.label("finding_id"),
+            ReviewFindingOutcome.outcome.label("outcome"),
+        )
+        .join(ReviewFinding, ReviewFinding.run_id == ReviewRun.id)
+        .join(subj_files, sa_and(subj_files.run_id == subject_id,
+                                 subj_files.path == ReviewFinding.file))
+        # LEFT, not inner: the ordinary hint has no recorded outcome at all, and
+        # an inner join would silently reduce this endpoint to "findings somebody
+        # already filed an outcome for" — a small and unrepresentative slice.
+        .outerjoin(ReviewFindingOutcome,
+                   sa_and(ReviewFindingOutcome.repo == repo,
+                          ReviewFindingOutcome.pr == ReviewRun.pr,
+                          ReviewFindingOutcome.finding_key
+                          == ReviewFinding.finding_key))
+        .where(
+            ReviewRun.repo == repo,
+            ReviewRun.pr != pr,
+            # ADJUDICATIONS ONLY, and this predicate is what makes the
+            # newest-observation pick below mean what its comment says it means.
+            # `verdict` has four values, not two: `unjudged` is a finding the
+            # panel KEPT on a round whose judge never ran (`judged: false`, or
+            # `reason='unjudged'` on the finding — see `_verdict`), and `sonar`
+            # is a cross-run observation. Neither is a judgement about the
+            # defect, so neither may DISPLACE one. Without this, a round 2 that
+            # merely failed to reach its judge writes a newer row for the same
+            # key, wins the `DISTINCT ON` below, fails the `confirmed` test
+            # after it, and erases a live confirmation — the endpoint answers
+            # `hints: []` and a quiet week looks identical to a judge outage.
+            #
+            # It is narrowed HERE rather than after the pick, and that is the
+            # opposite of what the `confirmed` test below does, deliberately:
+            # excluding `dismissed` early would resurrect stale confirmations
+            # (the regression the comment below is about), while excluding
+            # non-adjudications early is what stops a non-verdict outranking a
+            # verdict. Both are "the newest thing that ACTUALLY judged this".
+            ReviewFinding.verdict.in_(("confirmed", "dismissed")),
+            # `IS NULL OR <> 'refuted'`, never a bare `<> 'refuted'`: SQL's
+            # three-valued logic drops every row whose outcome is NULL from a
+            # plain inequality, and those rows are the majority of the table and
+            # the ordinary case. Written the short way this filter would have
+            # returned only findings that HAVE an outcome and is not refuted —
+            # the same NULL trap `ck_review_findings_recurs_of_revisited`
+            # documents one table over.
+            sa_or(ReviewFindingOutcome.outcome.is_(None),
+                  ReviewFindingOutcome.outcome != "refuted"),
+        )
+        # Newest observation per (rival PR, defect). The ORDER BY leader must
+        # match the DISTINCT ON expressions — Postgres requires it — so the
+        # recency tiebreak rides behind them.
+        #
+        # **`verdict` is NOT filtered here, and that ordering is the point.** The
+        # obvious version puts `verdict == "confirmed"` in the WHERE above, which
+        # reads identically and is wrong: it removes the dismissals BEFORE the
+        # newest-per-key pick, so a defect confirmed in round 1 and DISMISSED by a
+        # later round has its dismissal deleted from the population and its stale
+        # confirmation resurrected as "the newest observation". The endpoint would
+        # then quote, as confirmed next door, a finding that PR's own judge has
+        # since thrown out — and `GET /review/findings` would disagree with it.
+        # So: pick the newest observation of each defect first, then ask what that
+        # observation said (below). The outcome table catches the `refuted` case
+        # and cannot catch this one, because a later judge dismissal is not an
+        # outcome.
+        .distinct(ReviewRun.pr, ReviewFinding.finding_key)
+        .order_by(ReviewRun.pr, ReviewFinding.finding_key,
+                  ReviewRun.ts.desc(), ReviewFinding.id.desc())
+    )
+    if cutoff is not None:
+        hints = hints.where(ReviewRun.ts >= cutoff)
+
+    inner = hints.subquery()
+    # The verdict test, AFTER the newest-per-key pick. A defect whose newest
+    # observation is a dismissal drops out here; one whose newest observation is a
+    # confirmation stays, whatever earlier rounds said about it.
+    picked = (
+        select(inner)
+        .where(inner.c.verdict == "confirmed")
+        .subquery()
+    )
+    # COUNTED, then FETCHED, rather than fetched and measured. `considered` has to
+    # be the pre-cap number — a cap that trims an answer announces itself — and the
+    # obvious way to get it is `len(rows)` over an unbounded select. That reads fine
+    # at `days=7` on this repo and is a trap at the argument this endpoint permits:
+    # `days=3650` over a busy monorepo selects every confirmed finding any PR ever
+    # made in any file this one touches, materialises all of them, and returns
+    # twenty. `GET /review/collisions` fetches its whole rival population the same
+    # way and gets away with it because a rival is one row per PR; a hint is one row
+    # per (PR, defect), which is the same population multiplied by however many
+    # things went wrong in it.
+    #
+    # Two queries against one subquery, so the number and the rows cannot disagree
+    # about what was selected.
+    #
+    # ONE statement, not two, and that is a correctness fix rather than a tuning
+    # one. A separate `SELECT count(*)` followed by a separate `SELECT … LIMIT`
+    # gets a separate SNAPSHOT under Postgres' default READ COMMITTED, so a run
+    # recorded between them makes `considered` describe a population the rows were
+    # not drawn from — `hints_dropped` then lies, and `considered` can even come
+    # back smaller than the number of rows returned. Sharing a subquery OBJECT
+    # shares no snapshot; only being one statement does.
+    rows = (await session.execute(
+        # Recency is the ranking, and the only one. Severity is deliberately NOT
+        # the leader: a P3 confirmed in this file an hour ago is the sentence
+        # #508 was filed about, and a P1 from six days ago in the same file is
+        # not more likely to be about the diff in front of the reviewer. Both
+        # are on the row for a caller that disagrees.
+        #
+        # `finding_id` closes the ordering: every finding of one run shares its
+        # `ts` and `run_id`, so those two alone leave the cap free to return a
+        # different eight on each identical call.
+        select(picked, func.count().over().label("considered"))
+        .order_by(picked.c.ts.desc(), picked.c.run_id.desc(),
+                  picked.c.finding_id.desc())
+        .limit(limit)
+    )).all()
+    # The window counts the whole pre-LIMIT population, so it is on every row and
+    # identical across them. No rows means none were selected, which is a count of
+    # zero — the one case the window cannot report, because there is no row to
+    # carry it.
+    considered = rows[0].considered if rows else 0
+
+    now = datetime.now(UTC)
+    return {
+        "repo": repo,
+        "pr": pr,
+        "run_id": subject_id,
+        "ts": subject.ts.isoformat(),
+        # The subject's completeness, first, because it bounds every answer
+        # below: a prefix file list under-reports its own next door, and no row
+        # here can see that from the other side of the join.
+        "changed_files_total": subject.changed_files_total,
+        "files_recorded": files_recorded,
+        "files_complete": files_complete(subject.changed_files_total, files_recorded),
+        "window": {"days": days, "since": since,
+                   "cutoff": cutoff.isoformat() if cutoff is not None else None},
+        # Pre-cap, always. `considered` counts what the window and the file join
+        # produced; `hints` is what fits, and `hints_dropped` is the difference —
+        # a cap that trims an answer announces itself, or the trimmed answer
+        # reads as the whole one.
+        "considered": considered,
+        "hints": [_hint_view(r, now) for r in rows],
+        "hints_dropped": max(0, considered - len(rows)),
+        "scope": "confirmed findings on other PRs this board has panelled "
+                 "within the window, in files this PR touches",
+        # Said on the wire and not only in the docstring, because it is the one
+        # property a consumer must implement and cannot infer from the payload.
+        "contract": "a hint, not a finding: a reviewer must find the defect in "
+                    "the diff under review before reporting it",
+    }
+
+
 @router.get("/review/needs-human")
 async def needs_human_open(
     _reader: str = Depends(reader),
@@ -5904,13 +9134,16 @@ async def get_review(
 ) -> dict:
     """One run in full — scorecards plus every finding and its verdict."""
     # `undefer`, explicitly: this is the ONE endpoint that publishes the unread
-    # paths, and the column is deferred so the list views never pay for them.
+    # paths and #647's `rules`, and both columns are deferred so the list views
+    # never pay for them — `rules` for the sharper version of the same argument,
+    # being the largest column on the table at `MAX_RULES_CHARS`.
     # Async SQLAlchemy cannot lazy-load, so without this the attribute access
     # below raises `MissingGreenlet` rather than quietly issuing a second query —
     # which is the failure mode worth having, since it cannot go unnoticed.
     run = await session.scalar(
         select(ReviewRun).where(ReviewRun.id == run_id)
-        .options(undefer(ReviewRun.unread_files))
+        .options(undefer(ReviewRun.unread_files), undefer(ReviewRun.rules),
+                 undefer(ReviewRun.fix_pass), undefer(ReviewRun.stop_rungs))
     )
     if run is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"no review run {run_id}")
@@ -5956,6 +9189,68 @@ async def get_review(
         # was cut, and folding one into the other on read would hand every
         # consumer the collapse the storage side is built to prevent.
         "unread_files": run.unread_files,
+        # #643: the policy this round ran under, beside the verdict it produced.
+        # `_run_view` above carries `converged`, `stopped` and `stop_confident`;
+        # this is the dial set those were computed against, which is what makes
+        # them checkable rather than merely stored.
+        #
+        # HERE and not in `_run_view`, on `unread_files`' rule two keys up: ingest
+        # bounds one of these at `MAX_DIALS_CHARS` and `GET /reviews?limit=500`
+        # would serialise five hundred of them. One run's policy is a fair payload;
+        # a page of policies is a config dump.
+        #
+        # Unmasked: NULL is a round that applied no policy — every skip, every
+        # pre-flight refusal, and every round recorded before the column — and `{}`
+        # is a caller that sent an empty object.
+        "review_panel": run.review_panel,
+        # #647: the LAYER behind each of those values, and the working behind the
+        # `provenance_counts` two keys up. Detail-only, on `review_panel`'s rule
+        # directly above — `rules` is one entry per review dial and a page of them
+        # is a config dump — while the three scalars beside them ride `_run_view`,
+        # because a population is what a recalibration reads.
+        #
+        # Unmasked, both of them. NULL on `rules` is a round recorded before the
+        # column; NULL on `provenance_restored` is a round where the question did
+        # not arise — outside a cycle, or round 2, whose only prior round is the
+        # anchor — and neither is the same as an empty object.
+        "rules": run.rules,
+        "provenance_restored": run.provenance_restored,
+        # #624: the fix pass this round read, in full. Detail-only on `rules`' rule
+        # — it carries the file list and the finding keys — while its integer summary
+        # rides `_run_view` as `fix_pass_counts`, which is the cut this endpoint
+        # makes for `unread_files` two keys up and for `harness_path` below.
+        #
+        # Unmasked. NULL is "there was no pass to record": round 1, a run outside a
+        # cycle, every skip, and every round recorded before the column. A pass that
+        # HAPPENED and could not be read arrives as a record with nulls INSIDE it, so
+        # the two cases are told apart by the record's own `range.kind` and never by
+        # this key being absent.
+        "fix_pass": run.fix_pass,
+        # #732: the nine measurement blocks the stopping rule published beside its
+        # verdict — the eight `escalate_on` rungs and the premise brake's state.
+        # Detail-only on `fix_pass`' rule directly above, and the same cut: the
+        # three scalars a population is calibrated on (`cleared_floor` and the two
+        # below-floor counts) ride `_run_view`, and the objects behind them ride
+        # this endpoint.
+        #
+        # Verbatim and uninterpreted. Nothing here reads a rung's name or collapses
+        # a block's `over` (the measurement crossed a limit) onto its `fired` (this
+        # rung is why the cycle stopped) — that pair is the distinction
+        # `round_stop` publishes them for.
+        #
+        # Unmasked. NULL is "no rung this board could store": every round recorded
+        # before the column, every producer too old to nest them, and every set
+        # refused whole for its size — which `stop_rungs_dropped` told the sender
+        # about at the time.
+        "stop_rungs": run.stop_rungs,
+        # #112: where the harness that produced this round ran from. Detail-only,
+        # on the rule directly above and for the cut `_run_view` states: the three
+        # fields a population is GROUPED by ride every view, and the one a reader
+        # follows to go and look at a single round's machinery rides this one.
+        #
+        # Unmasked. NULL is "the panel did not say", which is every round recorded
+        # before the column — and never a claim that the round came from nowhere.
+        "harness_path": run.harness_path,
         # #113: what this round ASKED for, kept apart from the per-seat answer in
         # `reviewers[].code_blind`. A round with the setting on and every seat
         # blind is a configuration doing nothing, and only the difference shows it.

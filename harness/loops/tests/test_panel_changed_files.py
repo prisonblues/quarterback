@@ -33,9 +33,6 @@ import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
 
 
-
-
-
 def meta(files=None, total=None, **over) -> dict:
     m = {"title": "fix: a thing", "additions": 30, "deletions": 12,
          "baseRefName": "main", "headRefName": "fix/x", "headRefOid": "abc123"}

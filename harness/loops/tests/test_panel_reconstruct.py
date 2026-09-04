@@ -25,8 +25,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import panel_scope                                             # noqa: E402
-
+import panel_scope  # noqa: E402
 
 #: The repo the fork point is nominally on. Every test here stubs
 #: :func:`panel_scope._merge_base_now`, so nothing reaches GitHub and the value
@@ -662,7 +661,7 @@ def test_an_EMPTY_commit_has_no_patch_id_and_is_not_matched(tmp_path):
 # a note. It is imported rather than copied — a second copy is a second thing to
 # teach about every `gh` call panel.py grows, which is the failure `conftest.gh_stub`
 # exists to have stopped.
-from test_panel_provenance import CFG, _compare, _panel_round     # noqa: E402
+from test_panel_provenance import CFG, _compare, _panel_round  # noqa: E402
 
 
 def _rebased_round(tmp_path, monkeypatch, path=None, *, conflict=False,

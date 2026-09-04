@@ -12,31 +12,34 @@ why that distinction is not optional.
 
 from __future__ import annotations
 
-from panel_core import *            # noqa: F401,F403
-import panel_core                   # noqa: F401
-from panel_seats import *           # noqa: F401,F403
-import panel_seats                  # noqa: F401
-from panel_scope import *        # noqa: F401,F403  — re-exported for callers
-import panel_scope               # noqa: F401
+# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
+# is what lets :class:`CoverageRuling` default to an empty mapping without the
+# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
+import hashlib  # noqa: E402
+
+# #555: asked of the `needs_human` this box actually has, because a harness on PATH
+# can be older than this file and an unexpected keyword would cost the escalation.
+import inspect  # noqa: E402
+
+# Named here for the same reason, and used by exactly one check: a baseline's
+# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
+import math  # noqa: E402
 
 # Named directly, and BELOW the star imports on purpose: `escalated: Iterable[str]`
 # has to still mean `collections.abc.Iterable` the day one of those modules
 # re-exports the name, and the last import wins. Placed above, the guarantee would
 # have been a claim about another module's current contents rather than a property
 # of this file.
-from collections.abc import Iterable, Mapping # noqa: E402
-# Named here for the same reason, and used by exactly one check: a baseline's
-# recorded finish has to be a FINITE instant, and `json` parses a bare `Infinity`.
-import math                                   # noqa: E402
-# Same rule again. `hashlib` mints an obligation's key (#547) and `MappingProxyType`
-# is what lets :class:`CoverageRuling` default to an empty mapping without the
-# shared-mutable-default hazard a bare `{}` on a NamedTuple would carry.
-import hashlib                                # noqa: E402
-# #555: asked of the `needs_human` this box actually has, because a harness on PATH
-# can be older than this file and an unexpected keyword would cost the escalation.
-import inspect                                # noqa: E402
-from types import MappingProxyType            # noqa: E402
-from typing import NamedTuple                 # noqa: E402
+from collections.abc import Callable, Iterable, Mapping  # noqa: E402
+from types import MappingProxyType  # noqa: E402
+from typing import NamedTuple  # noqa: E402
+
+import panel_core  # noqa: F401
+import panel_scope  # noqa: F401
+import panel_seats  # noqa: F401
+from panel_core import *  # noqa: F401,F403
+from panel_scope import *  # noqa: F401,F403  — re-exported for callers
+from panel_seats import *  # noqa: F401,F403
 
 # ----------------------------------------------------------------------------- synthesis
 
@@ -236,6 +239,75 @@ def _key_gist(value: object, limit: int = 24) -> str:
     flat = "".join(ch if (ch.isascii() and ch.isalnum()) or ch in "-_." else "?"
                    for ch in str(value))
     return (flat[:limit] + "…" if len(flat) > limit else flat) or "(empty)"
+
+
+#: Why a fix pass did not make a correction it had already identified (#665).
+#:
+#: Four words, and they are the four ways a pass can END UP not writing a patch it
+#: knows is owed. `budget` is a ceiling — the growth cap, a line budget, a token
+#: cap — where the pass agrees the fix is right and cannot afford it. `premise` is
+#: #84/#491's case arriving one step earlier: the fix rests on an assumption the
+#: pass cannot decide. `scope` is a correction that would open files the change
+#: never touched, which #619 measures and #624 records. `refuted` is the pass
+#: disagreeing with the finding on the merits.
+#:
+#: A CLOSED vocabulary, and the reason is what the word is FOR. The register's
+#: whole job is that the next round does not pay to rediscover the fact, and the
+#: next round's reader is briefed off these words: "priced out" and "I think this
+#: finding is wrong" call for opposite next moves. An open vocabulary would let a
+#: fixer write a sentence, and a sentence is exactly the prose the loop already
+#: throws away.
+#:
+#: An unrecognised word is NOT a rejected declaration — see
+#: :func:`declination_or_none`. Losing the declaration to keep the vocabulary
+#: clean would be the bug this issue is about, committed in the name of the fix.
+DECLINE_REASONS: tuple[str, ...] = ("budget", "premise", "scope", "refuted")
+
+#: What a declaration carrying no usable reason word is recorded as. A real value
+#: in the register and not a null: the FACT is that a pass declined a correction,
+#: and that fact is worth inheriting whether or not the word beside it survived.
+DECLINE_UNSTATED = "unstated"
+
+
+def declination_or_none(value: object) -> tuple[str, str, str] | None:
+    """Read one ``KEY:REASON`` declaration — ``(key, reason, problem)``, or None.
+
+    ``None`` is returned for one failure and one only: the KEY half is not the
+    shape of a finding key. That is the one half the register cannot do without,
+    because a declaration nothing can be joined to is a row that matches no
+    finding for the rest of the cycle while its caller reads the silence as the
+    declaration having landed — the same failure ``--escalated`` and
+    ``--acknowledge`` are both checked at the door for.
+
+    The REASON half is different in kind and is treated differently on purpose.
+    A missing or unrecognised word is recorded as :data:`DECLINE_UNSTATED` and
+    NAMED in ``problem``, never dropped: this whole register exists because a
+    fact one actor established was thrown away, and throwing the same fact away
+    over its adjective would be that bug committed by the fix for it. What the
+    refusal protects is narrower — the word is briefed to the next round's fixer
+    and posted to the board, so a word nobody recognises must not travel as
+    though a fixer had said it.
+
+    ``:`` splits at the FIRST occurrence. A key is hex and cannot contain one, so
+    everything after it is the reason however many more it holds — and a caller
+    that pasted ``key:budget:whatever`` gets ``budget:whatever`` refused as a
+    word rather than silently read as ``budget``."""
+    raw = str(value)
+    key, _, reason = raw.partition(":")
+    if not _is_key(key):
+        return None
+    word = reason.strip().lower()
+    if word in DECLINE_REASONS:
+        return _key_norm(key), word, ""
+    return (_key_norm(key), DECLINE_UNSTATED,
+            (f"`{_key_gist(reason)}` is not one of {', '.join(DECLINE_REASONS)} — "
+             f"the declaration was recorded with no reason (`{DECLINE_UNSTATED}`), "
+             "so the next round inherits the defect but not what priced it out")
+            if reason.strip() else
+            (f"carries no reason — the declaration was recorded as "
+             f"`{DECLINE_UNSTATED}`, so the next round inherits the defect but not "
+             f"why it was left. Pass KEY:REASON, where REASON is one of "
+             f"{', '.join(DECLINE_REASONS)}"))
 
 
 def _defect_title(reports: list[Finding]) -> str:
@@ -719,6 +791,190 @@ def is_claim_key(raw: object) -> bool:
     return isinstance(raw, str) and bool(CLAIM_KEY_RE.match(raw.strip().lower()))
 
 
+# ------------------------------------------------------- #718's retirable declaration
+#
+# A `could_not_assess` line that the judge did NOT rule unresolvable stays a veto,
+# and until #718 it stayed one forever. `--acknowledge` takes `uc-` keys only, so a
+# coverage declaration had no key, no register and no way out: whatever anybody
+# subsequently learned, the round's record went on holding the landing exactly as
+# hard as it did on the day the seat wrote the sentence.
+#
+# Measured on lexray#1631 round 2. Two of its three vetoes were `could_not_assess`
+# by the claude seat, which cannot execute anything (#92, decided: reviewers stay
+# non-executing, so this is a permanent property of the design). Both were closed
+# from a worktree pinned at the PR head inside ten minutes — one of them by reading
+# a test file, the other by three runs of the suite under three environments. The
+# answers existed and had nowhere to go; `preland` reported both vetoes verbatim
+# afterwards and the PR still read HOLD on them.
+#
+# **This is the OTHER half of #547's shape, not a second mechanism.** A capability
+# limit nobody here could ever settle becomes an obligation and is discharged by
+# `--acknowledge`: a person accepting a RISK. A declaration somebody went and
+# ANSWERED is a different act with a different artefact — a fact that was measured,
+# not a risk that was accepted — so it gets its own key space (`ca-`), its own flag
+# (`--assessed`) and its own register, and the two cannot be passed to each other's
+# door. What it borrows from #547 is everything that made that register work: a
+# content-addressed key printed beside the declaration, one human decision per
+# declaration, and inheritance through `--baseline` so it is done once per cycle
+# rather than once per round.
+
+#: What an assessed declaration's key looks like. A third vocabulary at the same
+#: door, and it is deliberately neither of the two already there: an obligation key
+#: is `uc-` + 12 hex and a finding key is 8-64 bare hex, so `--acknowledge`,
+#: `--escalated` and `--assessed` each refuse the other two's keys loudly rather
+#: than accepting one and matching nothing for the rest of the cycle.
+DECLARATION_KEY_PREFIX = "ca-"
+DECLARATION_KEY_RE = re.compile(rf"^{DECLARATION_KEY_PREFIX}[0-9a-f]{{12}}$")
+
+
+def declaration_key(declaration: str) -> str:
+    """The stable id of a coverage declaration, derived from the declaration itself.
+
+    :func:`claim_key`'s construction on :func:`claim_key`'s reasoning, over a
+    different sentence: the seat's own `could_not_assess` phrase rather than the
+    judge's claim. Content-addressed, so a seat that declares the same gap next round
+    declares it under the same key and one assessment discharges it for the rest of
+    the cycle. Twelve hex behind a word prefix, for the two reasons stated there —
+    short enough that a person types it back off a PR comment, and not a bare digest
+    that every secret scanner reads as an API key.
+
+    Normalised through :func:`_claim_norm`, which absorbs spelling and not rewording.
+    The limit is the same one and it is if anything smaller here: a seat's declaration
+    is its own sentence rather than a judge's synthesis of several, so it is written
+    fresh each round by a model that was not shown last round's wording. A reworded
+    declaration mints a new key and the assessment does not carry — which is REPORTED
+    (an assessed key no declaration this round carries is a note, not silence), never
+    resolved by matching prose."""
+    return DECLARATION_KEY_PREFIX + hashlib.sha256(
+        _claim_norm(declaration).encode("utf-8")).hexdigest()[:12]
+
+
+def is_declaration_key(raw: object) -> bool:
+    """Whether a string is the shape :func:`declaration_key` mints."""
+    return isinstance(raw, str) and bool(
+        DECLARATION_KEY_RE.match(raw.strip().lower()))
+
+
+class Declaration(NamedTuple):
+    """One `could_not_assess` line as the ledger and the report carry it (#718).
+
+    Keyed on the declaration's TEXT and not on `(seat, text)`, which is the same
+    merge :class:`Obligation` makes and for the same reason: four seats stating one
+    gap are one question, and answering it four times is four chances to answer it
+    differently. :attr:`seats` records who said it so the report can still name them.
+
+    Not an :class:`Obligation`. An obligation is a claim the judge ruled nothing here
+    could ever settle; this is a declaration nothing here DID settle, which is the
+    kind somebody with a shell can close in ten minutes. The two are disjoint by
+    construction — :func:`reached_declarations` skips whatever the ruling claimed —
+    so a declaration is never both, and never answerable at both doors."""
+
+    #: :func:`declaration_key` of :attr:`declaration`.
+    key: str
+    #: The declaration, in the seat's own words.
+    declaration: str
+    #: Every seat that raised it, sorted, so the report does not depend on dict
+    #: ordering and two payloads of one round diff to nothing.
+    seats: tuple[str, ...]
+
+
+#: What a run records for `set_by` when nobody said who did the assessing. NOT the
+#: empty string in the report or the payload, because "unattested" is a claim about
+#: the record and "" is a field somebody forgot to fill in, and #40's rule turns on
+#: telling those apart: an unattested judgement is RECORDED as unattested rather than
+#: refused, which only works if the record says which it was.
+ASSESSED_UNATTESTED = "unattested"
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """Somebody went and answered a coverage declaration (#718).
+
+    The fifth register that travels between rounds on the baseline payload, and the
+    second whose value is an object rather than a bare round. ``acknowledged`` (#547)
+    records that a person accepted a risk; this records that a person MEASURED
+    something, and what they measured is most of the value — "the seed produces
+    exactly ten rows, `ics_invite` absent, idempotent on a second pass" is the whole
+    answer, and a bare key throws it away and leaves the next reader to take the
+    closure on trust.
+
+    **The self-grading objection, and the treatment it gets.** An orchestrator
+    marking its own round's vetoes closed is the actor attesting to its own work, and
+    that is exactly the objection ``--escalated`` already carries and
+    ``record-outcome``'s ``refuted`` already answers: the loop takes the caller's
+    word, records WHO said so and WHEN so the claim is checkable afterwards, and #40's
+    rule is that an unattested judgement is recorded as unattested rather than
+    refused. :attr:`set_by` is the caller's own word about itself and is a CLAIM, not
+    a signature — nothing here can authenticate a person, and an agent that wants to
+    write a human's name can. So it is stored beside its claimant and published as
+    one, the way ``ReviewFindingOutcome.attested_by`` is, and the report renders the
+    split rather than a verdict.
+
+    That is strictly stronger than the status quo it replaces, which is the point
+    worth holding on to when the objection comes back: today the answer is recorded
+    NOWHERE AT ALL and the veto stands on a question that has been settled.
+
+    Frozen, because it is inherited: a later round holding a reference to an earlier
+    round's assessment must not be able to re-word it in place."""
+
+    #: The round whose caller recorded it. Earliest wins on a merge, for the reason
+    #: every other register's does — a caller re-passing a key it inherited must not
+    #: re-date the assessment to now.
+    round: int
+    #: What actually closed it, in the assessor's words. May be empty, and an empty
+    #: one is NAMED rather than refused: see :func:`assessment_or_none`.
+    note: str = ""
+    #: Who says they did the assessing. :data:`ASSESSED_UNATTESTED` where nobody was
+    #: named. A claim, never a signature — see the class docstring.
+    set_by: str = ASSESSED_UNATTESTED
+
+    @property
+    def attested(self) -> bool:
+        """Did the caller name anybody? The split the report renders and the payload
+        carries, computed in one place so the two cannot come to disagree."""
+        return self.set_by != ASSESSED_UNATTESTED
+
+    def as_dict(self) -> dict:
+        """The payload shape — an object, like :meth:`Declination.as_dict` and for
+        its reason. ``attested`` is emitted rather than left to be re-derived: a
+        consumer that recomputed it from ``set_by`` would be re-implementing #40's
+        distinction, and the point of writing it down is that it is not re-derived
+        differently by the next reader."""
+        return {"round": self.round, "note": self.note,
+                "set_by": self.set_by, "attested": self.attested}
+
+
+def assessment_or_none(value: object) -> tuple[str, str, str] | None:
+    """Read one ``KEY:NOTE`` assessment — ``(key, note, problem)``, or None.
+
+    :func:`declination_or_none`'s shape and its asymmetry, which is deliberate and is
+    the same asymmetry: ``None`` is returned for one failure only — the KEY half is
+    not the shape :func:`declaration_key` mints — because an assessment nothing can
+    be joined to discharges no declaration for the rest of the cycle while its caller
+    reads the silence as the veto having been lifted.
+
+    A MISSING NOTE is named and recorded, never refused. The fact ("somebody answered
+    this") survives the loss of the sentence that says how, exactly as a declined
+    finding survives the loss of its reason word — and refusing here would leave the
+    veto standing on a question that has in fact been settled, which is the whole
+    defect this register exists to remove, re-committed by its own fix.
+
+    ``:`` splits at the FIRST occurrence, and everything after it is the note however
+    many more it holds. A key is a prefix and hex and cannot contain one, and a note
+    of somebody's shell commands very often does."""
+    raw = str(value)
+    key, _, note = raw.partition(":")
+    if not is_declaration_key(key):
+        return None
+    said = " ".join(note.split())
+    if said:
+        return key.strip().lower(), said, ""
+    return (key.strip().lower(), "",
+            "carries no note — the assessment was recorded with nothing saying what "
+            "closed the declaration, so the next reader has to take the closure on "
+            "trust. Pass KEY:NOTE, where NOTE is what you measured")
+
+
 class Obligation(NamedTuple):
     """A claim this review established that nothing in it could check.
 
@@ -845,6 +1101,48 @@ def reached_obligations(reviewer_meta: dict[str, dict],
             if ob is not None:
                 out.setdefault(ob.key, ob)
     return tuple(out.values())
+
+
+def reached_declarations(reviewer_meta: dict[str, dict],
+                         ruling: CoverageRuling = CoverageRuling(),
+                         ) -> tuple[Declaration, ...]:
+    """The coverage declarations this round is actually VETOING on (#718).
+
+    :func:`reached_obligations`' rule, applied to the complement of what that
+    function returns. It walks the same seats :func:`coverage_veto` walks and under
+    the same recorded state, so the ledger it builds is exactly the set of
+    declarations that cost this round its confidence — no more, which is what stops
+    a `ca-` key ever appearing beside a declaration that was already free, and no
+    fewer, which is what stops a veto standing under a key nobody was shown.
+
+    Three exclusions, each of them one of `coverage_veto`'s own:
+
+    * a seat that did not RUN declared nothing this round can act on;
+    * a **code-blind** seat's declarations are reported and do not vote, so they cost
+      the round nothing today and must not acquire a key that implies they do;
+    * a declaration the judge ruled **unresolvable** is an :class:`Obligation` and is
+      answered at `--acknowledge`'s door. Excluding it here is what keeps the two
+      registers disjoint: a declaration that could be closed at either door is one a
+      caller can close at the easier one, and the easier one is always the one that
+      asks for less.
+
+    Deduplicated by key and in first-seen order, exactly as obligations are — several
+    seats raising one gap is one question — with every seat that raised it recorded
+    against it so the report can still say who."""
+    seen: dict[str, list[str]] = {}
+    text: dict[str, str] = {}
+    for name, meta in sorted(reviewer_meta.items()):
+        if not meta.get("ran") or meta.get("code_blind"):
+            continue
+        for gap in meta.get("could_not_assess") or []:
+            if (name, gap) in ruling.unresolvable:
+                continue
+            key = declaration_key(gap)
+            text.setdefault(key, gap)
+            if name not in seen.setdefault(key, []):
+                seen[key].append(name)
+    return tuple(Declaration(k, text[k], tuple(sorted(v)))
+                 for k, v in seen.items())
 
 
 def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
@@ -978,9 +1276,9 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
     # that, and dismissing a false positive is its stated job.
     with tempfile.TemporaryDirectory(prefix="panel-judge-") as tmp:
         if code_tree is not None:
-            sandbox, reads_code = panel_seats.seat_checkout(code_tree, Path(tmp) / "cwd")
+            sandbox, reads_code = panel_seats.seat_checkout(code_tree, Path(tmp) / "seat")
         else:
-            sandbox, reads_code = member_sandbox(Path(tmp) / "cwd"), False
+            sandbox, reads_code = member_sandbox(Path(tmp) / "seat"), False
         if reads_code:
             # Told, and pinned, exactly as a reviewer seat is — the brief is what
             # stops it treating the diff as the whole record, and the pin is what
@@ -1066,7 +1364,7 @@ REWORD_RATIO = 0.85
 #: words are what this list must leave alone: "not" and "never" are deliberately
 #: absent, since "is closed" and "is never closed" are two different defects.
 _TITLE_NOISE = frozenset(
-    "a an the of in on at to by is it its as be or and for with this that".split())
+    ["a", "an", "the", "of", "in", "on", "at", "to", "by", "is", "it", "its", "as", "be", "or", "and", "for", "with", "this", "that"])
 
 
 def _stem(word: str) -> str:
@@ -1115,6 +1413,44 @@ def _same_words(a: str, b: str) -> bool:
 #: the cheapest split that answers it. It is also the band `round_trigger_floor`
 #: defaults to, so the count is the one that decides whether a round buys another.
 TREND_SEVERE = "P2"
+
+
+@dataclass(frozen=True)
+class Declination:
+    """A correction a fix pass identified and did not make (#665).
+
+    The third register that travels between rounds on the baseline payload, and
+    the only one of the three whose value is a PAIR rather than a round number.
+    ``escalated`` (#221) and ``acknowledged`` (#547) each record that an act
+    happened; this records that an act did NOT happen, and "why not" is the half
+    that stops the next round paying to rediscover it — a defect the pass could
+    not afford and a defect the pass thinks is not real want opposite next moves,
+    and a bare key cannot tell them apart.
+
+    Frozen, because it is inherited: a later round holding a reference to an
+    earlier round's declaration must not be able to re-word it in place."""
+
+    #: The round whose fix pass declared it. Earliest wins on a merge, for the
+    #: reason the cycle id does — a caller re-passing a key it inherited must not
+    #: re-date the declaration to now.
+    round: int
+    #: One of :data:`DECLINE_REASONS`, or :data:`DECLINE_UNSTATED` where the
+    #: declaration arrived without a word this loop recognises. Never null: see
+    #: :func:`declination_or_none` on why the fact outlives its adjective.
+    reason: str
+
+    def as_dict(self) -> dict:
+        """The payload shape — an OBJECT, where the two older registers serialise
+        a bare int.
+
+        A second parallel register keyed the same way (``declined`` plus
+        ``declined_reasons``) was the cheaper diff and was rejected: it is the
+        same answer written twice with two chances to disagree, and the two halves
+        would be merged by different code on every baseline read. Nesting keeps
+        one entry indivisible, and :func:`_inherit_declined` still reads a bare
+        int as "the round, reason unstated" so a hand-written baseline and a
+        payload from before the reason existed both load."""
+        return {"round": self.round, "reason": self.reason}
 
 
 @dataclass
@@ -1198,6 +1534,33 @@ class RoundTrend:
     #: itself sends null: "raised by no earlier round" is vacuous when there was no
     #: earlier round.
     new_findings: int | None = None
+    #
+    # #618's three columns, APPENDED for the reason `new_findings` was: dataclass
+    # field order is a constructor signature, and every positional `RoundTrend(round,
+    # reviewed, findings, p1p2, introduced, pr_chars)` in this repo's suites would
+    # silently re-bind columns if a field were inserted among them.
+    #: What the fix pass BEFORE this round wrote, split by whether anything can check
+    #: it — :func:`panel_seats.referee_split`'s three buckets, read back out of the
+    #: payload's ``round_stop.unrefereed_fix``.
+    #:
+    #: The block already printed `introduced` — how many of a round's findings the last
+    #: pass authored — and said nothing about what that pass DID. A pass that wrote 330
+    #: test lines and a pass that wrote 330 production lines are not the same event,
+    #: and until #618 the table rendered them identically: on lexray#1780 the fix
+    #: passes after round 1 wrote 1,313 lines of which 848 were test and doc, and the
+    #: trend block a reader checks for the shape of a cycle could not show it.
+    #:
+    #: None, never 0, wherever there was no pass to read: round 1, a round whose fix
+    #: range was unreadable, a round that reviewed nothing, and a payload written
+    #: before #554 recorded the split. `0 production lines` read off any of those is
+    #: the same fabrication `introduced` withholds a zero to avoid — and it is the
+    #: flattering direction, since it reads as a pass that wrote nothing.
+    production: int | None = None
+    #: The test half of that split. See :attr:`production`.
+    test: int | None = None
+    #: The prose half — comments, docstrings, documentation paths. See
+    #: :attr:`production`.
+    prose: int | None = None
 
 
 def attributed(counts: object) -> bool:
@@ -1308,6 +1671,43 @@ def _countable(payload: dict) -> list[dict] | None:
     return raised
 
 
+def _pass_churn(payload: dict) -> dict:
+    """What the fix pass before a round wrote, as `{kind: count-or-None}` (#618).
+
+    Read back out of the payload's own ``round_stop.unrefereed_fix`` — #554's block,
+    recorded on every round since it landed — rather than re-derived. The trend block's
+    standing rule: this round's row and the same round's row one round later have to be
+    the same numbers, and the only way to guarantee that is to read the number the
+    round itself published.
+
+    **``churn`` is the presence test and the three buckets are not.** A pass that
+    genuinely wrote nothing and a round that had no pass to read both record zeros in
+    every bucket, and the payload distinguishes them nowhere else — which is exactly
+    why `panel.py`'s own report line gates on ``churn`` before printing the split. So a
+    zero total is read as "not measured" here too, and every cell is withheld. The cost
+    is a real empty fix range rendering as unknown; the alternative is printing `0
+    production` for round 1, which is a claim about a fix pass that did not exist.
+
+    Tolerant of everything, on :func:`load_baseline`'s standing rule that a bad payload
+    costs a cell and never the review — and it degrades to None rather than to a
+    number, because every wrong number this block can print reads as convergence."""
+    stop = payload.get("round_stop")
+    return churn_cells((stop or {}).get("unrefereed_fix")
+                       if isinstance(stop, dict) else None)
+
+
+def churn_cells(split: dict | None) -> dict:
+    """One :func:`referee_state` mapping as the trend block's three cells (#618).
+
+    Split out of :func:`_pass_churn` because the CURRENT round does not have a payload
+    to read — it has the state it is about to write one from — and the two must apply
+    one rule. A round's own row and the same round's row one round later disagreeing
+    about what its fix pass wrote is the failure this whole block exists to prevent."""
+    if not isinstance(split, dict) or not _nonneg_int(split.get("churn")):
+        return {kind: None for kind in panel_seats.REFEREE_KINDS}
+    return {kind: _nonneg_int(split.get(kind)) for kind in panel_seats.REFEREE_KINDS}
+
+
 def _trend_row(was: int, payload: dict) -> RoundTrend:
     """Read one accepted baseline as a :class:`RoundTrend` row.
 
@@ -1368,7 +1768,13 @@ def _trend_row(was: int, payload: dict) -> RoundTrend:
         # refused round records the size of a PR it then did not review — and a
         # growth ratio computed from a round nobody read is a measurement of
         # nothing. `first_reviewed` beside it takes the same view (#298).
-        pr_chars=_whole_pr_chars(payload) if reviewed else None)
+        pr_chars=_whole_pr_chars(payload) if reviewed else None,
+        # #618's split, gated on `reviewed` for the reason every cell above is: a
+        # skipped round has no fix pass in front of it that anybody read, and three
+        # zeros there would say a pass wrote nothing when what happened is that
+        # nothing was looked at.
+        **(_pass_churn(payload) if reviewed
+           else {kind: None for kind in panel_seats.REFEREE_KINDS}))
 
 
 @dataclass
@@ -1416,6 +1822,22 @@ class Baseline:
     #: see above — and the briefs name that round to the reviewers, so it has to
     #: travel with the sha rather than being guessed from this run's round number.
     head_round: int | None = None
+    #: EVERY accepted round's head commit, `round -> sha`, validated by the same
+    #: rule ``head_sha`` is (#559).
+    #:
+    #: ``head_sha`` alone answers "where does the fix range START", which has one
+    #: right answer and takes the latest. This answers a different question — *had
+    #: this cycle already seen these exact lines?* — and for that the earlier rounds
+    #: are the whole point. :func:`panel_scope.restored_lines` reads the entries
+    #: BEFORE the anchor's round to tell a fix pass that restored already-reviewed
+    #: code from one that wrote it, which position alone cannot do: a
+    #: revert-of-a-revert adds ninety reviewed lines and a line diff calls every one
+    #: of them the fixer's own work.
+    #:
+    #: A dict rather than a list because the round number is what selects "earlier",
+    #: and empty for a cycle whose payloads all predate ``head_sha`` — which reads as
+    #: "nothing to compare against" and leaves attribution exactly where it was.
+    head_shas: dict[int, str] = field(default_factory=dict)
     #: What the round that supplied ``head_sha`` asked its fixer to fix — file
     #: spelling -> the finding keys raised against it. #67's other end of the
     #: recurrence chain (:func:`panel_scope._recurrence`): a new finding standing
@@ -1439,6 +1861,105 @@ class Baseline:
     #: different consumers at different grains: the mechanical test wants a file
     #: index, and the judge wants sentences it can recognise the fix in.
     fixed_findings: list[tuple[str, str, str, int | None, str]] = field(default_factory=list)
+    #: The anchor round's ``{round-local id: key}`` map — #627's other spelling for a
+    #: finding, and the only one a fixer is actually shown.
+    #:
+    #: An excision has to be aimed at the commit that answered ONE named finding, and
+    #: `review-pr.md` asks a fixer to name it in the commit body. What the fixer has in
+    #: front of it is the **To fix** list, which prints ``[1609-F03]`` beside every
+    #: finding and prints no key at all — so a rule that accepted only keys would be
+    #: asking a fixer to join its own commit message against a payload it never opened,
+    #: and would find no seam on every pass that did exactly what it was told.
+    #:
+    #: Run-LOCAL by construction (:func:`_finding_id`), which is why it is read off the
+    #: ANCHOR round's payload and no other: the numbering follows output position, so
+    #: the same defect is ``F03`` in one round and ``F07`` in the next. That is also
+    #: what bounds the risk of accepting it — the map holds one round's ids, and the
+    #: round it holds is the one whose fixer wrote the commits being read.
+    fixed_ids: dict[str, str] = field(default_factory=dict)
+    #: Which keys in that brief were SONAR HARD-GATE issues rather than panel findings.
+    #:
+    #: ``fixed_findings`` is read out of both of the fixer's brief buckets, `to_fix`
+    #: and `sonar_findings`, because for every consumer above this one they are one
+    #: list: the fixer was sent to all of them and the pass answered all of them.
+    #: #627's excision is the one reader for which they are not. A hard-gate issue is
+    #: exempt from both severity floors at every rule in :func:`round_stop` — it is an
+    #: external gate's verdict rather than a judged opinion — and an excision's whole
+    #: argument is that the finding it hands back was never owed. That argument cannot
+    #: be made about a finding no floor applies to, so a `P3` Sonar issue in the brief
+    #: must not read as sub-floor work whose fix can be thrown away (found by a Codex
+    #: second opinion, on the answering side of a filter this already had on the
+    #: caused side).
+    #:
+    #: Keys only, and empty for every payload whose `sonar_findings` bucket was empty
+    #: — which is every repo with no Sonar seat, where this costs nothing and says
+    #: nothing.
+    fixed_gate: set[str] = field(default_factory=set)
+    #: The SEVERITY of every finding in the anchor round's brief, in payload order —
+    #: #622's strict half, and the one field here that has to count the findings
+    #: ``fixed_findings`` deliberately drops.
+    #:
+    #: The question it answers is not "what was the fixer working on" but "was ALL of
+    #: it budgeted", and that is a claim about the WHOLE list: one mandatory finding in
+    #: it and the pass had unbudgeted work to do, so the priced spend stops being
+    #: attributable to the band. ``fixed_findings`` drops any record it cannot place —
+    #: no file, or no key — which is right for recurrence (a finding nothing can place
+    #: is no evidence the fixer was working anywhere) and would be exactly wrong here:
+    #: dropping an unplaceable P1 turns a mixed list into an all-budgeted one and
+    #: manufactures the premise for an accusation.
+    #:
+    #: **So EVERY ENTRY IN THE TWO BRIEF BUCKETS IS COUNTED, including one that is not
+    #: a mapping at all.** Both unreadable shapes — a record whose severity nothing
+    #: could parse, and a bucket entry that is not a record — are written ``"?"``, a
+    #: band no floor admits, which declines the strict verdict rather than guessing at
+    #: it. The non-mapping case was skipped in the first cut of this field and a
+    #: different-vendor review of PR #694 found it: a brief of one P3 and one malformed
+    #: entry read as wholly budgeted, and a pass legitimately spending on whatever that
+    #: entry said would have been accused of overspending.
+    #:
+    #: Empty for a round with no anchor payload, which reads as "no brief to test" and
+    #: not as "a brief with nothing in it": :func:`budgeted_brief` refuses both, and
+    #: says which.
+    fixed_severities: list[str] = field(default_factory=list)
+    #: The dials the ANCHOR round ran under — its payload's ``review_panel`` block,
+    #: whole and unedited (`Dials.as_dict`), or ``{}`` for a payload that carries none.
+    #:
+    #: The band a finding sits in is a function of the floors it was BANDED under, and
+    #: those are the anchor round's rather than this one's: the fixer was briefed under
+    #: that policy, spent under it, and is only fairly measured against it. An operator
+    #: who moved `fix_severity_floor` between rounds must not thereby reclassify what
+    #: the last pass was paying for.
+    #:
+    #: Carried whole rather than picked apart here for `first_reviewed`'s reason —
+    #: whatever reads it has to be able to say which values it applied — and read by
+    #: exactly one consumer (:func:`budgeted_brief`), which validates every key it
+    #: touches rather than trusting a payload that may have been written by an older
+    #: version, by hand, or under a `review_panel` block this release has never seen.
+    fixed_dials: dict = field(default_factory=dict)
+    #: What the ANCHOR round's budget block RECORDED — its payload's
+    #: ``round_stop.fix_budget``, or ``{}`` for a payload carrying none.
+    #:
+    #: Kept apart from ``fixed_dials`` beside it because since #551 the two answer
+    #: different questions and can hold different numbers. ``fixed_dials`` carries the
+    #: WRITTEN `low_severity_fix_lines`, which is what decides whether a finding is in
+    #: the 💸 band at all (`Dials.budgeted_band` reads the written value and #551 did
+    #: not change that). This carries the APPLIED budget — `Dials.budget_for`'s
+    #: pro-rata share of the cycle's first round, clamped — which is the number that
+    #: round's fixer was actually given in its brief and the only number a breach may
+    #: be claimed against.
+    #:
+    #: The two diverge without anybody touching a dial: round 1 takes its denominator
+    #: from ``len(review.diff)`` and round 2 takes round 1's recorded ``pr_chars``, and
+    #: those are two readings of one size that need not agree. Read back off the
+    #: payload rather than recomputed here, because recomputing needs a denominator
+    #: this round does not have — the anchor's own first-round reading — and a second
+    #: derivation of a budget is how a report and a payload come to disagree about the
+    #: policy a round ran under.
+    #:
+    #: ``{}`` for any payload written before #622, which declines the strict verdict:
+    #: a round whose applied budget was never recorded cannot be shown to have been
+    #: given the one this round would price against.
+    fixed_budget: dict = field(default_factory=dict)
     #: When the LATEST prior round that recorded one FINISHED, as epoch seconds
     #: (#192). The left-hand end of the fix phase: this round's own start is the
     #: right-hand end, and the span between them is the fixer, the verification
@@ -1523,6 +2044,63 @@ class Baseline:
     #: question to the same person every round, which is the permanent HOLD this
     #: register exists to end, arriving one round later and wearing a discharge.
     acknowledged: dict[str, int] = field(default_factory=dict)
+    #: Corrections an earlier round's fix pass identified and did NOT make
+    #: (``--declined``, #665), mapped to the round and the reason each was first
+    #: declared under.
+    #:
+    #: Inherited for the reason its two siblings above are, and the reason is
+    #: different again. An escalation and an acknowledgement each record something
+    #: a HUMAN did outside the loop; this records something one of the loop's own
+    #: actors decided it could not do — and the loop then threw the decision away.
+    #: Observed live: a fix pass declared two corrections it could not pay for
+    #: under the growth ceiling, the declaration went nowhere, and the next round
+    #: spent its own budget rediscovering one of them (``classify()``'s now-wrong
+    #: KEEP reason) and reported it as a fresh finding. The information existed,
+    #: the fixer was honest about it, and the cycle paid twice.
+    #:
+    #: **It subtracts from nothing.** ``escalated`` is a filter in front of all four
+    #: stop rules; this is not a filter at all. A declined finding is still
+    #: outstanding, still counted at every rule, still handed to the next fix pass,
+    #: and still blocks a stop exactly as it did before — the register can only ever
+    #: ADD a veto line and take a cycle's claim of clean convergence away. That is
+    #: what makes it un-gameable by the one actor that writes it: there is no
+    #: declaration a fixer can make that buys it a smaller round, a bigger budget or
+    #: an easier stop.
+    declined: dict[str, Declination] = field(default_factory=dict)
+
+    #: Declination keys a human has RETRACTED (`--retract`, #674), mapped to the
+    #: round the retraction was first recorded in.
+    #:
+    #: The fourth register of this shape and the only one that CANCELS another. A
+    #: declination is what a fix pass could not do; a retraction is a person saying
+    #: the correction has since been made, or was never owed. Without it #665's
+    #: register is a one-way door: nothing in the loop retracts a declaration, so the
+    #: veto it raises stands for the rest of the cycle and — through `confident` and
+    #: `preland --require-earned-stop` — holds the landing with it.
+    #:
+    #: A HUMAN act, and inherited for the same reason `acknowledged` is: a later round
+    #: does not make it stop being true, and re-asking would rebuild the permanent HOLD
+    #: this removes. Deliberately NOT inferable from a round's own findings — an absent
+    #: finding is not evidence of a repair when the round's scope never re-read the
+    #: file — and never from a fix pass reporting its own success, which is the actor
+    #: attesting to its own work (#622).
+    retracted: dict[str, int] = field(default_factory=dict)
+    #: Coverage-declaration keys somebody has ANSWERED (``--assessed``, #718), mapped
+    #: to the round, the note and the claimed assessor each was first recorded under.
+    #:
+    #: The fifth register of this shape, inherited for ``acknowledged``'s reason
+    #: exactly: the answer does not stop being the answer because a round ended, and
+    #: a cycle that forgot it between rounds would put a question somebody has
+    #: already measured back in front of them — the permanent HOLD this register
+    #: exists to end, arriving one round later wearing a discharge.
+    #:
+    #: An object rather than a bare round, like ``declined`` and unlike the other
+    #: three, because the NOTE is most of what an assessment is worth: "somebody
+    #: closed this" is a fact the next reader has to take on trust, and "the seed
+    #: produces exactly ten rows, idempotent on a second pass" is a fact they can
+    #: check. Losing the sentence to save a nesting level would keep the register and
+    #: throw away the thing it exists to carry.
+    assessed: dict[str, Assessment] = field(default_factory=dict)
     #: ``(round, chars, measurement)`` of the EARLIEST accepted baseline — the
     #: denominator `review_panel.max_fix_growth` measures this round against (#165).
     #:
@@ -1728,6 +2306,141 @@ def _inherit(into: dict[str, int], raw: object, was: int, path, problems: list[s
                 "declaration's")
         first = when if ok else was
         into[key] = min(first, into.get(key, first))
+
+
+#: What a cycle loses when a `declined` register cannot be read. Written out once
+#: rather than inline, because :func:`_inherit` takes it as a sentence and the
+#: reason has to be the same one in every branch that reports a failure.
+DECLINED_COST = ("a correction an earlier fix pass already declared it could not "
+                 "make is rediscovered from scratch, and reported as a fresh finding")
+
+
+def _inherit_declined(into: dict[str, Declination], raw: object, was: int, path,
+                      problems: list[str]) -> None:
+    """Read the `{key: {round, reason}}` register out of a baseline payload (#665).
+
+    **The key and the round half go through :func:`_inherit` and are not
+    re-implemented here**, which is that function's own rule applied to a third
+    caller: the half that matters is the failure handling — an unreadable
+    container, a key of the wrong shape, a round outside the cycle — and a third
+    copy of it is a third chance for one copy to silently stop matching the
+    others. Everything below the call is the half `_inherit` cannot have, because
+    it is the half no other register carries.
+
+    A value that is not an object is read as the ROUND alone, exactly as
+    `_inherit` reads a bare list: a hand-written baseline saying ``{"abc…": 2}``
+    means "round 2 declared this", and the reason is simply not known. It is
+    recorded :data:`DECLINE_UNSTATED` and not reported, because nothing went
+    wrong — the payload never claimed to carry a word.
+
+    A reason word this loop does not recognise IS reported, and the entry is still
+    inherited under :data:`DECLINE_UNSTATED`. Dropping it would lose a defect over
+    its adjective, which is the failure this whole register exists to stop; and
+    passing the word through would put a string no vocabulary contains into the
+    next round's brief and onto the board, wearing a fixer's authority.
+
+    Earliest round wins a collision across baselines, and the earliest round's
+    REASON travels with it. The two cannot be merged separately without inventing
+    a declaration nobody made: round 2 said `budget`, round 3 re-declared the same
+    key as `scope`, and a register holding round 2's date beside round 3's word
+    would be a sentence neither pass wrote."""
+    rounds: dict[str, int] = {}
+    reasons: dict[str, object] = {}
+    flat: object = raw
+    if isinstance(raw, dict):
+        split: dict[object, object] = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                split[k] = v.get("round")
+                if _is_key(k):
+                    reasons[_key_norm(k)] = v.get("reason")
+            else:
+                # A bare round, from a hand-written baseline. `_inherit` judges
+                # it; nothing is claimed about a reason nobody sent.
+                split[k] = v
+        flat = split
+    _inherit(rounds, flat, was, path, problems, "declined", "the declaration",
+             _is_key, _key_norm, "the shape of a finding key", DECLINED_COST)
+    for key, when in rounds.items():
+        word = reasons.get(key)
+        if word is None:
+            word = DECLINE_UNSTATED
+        elif str(word).strip().lower() in DECLINE_REASONS:
+            word = str(word).strip().lower()
+        else:
+            problems.append(
+                f"baseline {path} declines {key} for `{_key_gist(word)}`, which is "
+                f"not one of {', '.join(DECLINE_REASONS)} — the declaration was "
+                f"inherited as `{DECLINE_UNSTATED}`, so the defect carries forward "
+                "and what priced it out does not")
+            word = DECLINE_UNSTATED
+        held = into.get(key)
+        if held is None or when < held.round:
+            into[key] = Declination(when, word)
+
+
+#: What a cycle loses when an `assessed` register cannot be read. Written out once
+#: for :func:`_inherit`'s sake, the way :data:`DECLINED_COST` is.
+ASSESSED_COST = ("a coverage declaration somebody already went and answered goes "
+                 "back to costing the round its confidence, and the person who "
+                 "answered it is asked the same question again next round")
+
+
+def _inherit_assessed(into: dict[str, Assessment], raw: object, was: int, path,
+                      problems: list[str]) -> None:
+    """Read the `{key: {round, note, set_by}}` register out of a baseline payload
+    (#718).
+
+    :func:`_inherit_declined`'s structure, and it is deliberately that function's
+    and not a fresh one: the key half, the container half and the round half go
+    through :func:`_inherit`, so the three registers of this shape cannot drift into
+    three different answers about a malformed baseline. Only the fields no other
+    register carries are judged here.
+
+    A value that is not an object is read as the ROUND alone — a hand-written
+    baseline saying ``{"ca-…": 2}`` means "round 2 recorded this", with no note and
+    nobody named — and it is NOT reported, because nothing went wrong: the payload
+    never claimed to carry either.
+
+    Neither field can fail in a way worth refusing over. A note is free text by
+    definition and there is no vocabulary to check it against; an assessor's name is
+    a claim and not a signature, so the only thing this can do with an unusable one
+    is record it as :data:`ASSESSED_UNATTESTED` — which is what an absent one records
+    too, and is the honest reading of both. Dropping the entry instead would put a
+    veto back on a question somebody answered, over the spelling of a field that
+    proves nothing either way.
+
+    Earliest round wins a collision, and the earliest round's NOTE and ASSESSOR
+    travel with it, for :func:`_inherit_declined`'s reason: merging the three
+    separately would attribute round 2's date to round 5's sentence and name
+    somebody as the author of an answer they did not give."""
+    rounds: dict[str, int] = {}
+    said: dict[str, dict] = {}
+    flat: object = raw
+    if isinstance(raw, dict):
+        split: dict[object, object] = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                split[k] = v.get("round")
+                if is_declaration_key(k):
+                    said[str(k).strip().lower()] = v
+            else:
+                split[k] = v
+        flat = split
+    _inherit(rounds, flat, was, path, problems, "assessed", "the assessment",
+             is_declaration_key, lambda k: k.strip().lower(),
+             "the shape of a declaration key", ASSESSED_COST)
+    for key, when in rounds.items():
+        entry = said.get(key) or {}
+        note = entry.get("note")
+        who = entry.get("set_by")
+        held = into.get(key)
+        if held is None or when < held.round:
+            into[key] = Assessment(
+                when,
+                " ".join(str(note).split()) if isinstance(note, str) else "",
+                " ".join(str(who).split()) if isinstance(who, str) and str(who).strip()
+                else ASSESSED_UNATTESTED)
 
 
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
@@ -2034,15 +2747,47 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # they exist for if a round drops them.
         #
         # The KEY SHAPES differ and are checked apart — an obligation key is `uc-`
-        # plus eight hex, a finding key is bare hex — so a key pasted into the wrong
-        # flag is reported here rather than inherited into a register where it would
-        # match nothing for the rest of the cycle while the caller read the silence
-        # as the acknowledgement being honoured.
+        # plus twelve hex, a declaration key is `ca-` plus twelve, a finding key is
+        # bare hex — so a key pasted into the wrong flag is reported here rather than
+        # inherited into a register where it would match nothing for the rest of the
+        # cycle while the caller read the silence as the acknowledgement being
+        # honoured.
         _inherit(b.acknowledged, payload.get("acknowledged"), was, path, b.problems,
                  "acknowledged", "acknowledgement", is_claim_key,
                  lambda k: k.strip().lower(), "the shape of an obligation key",
                  "an unverifiable claim a human already accepted goes back to costing "
                  "the round its confidence and is put to them again next round")
+        # #665's register, the third of the shape and the only one whose entries
+        # are objects. Read through its own reader for the reason stated there:
+        # the key and the round go through `_inherit` above, and only the reason
+        # word — which no other register has — is judged here.
+        #
+        # It rides the same tolerant-and-loud rule as the two above, and the cost
+        # of losing it is the sharpest of the three because it is measurable: the
+        # cycle pays a second time for a fact one of its own actors already
+        # established, and books the second payment as a discovery.
+        _inherit_declined(b.declined, payload.get("declined"), was, path, b.problems)
+        # #674's register, the fourth of the shape and the mirror of the one above:
+        # `declined` records what a pass could not do, this records a person saying it
+        # no longer needs doing. Inherited on `acknowledged`'s exact terms — a human
+        # act performed outside the loop that no later round makes untrue — and read
+        # by the same function for the same reason, since a key and a round is all it
+        # is. The cost of losing one is stated as a HOLD rather than a cost in rounds
+        # because that is what it is: the declination comes back, the veto with it,
+        # and the PR stops being strictly landable until somebody types the flag again.
+        _inherit(b.retracted, payload.get("retracted"), was, path, b.problems,
+                 "retracted", "retraction", _is_key,
+                 lambda k: k.strip().lower(), "the shape of a finding key",
+                 "a declination a human already retracted comes back, and with it the "
+                 "veto that stops this PR landing on an earned stop")
+        # #718's register, the fifth of the shape and the second whose entries are
+        # objects. It is `acknowledged`'s sibling and not `declined`'s: both record an
+        # act performed outside the loop that no later round makes untrue, and both
+        # rebuild a permanent HOLD the moment a round drops one. Read through its own
+        # reader for `_inherit_declined`'s reason — the key, the container and the
+        # round are `_inherit`'s job, and only the note and the claimed assessor,
+        # which no other register carries, are judged there.
+        _inherit_assessed(b.assessed, payload.get("assessed"), was, path, b.problems)
         for bucket in ("to_fix", "dismissed", "sonar_findings"):
             for f in payload.get(bucket) or []:
                 if not isinstance(f, dict):
@@ -2108,6 +2853,12 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                                   "rather than attributing against whatever that names")
                 continue
             b.head_sha, b.head_round, anchor_payload = sha, was, payload
+            # Banked for every round, not only the newest, because #559's filter
+            # needs the ones this loop is walking PAST. Written after the same
+            # validation the anchor gets — an unvalidated sha here would reach
+            # `git show` — and a later payload for one round overwrites an
+            # earlier one, which is the tie-break `ordered` already settled.
+            b.head_shas[was] = sha
         # What that anchor round asked its fixer to fix (#67). Read off the SAME
         # payload the anchor came from and no other: the fix range this round
         # attributes against runs from that commit, so those are the complaints
@@ -2118,7 +2869,70 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         if anchor_payload is not None:
             for bucket in ("to_fix", "sonar_findings"):
                 for f in anchor_payload.get(bucket) or []:
+                    # #622's strict half, and a NON-MAPPING ENTRY IS COUNTED RATHER
+                    # THAN SKIPPED — which is the opposite of what the two readers
+                    # below do with it, and the asymmetry is the whole point.
+                    #
+                    # `fixed_here` and `fixed_findings` answer "where was the fixer
+                    # working", and an entry nothing can read is no evidence about
+                    # that, so they drop it. This list answers "was ALL of the brief
+                    # budgeted", which is a claim about the WHOLE list — and there,
+                    # dropping an entry is the one thing that must never happen: a
+                    # brief of one P3 and one unreadable record would read as wholly
+                    # budgeted, and a pass that was legitimately spending on whatever
+                    # that record said would be accused of overspending. The first
+                    # draft of this block skipped it and justified the skip in a
+                    # comment ("the one case that cannot be counted, since there is
+                    # nothing in it to read a severity off"), which was true about the
+                    # severity and false about the finding. A different-vendor review
+                    # of PR #694 found it.
+                    #
+                    # It is recorded as `"?"` — the same sentinel a dict entry whose
+                    # severity nothing could parse gets, one line down — so both
+                    # unreadable shapes decline the brief through ONE mechanism:
+                    # `severity_at_least` reads `"?"` as P1, P1 is at or above every
+                    # trigger floor, and `Dials.budgeted` is false there. No branch in
+                    # `budgeted_brief` has to know that this case exists.
                     if not isinstance(f, dict):
+                        b.fixed_severities.append("?")
+                        continue
+                    # Recorded BEFORE the placement guard below rather than after it,
+                    # on the same argument: a record that cannot be PLACED still
+                    # counts as a finding the fixer was sent to, and dropping an
+                    # unplaceable P1 would turn a mixed list into an all-budgeted one
+                    # exactly as dropping the malformed entry above would.
+                    b.fixed_severities.append(str(f.get("severity") or "?"))
+                    # #627, AND IT IS THE ONE THING IN THIS LOOP THAT DROPS A READABLE
+                    # RECORD. A finding flagged `excised` is one the round that raised
+                    # it took OUT of its fixer's list, because the sub-floor fix that
+                    # caused it is being reverted instead — the report says "hand a
+                    # fixer NONE of the findings below". So nothing below this line is
+                    # true of it: no fixer was sent to it, no fix answered it, and it is
+                    # evidence about no location.
+                    #
+                    # Left in, it became next round's brief, and the four readers of that
+                    # brief each drew a false conclusion from it: `fix_pass_outcome`
+                    # counted it `still_open` against a pass that was told to ignore it,
+                    # `_recurrence` treated a finding at that line as a repeat of a fix
+                    # nobody attempted, `recurrence_brief` printed it as a complaint the
+                    # fixer had answered, and — worst — `sub_floor_brief` re-admitted it
+                    # to the sub-floor band, so a revert commit naming it read as a SEAM
+                    # and the next round could propose excising the excision, putting
+                    # back the very fix this one removed. Found by a Codex second
+                    # opinion.
+                    #
+                    # `fixed_severities` above KEEPS it, and the asymmetry is the one
+                    # this loop already has: that list answers "was ALL of the brief
+                    # budgeted", which only ever DECLINES on an extra entry, and
+                    # declining is the direction `budgeted_brief` is documented to
+                    # prefer. Dropping it there would let a round whose excised finding
+                    # was mandatory work read as wholly cheap.
+                    #
+                    # `is True` and not truthiness: a payload written by an older
+                    # release carries no such key, and a hand-edited one carrying junk
+                    # must read as the old behaviour rather than silently emptying a
+                    # brief.
+                    if f.get("excised") is True:
                         continue
                     file = str(f.get("file") or "")
                     key = str(f.get("key") or "") or _key_from_title(file, _baseline_title(f))
@@ -2128,12 +2942,49 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                         # under "" — which `_same_file` would suffix-match against
                         # every path there is.
                         continue
+                    if bucket == "sonar_findings":
+                        # #627, and the only thing in this loop that cares which
+                        # bucket a record came from. Recorded rather than derived
+                        # later: nothing downstream of `fixed_findings` can tell a
+                        # hard-gate issue from a panel finding, because the tuple
+                        # carries a severity and no source.
+                        b.fixed_gate.add(key)
                     b.fixed_here.setdefault(file, set()).add(key)
+                    # #627's other spelling, off the same record. Recorded only where
+                    # the payload names one and it is not already taken by a different
+                    # finding: an id is round-local, two buckets are read into one map,
+                    # and an id resolving to two keys would aim an excision at whichever
+                    # of them was written last. A collision drops BOTH readings rather
+                    # than picking one — the key spelling still works, and a seam that
+                    # cannot be identified must read as no seam.
+                    got_id = str(f.get("id") or "")
+                    if got_id:
+                        b.fixed_ids[got_id] = ("" if b.fixed_ids.get(got_id, key) != key
+                                               else key)
                     line = f.get("line")
                     b.fixed_findings.append(
                         (key, str(f.get("severity") or "?"), file,
                          line if isinstance(line, int) and not isinstance(line, bool) else None,
                          str(f.get("synthesis") or _baseline_title(f) or "")))
+            # The policy that brief was banded under, off the SAME payload and no
+            # other (#622). A finding's band is a function of the two floors, and the
+            # floors that matter are the ones the FIXER was briefed under — an
+            # operator who moved `fix_severity_floor` between rounds must not thereby
+            # reclassify what the last pass was paying for. Taken whole rather than
+            # picked apart here: :func:`budgeted_brief` is the single consumer and it
+            # validates each key it reads, because this mapping can have been written
+            # by an older release, by hand, or by a `review_panel` block this one has
+            # never seen.
+            block = anchor_payload.get("review_panel")
+            b.fixed_dials = dict(block) if isinstance(block, dict) else {}
+            # And what that round APPLIED, which since #551 is not the same number
+            # (`fixed_budget`). Off the same payload as everything else in this block,
+            # on the rule the whole function follows: the brief, the floors it was
+            # banded under and the budget it was spent against are one round's policy,
+            # and assembling them from different payloads is how a premise gets paired
+            # with the wrong round's rules.
+            spent = (anchor_payload.get("round_stop") or {}).get("fix_budget")
+            b.fixed_budget = dict(spent) if isinstance(spent, dict) else {}
         # The fix phase's earlier end (#192), on its own pass rather than folded
         # into the loop above: a round can record a head and no finish (a payload
         # from before the field) or a finish and no head (a round whose PR read
@@ -2317,7 +3168,8 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                   flagged: int, diff_chars: int, *, ci_status: str,
                   ci_declared_absent: bool = False,
                   coverage: CoverageRuling = CoverageRuling(),
-                  acknowledged: Iterable[str] = ()) -> list[str]:
+                  acknowledged: Iterable[str] = (),
+                  assessed: Iterable[str] = ()) -> list[str]:
     """Reasons a quiet round is not evidence of a quiet PR.
 
     A counter cannot tell a genuinely dry round from a broken one — a reviewer
@@ -2432,7 +3284,27 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
       claim already on the ledger adds nothing to this list. What a new seat can
       still cost is a gap it found that the others missed and that this panel COULD
       have closed — which is diligence, is discharged by going and looking, and is
-      the behaviour worth keeping."""
+      the behaviour worth keeping.
+
+    **`assessed` is the other half of that last sentence** (#718). "Discharged by
+    going and looking" was true of the act and false of the record: somebody went and
+    looked, and the round had nowhere to put the answer, so the veto stood on a
+    question that had been settled. `assessed` is where the answer goes — a set of
+    `ca-` keys, each naming one declaration a person says they have now answered,
+    carried between rounds on the payload exactly as `acknowledged` is.
+
+    It exempts the per-seat declaration lines above and nothing else. Not an
+    obligation (that is `acknowledged`'s door, and `reached_declarations` keeps the
+    two sets disjoint), not a truncation, not an absent seat, not CI, not a judge
+    skip — every one of which is a different fact that a person answering a coverage
+    question has not touched. So this cannot empty a veto list that was not otherwise
+    empty except by answering every declaration in it one at a time, which is the
+    work, not a way around it."""
+    # Normalised the way `acknowledged` is a few lines below, and for its reason: a
+    # key travels through a shell, a PR comment and a person's clipboard before it
+    # gets here, and a padded or upper-case spelling that silently matched nothing
+    # would leave the caller reading the veto as one they had already answered.
+    seen_assessed = {k.strip().lower() for k in assessed if isinstance(k, str)}
     out = []
     for name, meta in sorted(reviewer_meta.items()):
         if not meta.get("ran"):
@@ -2489,8 +3361,26 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
                 # obligation block below, which emits one line for the CLAIM rather
                 # than one per seat that raised it. A gap the judge did not rule on
                 # falls through to the line it has always produced.
-                if (name, gap) not in coverage.unresolvable:
-                    out.append(f"{name} could not assess: {gap}")
+                if (name, gap) in coverage.unresolvable:
+                    continue
+                # #718's exemption, and it is the plainest recorded state in this
+                # function: an argument on the command line naming the declaration's
+                # own key. Not a ruling, not a model's prose, not a regex over the
+                # declaration's wording — the rule every exemption here keeps.
+                #
+                # It is also the only exemption in this function that can be granted
+                # by the actor that ran the round, which is the objection #718 states
+                # and answers rather than dodges. Two things bound it. The key is
+                # content-addressed over the declaration, so the caller cannot
+                # exempt a declaration it has not read and quoted back; and the
+                # answer is RECORDED — round, note and who claims to have done it —
+                # so a closure nobody could defend is a closure somebody can find.
+                # Against the status quo that is strictly more: the alternative is
+                # not scrutiny, it is a veto standing on a question that was settled
+                # and an answer written down nowhere at all.
+                if declaration_key(gap) in seen_assessed:
+                    continue
+                out.append(f"{name} could not assess: {gap}")
     # What the declarations above became. One line per CLAIM, not per seat, and only
     # for the claims a VETOING declaration raised — a blind seat's or an absent
     # seat's cost the round nothing today and must not start costing it something
@@ -3075,6 +3965,78 @@ def same_premise(a: str, b: str) -> bool:
             and _same_words(a, b))
 
 
+def working_head(repo_path: str = ".") -> str:
+    """The commit the tree a fix is about to be written in is sitting on, or ``""``.
+
+    #560. The brake derives its whole value from running BEFORE the patch — it fires
+    on the FIRST declaration and exit 4 means *do not write this fix* — and that
+    ordering is unobservable in the one configuration `panel-review-pr.md` recommends
+    for more than one PR. Where the orchestrator IS the fixer there is no brief handed
+    to a second agent, so no moment between "decide the premise" and "start editing"
+    for the brake to occupy, and the premise gets declared against the round it
+    followed once the pass is already written and pushed. That declaration and an
+    honest one produce byte-identical register entries, so nothing downstream can tell
+    a brake from an annotation. This is the one field that can.
+
+    **Read from the current working directory, not from a flag.** A flag was the
+    obvious shape and it is the wrong one for the reason `declare_premise` gives for
+    making a `no` sticky: the actor supplying the evidence is the actor the evidence is
+    about, and a fixer that has to pass `--premise-head` can pass the head it wishes it
+    had. `cfg["path"]` was the other candidate and it is wrong differently — in
+    worktree mode, which is the mode the collapsed case runs in, the canonical checkout
+    is not the tree the patch lands in, so it would stamp a commit that has nothing to
+    do with this fix pass.
+
+    **Unreadable is `""` and never a guess**, on :func:`panel_scope._git`'s contract:
+    no `git` on PATH, a declaration made outside a checkout, a repository with no
+    commit yet. All of them mean "nobody recorded where the tree was", which reads
+    downstream as unknown and accuses nobody. Inferring it from the PR instead would
+    mint a stamp for a tree the declaration was never made in, and the ordering check
+    would then say something false rather than nothing.
+
+    **WHAT THIS IS NOT, said plainly because the first version of #560 overstated
+    it.** The directory is the one the declaring PROCESS was launched in, and that is
+    the tree the patch lands in only when the declaration was made there. Run from
+    the canonical checkout, from a sibling worktree, or outside a repository
+    altogether, this records some other tree's head or none — and the ordering check
+    then reports nothing, because a stamp matching no round's head is silence. So an
+    actor that would rather not be stamped does not have to falsify an argument; it
+    can pick a directory. That is #622 — every brake on the fix pass is measured by
+    the actor it constrains — and it is not closed here. What IS closed is the
+    accident this issue was opened on: an orchestrator-that-is-also-the-fixer
+    declaring in its own patch tree, after the pass, with no intent to deceive."""
+    sha = (panel_scope._git(repo_path, "rev-parse", "HEAD") or "").strip()
+    return sha if _SHA_RE.fullmatch(sha) else ""
+
+
+def _declared_heads(raw: object, rounds: Iterable[int]) -> dict[int, str]:
+    """The heads a register recorded against one declaration's rounds (#560).
+
+    JSON has no integer keys, so the rounds come back as strings and are read to ints
+    here — the same round numbers `rounds` already carries, and anything naming a
+    round this entry does not claim is dropped along with anything that is not a
+    commit id.
+
+    DROPPED, not reported, unlike every other malformed thing `load_premises` finds.
+    The register field is younger than the register: every declaration made before
+    this existed carries no `heads` at all, and a `problems` line for each of them
+    would fire on ordinary history and say nothing a caller can act on. A missing or
+    unreadable stamp already has a meaning — the ordering was not checkable on that
+    declaration — and it is the meaning that accuses nobody."""
+    out: dict[int, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    claimed = set(rounds)
+    for key, sha in raw.items():
+        try:
+            was = int(key)
+        except (TypeError, ValueError):
+            continue
+        if was in claimed and isinstance(sha, str) and _SHA_RE.fullmatch(sha):
+            out[was] = sha
+    return out
+
+
 def new_premise_register(repo: str = "", pr: int | None = None) -> dict:
     """An empty register for one PR's cycle."""
     return {"version": PREMISE_REGISTER_VERSION, "repo": repo, "pr": pr,
@@ -3149,6 +4111,7 @@ def load_premises(path: str, repo: str = "", pr: int | None = None
         kept.append({"key": premise_key(text), "text": text,
                      "norm": _norm_title(text), "rounds": sorted(rounds),
                      "decidable": answer if answer in DECIDABILITY else "unknown",
+                     "heads": _declared_heads(entry.get("heads"), rounds),
                      "findings": sorted({_key_norm(k) for k in (entry.get("findings") or [])
                                          if _is_key(k)})})
     reg["premises"] = kept
@@ -3169,7 +4132,7 @@ def find_premise(reg: dict, text: str) -> dict | None:
 def declare_premise(reg: dict, text: str, round_no: int,
                     findings: Iterable[str] = (), limit: int | None = None,
                     decidable: str = "unknown",
-                    undecidable_brake: bool = False) -> dict:
+                    undecidable_brake: bool = False, head: str = "") -> dict:
     """Record that a fix pass is about to be written against ``text``, and say
     whether it may be.
 
@@ -3216,7 +4179,15 @@ def declare_premise(reg: dict, text: str, round_no: int,
     STICKS. Neither a later ``"yes"`` nor a later silence clears it, and the brake
     reads the entry rather than the declaration in front of it. See the comment on
     the assignment for why: everything else here would let the one agent whose fix is
-    being refused lift its own refusal by changing its answer."""
+    being refused lift its own refusal by changing its answer.
+
+    ``head`` is where the tree stood when this was declared (#560), from
+    :func:`working_head`. It records nothing about the premise and everything about
+    WHEN the sentence was said, and it settles exactly one of the two ways the
+    ordering fails: the pass that was already COMMITTED when the premise was declared,
+    which is the shape #560 reported and which :func:`retroactive_declarations` reads.
+    The pass that was merely WRITTEN moves no head and is not settled here — see that
+    function for the three attempts at it and why the evidence does not carry it."""
     text = " ".join(str(text).split())
     answer = str(decidable or "unknown").strip().lower()
     if answer not in DECIDABILITY:
@@ -3231,12 +4202,24 @@ def declare_premise(reg: dict, text: str, round_no: int,
     entry = find_premise(reg, text)
     if entry is None:
         entry = {"key": premise_key(text), "text": text, "norm": _norm_title(text),
-                 "rounds": [], "findings": [], "decidable": "unknown"}
+                 "rounds": [], "findings": [], "decidable": "unknown", "heads": {}}
         reg.setdefault("premises", []).append(entry)
     if round_no not in entry["rounds"]:
         entry["rounds"] = sorted([*entry["rounds"], round_no])
     entry["findings"] = sorted({*entry["findings"], *keys})
     entry.setdefault("decidable", "unknown")
+    # **THE FIRST STAMP FOR A ROUND WINS**, which is the same rule the round count
+    # already applies to a restatement and for the same reason. A fixer that states
+    # its premise, is interrupted and states it again has proposed one fix pass; if
+    # the second statement moved the stamp forward, an honest fixer that declared
+    # first and restated mid-pass would be recorded as having declared after its own
+    # patch — the exact accusation this field exists to make, aimed at the one case
+    # it must never be aimed at. Overwriting also hands the actor the eraser: any
+    # declaration could be back-dated by re-declaring from a stale checkout.
+    stamp = str(head or "").strip()
+    entry.setdefault("heads", {})
+    if stamp and _SHA_RE.fullmatch(stamp) and round_no not in entry["heads"]:
+        entry["heads"][round_no] = stamp
     # **A `no` is STICKY, and the brake reads the ENTRY rather than this declaration.**
     # Both halves close the same hole, and it is the hole every self-reported signal in
     # this loop has: the agent whose fix is being refused is the one supplying the
@@ -3286,6 +4269,7 @@ def declare_premise(reg: dict, text: str, round_no: int,
             "decidable": entry["decidable"], "answered": answer,
             "repeated": repeated, "undecidable": undecidable,
             "undecidable_brake": bool(undecidable_brake),
+            "head": entry["heads"].get(round_no, ""),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -3302,8 +4286,91 @@ def undeclared_passes(reg: dict, round_no: int) -> list[int]:
     return [r for r in range(1, max(round_no, 1)) if r not in declared]
 
 
+def retroactive_declarations(reg: dict, heads: Mapping[int, str] | None) -> list[dict]:
+    """Declarations this cycle's own records place after the fix pass they explain
+    (#560), as ``[{key, text, round, head, head_round}, …]``.
+
+    ``heads`` is round -> the commit that round reviewed, which the round already has:
+    every earlier round's from `Baseline.head_shas`, and this round's from its own
+    `head_sha`. A declaration for round R stamped with the head of some LATER round
+    was said after the round-R fix pass was written, committed and pushed, so exit 4
+    had no patch left to refuse. That is what this reports, and it is the shape #560
+    was opened on — the issue says the premise was declared "after the pass had been
+    written, committed and pushed", twice.
+
+    **Positive identification only, and everything else is silence.** A stamp
+    matching no round's head is not reported — a fixer that declared from an
+    unpushed local commit, an amend, a rebase, a stray checkout and a declaration
+    made from the wrong directory all land there, and the honest reading of all of
+    them is that the ordering was not checkable. The alternative rule — "anything
+    that is not the round's own head is late" — would accuse an honest fixer for a
+    rebase it did not perform, and a check that cries wolf on ordinary history is one
+    an orchestrator learns to pass over. This fires on a fact rather than on an
+    absence: the tree was carrying a commit the cycle itself recorded as arriving
+    after the round in question, and there is no innocent way for that to be true.
+
+    **WHAT THIS DELIBERATELY DOES NOT REPORT, and the three attempts it cost.** A fix
+    pass that edits the working tree and declares BEFORE committing has not moved
+    `HEAD`, so its stamp equals its own round's head and is byte-identical to the
+    honest declaration made before the first edit. Edit, then commit is the ordinary
+    shape of a fix pass, so this is not a corner. It is also **not detectable from
+    anything this loop can read**, and each attempt failed in its own way:
+
+    * *Ask whether the declaring tree is dirty.* An unrelated edit predating the
+      round, a tracked generated file, a staged unrelated change and a dirty submodule
+      all answer yes — and `review-pr.md` permits pre-existing dirt outright in
+      fix-in-place mode. It accused the honest fixer, which is worse than the
+      detection it bought: an operator switches such a check off.
+    * *Compare a porcelain fingerprint the round took against one the declaration
+      took.* Better, and still wrong twice over. A concurrent agent in a shared
+      checkout, an editor autosave or a background build moves the tree between the
+      two readings with no fix pass involved — and this fleet runs several agents in
+      shared checkouts routinely. Meanwhile a file ALREADY modified when the round ran
+      fingerprints as ` M path` both times however much the fix pass then changed it,
+      so the case the comparison existed for slipped through.
+    * *Hash contents instead of status codes.* Closes the second half and leaves the
+      first untouched, because the ambiguity is not in the digest. It is in the
+      inference: a tree change cannot be attributed to a particular actor from
+      evidence read in that actor's own environment. That is #622, and it is not
+      solvable here.
+
+    So the ordering ahead of an uncommitted patch is UNCHECKED rather than checked and
+    found clean, and this list's silence must be read that way. The alternative — an
+    entry that says "the tree differed, and I cannot tell you why" — was considered
+    and rejected: in this fleet it would fire on ordinary concurrent work, which is
+    the loud-and-wrong the `config_notes` gate on `undeclared_passes` already argues
+    against, and it would enumerate part of a category (declarations whose ordering
+    could not be confirmed) while the far larger part of it went unlisted.
+
+    Ties go to the EARLIEST round holding a head, which matters when a fix pass
+    pushed nothing and two rounds reviewed the same commit. Then "which round does
+    this stamp belong to" has more than one answer and the earliest is the only one
+    that cannot manufacture an accusation out of a pass that changed nothing.
+
+    Compares commit ids and asks `git` nothing. Every sha here was recorded by the
+    cycle itself, so this costs a round no subprocess, no network call and no local
+    checkout — which is what lets it run on every round rather than on the terminal
+    one, the way :func:`panel_scope.fix_pass_commits` has to."""
+    first_at: dict[str, int] = {}
+    for was, sha in sorted((heads or {}).items()):
+        if isinstance(sha, str) and sha:
+            first_at.setdefault(sha, was)
+    late = []
+    for e in reg.get("premises") or []:
+        stamps = e.get("heads") or {}
+        for was in sorted(e.get("rounds") or []):
+            at = first_at.get(stamps.get(was) or "")
+            if at is None or at <= was:
+                continue
+            late.append({"key": e["key"], "text": e["text"], "round": was,
+                         "head": stamps[was], "head_round": at})
+    return sorted(late, key=lambda d: (d["round"], d["key"]))
+
+
 def premise_state(reg: dict, round_no: int, limit: int | None = None,
-                  undecidable_brake: bool = False) -> dict:
+                  undecidable_brake: bool = False,
+                  heads: Mapping[int, str] | None = None,
+                  wired: bool = False) -> dict:
     """What the cycle's declarations say, for `round_stop` and for the payload."""
     entries = reg.get("premises") or []
 
@@ -3321,11 +4388,41 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
     # runtime can observe. `round_stop` is what gates on the flag.
     undecidable = [view(e) for e in entries
                    if (e.get("decidable") or "unknown") == "no"]
+    # #560's two halves, and they answer two different questions a reader of
+    # `undeclared_rounds` alone cannot tell apart.
+    #
+    # `wired` is whether THIS ROUND'S INVOCATION was given a `--premise-file` path,
+    # and that sentence is the whole of what it claims. It is worth carrying because
+    # without it a cycle that never wired a register and a cycle whose fixer skipped a
+    # declaration produce the same `undeclared_rounds` list, and on lexray#1697 the
+    # first happened: the orchestrator handed the fixer no register path, `panel.py
+    # --premise` was uncallable during the pass, and that was visible only because the
+    # fixer said so.
+    #
+    # **It does NOT establish that the fixer could reach the register**, and the first
+    # version of #560 claimed it drew that distinction. The round and the fix pass are
+    # separate invocations: a round can be handed a path the fixer was never told
+    # about, or a path the fixer could not write. What the payload does hold about the
+    # fixer's side is `declared` — a register with entries in it was reached by
+    # somebody — and `undeclared_rounds`, which names the passes that left none. The
+    # honest reading of `wired: false` with rounds listed is "the reader of this
+    # cycle was not even pointed at a register", not "the fixer had no brake".
+    #
+    # `stamped` is how many round-declarations carried a head, which is what makes
+    # `retroactive`'s silence readable: zero stamps means the ordering was not
+    # checkable on this cycle, not that it checked out. It is a floor on
+    # checkability and not a ceiling — a stamped declaration is checkable against
+    # `retroactive`'s one shape, the pass already committed when it was said, and
+    # nothing in this payload checks the pass that was written and not yet committed.
+    # `retroactive_declarations` has the three attempts at that and why none held.
     return {"limit": limit,
             "declared": len(entries),
             "repeated": repeated,
             "undecidable": undecidable,
             "undecidable_brake": bool(undecidable_brake),
+            "wired": bool(wired),
+            "stamped": sum(len(e.get("heads") or {}) for e in entries),
+            "retroactive": retroactive_declarations(reg, heads),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
@@ -3451,6 +4548,59 @@ def unrefereed_fix_brake(panel: dict, notes: list[str]) -> bool:
     return False                                      # unreachable
 
 
+def guard_lines_brake(panel: dict, notes: list[str]) -> bool:
+    """`review_panel.escalate_on.guard_lines` (#618) — does a fix pass that wrote
+    more guard lines than `max_fix_guard_lines` allows END the cycle, or is the
+    crossing only reported?
+
+    Read per KEY through the same fallback its four siblings use and for the identical
+    reason: `review_panel` merges one level deep, so a repo writing `escalate_on` at
+    all replaces the default object wholesale.
+
+    **A flag whose threshold lives one key away**, which is `escalate_on.unrefereed_fix`
+    over :data:`panel_seats.UNREFEREED_MIN_CHURN` exactly. The number and the verdict
+    are separable decisions and #67 is the reason they have to be here: an instrument
+    earns a gate over a few dozen cycles or not at all, and this one has ONE — the five
+    rounds of lexray#1780. So a repo that writes a ceiling gets it measured and
+    reported, and has to say so a second time before a round ends on it. Writing the
+    threshold here as well would be one number in two files with two chances to
+    disagree.
+
+    **Off by default, and the asymmetry with `unrefereed_fix` is the whole argument.**
+    That rung is a PREDICATE — zero refereed lines — and a predicate has nothing to
+    calibrate, which is what made it shippable as a gate on one cycle's evidence. This
+    is a THRESHOLD, so the same evidence buys the weaker action only. `max_fix_growth`
+    ends a cycle on #188 and #236; this has one PR, and the dial is what keeps the
+    stronger reading one flag away rather than a release away.
+
+    ``false`` is a second spelling of ``null`` and is honoured as one; ``true`` is the
+    only other value, and anything else is a hard exit through
+    :func:`panel_seats._refuse_value` — the line every dial in this file draws between
+    an unknown key and a malformed value of a known one."""
+    raw = panel.get("escalate_on", _ABSENT)
+    if raw is _ABSENT or raw is None or raw == "":
+        rules: dict = dict(ESCALATE_ON_DEFAULTS)
+    elif isinstance(raw, dict):
+        rules = raw
+    else:
+        # Already refused by `premise_repeat_limit` on every real path — `run()` calls
+        # that one first — but this function is public and is called directly by
+        # tests, so it does not rely on a sibling having been called before it.
+        _refuse_value("escalate_on", raw,
+                      'a JSON object of reserved matters, e.g. {"premise_repeated": 2}')
+        return False                                  # unreachable
+    want = rules.get("guard_lines", ESCALATE_ON_DEFAULTS.get("guard_lines"))
+    if want is None or want is False or want == "":
+        return False
+    if want is True:
+        return True
+    _refuse_value("escalate_on.guard_lines", want,
+                  "true to end a cycle whose fix pass churned more guard lines than "
+                  "`max_fix_guard_lines` allows, or false/null to report the crossing "
+                  "and go on. The threshold is that key and is not written here")
+    return False                                      # unreachable
+
+
 def referee_state(split: dict | None, armed: bool) -> dict:
     """#554's measurement as this round read it, for `round_stop` and the payload.
 
@@ -3497,6 +4647,452 @@ def referee_state(split: dict | None, armed: bool) -> dict:
             "unrefereed": unrefereed,
             "share": round(unrefereed / churn, 4) if churn else None,
             "min_churn": panel_seats.UNREFEREED_MIN_CHURN, "over": over}
+
+
+def guard_churn_state(referee: dict | None, limit: int | None, armed: bool) -> dict:
+    """#618's measurement as this round read it, for `round_stop` and the payload.
+
+    ``referee`` is :func:`referee_state`'s own output and nothing else — the churn of
+    the pass that landed between the last round and this one, already classified. This
+    reads the SAME object rather than re-splitting the diff, on the rule every count in
+    this file follows: two derivations of one quantity are two things that can
+    disagree, and the report prints both numbers next to each other.
+
+    ``lines`` is `test + prose`, which is #554's `unrefereed` bucket. That is not a
+    coincidence and it is worth saying why the two features share a numerator: the
+    lines with no referee and the lines that are guard rather than guarded are the same
+    lines, so a second definition here would let a repo's budget (`unrefereed_line_weight`
+    prices exactly this bucket) and its ceiling count different things.
+
+    **It is a ceiling on the PASS and it does not bank.** ``referee`` is one round's fix
+    range; nothing earlier is in it, and nothing carries forward. A quiet round
+    therefore cannot fund a loud one, which is the case the ceiling exists for and the
+    thing a cumulative reading gets wrong — on lexray#1780 `guard_ratio` fell every
+    round of a five-round runaway because the runaway moved both halves of the
+    proportion together.
+
+    ``over`` is a property of the MEASUREMENT and takes no notice of ``armed``, on
+    :func:`injection_state`'s split rather than :func:`referee_state`'s: the whole point
+    of shipping this uncalibrated is that a repo may set a ceiling to WATCH it, and a
+    round that crossed a watched ceiling must record that it did. ``armed`` says
+    whether the crossing may also end the cycle, and `round_stop` publishes ``fired``
+    beside both.
+
+    Every field is present on every round, its three siblings' rule. ``limit: None`` is
+    the honest reading of "nothing was being checked", and it is the shipped one.
+
+    **``lines`` IS ``None`` WHERE NOBODY READ THE PASS, AND MUST NEVER BE A ZERO**
+    (found by a codex second opinion, which was right that the first draft had this
+    backwards). Round 1 has no pass to read and a rewritten branch has no readable
+    range, and a `0` published for either says a fix pass wrote no guard line when what
+    happened is that nothing was looked at — :func:`fix_surface_state`'s rule, and it
+    is the FLATTERING direction here, since "wrote nothing" is the strongest possible
+    version of the very claim this ceiling exists to make. The VERDICT was safe either
+    way — ``over: False``, the #500 posture its two neighbours take, so a round that
+    could not see the pass never ends a cycle on it — but the number a human reads was
+    not.
+
+    The presence test is ``churn``, on :func:`churn_cells`' terms and with its one
+    accepted conflation: a pass that genuinely churned nothing records zeros in every
+    bucket and is indistinguishable in this payload from a round that read no range.
+    That costs an empty fix range a printed `0` and buys never printing one for round
+    1."""
+    referee = referee or {}
+    lines = (int(referee.get("unrefereed") or 0)
+             if _nonneg_int(referee.get("churn")) else None)
+    return {"limit": limit, "lines": lines, "armed": bool(armed),
+            "over": bool(limit is not None and lines is not None and lines > limit)}
+
+
+#: What :func:`budgeted_brief` publishes when there was no prior brief to test, and
+#: the shape every one of its answers takes. Present on every round for
+#: :func:`referee_state`'s reason — a payload with no key and a round with no brief
+#: to read are different claims — with ``None`` rather than ``0`` in the counts,
+#: because "the prior round asked for nothing" and "there was no prior round" are two
+#: more.
+#:
+#: ``why`` is a SENTENCE and not a code, because its only two readers are a human
+#: looking at a report and a human looking at a payload, and the question it answers —
+#: "why is there no strict verdict here" — has six different answers, one per condition
+#: :func:`budgeted_brief` can decline on, that a consumer would otherwise have to
+#: reconstruct from three nulls.
+NO_PRIOR_BRIEF = {"round": None, "findings": None, "budgeted": None,
+                  "all_budgeted": False,
+                  "why": "no earlier round's To fix list reached this round"}
+
+
+def budgeted_brief(prior: Baseline | None, round_no: int, limit: int | None,
+                   weight: int) -> dict:
+    """Was the WHOLE of the prior round's To fix list budgeted? — #622's strict half,
+    and the only premise under which a priced overspend is a breach rather than an
+    unproven one.
+
+    :func:`fix_budget_state` prices a fix pass and cannot say which finding each line
+    paid for, so ``spend > limit`` is normally no accusation: a round clearing two P1s
+    may spend three hundred production lines the budget never applied to. **There is
+    one shape where the attribution is not needed.** Where every finding the fixer was
+    sent to answer sits in the 💸 band — at or above `fix_severity_floor`, below
+    `round_trigger_floor`, with a budget to draw on — the pass had no mandatory work in
+    front of it, every line it wrote answers a budgeted finding or answers nothing in
+    the brief at all, and the priced total stops being an upper bound on the budgeted
+    spend and becomes the budgeted spend. That was recorded as considered-and-deferred
+    when the measurement landed (PR #668), on the ground that it needs the prior
+    round's list and the dials it was banded under out of a baseline payload. Since
+    #665/#674 that is routine — `escalated`, `acknowledged`, `declined` and `retracted`
+    all travel between rounds on exactly that payload — so this reads the two things it
+    needs off the anchor payload the same way, and the deferral is spent.
+
+    **The verdict is a PREMISE and not a measurement.** Nothing here counts a line.
+    ``all_budgeted`` says only whether the strict reading is available; the arithmetic
+    stays where it was, in one place, priced once.
+
+    **Seven conditions, and every one of them declines rather than guesses.** The
+    failure this guards against is not a missed breach — that is where the loop already
+    is — it is a breach announced against a round that did not commit one, which is a
+    machine calling a fix pass dishonest on the strength of a payload it misread:
+
+    * **an anchor brief exists** (``prior.fixed_severities``). Round 1 has none, and
+      neither does a round whose baseline could not be read;
+    * **the brief is NOT EMPTY.** An anchor round that asked for nothing makes
+      ``all()`` vacuously true, and a pass that churned lines against an empty brief
+      spent them on something the brief never named — which is real and is #619's
+      question about surface, not this one's about budget. Vacuous truth is the
+      cheapest way to manufacture an accusation and it is refused by name;
+    * **the anchor round is the round immediately before this one.** The pass being
+      priced runs from the anchor's head to this round's, and where a round in between
+      recorded no head that range covers more than one fix phase — answering lists this
+      run does not hold. `revert_state` already keeps that case apart as ``spans``; here
+      it is simply refused;
+    * **the anchor payload names its band dials readably.** Both floors must be real
+      severities, and `low_severity_fix_lines` a number. That is checked rather than
+      left to :func:`severity_at_least`'s fallbacks, and the reason is that they are
+      not symmetric: an unreadable TRIGGER floor reads as no floor and budgets nothing
+      (harmless), while an unreadable FIX floor also reads as no floor and admits
+      EVERYTHING to the band — the loosening direction on exactly the test this
+      function exists to make strict;
+    * **the budget that round APPLIED, and its weight, are the ones in force here.**
+      The published ``spend`` is priced with this round's weight and compared against
+      this round's limit, and a breach claimed against a number the fixer was never
+      given is an accusation about a policy nobody applied. Where the two rounds
+      differ there are two honest numbers and this function will not pick one.
+
+      **The APPLIED budget and not the written dial, which is #551's whole
+      interaction with this feature.** Since that landed, the number in the fixer's
+      brief is `min(low_severity_fix_lines, its pro-rata share of the cycle's first
+      round)`, clamped — and the two rounds can apply different budgets with nobody
+      touching a dial, because round 1 takes that denominator from ``len(review.diff)``
+      and round 2 takes round 1's recorded ``pr_chars``. Checked on the dial instead,
+      this would wave through a pair of rounds that spent against 13 and 15 lines
+      because both wrote 40, and price the pass against a bound it was never given —
+      a false breach, and #551's own note puts the divergence on small PRs, which is
+      exactly where the priced total is closest to the limit. It is read off
+      :attr:`Baseline.fixed_budget`, the anchor's own recorded block, because
+      recomputing it needs that round's reading of round 1's size and this round does
+      not hold it. The WRITTEN dial is still read, for the one thing it still decides:
+      which findings were in the band at all;
+    * **every finding in the brief is budgeted**, under the ANCHOR round's floors and
+      not this round's. The fixer was briefed under that policy and spent under it, so
+      it is the policy it is fairly measured against — and an operator who dropped the
+      fix floor between rounds must not thereby reclassify what the last pass was
+      paying for;
+    * **and every finding in it can be READ.** A record whose severity nothing could
+      parse, and a bucket entry that is not a mapping at all, are both findings the
+      fixer was sent to and neither can be shown to be budgeted. An unreadable finding
+      must DECLINE the brief rather than disappear from it: a list of one P3 and one
+      malformed record, with the malformed one dropped, reads as wholly budgeted and
+      would have a pass accused of overspending on work nobody can identify. That is
+      the defect a different-vendor review found in PR #694's first cut, and it is
+      listed as its own condition here because that is the shape it will come back in.
+
+    Both unreadable shapes decline through :meth:`panel_seats.Dials.budgeted` rather
+    than through a special case here — :class:`Baseline` records ``"?"`` for either,
+    :func:`severity_at_least` reads an unparseable severity as P1, P1 is at or above
+    every trigger floor, and a finding at or above the trigger floor is not budgeted.
+    So no branch below knows this condition exists, and the safe direction falls out of
+    the predicate the rest of the round already uses rather than out of a second one
+    written to agree with it. ``why`` still tells the two apart, because "the pass had
+    mandatory work" and "nobody knows what it had" are different news.
+
+    ``prior`` is the :class:`Baseline` and nothing else, on
+    :func:`guard_churn_state`'s rule: the anchor's list, its dials and its round number
+    are three readings of ONE payload, and a caller assembling them separately could
+    pair a brief with the wrong round's policy.
+    """
+    if prior is None or not prior.fixed_severities:
+        # Round 1, a baseline that could not be read, and an anchor payload whose two
+        # brief buckets were empty — three states, and the sentence covers all three
+        # because what a consumer does about them is the same: there is nothing to
+        # test the pass against. An anchor round that genuinely asked for NOTHING is
+        # in here on purpose. `all()` over an empty list is vacuously true, so a
+        # brief with no findings in it would otherwise be the cheapest way there is to
+        # manufacture the premise for an accusation — and a pass that churned lines
+        # against an empty brief spent them on something the brief never named, which
+        # is #619's question about surface rather than this one's about budget.
+        #
+        # The two are told apart in `why` and NOT in `findings`, which stays null for
+        # both: "the prior round asked for nothing" and "there was no prior round" are
+        # different claims about the cycle, and a `0` published for either would be the
+        # second wearing the first's clothes — `spend`'s own rule one function down.
+        at = None if prior is None else prior.head_round
+        return {**NO_PRIOR_BRIEF, "round": at,
+                "why": NO_PRIOR_BRIEF["why"] if at is None else
+                f"round {at} asked its fixer to fix nothing, so there is no brief for "
+                "this pass to have spent against"}
+    listed = list(prior.fixed_severities)
+    at = prior.head_round
+    got = {**NO_PRIOR_BRIEF, "round": at, "findings": len(listed)}
+    # The anchor round has to be the one whose fix pass this is. `head_round` is the
+    # latest EARLIER round that recorded a head, which `load_baseline` may have taken
+    # from round 1 on a run whose round 2 payload named none — and then the range
+    # being priced spans two fix phases while this brief describes one. `revert_state`
+    # keeps the same case apart as `spans` and prints a caveat; here there is no
+    # caveat that would make an accusation safe, so it is simply refused.
+    if at != round_no - 1:
+        return {**got, "why": f"round {at} is the last earlier round that recorded a "
+                              f"commit, so the pass priced here spans more than round "
+                              f"{round_no - 1}'s To fix list"}
+    dials, spent = prior.fixed_dials or {}, prior.fixed_budget or {}
+    floors = [dials.get("fix_severity_floor"), dials.get("round_trigger_floor")]
+    if any(not isinstance(f, str) or f.strip().upper() not in SEVERITIES
+           for f in floors):
+        return {**got, "why": f"round {at}'s payload does not name both band floors as "
+                              "severities, so which findings it banded cannot be read "
+                              "back out of it"}
+    # The WRITTEN dial, which is what decides band membership below and nothing else.
+    # `bool` is an `int` subclass, so a hand-edited `true` would otherwise reach
+    # `Dials.budgeted` as a truthy 1 and put findings in a band the round did not have;
+    # a string would be truthy there too, which is the loosening direction.
+    written = dials.get("low_severity_fix_lines")
+    if written is not None and not (isinstance(written, int)
+                                    and not isinstance(written, bool)):
+        return {**got, "why": f"round {at}'s payload does not name "
+                              "`low_severity_fix_lines` as a number, so which of its "
+                              "findings were in the band cannot be read back out of it"}
+    # And the budget that round APPLIED, which since #551 is a different number from
+    # the dial and is the only one a breach may be claimed against: `budget_lines` is
+    # `min(written, its pro-rata share of the cycle's first round)`, clamped, and it is
+    # what the anchor round's fixer was told in its brief.
+    #
+    # Read off the anchor's own recorded block rather than recomputed. Recomputing
+    # needs the denominator THAT round divided by — its reading of round 1's size —
+    # which this round does not hold; and round 1 takes that denominator from
+    # `len(review.diff)` while round 2 takes round 1's recorded `pr_chars`, so the two
+    # can differ with no dial touched. Both values off ONE recorded object, on the rule
+    # the rest of this function follows: a limit from the dials block and a weight from
+    # the stop block would be two halves of a policy nothing guarantees were applied
+    # together.
+    was_limit, was_weight = (spent.get("limit"), spent.get("weight"))
+    ints = [v for v in (was_limit, was_weight)
+            if isinstance(v, int) and not isinstance(v, bool)]
+    if len(ints) != 2 or was_limit != limit or was_weight != weight:
+        return {**got, "why": f"round {at} spent against an applied budget of "
+                              f"{was_limit!r} at x{was_weight!r} and this round prices "
+                              f"against {limit!r} at x{weight!r} — a breach claimed "
+                              "against a number the fixer was never given would be "
+                              "about a policy nobody applied"}
+    # One predicate, and it is the round's own: `Dials.budgeted` is what marks a
+    # finding 💸 in the fixer's list and what the report reads, so a second spelling
+    # here could let a finding be listed as budgeted and measured as mandatory in the
+    # same cycle. Built with the anchor's three band dials and nothing else — every
+    # other field on `Dials` is irrelevant to this question and defaulting them keeps
+    # the payload's other keys out of a verdict that must not depend on them.
+    was = Dials(fix_severity_floor=str(floors[0]).strip().upper(),
+                round_trigger_floor=str(floors[1]).strip().upper(),
+                low_severity_fix_lines=written)
+    budgeted = sum(1 for sev in listed if was.budgeted(sev))
+    # The VERDICT above is `Dials.budgeted`'s and only its. This is for the SENTENCE,
+    # and it exists because the two ways of not being budgeted are not the same news:
+    # a P1 in the brief means the pass had work the budget never applied to, and an
+    # entry nothing could read means nobody knows what it had. Reported as "mandatory
+    # work" either way — which is what the first draft did — the second reads as a
+    # statement about severity that nothing established.
+    #
+    # Normalised the way `_severity` normalises, and read only to choose wording: a
+    # disagreement between this and the predicate above can change which sentence is
+    # printed and can never change `all_budgeted`.
+    unreadable = sum(1 for sev in listed if str(sev).strip().upper() not in SEVERITIES)
+    unbudgeted = len(listed) - budgeted
+    if budgeted == len(listed):
+        why = None
+    elif unreadable:
+        why = (f"{unreadable} of round {at}'s {len(listed)} finding(s) carry no severity "
+               "this round can read, so whether the pass had mandatory work in front of "
+               "it is not known — and an unreadable finding must decline the brief "
+               "rather than disappear from it"
+               + (f" ({unbudgeted - unreadable} more were mandatory work)"
+                  if unbudgeted > unreadable else ""))
+    else:
+        why = (f"{unbudgeted} of round {at}'s {len(listed)} finding(s) were mandatory "
+               "work, which this spend may have gone on and a diff cannot say it did "
+               "not")
+    return {**got, "budgeted": budgeted, "all_budgeted": budgeted == len(listed),
+            "why": why}
+
+
+def fix_budget_state(referee: dict | None, limit: int | None, weight: int,
+                     band: bool, brief: dict | None = None) -> dict:
+    """#622's measurement as this round read it, for `round_stop` and the payload —
+    what the last fix pass SPENT, priced the way `low_severity_fix_lines` is spent,
+    counted by something that is not the fixer.
+
+    Every other bound on a fix pass in this file is measured from outside it. This one
+    was not: `low_severity_fix_lines` is resolved here, relayed into the fixer's brief
+    as a paragraph ("measure each fix's churned lines (`git diff --numstat`) … stop
+    when the budget is spent"), and then counted by the agent it constrains. On
+    lexray#1780 the relayed number was correct at every round and the passes came out
+    at 850, 322, 356 and 142 added lines against a budget of 40 — and nothing anywhere
+    recorded that, because the only reader was the actor. `harness_rules.py` already
+    says the principle beside the dial: the fixer "is never asked 'does this risk
+    ballooning?', because that is a judgement by the actor whose judgement the 85%
+    impugns". The counting was delegated to that same actor. This is the reader.
+
+    ``referee`` is :func:`referee_state`'s own output and nothing else, on
+    :func:`guard_churn_state`'s rule and for its reason: `low_severity_fix_lines`,
+    `max_fix_guard_lines` and #554's predicate are three readings of ONE split, and a
+    second derivation here would let the report print two numbers for the same lines.
+    ``limit`` and ``weight`` are `low_severity_fix_lines` and `unrefereed_line_weight`
+    off the resolved dials — the very values relayed in the brief, so the reader and
+    the actor are held to one number by construction rather than by two copies.
+
+    ``spend`` prices the pass exactly as the brief prices it: production at 1 and test
+    plus prose at ``weight``, over churn (insertions plus deletions), which is the unit
+    `git diff --numstat` reports and :func:`panel_seats._referee_kind_lines` already
+    counts in.
+
+    **``within`` IS ONE-SIDED, AND SAYING SO IS THE WHOLE HONESTY OF THIS BLOCK.** The
+    budget does not bound the pass; it bounds the part of the pass spent on the 💸 band
+    — findings at or above `fix_severity_floor` and below the `round_trigger_floor`
+    cut — and a diff cannot attribute a line to the finding it was written for. So the
+    priced total is an UPPER BOUND on the budgeted spend, and only one of its two
+    readings is a fact:
+
+    * ``within: True`` — the WHOLE pass, mandatory work included, priced under the
+      budget. The budgeted part is under it too, whatever anybody counted. That is
+      decidable from the diff alone and it is the verdict this block exists to
+      publish.
+    * ``within: False`` — the pass cannot be SHOWN to have stayed inside its budget.
+      Not a breach: a round clearing two P1s may spend three hundred production lines
+      the budget never applied to. It is the absence of the assurance above, and a
+      reader must not read it as an accusation.
+    * ``within: None`` — nothing was measured. Round 1, an unreadable fix range, a
+      repo with no budget written, or a repo whose `fix_severity_floor` meets the
+      trigger cut so there is no band to pay for (``band``).
+
+    **``breach`` IS THE SIDE ``within`` DOES NOT HAVE, and it is the whole of what this
+    function gained.** ``within: False`` was never a violation and there was therefore
+    no input at all for which this reported one — a pass whose entire To fix list was
+    budgeted P3/P4 findings, priced at 41 production lines against `limit: 40`, ran a
+    round identical to a four-line pass. That was the honest shape while the
+    attribution was missing; it is not the honest shape now that it is not.
+    :func:`budgeted_brief` supplies the ONE premise that removes the need for
+    per-line attribution: where every finding the fixer was sent to answer sits in the
+    💸 band, the pass had no mandatory work in front of it, so the priced total is not
+    an upper bound on the budgeted spend — it IS the budgeted spend, and ``spend >
+    limit`` is a fact about the pass rather than the absence of one.
+
+    * ``breach: True`` — the whole brief was budgeted and the pass priced over the
+      budget. Provable from the diff, the prior round's list and the dials both rounds
+      ran under, with nothing taken on the fixer's word.
+    * ``breach: False`` — the premise held and the pass was inside its budget. Stronger
+      than ``within: True`` and not the same claim: this one says the budget was kept
+      by a pass that had no mandatory work to hide behind.
+    * ``breach: None`` — no strict verdict was available, which is the ordinary case
+      and stays ordinary. The brief carried mandatory work, or there was no brief, or
+      the dials moved between rounds. ``brief`` carries which. **A ``None`` here is
+      never evidence of anything** — it is the reading `within` has always had, and a
+      consumer that treats it as a pass or as a failure is wrong about most rounds.
+
+    ``brief`` is :func:`budgeted_brief`'s own output and nothing else, on ``referee``'s
+    rule: the premise is decided in one place, against one payload, and this function
+    reads the verdict rather than re-deriving it from a list and a dials block it would
+    have to re-validate.
+
+    **Why the strict half needs no flag to arm, where `max_fix_guard_lines` does.**
+    That ceiling is a number nobody has calibrated, so a repo may reasonably set one to
+    WATCH it, and `escalate_on.guard_lines` is what turns watching into stopping. There
+    is no equivalent judgement left here. The budget is a number this repo already
+    wrote, the band it applies to is a band this repo already configured, and the
+    premise is a proof rather than a threshold — so an `escalate_on` key would not be
+    offering a choice, it would be offering to ignore an arithmetic breach of the
+    repo's own policy. That is also the reason it is not the 29th dial #621 forbids:
+    no number here is new, and the only new thing is that the count now has a reader
+    other than the actor it constrains, which is #622's title.
+
+    **The upper bound half is still REPORTED AND NEVER GATED**, on #67's rule and
+    unchanged by any of the above: nothing reads ``within`` to move ``stop``, in either
+    direction, and a loud round whose brief carried a P1 ends exactly where it ended
+    before. What :func:`round_stop` reads is ``breach``, and only where it is ``True``.
+
+    Every field is present on every round, its three siblings' rule. ``spend`` is
+    ``None`` and never ``0`` where nobody read the pass, on
+    :func:`guard_churn_state`'s argument and with its presence test (``churn``): a
+    published ``0`` for round 1 would say a fix pass spent nothing when what happened
+    is that there was no fix pass, and "spent nothing" is the flattering direction on
+    exactly the claim this block exists to make."""
+    referee = referee or {}
+    measured = _nonneg_int(referee.get("churn"))
+    production = int(referee.get("production") or 0) if measured else None
+    unrefereed = int(referee.get("unrefereed") or 0) if measured else None
+    spend = (None if production is None or unrefereed is None
+             else production + weight * unrefereed)
+    # `limit` is published as null wherever nothing is being paid for out of it, which
+    # is a repo with no budget AND a repo whose bands meet (`Dials.budgeted_band`). A
+    # reader must not be able to tell those apart from the number alone — both mean
+    # "there is no budget in force on this round" — and `band` is beside it for the
+    # one who needs to know which.
+    in_force = limit if band else None
+    within = None if in_force is None or spend is None else spend <= in_force
+    # The strict half, and it hangs off `within` rather than recomputing the
+    # comparison: one arithmetic, one place. `within is None` already covers every way
+    # there is nothing to compare — no budget in force, no band, no pass read — so the
+    # only thing left for the premise to add is whether the comparison MEANS anything
+    # about the budget, which is exactly what `all_budgeted` answers.
+    said = dict(brief) if isinstance(brief, dict) else {**NO_PRIOR_BRIEF}
+    return {"limit": in_force, "weight": int(weight), "band": bool(band),
+            "production": production, "unrefereed": unrefereed, "spend": spend,
+            "within": within,
+            "brief": said,
+            "breach": (not within if within is not None
+                       and said.get("all_budgeted") else None)}
+
+
+def fix_surface_state(surface: object) -> dict | None:
+    """#619's measurement as `round_stop` publishes it, or ``None`` where there was
+    none to make.
+
+    ``surface`` is `panel.py`'s reading of the fix range: the files the last fix pass
+    touched, and the subset of them that no earlier round's diff contained. The
+    quantity is SURFACE and not size, which is the point of it — every other number
+    downstream of a fix pass counts lines or findings (`max_fix_growth`,
+    `max_fix_growth_chars`, `fix_injection`), and a fix that adds fifteen lines to two
+    nginx templates nobody had reviewed is invisible to all three. On lexray#1780 it
+    was the P1: round 3's pass touched twelve files, seven of them never in front of a
+    reviewer, and both of the cycle's later P1s were in that new surface.
+
+    **REPORTED AND NOT GATED, on #67's rule.** Nothing in :func:`round_stop` reads this
+    to move ``stop``, and the decision to gate it — `max_fix_new_files`, or report-only
+    — has not been taken. #619 asks for the instrument first in as many words, and the
+    comment beside #67's other withheld tallies in `panel.py` argues the same thing for
+    them.
+
+    **``None`` IS THE ANSWER "NOT MEASURED", AND IT MUST NEVER BECOME A ZERO.** Round 1
+    has no fix pass to read and a rewritten branch has no readable range — the same
+    conditions under which `unrefereed_fix` has nothing to say — and a payload that
+    published ``count: 0`` for those would be claiming a pass opened no new files when
+    what happened is that nobody looked. So a mapping carrying neither ``count`` nor
+    ``new_files`` is treated as an absent measurement rather than as an empty one; a
+    mapping carrying either is normalised and published in full, ``count`` from the
+    caller where it gave one and from ``new_files`` where it did not."""
+    if not isinstance(surface, dict):
+        return None
+    count, raw_new = _nonneg_int(surface.get("count")), surface.get("new_files")
+    if count is None and raw_new is None:
+        return None
+    new_files = [str(f) for f in (raw_new or ())]
+    return {"files": [str(f) for f in (surface.get("files") or ())],
+            "new_files": new_files,
+            "count": len(new_files) if count is None else count,
+            "prior_files": _nonneg_int(surface.get("prior_files"))}
 
 
 # --------------------------------------------------------------------- #506: and the
@@ -3708,6 +5304,277 @@ def revert_state(kind: str, *, why: str | None = None, base_sha: str | None = No
     }
 
 
+#: The record's own integer summary, and every number on it. Each entry is a COUNT
+#: or ``None`` — never a share, a rate, a ratio, a score or a rank — and that is
+#: #624's "do not leaderboard it" written as a vocabulary rather than as a
+#: paragraph. Every obvious ratio over a fix pass is gameable in a direction worse
+#: than the disease, and the issue enumerates four of them: lines per finding
+#: cleared rewards compressed and superficial fixes; findings introduced per pass
+#: rewards weakening tests and avoiding the files most likely to be read; new files
+#: opened rewards refusing a cross-file repair that is genuinely required — a P1
+#: left unfixed to protect a metric; and share still standing a round later is
+#: invalid under increment scope, because the later round may never have re-read
+#: the repair. So the record carries the numerators and the denominators and
+#: divides none of them: a consumer that wants a ratio has to write it down, in its
+#: own code, where somebody can argue with it.
+#:
+#: It is also a PROJECTION and not a second measurement. Every entry is the same
+#: value the record already publishes in its structured blocks
+#: (:func:`fix_pass_record` says which), flattened into one bounded integer mapping
+#: so that a board can carry it on a run LIST without carrying the path lists and
+#: the finding keys with it — the cut `_run_view` already makes for `unread_files`
+#: and `harness_path`. ``test_every_count_is_the_records_own_number`` pins the
+#: projection, so the flat copy cannot drift from the block it came from.
+FIX_PASS_COUNTS = ("briefed", "placed", "cleared", "still_open",
+                   "production", "test", "prose", "churn",
+                   "files", "new_files", "introduced")
+
+#: What a fix-pass record does NOT carry, one line each, published ON the record.
+#:
+#: An artifact whose gaps are only in the release notes is an artifact a consumer
+#: two years from now reads as complete. These travel with the row for the reason
+#: :data:`NO_PRIOR_BRIEF`'s ``why`` travels with a null verdict: the question "why
+#: is this field not here" has several different answers, and a reader holding one
+#: stored record cannot reconstruct which of them applied.
+#:
+#: The first is the one #624 was scoped around. #621's 2026-08-31 scope decision
+#: parks #623 (typed obligations), and a per-finding `fixed | refuted | deferred`
+#: column is not buildable without it: a diff carries no attribution from a churned
+#: line back to the finding it was written for, so the only available source is the
+#: fixer's own account of itself — which is the thing this family of issues exists
+#: to remove. The declaration that DOES exist is not smuggled in here either: it
+#: lives in the board's `review_finding_outcomes`, one row per defect, with the
+#: identity that recorded it and a separate field for the human it CLAIMS signed it
+#: off, and it is a different artifact with a different author.
+FIX_PASS_GAPS = (
+    "no per-finding outcome: `fixed | refuted | deferred` needs a finding's TYPE "
+    "(#623, parked) and a line-to-finding attribution a diff does not carry; the "
+    "declared form lives in `review_finding_outcomes` with its own claimant",
+    "`cleared` is not `verified fixed`: it means this round did not raise the "
+    "complaint again, and under `increment` scope this round re-read only the fix "
+    "range — `scope` is beside it so the reading cannot be taken for a stronger one",
+    "no actor: this record names the PASS, by its commit range and the round that "
+    "briefed it, and never the agent, model or session that performed it — an "
+    "artifact with no actor key cannot be aggregated into a table of fixers",
+    "no per-finding line ranges, so no cost per finding: the fixer would have to "
+    "declare them, which is a self-report (#622), and nothing else in the round can "
+    "check one",
+)
+
+
+def fix_pass_record(round_no: int, *, revert: dict | None, referee: dict | None,
+                    surface: object = None, brief: dict | None = None,
+                    cleared: Iterable[dict] = (), still_open: Iterable[dict] = (),
+                    introduced: int | None = None, cycle: str | None = None,
+                    source: str | None = None, narrowed: Iterable[str] = (),
+                    declined: Mapping[str, object] | None = None,
+                    escalated: Mapping[str, int] | None = None) -> dict | None:
+    """The fix pass this round read, as a first-class artifact — #624, epic item 4.
+
+    **The fixer is the only actor in this loop nobody records.** Reviewers have
+    scorecards, rounds have payloads, findings have keys and outcomes, judges have a
+    model and an effort. The pass BETWEEN two rounds — the actor that writes the code
+    that produces the next round's findings — had no record of its own. On
+    `prisonblues/lexray#1780` the four passes came out at +850/-314 across 11 files,
+    +322/-49 across 9, +356/-41 across 12 (7 of them files no round had read) and
+    +142/-31 across 7, and every one of those numbers had to be reconstructed from
+    `git` by hand, afterwards, to write the issue.
+
+    **This is an ASSEMBLY, not a new measurement, and that is the point of it.**
+    Almost everything here was already being derived, once a round, and then filed
+    under the round's stop decision as five unrelated rungs: the churn split at
+    ``round_stop.unrefereed_fix`` (#554), the surface at ``round_stop.fix_surface``
+    (#619), the range and the brief's fate at ``round_stop.revert`` (#506), the
+    budget pricing at ``round_stop.fix_budget`` (#622) and the attribution at
+    ``provenance_counts`` (#489). #624's own words: the interesting field "already
+    exists per-round as ``introduced`` — it simply is not attached to the pass that
+    caused it". So every value here is READ OFF THE SIBLING THAT ALREADY DERIVED IT
+    — ``revert`` is :func:`revert_state`'s output, ``referee`` is
+    :func:`referee_state`'s, ``brief`` is :func:`budgeted_brief`'s, ``surface`` goes
+    through :func:`fix_surface_state` exactly as `round_stop` sends it — on this
+    module's standing rule that two derivations of one quantity are two things that
+    can disagree, and here they would disagree inside one payload.
+
+    **Every field is derived from observable state, and the two that are not say so
+    in their own key.** #622's second opinion, adopted by #621: anything the fixer
+    self-reports is the thing these issues exist to remove. So the measurements come
+    from the diff, the commits and the payload the pass was given — never from the
+    pass's account of itself — and the declarations the loop already carries are
+    segregated under ``declared``, kept out of every count, and named as
+    declarations:
+
+    ======================  ==========================================  ==============
+    field                   what it is                                  authority
+    ======================  ==========================================  ==============
+    ``range``               both ends of the commit range, which of the  derived
+                            three readers supplied the diff, how many
+                            commits and merges it holds, and ``spans``
+                            — how many fix phases it actually covers
+    ``brief.round``         which round's To fix list the pass answered  derived
+    ``brief.findings``      how many findings that list held            derived
+    ``churn``               production / test / prose / total, over     derived
+                            insertions plus deletions
+    ``surface``             files touched, and which of them no          derived
+                            earlier round of this cycle had read
+    ``cleared``             brief entries this round no longer raises    derived
+    ``still_open``          brief entries it still raises                derived
+    ``introduced``          how many of THIS round's findings were       derived
+                            attributed to this pass
+    ``declared.narrowed``   keys the pass said it answered at the point  **declared**
+                            they were raised and no wider (#615)
+    ``declared.declined``   corrections it said it would not make (#665) **declared**
+    ``declared.escalated``  findings it referred to a human (#221)       **declared**
+    ======================  ==========================================  ==============
+
+    ``declared`` is here rather than dropped because a declaration the loop already
+    ACTS on has to be visible on the pass that made it — ``narrowed`` clears a
+    finding, ``escalated`` takes one out of every stop rule, ``declined`` files a
+    veto — and an auditable record of a consequential claim is worth more than a
+    silence. It is dated by THIS round, not by the pass's own say-so: `--narrowed`,
+    `--declined` and `--escalated` are passed to the round that reads the pass, so an
+    entry stamped ``round_no`` is one made about the pass this record is about, and
+    an inherited entry from an earlier round belongs to an earlier pass and is left
+    there. Nothing in ``counts`` is computed from any of it.
+
+    **It gates nothing, and there is no flag to arm one.** :func:`round_stop` does
+    not read this record and is not passed it; no dial is added; ``escalate_on``
+    grows no key. #67's instrument-before-gate rule for the first and #621's "not a
+    29th dial" for the second — and #624 is explicit beyond both of those: "record
+    the pass, report the numbers as diagnostics, and calibrate against real cycles
+    before anything is scored, ranked or gated. The record is the deliverable here;
+    the judgements are a later, separate decision." :data:`FIX_PASS_COUNTS` is where
+    the no-ratio half of that is enforced, and :data:`FIX_PASS_GAPS` is what the
+    record admits it cannot say.
+
+    **``None`` IS "THERE WAS NO PASS", AND IT IS THE ONLY THING IT MEANS.** Round 1,
+    and a run with no earlier round, have no pass in front of them — which is
+    :data:`REVERT_NOT_ASKED`, the one verdict in this file that means exactly that,
+    reused rather than re-derived from a round number. A pass that HAPPENED and could
+    not be read — a rewritten branch, an API refusal, a baseline that named no commit
+    — gets a record with nulls in it, because "the pass opened no file and churned no
+    line" is the flattering direction on every claim this artifact makes, and it is
+    the claim an unmeasured round would otherwise publish. Every block here follows
+    the null-not-zero rule its own producer already follows (:func:`churn_cells`,
+    :func:`fix_surface_state`, :func:`_introduced`), and shares their presence tests
+    rather than inventing new ones.
+
+    A skipped round records ``None`` too, though a pass may well have landed in front
+    of it: the round reviewed nothing, so it measured nothing, and a record of zeros
+    would attribute an unread pass's silence to the pass. `panel.py` leaves the key
+    at its default on those exits for the same reason ``round_stop`` is null there.
+    """
+    # The one clean test for "there was a pass at all", and it is the anchor's own
+    # verdict rather than `round_no > 1`: a run OUTSIDE a cycle has no earlier round
+    # whatever its round number says, and `revert_state` is already the place that
+    # distinction is made.
+    if not isinstance(revert, dict) or revert.get("kind") == REVERT_NOT_ASKED:
+        return None
+    said = brief if isinstance(brief, dict) else {**NO_PRIOR_BRIEF}
+    briefed = _nonneg_int(said.get("findings"))
+    # ONE presence test for the churn cells and their total, and it is
+    # `churn_cells`' own — a pass that genuinely churned nothing and a round with no
+    # readable range record zeros in every bucket and the payload distinguishes them
+    # nowhere else, so a zero total reads as "not measured" here exactly as it does
+    # in the trend block. The cost is a real empty fix range rendering as unknown;
+    # the alternative is publishing `0 production` for a pass nobody could see.
+    split = referee if isinstance(referee, dict) else {}
+    total = _nonneg_int(split.get("churn"))
+    cells = churn_cells(split)
+    # `fix_surface_state` and not the raw mapping: it is the normaliser `round_stop`
+    # sends the same object through, so the record and `round_stop.fix_surface`
+    # cannot publish two different readings of one set difference.
+    shown = fix_surface_state(surface)
+    # Keys and severities, not the five-field records `revert_state` carries. The
+    # identity is the key — it is what joins to a stored finding — and the full
+    # records are already in `round_stop.revert` for the rounds that asked for a
+    # proposal, read out of the SAME `fix_pass_outcome` call, so nothing here can
+    # disagree with them about which complaints survived.
+    def keyed(records: Iterable[dict]) -> list[dict]:
+        return [{"key": r.get("key"), "severity": r.get("severity")}
+                for r in records if isinstance(r, dict)]
+
+    was_cleared, was_open = keyed(cleared), keyed(still_open)
+    # `placed` is how many of the brief this round could KEY, and it is published
+    # because `cleared + still_open` does not have to equal `findings`:
+    # `Baseline.fixed_findings` drops a record with no key or no file, while
+    # `fixed_severities` counts every entry in both buckets including one that is not
+    # a record at all (#694's own correction). Without this a reader would see two
+    # lists that do not add up to the total beside them and have no way to tell a
+    # dropped record from a lost one.
+    #
+    # Null, not zero, wherever there was no brief to place: `briefed` is null for
+    # round 1, an unreadable baseline and an anchor that asked for nothing alike
+    # (`budgeted_brief` tells those apart in `why`), and a `0` here would say the
+    # pass cleared nothing when what happened is that nobody knows what it was sent
+    # to do.
+    placed = len(was_cleared) + len(was_open) if briefed is not None else None
+    dated = {k for k, when in (escalated or {}).items() if when == round_no}
+    unmade = {k for k, d in (declined or {}).items()
+              if getattr(d, "round", None) == round_no}
+    return {
+        # The round that READ the pass — this one. Named rather than left implicit
+        # beside `brief.round`, because the pair is the whole address of a pass: it
+        # is the work between those two rounds, and `spans` says when that is more
+        # than one phase.
+        "read_round": round_no,
+        "cycle": cycle or None,
+        # What the reading round reviewed, which decides how `cleared` may be read
+        # (`fix_pass_outcome`) — recorded rather than described, so the caveat in
+        # `gaps` and the payload cannot drift.
+        "scope": revert.get("scope") or "",
+        "range": {
+            "base": revert.get("base"),
+            "head": revert.get("head"),
+            # The abbreviated display span `revert_state` renders; the full SHAs are
+            # beside it. Never a command: nothing about this record proposes an
+            # action, which `round_stop.revert` is the place for.
+            "span": revert.get("range"),
+            # `_fix_range_diff`'s own verdict and its sentence — `ok`, `no-fix`,
+            # `blind`, `rewritten` — because "the pass could not be read" and "the
+            # pass changed nothing" are opposite facts behind one set of nulls.
+            "kind": revert.get("kind"),
+            "why": revert.get("why"),
+            # How many fix phases the range covers. 1 in the ordinary case, more
+            # where an intervening round recorded no commit to anchor on — and where
+            # it is more than 1 the word "pass", singular, is wrong about this row.
+            "spans": revert.get("spans"),
+            "commits": revert.get("commit_count"),
+            "merges": revert.get("merges"),
+            # Which of the three readers supplied the diff every measurement here
+            # was taken over: the compare endpoint, the round's own increment, or
+            # #504's local reconstruction. A population that mixes them is measuring
+            # against a denominator that moved (#512, #637).
+            "source": source or None,
+        },
+        "brief": {"round": said.get("round"), "findings": briefed, "placed": placed,
+                  # `budgeted_brief`'s sentence, carried rather than re-derived:
+                  # "there was no earlier round" and "the earlier round asked for
+                  # nothing" are two nulls in `findings` and one of them is a fact
+                  # about the cycle.
+                  "why": said.get("why")},
+        "churn": {**cells, "churn": total if total else None},
+        "surface": shown,
+        "cleared": was_cleared,
+        "still_open": was_open,
+        "introduced": introduced,
+        "declared": {"narrowed": sorted({str(k) for k in narrowed}),
+                     "declined": sorted(unmade),
+                     "escalated": sorted(dated)},
+        "counts": {
+            "briefed": briefed,
+            "placed": placed,
+            "cleared": len(was_cleared) if briefed is not None else None,
+            "still_open": len(was_open) if briefed is not None else None,
+            **{kind: cells[kind] for kind in panel_seats.REFEREE_KINDS},
+            "churn": total if total else None,
+            "files": len(shown["files"]) if shown else None,
+            "new_files": shown["count"] if shown else None,
+            "introduced": introduced,
+        },
+        "gaps": list(FIX_PASS_GAPS),
+    }
+
+
 def _by_severity(records: Iterable[dict]) -> str:
     """`2×P2, 1×P3` — a severity census of a finding list, worst first, for the one
     line a human reads. Empty string for an empty list, so a caller can drop it into a
@@ -3719,6 +5586,440 @@ def _by_severity(records: Iterable[dict]) -> str:
     ranked = sorted(counts, key=lambda s: (SEVERITIES.index(s) if s in SEVERITIES
                                            else len(SEVERITIES), s))
     return ", ".join(f"{counts[s]}\u00d7{s}" for s in ranked)
+
+
+# ------------------------------------------------------------------- #627: the one
+# backtrack the loop takes on its own.
+#
+# Everything above this line REPORTS a revert and refuses to run one, and the reason is
+# stated there: a fix pass is MIXED, so reverting one that cleared three P2s to remove
+# five P3s puts the P2s back, and nothing in the loop knows which half is which without
+# asking. That refusal is not being relaxed. What #627 identifies is a case that is not
+# a mixed pass at all.
+#
+# A single fix that answered a finding BELOW `round_trigger_floor` answered one
+# complaint that was, by definition, not blocking the close. If the next round
+# attributes a new finding to that fix, the whole cost of removing it is one P3 or P4
+# returning to a state this repo's own policy already calls reportable and
+# non-blocking — an unpaid budget item, which every budgeted cycle produces on
+# purpose. There is nothing to weigh, and where there is nothing to weigh there is no
+# decision to hand upstairs. So: excise the fix, hand the sub-floor finding back to the
+# board unfixed, drop the finding it caused, and let the cycle carry on.
+#
+# THREE THINGS MAKE IT SAYABLE, and each is a way this declines rather than guesses:
+#
+# * attribution at the grain of the FIX. `panel_scope._provenance` works at the grain
+#   of the pass — its added-line set is the whole range's — so a finding standing on
+#   one commit's line is indistinguishable from one standing on another's.
+#   `panel_scope.blame_owners` is the finer instrument, and a pass that left no seam
+#   for it to read is reported as such rather than aimed at approximately;
+# * a revert that CANNOT CASCADE. A sub-floor fix whose lines a later blocking fix
+#   built on is no longer a clean excision — taking it out takes part of a P1's fix
+#   with it, which is the mixed revert this rule is careful not to be. The test is that
+#   every line the commit added is still the commit's own at the head;
+# * a COUNT, because a repo where this fires often is saying something about its
+#   sub-floor budget that no other number in the payload says.
+#
+# NOTHING HERE RUNS ANYTHING EITHER. The excision is a command in the payload, exactly
+# as #506's proposal is, and the actor that runs it is the orchestrator holding the
+# checkout (`panel-review-pr.md` §5). The difference between the two is not who
+# executes but whether a human has to decide first: #506's is a decision, and this is
+# not one.
+
+
+def sub_floor_brief(brief: Iterable[tuple], dials: dict | None,
+                    gate: Iterable[str] = ()) -> tuple[dict[str, dict], str, str | None]:
+    """The anchor round's findings BELOW its own trigger floor, as `({key: record},
+    floor, why)` — which of the complaints the last fix pass answered were sub-floor,
+    and the floor that decided it.
+
+    The floor travels with the verdict rather than being looked up again by whoever
+    prints it. It is the ANCHOR round's, and this round's report is written under
+    THIS round's dials, so a floor moved between the two would otherwise have the
+    report naming a cut the classification did not use (found by a Codex second
+    opinion).
+
+    ``brief`` is :attr:`Baseline.fixed_findings` and ``dials`` is
+    :attr:`Baseline.fixed_dials`: the list the fixer was sent to answer and the policy
+    it was banded under, off ONE payload, on :func:`budgeted_brief`'s rule and for its
+    reason — a brief paired with another round's floors would reclassify what that pass
+    was paying for.
+
+    **The ANCHOR round's trigger floor and not this round's.** An operator who moved
+    `round_trigger_floor` between rounds must not thereby make a fix that answered
+    mandatory work look like a cheap one that can be thrown away. Where the payload does
+    not name it as a severity this declines, exactly as :func:`budgeted_brief` does, and
+    the asymmetry is the same: an unreadable floor read as no floor would admit
+    EVERYTHING to the sub-floor band, which is the loosening direction on the one test
+    that decides whether a fix may be removed without asking.
+
+    ``gate`` is :attr:`Baseline.fixed_gate` — the keys in that brief that were SONAR
+    HARD-GATE issues — and they are never sub-floor whatever severity they carry. A
+    hard-gate issue is exempt from both severity floors at every rule in
+    :func:`round_stop`, because it is an external gate's verdict rather than a judged
+    opinion, and this rule's argument is that the finding it hands back to the board
+    was never owed. That argument cannot be made about a finding no floor applies to.
+    It is the answering-side twin of the filter `panel.py` puts on the caused side,
+    and both are needed: one keeps a gate issue out of the list an excision drops, the
+    other keeps a gate issue's own fix from being the thing excised.
+
+    Severity is the only test otherwise. `fix_severity_floor` is deliberately NOT
+    applied: a finding below the fix floor was never in the brief to begin with — no
+    fixer was sent to it, so no fix answered it — and adding the floor as a second
+    condition would only describe the same set in a way that a later change to one dial
+    could break.
+
+    An entry whose severity nothing can parse is not sub-floor. That falls out of
+    :func:`severity_at_least`, which reads an unparseable severity as P1, and P1 is at or
+    above every trigger floor — so an unreadable record declines through the predicate
+    the rest of the round already uses rather than through a branch written here to
+    agree with it (:class:`Baseline`'s ``"?"`` sentinel, same mechanism).
+    """
+    floor = (dials or {}).get("round_trigger_floor")
+    if not isinstance(floor, str) or floor.strip().upper() not in SEVERITIES:
+        return {}, "", ("the round that briefed this fix pass does not name "
+                    "`round_trigger_floor` as a severity in its payload, so which of "
+                        "its findings were below the floor cannot be read back out "
+                        "of it")
+    floor = floor.strip().upper()
+    exempt = {str(k) for k in gate}
+    out: dict[str, dict] = {}
+    for key, severity, file, line, title in brief:
+        if severity_at_least(severity, floor) or str(key) in exempt:
+            continue
+        out[str(key)] = {"key": str(key), "severity": severity, "file": file,
+                         "line": line, "title": title}
+    return out, floor, None
+
+
+def _names_finding(message: str, spelling: str) -> bool:
+    """Does this commit message NAME this finding — by its key or by its round-local
+    id?
+
+    A substring test with both ends fenced, and the fence is the whole of it. Both
+    spellings are short alphanumeric tokens: a round-local id is `1609-F03` and a
+    finding key is sixteen hex characters, so a bare `in` matches `34-F10` inside
+    `34-F100` on a round with a hundred findings, and matches a key inside any longer
+    hex string that happens to contain it — a commit sha, most obviously, which every
+    fix pass's message may quote. Either match aims an excision at the wrong hunk,
+    which is the one failure `panel-review-pr.md` names for this rule.
+    """
+    if not (message and spelling):
+        return False
+    return bool(re.search(rf"(?<![0-9A-Za-z_-]){re.escape(spelling)}"
+                          rf"(?![0-9A-Za-z_-])", message, re.IGNORECASE))
+
+
+def excision_seams(commits: Iterable[dict], sub_floor: Mapping[str, dict],
+                   brief: Iterable[tuple], ids: Mapping[str, str] | None = None
+                   ) -> tuple[dict[str, dict], list[dict]]:
+    """Which commits of the fix pass are a SEAM — `({sha: seam}, refused)`.
+
+    A seam is a commit whose message names exactly ONE finding out of the anchor
+    round's brief, and that finding is below the trigger floor. That is the shape
+    `review-pr.md` step 3 asks a fixer to leave ("each one stays its own hunk or its own
+    commit, named in the commit body by the finding it answers") and the only shape an
+    excision can be aimed at without guessing.
+
+    ``ids`` is the anchor round's ``{round-local id: key}`` map, so a commit body may
+    name the finding either way. The id is what a fixer actually has: the **To fix**
+    list prints `[1609-F03]` beside every finding and prints no key at all, so a rule
+    that accepted only keys would ask a fixer to join its own commit message against a
+    payload. Both spellings resolve to the key, which is what everything downstream is
+    keyed on.
+
+    ``refused`` carries the commits that named a sub-floor finding and are NOT seams,
+    each with a sentence. That list is the point of the function as much as the seams
+    are: a commit that answered one P3 and one P1 together is a mixed pass in
+    miniature, and the difference between reporting that and silently not finding a
+    seam is the difference between a rule that declined and a rule that appeared not to
+    apply.
+
+    **A merge commit is never a seam.** `git revert` refuses one without `-m`, and a
+    merge is how a base branch gets inside a range in the first place — the same
+    argument :func:`revert_state` makes for withholding a range command, asked one
+    commit at a time.
+    """
+    every = {str(key): str(key) for key, *_ in brief}
+    for spelling, key in (ids or {}).items():
+        if str(key) in every:
+            every[str(spelling)] = str(key)
+    seams: dict[str, dict] = {}
+    refused: list[dict] = []
+    for commit in commits:
+        message = str(commit.get("message") or "")
+        named = {key for spelling, key in every.items()
+                 if _names_finding(message, spelling)}
+        sub = named & set(sub_floor)
+        if not sub:
+            # Not a seam and not a refusal: a commit that answered mandatory work, or
+            # one that named nothing at all, is simply not what this rule is about.
+            continue
+        record = {"commit": str(commit.get("sha") or ""),
+                  "subject": str(commit.get("subject") or ""),
+                  # ONE shape for every entry in `declined`, on `injection_state`'s
+                  # rule applied inside a list: a consumer walking it must not have to
+                  # test for a key's presence to know what kind of refusal it is
+                  # reading. A refusal made here has no finding attributed to it yet
+                  # and may never get one, so both fields are the empty answer rather
+                  # than absent.
+                  "answered": None, "caused": []}
+        if commit.get("merge"):
+            refused.append({**record, "why":
+                            "the commit is a merge, and `git revert` refuses one "
+                            "without `-m` — a merge is also how other people's commits "
+                            "get into a fix range, so undoing it is not the removal of "
+                            "one fix"})
+            continue
+        if len(named) > 1:
+            mandatory = sorted(named - set(sub_floor))
+            refused.append({**record, "why":
+                            f"the commit names {len(named)} of the round's findings"
+                            + (f", {len(mandatory)} of them mandatory work above the "
+                               "trigger floor" if mandatory else
+                               " — more than one sub-floor fix landed in it")
+                            + ", so removing it would remove fixes nothing attributed "
+                              "a finding to"})
+            continue
+        seams[record["commit"]] = {**record,
+                                   "answered": sub_floor[next(iter(sub))]}
+    return seams, refused
+
+
+def _read_once(reader, seen: dict, of: str):
+    """One reader called at most once per subject, answer cached — including a
+    ``None``.
+
+    A miss and a failure are both answers here, and both are expensive: a `git blame`
+    that could not run is asked about the same file twice, once for the finding
+    standing on it and once for the cascade test over the commit that wrote it. The
+    cache is what makes "called at most once" a property of the code rather than of the
+    order the branches happen to run in, and it must cache the ``None`` too — a reader
+    that returns ``None`` for a file this checkout does not carry would otherwise be
+    re-run for every line of it.
+    """
+    if of in seen:
+        return seen[of]
+    seen[of] = reader(of) if callable(reader) else None
+    return seen[of]
+
+
+def excision_state(kind: str, *, why: str | None = None, commits: dict | None = None,
+                   brief: Iterable[tuple] = (), dials: dict | None = None,
+                   gate: Iterable[str] = (),
+                   ids: Mapping[str, str] | None = None,
+                   caused: Iterable[dict] = (),
+                   blame: Callable[[str], Mapping[int, str] | None] | None = None,
+                   added: Callable[[str], Mapping[str, int] | None] | None = None
+                   ) -> dict:
+    """#627's excisions as this round can name them, for :func:`round_stop` and the
+    payload — the same division of labour :func:`revert_state` has: the arithmetic
+    lives beside the thing it measures and the stop rule stays a rule about findings.
+
+    ``kind`` is :func:`panel_scope._fix_range_diff`'s own verdict for this round's fix
+    range, or :data:`REVERT_NOT_ASKED` where there was no earlier round to have a range
+    with — #500's vocabulary reused rather than restated, exactly as
+    :func:`revert_state` reuses it. Only `ok` can name a commit, and a rebased round
+    says so in #500's words rather than guessing at one.
+
+    ``caused`` is the findings this round attributed to the fix pass — the same
+    ``introduced`` records :attr:`revert_state.removes` carries.
+
+    ``blame`` and ``added`` are READERS and not data: ``blame(file)`` is
+    :func:`panel_scope.blame_owners` for that file at this round's head, ``added(sha)``
+    is :func:`panel_scope.commit_insertions` for that commit, and each returns ``None``
+    where the checkout could not answer. They are passed as callables rather than as
+    two pre-read maps because the caller cannot know WHICH files and commits to read
+    until the seams have been worked out, and working that out twice — once in the
+    caller to decide what to read and once here to decide what it means — is two
+    derivations of one answer with two chances to disagree. Handing over the readers
+    keeps the derivation here, in one place, and keeps this module's rule that nothing
+    in it shells out: the only subprocess in reach belongs to the function that was
+    passed in. Each is called at most once per file and per commit.
+
+    Every field is present on every round, :func:`injection_state`'s rule and for its
+    reason: an absent key and "there was nothing to excise" are different claims.
+
+    **``count`` IS ``None`` WHERE NOTHING COULD BE READ AND MUST NEVER BE A ZERO.**
+    Round 1, a rebased range, an anchor payload whose trigger floor is unreadable and a
+    checkout that could not list the pass are all "nobody looked", and a `0` published
+    for any of them says a round found no fix to excise — which is the flattering
+    direction on the very number #627 asks for, since a repo where this fires often is
+    being told something about its sub-floor budget. ``why`` says which.
+
+    ``declined`` is the other half of the answer and it is never empty for a reason the
+    payload does not carry. A caused finding whose seam a later commit built on stays
+    in the cycle and gets handed to a fixer like any other, and a reader has to be able
+    to tell that from the rule not applying — #627's own words: report it instead of
+    forcing it.
+
+    **THE EXCISION'S OWN RESTORATION IS CHURN, AND IT IS COUNTED (#692).** The unit
+    #692 settled on is churned lines — "a line that is touched is a surface area for
+    bugs", cumulative across passes rather than the size of the surviving diff — and by
+    that definition an excision is itself a pass that touches lines: it deletes what the
+    sub-floor fix wrote and puts back what that fix replaced. Nothing here exempts any
+    of it. The excision commit lands inside the NEXT round's fix range, so
+    :func:`referee_state`'s split, :func:`guard_churn_state`, :func:`fix_budget_state`
+    and #619's surface all see it, exactly as they see any other commit, and that is
+    the honest answer: the branch was touched, and a correction that touched code is
+    still a touch.
+
+    **What is exempted is ATTRIBUTION, which is a different question and only that
+    one.** #559 established that restoring reviewed code counts as WRITING it to a line
+    diff, so a naive revert inflates `escalate_on.fix_injection` and the remedy for the
+    gate reads to the gate as the disease. The lines an excision puts back sat at an
+    earlier round's head by construction — the sub-floor fix landed after it — so
+    :func:`panel_scope.restored_lines` is looking for exactly them and takes them out of
+    `introduced`. "How much surface was disturbed" and "who wrote this line" are two
+    questions; #692 settles the first and #559 the second, and this mechanism answers
+    yes to the first and no to the second on purpose. The honest limit is
+    :data:`panel_scope.RESTORED_RUN_MIN`: below five consecutive lines a restoration is
+    not distinguished from authorship, so an excision smaller than that leans one
+    round's `introduced` high by a handful of lines.
+
+    **`low_severity_fix_lines` IS ONE OF THOSE READINGS, AND THE EXCISION IS CHARGED TO
+    IT LIKE ANY OTHER COMMIT.** An earlier draft of this docstring claimed the opposite
+    — that the budget bounds what a round may SPEND on the sub-floor band and an excision
+    is the removal of such a fix rather than one more of them — and a Codex second
+    opinion pointed out that it contradicted the paragraph above it and that no code
+    anywhere implemented it. It does not, and the paragraph above is the one that is
+    true: `fix_budget_state` prices :func:`referee_state`'s split, the revert commit is
+    in that split, and its churn is priced at insertions plus deletions exactly as the
+    fix it removes was. There is an argument for exempting it — a round can be priced
+    for undoing work it was told not to have done, and that bites hardest where the
+    budget is tightest, which is where this fires most — but exempting it would mean
+    finding the revert commit inside the next round's fix range and subtracting its
+    churn from a total the fixer's own brief prices the same way, and #692 settled the
+    unit as churned lines precisely so that no correction gets to be free. The exposure
+    is stated rather than closed: where the rest of the anchor round's brief was wholly
+    budgeted, :func:`budgeted_brief` supplies the strict premise and a large excision can
+    fire an overspend against a pass that only did what this rule ordered.
+
+    **What ``destroys`` does NOT price, said in the payload rather than left to be
+    discovered (#558).** An excision removes the artefact the sub-floor fix wrote, and
+    the only column here that describes it is a line count split by path. #558 is open
+    on exactly this: a revert proposal prices what comes back and never what gets
+    destroyed, and on lexray#1697 two "P3 findings return" entries were the sole
+    coverage of the mechanism the PR existed to build. The rule #627 decided is not
+    conditioned on that pricing and this does not invent one — but a consumer reading
+    ``answered`` as the whole cost of an excision is making #558's mistake, and the
+    field names the guard lines so that the reading is available rather than implied.
+    """
+    seen_blame: dict[str, Mapping[int, str] | None] = {}
+    seen_added: dict[str, Mapping[str, int] | None] = {}
+    out: dict = {"kind": kind, "why": None, "floor": None, "sub_floor": None,
+                 "seams": None, "count": None, "excise": [], "declined": []}
+    if kind != FIX_RANGE_OK:
+        return {**out, "why": why or ("there was no fix pass between two rounds for a "
+                                      "sub-floor fix to be excised from")}
+    sub_floor, floor, floor_why = sub_floor_brief(brief, dials, gate)
+    if floor_why:
+        return {**out, "why": floor_why}
+    out["floor"], out["sub_floor"] = floor, len(sub_floor)
+    if not sub_floor:
+        # Read and answered: the pass had no sub-floor fix in it, so there is nothing
+        # this rule can apply to. A measured zero and not a null — the question was
+        # asked and the answer is none.
+        return {**out, "seams": 0, "count": 0,
+                "why": "the round that briefed this fix pass sent it to no finding "
+                       f"below its `{floor}` trigger floor, so no fix in the pass "
+                       "answered one"}
+    read = commits if isinstance(commits, dict) else {}
+    listed = read.get("commits") or []
+    if not listed:
+        return {**out, "why": read.get("why") or
+                "the commits in this fix range could not be read, so which fix "
+                "answered a sub-floor finding cannot be said"}
+    seams, refused = excision_seams(listed, sub_floor, brief, ids)
+    out["seams"], out["declined"] = len(seams), list(refused)
+    if not seams:
+        return {**out, "count": 0,
+                "why": f"none of the {len(listed)} commit(s) in this fix pass names one "
+                       f"of the {len(sub_floor)} sub-floor finding(s) it was sent to, so "
+                       "there is no seam to excise — a fix smeared through a pass cannot "
+                       "be removed without taking the others with it"}
+    # From here the round KNOWS which fixes are sub-floor and which commit each is, so
+    # every answer below is a measured one and `count` is a number rather than a null.
+    out["count"] = 0
+    by_commit: dict[str, list[dict]] = {}
+    for finding in caused:
+        file, line = str(finding.get("file") or ""), finding.get("line")
+        if not file or not isinstance(line, int) or isinstance(line, bool):
+            # A finding nothing can place is no evidence about which fix wrote the line
+            # it sits on. Dropped rather than attributed — the same posture
+            # `Baseline.fixed_findings` takes on an unplaceable record.
+            continue
+        blamed = _read_once(blame, seen_blame, file)
+        if blamed is None:
+            out["declined"].append({
+                "commit": None, "subject": "", "answered": None, "caused": [finding],
+                "why": f"`{file}` could not be blamed in this checkout, so which fix "
+                       "wrote the line this finding sits on is not known"})
+            continue
+        owner = blamed.get(line)
+        if owner in seams:
+            by_commit.setdefault(owner, []).append(finding)
+    for sha, findings in by_commit.items():
+        seam = seams[sha]
+        wrote = _read_once(added, seen_added, sha)
+        if wrote is None:
+            out["declined"].append({**seam, "caused": findings, "why":
+                                    "the lines this commit added could not be counted "
+                                    "in this checkout, so it cannot be shown that "
+                                    "nothing later in the pass built on them"})
+            continue
+        unblamed = sorted(path for path in wrote
+                          if _read_once(blame, seen_blame, str(path)) is None)
+        if unblamed:
+            out["declined"].append({**seam, "caused": findings, "why":
+                                    f"{', '.join(f'`{p}`' for p in unblamed)} could not "
+                                    "be blamed in this checkout, so it cannot be shown "
+                                    "that nothing later in the pass built on this fix"})
+            continue
+        # NOT `added`, which is the READER this loop calls once per commit: rebinding
+        # it here left the second seam of a two-seam round asking an integer for its
+        # line counts, getting a `None` back through `_read_once`'s `callable` test,
+        # and declining with "could not be counted" over a checkout that answered
+        # perfectly well (found by a Codex second opinion).
+        wrote_lines = sum(int(n) for n in wrote.values())
+        kept = sum(1 for path in wrote
+                   for owner in (_read_once(blame, seen_blame, str(path)) or {}).values()
+                   if owner == sha)
+        if kept != wrote_lines:
+            # THE CASCADE, and it is refused in both directions. Fewer surviving lines
+            # than the commit wrote means a later commit in the pass rewrote or removed
+            # part of this fix — very often a blocking fix building on it, which is the
+            # one case #627 excludes by name. MORE means blame credits the commit with
+            # lines its own diff did not count, which is what a rename looks like from
+            # here; either way the commit's lines and the head's are not the same set,
+            # and a revert of it is no longer the removal of one fix.
+            out["declined"].append({**seam, "caused": findings, "why":
+                                    f"{kept} of the {wrote_lines} line(s) this fix added are "
+                                    "still its own at the head, so a later commit in "
+                                    "the pass has built on it — reverting it now would "
+                                    "take part of another fix with it"})
+            continue
+        guard = sum(int(n) for path, n in wrote.items()
+                    if _guard_kind(str(path)) in ("test", "doc"))
+        out["excise"].append({
+            **seam,
+            # What comes BACK on the board, unfixed — the whole priced cost of the
+            # excision under #627's argument, and the field a reader must not mistake
+            # for the whole cost of it (see the docstring, and #558).
+            "answered": seam["answered"],
+            # What goes away with it and is not handed to a fixer.
+            "caused": findings,
+            # The action, spelled out, run by nothing here. ONE commit and the FULL
+            # sha, on `revert_state`'s rule: a display span is read and a command is
+            # executed, and an abbreviation ambiguous in this repository resolves to
+            # nothing or to something else.
+            "command": f"git revert --no-commit {sha}",
+            # #558's gap, named rather than priced.
+            "destroys": {"files": sorted(str(p) for p in wrote),
+                         "lines": wrote_lines, "guard_lines": guard},
+        })
+    out["count"] = len(out["excise"])
+    return out
 
 
 def premise_report(verdict: dict, register_path: str, notes: list[str],
@@ -3754,6 +6055,18 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
         out.append(f"decidable  {answer} — the runtime this assertion runs in "
                    + ("can" if answer == "yes" else "CANNOT")
                    + " observe the property the fix asserts")
+    # #560, on the line above's rule: said on every declaration, because a fixer that
+    # never sees the stamp does not know the ordering is being recorded, and an
+    # unreadable checkout has to be visible at the moment it happens rather than three
+    # rounds later in somebody else's payload.
+    if verdict.get("head"):
+        out.append(f"at       {verdict['head'][:12]} — the tree this was declared "
+                   "from. A later round reads it to tell a premise declared before "
+                   "its own fix pass from one declared after it (#560)")
+    else:
+        out.append("at       NOT RECORDED — this tree's HEAD could not be read, so no "
+                   "round can tell whether this premise preceded its own fix pass or "
+                   "followed it (#560)")
     if verdict["undeclared_rounds"]:
         # #84: an undeclared fix pass is UNESCALATABLE, and saying so is the point.
         # A cycle nobody could have braked reads exactly like one that did not need
@@ -4009,8 +6322,13 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     limit = premise_repeat_limit(cfg["review_panel"], notes)
     undecidable_brake = premise_undecidable_brake(cfg["review_panel"], notes)
     reg, problems = load_premises(register_path, cfg.get("github") or "", pr_number)
+    # #560's stamp, read here rather than taken from the caller. The declaration is
+    # made from the tree the patch is about to be written in, so that tree's HEAD is
+    # the fact — see :func:`working_head` for why it is not a flag, and
+    # :func:`retroactive_declarations` for the one ordering failure it settles and the
+    # one it does not.
     verdict = declare_premise(reg, premise, round_no, findings or [], limit,
-                              decidable, undecidable_brake)
+                              decidable, undecidable_brake, working_head())
     if verdict["decidable"] == "no" and not undecidable_brake:
         # The repo switched it off, and the declaration still says the fix cannot be
         # verified where it runs. Recorded and reported rather than swallowed, on
@@ -4062,12 +6380,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                baseline_ok: bool = True, repeated: Iterable[str] = (),
                escalated: Iterable[str] = (), *,
                trigger_floor: str = NO_SEVERITY_FLOOR,
-               fix_floor: str = NO_SEVERITY_FLOOR,
+               cleared_floor: str = NO_SEVERITY_FLOOR,
+               narrowed: Iterable[str] = (),
+               declined: Iterable[str] = (),
                premises: dict | None = None,
                injection: dict | None = None,
                revert: dict | None = None,
+               excision: dict | None = None,
                not_falling: dict | None = None,
-               unrefereed: dict | None = None) -> dict:
+               unrefereed: dict | None = None,
+               guard_churn: dict | None = None,
+               fix_budget: dict | None = None,
+               surface: dict | None = None) -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -4087,7 +6411,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
     1. findings this round that no earlier round raised, **at or above**
        ``trigger_floor`` -> go again;
-    2. a P1/P2 still outstanding **at or above** ``fix_floor``, or a Sonar hard-gate
+    2. a P1/P2 still outstanding **at or above** ``cleared_floor``, or a Sonar hard-gate
        issue still outstanding at **any** severity -> go again, whatever
        anyone declared (a blocker
        raised again is a blocker that was not fixed) — **except one in**
@@ -4101,20 +6425,74 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
        veto line, ``confident`` is false, and ``reason`` says a human is owed an
        answer;
     3. ``repeated`` — the KEYS of findings an earlier round already raised that
-       are STILL outstanding, at any severity **at or above** ``fix_floor``
-       -> go again. The fixer was told
-       about them and they are still there, and ``/panel-review-pr``'s bar is
-       every finding fixed, not every P1/P2. This used to only cost the stop its
-       confidence, which ended the cycle with a judge-confirmed defect present and
-       nothing acting on the veto that said so. Keys rather than a count so the
-       escalation filter below can subtract the escalated ones: a count computed
-       before this function sees it puts the jam straight back, filtered by
+       are STILL outstanding, **at or above** ``trigger_floor`` -> go again. The
+       fixer was told about them and they are still there. This used to only cost
+       the stop its confidence, which ended the cycle with a judge-confirmed defect
+       present and nothing acting on the veto that said so. Keys rather than a count
+       so the escalation filter below can subtract the escalated ones: a count
+       computed before this function sees it puts the jam straight back, filtered by
        whichever caller remembered to, which is not a rule but a convention with
        one participant;
     4. otherwise dry -> stop.
 
+    **RULE 3 TAKES THE TRIGGER FLOOR AND NOT THE CLEARED ONE, and that is the
+    convergence fix (#621).** The rule it replaces bounded the repeat by
+    ``cleared_floor`` — anything the fix pass was ASKED to clear and did not. That was
+    sound while the two floors sat a tier apart, and it stops being sound the moment
+    the fix floor drops far enough that a pass may spend its budget on P3/P4 work: a
+    single unpaid P3 is then a finding the fixer was asked to clear, did not, and can
+    only close by WRITING LINES — and writing lines is what authors the next round's
+    findings, which is the loop this whole branch exists to break. The decided rule is
+    that **a repeated finding keeps the cycle going only if it would have bought a
+    round in the first place.** A finding under the trigger floor never bought one
+    when it was new and does not buy one by being raised twice; it is reported — in
+    ``repeated_below_trigger_floor``, in the stop's own ``reason``, and in
+    ``outstanding.fixable`` where a fix pass could still take it — and the cycle stops.
+    Reported is the load-bearing half of that sentence: such a round is NOT dry, and it
+    says which findings it stood down on rather than borrowing the word, on exactly the
+    terms #165's below-floor branch already set for new findings.
+
+    What that does NOT change, said explicitly because each is the kind of thing a
+    reader assumes went with it: a repeated **P1/P2 still goes again**, under rule 2
+    and under rule 3 both — rule 2's bound is untouched, and a P1/P2 is at or above
+    any trigger floor a repo can set. A **Sonar hard-gate issue** keeps exactly the
+    standing it has today: ``exempt`` is a property of the KEY and not of one rule, so
+    it passes both floors at every rule, and a still-open gate issue goes again
+    however Sonar graded it. **Escalations are still subtracted before every rule**,
+    and so are ``narrowed`` keys — the filters run once, in front of all four, and
+    this changes neither.
+
+    **``declined`` IS NOT A FILTER AND IS NOT A RULE (#665).** It is the register of
+    corrections an earlier fix pass identified and could not make, and it is the one
+    input to this function that changes no rule's answer. Nothing is subtracted for
+    it, nothing is exempted by it, and no branch below can be reached BECAUSE of it
+    that could not be reached without it. What it does is take a stop's claim to
+    have converged: a cycle ending with declarations on the record has not run out
+    of defects, it has run out of corrections anybody was willing to make, and those
+    two ending in the same word is how a PR lands with known-unfixed defects and a
+    clean verdict.
+
+    So it costs a veto line and it costs ``converged``, and it costs them only on a
+    STOP — on a ``go again`` the round is not claiming anything. The direction is
+    the one this whole register is bound by: it can make a verdict less confident
+    and never more, which is what makes it safe to be written by the actor it
+    reports on.
+
+    **Every declaration in the register counts, not only the ones this round raised
+    again**, and that is the one place it parts company with ``escalated``'s
+    ``blocking``. Bounding it to what the round raised was written first and is
+    wrong here: under the default `increment` scope a later round never re-reads the
+    file the declined correction was owed in, so the bound would silence the
+    register in exactly the case that motivated it — the quiet round after the pass
+    that declined. The cost of the wider rule is stated rather than hidden: nothing
+    RETRACTS a declaration, so a correction genuinely made in a later pass goes on
+    costing the cycle its confidence until the cycle ends. That is the conservative
+    direction (a defect nobody recorded as fixed reads as unfixed), it never adds a
+    round, and #617's ``--new-cycle`` is the clean start for a PR that has actually
+    had the work done.
+
     The cap is what stops rule 3 running forever when two reviewers disagree
-    about a P4 — the cycle ends either way, and a cap reached with work
+    about a P2 — the cycle ends either way, and a cap reached with work
     outstanding is recorded as such rather than as convergence.
 
     **``outstanding`` IS THE SECOND QUESTION, AND IT IS NOT THE ONE ``stop``
@@ -4156,9 +6534,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     **THE TWO FLOORS (#165), and why there are two.** Both default to
     :data:`NO_SEVERITY_FLOOR`, so a caller that has not heard of them gets exactly
     the behaviour above; `panel.py` passes the repo's
-    ``review_panel.round_trigger_floor`` and ``fix_severity_floor``.
+    ``review_panel.round_trigger_floor`` and :attr:`panel_seats.Dials.cleared_floor`
+    — which is the ``fix_severity_floor`` until a budget is in force and the cut
+    afterwards, and is NOT ``Dials.fix_floor``. The parameter is called
+    ``cleared_floor`` because that is the concept it carries and because the other
+    name is live one module over holding a different value (#549); the payload key
+    follows it.
 
-    ``trigger_floor`` bounds rule 1 alone: a new finding below it is still counted,
+    ``trigger_floor`` bounds rules 1 and 3: a new finding below it is still counted,
     still reported and still in the payload, it simply does not by itself buy a
     panel, a fix pass and another panel. That rule is the one the measurement
     indicts. From round 2 the thing under review IS the previous round's fix, so
@@ -4167,17 +6550,27 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     test fed by its own output can only end on the cap, which is what all seven
     panels did.
 
-    ``fix_floor`` bounds rules 2 and 3, and it has to or the other dial does
-    nothing. A finding below the fix floor is one the fix round was never asked to
-    clear, so it is outstanding every round by construction: rule 3's own
-    justification — "the fixer was told about them and they are still there" — is
-    simply false of it, and left unbounded it would go again until the cap on a P3
-    nobody ever intended to fix. Rule 2 takes the same bound for the same reason,
-    which matters only where the fix floor is ``P1``: at ``P2`` every P1/P2 is
-    already at or above it and the filter is a no-op. Read the other way round, that
-    is the honest scope of "``P4`` restores the old behaviour" — true of rules 1 and
-    3, and vacuous for rule 2, whose bar is the hardcoded ``("P1", "P2")`` tuple, so
-    a floor can only ever RAISE it and only ``P1`` moves it at all.
+    ``cleared_floor`` bounds rule 2 alone, and it bounds the DISPOSAL below. A
+    finding under it is one the fix round was never asked to clear, so it is
+    outstanding every round by construction and no rule may read that as the fixer
+    having failed. Rule 2 takes the bound for that reason, which matters only where
+    the floor is ``P1``: at ``P2`` every P1/P2 is already at or above it and the
+    filter is a no-op. Read the other way round, that is the honest scope of "``P4``
+    restores the old behaviour" — true of rule 1, and vacuous for rule 2, whose bar
+    is the hardcoded ``("P1", "P2")`` tuple, so a floor can only ever RAISE it and
+    only ``P1`` moves it at all.
+
+    **The two floors now bound different rules because they answer different
+    questions, and rule 3 asks the first one.** ``trigger_floor`` answers *is this
+    finding worth another panel, another fix pass and another panel?*;
+    ``cleared_floor`` answers *was this finding this pass's work?*. Rule 3 is a
+    question about whether to spend another round, so it takes the round dial —
+    which also makes the two rules that can extend the cycle bounded by one number a
+    repo sets once, instead of by whichever of two dials the reader guessed. Rule 2
+    and the disposal are questions about work, so they keep the work dial. The one
+    consequence worth naming: a finding above the cleared floor and below the trigger
+    floor is a finding a fix pass IS asked to clear and whose non-clearance buys no
+    round — reported, in ``outstanding.fixable``, and not a reason to go again.
 
     **NEITHER FLOOR APPLIES TO A SONAR HARD-GATE ISSUE**, at any rule. A finding with
     ``verdict == "sonar"`` in ``outstanding`` is a red quality gate, not a judged
@@ -4218,6 +6611,65 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     every later round its confidence. A round that is genuinely dry is reported as
     dry even while the cycle's register is non-empty; the open question lives in
     the relay and its issue, which is where a human is looking for it.
+
+    ``narrowed`` is #615, and it is the SECOND filter in front of the four rules. The
+    fixer's vocabulary was ``fixed | refuted | deferred`` plus escalation, and all four
+    answer *whether* to act; none of them answers *how far*. Rich's decision adds the
+    fourth outcome: the finding is real, this pass fixed it **at the point it was
+    raised**, and the general form is not this pass's work.
+
+    **It CLEARS.** A narrowed key is subtracted alongside the escalated ones, before
+    the rules, so it is not outstanding under rule 2, rule 3 does not count it, and it
+    is in neither ``outstanding.fixable`` nor ``below_floor``. It takes NO veto line
+    and costs the round no confidence — that is the whole difference from an
+    escalation, which is an open question a human owes an answer to, where this is an
+    answer already given.
+
+    **But the stop SAYS SO, by name.** A round whose quiet was bought by a narrowing
+    gets its own ``reason`` — never "dry", which is a claim that nothing was raised —
+    and the reason counts how many of the cleared keys were at or above the trigger
+    floor, because a P1 answered narrowly and a P4 answered narrowly are the same
+    mechanism and not the same news. The keys are repeats by construction: the flag
+    is passed on the round after the pass that declared it, and only the keys THIS
+    round raised are honoured, so every one of them is a finding a fresh panel put up
+    again after a fixer said it was answered.
+
+    **And that is the whole of the charge.** Costing ``confident`` or ``converged`` at
+    or above the trigger floor was considered on the review of #631 and declined: it
+    would leave a fixer's only way to end a cycle cleanly the class-wide fix, which is
+    the pressure this outcome exists to remove, and it would price an ANSWER as though
+    it were an open question. The asymmetry with ``escalated`` — which costs a veto,
+    ``confident`` and ``converged`` — is the point rather than an oversight: one names
+    work nobody has done, the other names work that was done and bounded. What a
+    narrowing costs is two lines of justification, a board row and, where the general
+    form is itself a claim-miss, an issue; that bill is the caller's to collect, and
+    the reason line is what tells a human there is one outstanding.
+
+    **Why clearing is the point rather than a leniency.** A fixer that cannot answer a
+    finding partially will answer it maximally, because the maximal answer is the only
+    one that fully satisfies a brief which says "never note a problem and move on".
+    The maximal answer is what makes a pass edit files the finding never named, and
+    those files are where the next round's findings come from — one finding about one
+    route became server-level nginx ``gzip``, and the round after that was a P1
+    (lexray#1780, and ``surface`` below is the instrument for the same failure). Give
+    the partial answer a name and let it CLEAR, and it becomes reachable; leave it
+    counting as outstanding and rule 3 holds the cycle open until somebody writes the
+    class-wide fix, which is the pressure this branch exists to remove wearing a
+    kinder name.
+
+    It is not free. A narrowing owes two lines — why the narrow fix is complete for the
+    finding as raised, and what the general form would be — and a board row, and a
+    GitHub issue **only where the general form is itself a claim-miss**. None of that
+    is enforceable here: this function sees keys, and the cost is the caller's to
+    collect (``panel-review-pr.md``). What this function does guarantee is the one
+    thing a fixer could otherwise buy with the word: a **Sonar hard-gate issue cannot
+    be narrowed away**. See the comment on ``answered``.
+
+    The register carries the same two caveats the escalated one does, one paragraph
+    up, and for the same reasons — the keys are a claim by the agent that wrote the
+    fix, and a key is not a finding, so a fresh panel that words the defect
+    differently mints a key this cannot match and the finding is simply outstanding
+    again.
 
     **A stop that is HOLDING an escalation is never reported as convergence.** It
     takes a veto line, which costs ``confident`` by the existing rule, and it says
@@ -4489,6 +6941,108 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     line saying exactly why, never a merge and never a review that reads cleaner than
     it is; and ``escalate_on.unrefereed_fix: false`` switches it off in one line.
 
+    ``guard_churn`` is #618, and it is the SIXTH bound here — the only one measured per
+    FIX PASS rather than per PR, and the only one whose threshold ships unset.
+
+    **What it measures, and why the obvious statistic could not.** The panel already
+    reports `guard_ratio`: test and doc lines over source lines, cumulative over the
+    whole PR. On lexray#1780 that ratio read 2.21 -> 2.19 -> 2.13 -> 2.09 -> 2.02 across
+    five rounds in which source went 476 -> 941 and test went 883 -> 1,632. **It fell
+    monotonically through the runaway it was watching**, because a proportion cannot
+    tell "this change is well guarded" from "this change and its guards are both running
+    away" — the runaway moves numerator and denominator together. A ceiling on it would
+    have fired on none of those five rounds and would fire at round 1 on a heavily
+    guarded PR that never churned: wrong in both directions.
+
+    The per-pass DELTA is the quantity that can see the event. Rounds 2-5 wrote 380, 205,
+    205 and 58 lines of test and prose against 177, 116, 114 and 58 of production, and
+    that is a shape. :func:`guard_churn_state` reads it off ``unrefereed``'s own split,
+    so the ceiling and #554's budget weight count the same lines.
+
+    **It does not bank.** Each round's measurement is its own fix range and nothing
+    earlier. A quiet round cannot fund a loud one, which is the case a ceiling on a pass
+    exists for and the case a cumulative reading gets wrong.
+
+    **It ships UNCALIBRATED, and that is the answer rather than a placeholder.**
+    `max_fix_guard_lines` defaults to ``None``. The evidence is one cycle; a threshold
+    drawn between its quiet round's 58 lines and its loud round's 380 would be a number
+    chosen to fit one PR, which #67 forbids. So the count is taken and published every
+    round and nothing fires until a repo writes a number. `escalate_on.guard_lines` is
+    then a SECOND thing to write before a round can end on it, defaulting to false: a set
+    ceiling is watched, an armed one stops. That split is the whole design — the weaker
+    action first, the stronger one a flag away rather than baked in.
+
+    **The same two bounds as ``injection``, ``not_falling`` and ``unrefereed``**, and
+    deliberately NOT ``max_fix_growth``'s: that ceiling is applied by the caller and
+    forces a stop unconditionally, on years of measurement. This one may only turn a ``go
+    again`` into a STOP, and only the round rule 1 was buying.
+
+    ``fix_budget`` is #622, and it is the argument here that closes a gap rather than
+    opening a measurement: `low_severity_fix_lines` is the one bound on a fix pass that
+    was counted by the pass itself. The dial is resolved in `panel.py`, relayed into
+    the fixer's brief as a paragraph asking the fixer to run `git diff --numstat` after
+    each fix and stop when the budget is gone, and read by nobody else. On lexray#1780
+    the relayed number was right every round and the passes came out at 850, 322, 356
+    and 142 lines against a budget of 40; the only reason anyone knows is that the
+    fixer said so. :func:`fix_budget_state` prices the same split ``unrefereed`` and
+    ``guard_churn`` read — production at 1, test and prose at `unrefereed_line_weight`
+    — and puts the number beside the limit.
+
+    **It carries TWO verdicts about one number, and only the second one gates.**
+    ``within`` is the upper bound: the budget bounds the 💸 band and not the pass, and a
+    diff cannot attribute a line to the finding it paid for, so ``within: True`` is a
+    fact (the whole pass priced under the budget, so the budgeted part is too) and
+    ``within: False`` is the absence of one, never an accusation. Nothing here reads
+    it, in either direction, exactly as before.
+
+    ``breach`` is the strict verdict, and it is the rung. :func:`budgeted_brief`
+    establishes the one premise that removes the need for per-line attribution — every
+    finding the LAST round sent the fixer to answer was in the 💸 band, so the pass had
+    no mandatory work in front of it and the priced total IS the budgeted spend. On
+    that premise, and on no other, ``spend > limit`` is a fact about the pass rather
+    than an unproven crossing, and the round ends on it with a veto line and
+    ``confident`` false.
+
+    **The same two bounds as its four siblings**, taken through ``going_again``: it may
+    only turn a ``go again`` into a STOP, and only the round rule 1 was buying, so it
+    can never cancel the repair round for a P1 an earlier round raised or for a finding
+    that came back.
+
+    **And still no flag to arm**, which is #621's "not a 29th dial" and is a stronger
+    claim here than it is one rung up. `max_fix_guard_lines` needs `escalate_on` because
+    its ceiling is uncalibrated and a repo may set one to WATCH it; there is no
+    equivalent judgement left in this one. The limit is a number the repo wrote, the
+    band is one its own floors carve out, and the premise is proved rather than assumed
+    — an `escalate_on` key would offer the option of ignoring an arithmetic breach of
+    the repo's own policy, which is not a dial anybody asked for.
+
+    ``surface`` is #619, and it is the second argument to this function that decides
+    nothing — reported, never gated. It is the set of files the last fix pass touched
+    that no earlier round had read, measured in `panel.py` and arriving on a fixed
+    contract (``files``, ``new_files``, ``count``, ``prior_files``), or ``None`` where
+    there was no measurement to make.
+
+    **It is a quantity none of the other dials can see.** Everything downstream of a
+    fix pass counts lines or findings — ``max_fix_growth`` at 3.0x,
+    ``max_fix_growth_chars`` at 30,000, ``fix_injection`` at 0.5 — and a fix that adds
+    fifteen lines to two nginx templates nobody had reviewed is invisible to all three.
+    Surface is not size. On lexray#1780 round 3's pass touched twelve files and seven
+    of them had never been in front of a reviewer; both of the cycle's later P1s were
+    in that new surface, and ten of the PR's files arrived from a fix pass rather than
+    from the change under review. ``reviewer_scope`` bounds where a REVIEWER's findings
+    may land and nothing bounded where a FIXER's edits may.
+
+    **It is the instrument for the failure ``narrowed`` gives a vocabulary to**, which
+    is why the two arrived together: that one lets a fixer decline the class-wide fix,
+    this one counts the rounds where it was available and went unused.
+
+    **No gate, on #67's rule.** Nothing here reads it to move ``stop``, and the choice
+    between a dial (``max_fix_new_files``) and report-only has not been made. The
+    payload's ``fix_surface`` is null rather than zero where the measurement could not
+    be taken, on :func:`fix_surface_state`'s argument: round 1 has no pass to read, and
+    "the pass opened no new files" is a claim about a fix pass where what happened is
+    that nobody looked.
+
     ``revert`` is #506, and it is the only argument to this function that DECIDES
     NOTHING. Every other one can move ``stop``; this one cannot, in either direction.
     It exists because ending the cycle on ``injection`` is half an answer — **the fix
@@ -4515,6 +7069,41 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     is ``blind`` records that instead of naming a range it cannot see. ``offered`` is
     the field that says a proposal was actually put, and it is ``fired``'s counterpart
     one rule down.
+
+    **``excision`` (#627) is the ONE backtrack the loop takes without asking, and it
+    is not a smaller version of the rule above.** A whole fix pass is mixed, which is
+    why reverting one is a human's decision; a single fix that answered a finding below
+    `round_trigger_floor` is not, because the entire cost of removing it is one P3 or
+    P4 returning to the board unfixed — the state an unpaid budget item is already in.
+    So :func:`excision_state` names the commit, the sub-floor finding that comes back,
+    the finding that goes away with it and the `git revert` for it, and declines by
+    name wherever a later commit in the pass has built on that fix.
+
+    It moves nothing in this function. The caused finding is still outstanding to every
+    rule here, so a round that names an excision goes again exactly as it would have
+    without one — which is #627's "the cycle continues", and the reason there is no
+    ``fired`` or ``offered`` beside ``count``.
+
+    **``converged`` (#626) is the payload saying, in one boolean, whether this was a
+    clean finish** — and it exists because until now the reader had to assemble that
+    from four fields and could assemble it wrong. It is true only where the cycle
+    STOPPED, ``confident``, with no veto line, nothing outstanding and no escalation
+    held; false in every other stop and on every ``go again``.
+
+    It is computed FROM ``confident`` rather than beside it, so a capped stop and a
+    vetoed stop are false here by construction rather than by two expressions
+    agreeing. Then it is stricter: it also requires ``outstanding.fixable``,
+    ``below_floor`` and the held escalations to be empty — the disposal's own "nothing
+    is outstanding — the cycle ends with nothing to hand on".
+
+    That strictness is where the judgement is, so it is stated. A below-floor policy
+    stop keeps its ``confident: True`` — #165 argues that at length and nothing here
+    revisits it — and is nevertheless NOT converged, because its ``reason`` is
+    "reported, not fixed here" rather than "dry" and the metric this field serves is
+    the share of cycles ending in a confident **dry** round. Counting it would count a
+    cycle that ended with real findings unfixed by policy as a clean finish. The
+    asymmetry is deliberate: a false negative costs such a round nothing it had, and a
+    false positive is the one reading this field exists to make impossible.
 
     Two honest caveats, recorded here because they are properties of the design
     and not of the code, and because this docstring is where they are KEPT — the
@@ -4559,7 +7148,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #
     # A `dict` is deliberately NOT rejected: it iterates its keys, which is correct
     # and is what the production call site passes (the register itself).
-    for name, value in (("repeated", repeated), ("escalated", escalated)):
+    for name, value in (("repeated", repeated), ("escalated", escalated),
+                        ("narrowed", narrowed), ("declined", declined)):
         if isinstance(value, str):
             raise TypeError(
                 f"round_stop({name}=...) takes a COLLECTION of finding keys, not one "
@@ -4568,31 +7158,19 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         if isinstance(value, int):
             raise TypeError(
                 f"round_stop({name}=...) takes finding KEYS, not a count ({value!r}): "
-                "the escalated ones are subtracted here, and a count computed by the "
-                "caller cannot express that")
-    held = frozenset(k for k in escalated if k)
-    # The escalated keys THIS round actually saw. The register is a property of
-    # the cycle and only grows; what is blocking is a property of the round, and
-    # conflating them meant one stale or mistyped key made every later round of
-    # the cycle non-confident forever — including rounds that were genuinely dry,
-    # and including after a human had answered the premise and the code moved.
-    # A permanently vetoed cycle is the "loud and wrong" a reader learns to
-    # ignore, which is worse than the jam this whole rule closes.
-    blocking = held & ({*new_keys} | {c.key for c in outstanding})
-    # The work a fix round can actually clear, under names of their own. The
-    # subtraction happens ONCE, before the rules, because every rule below asks
-    # "is there work outstanding" and an escalated finding is precisely work the
-    # cycle has been forbidden to do — but the parameters keep meaning what they
-    # are called, so the cap message and anything else downstream that wants "what
-    # the cycle still has to clear, escalations and all" can still say so.
-    clearable_new = [k for k in new_keys if k not in held]
-    clearable = [c for c in outstanding if c.key not in held]
+                "the escalated and the narrowed ones are subtracted here by key, and a "
+                "count computed by the caller cannot express that")
     # Severity by key, off `outstanding` — which carries it for the same findings
     # `new_keys` and `repeated` name. Deriving it here rather than widening either
     # parameter keeps every existing caller's contract: they pass bare keys today,
     # and a key whose severity this cannot find is treated as ABOVE the floor (the
     # `SEVERITIES[0]` fallback), so an unrecognised key costs a round rather than
     # silently dropping a finding out of the loop.
+    #
+    # This and `exempt` sit ABOVE the escalation/narrowing filters rather than below
+    # them because `answered` reads `exempt` — a Sonar gate issue may not be narrowed
+    # away — and the filters are what the four rules are applied to. Nothing here
+    # depends on them in return: both are read straight off `outstanding`.
     severity = {c.key: c.severity for c in outstanding}
     # SONAR'S HARD-GATE ISSUES ARE EXEMPT FROM BOTH FLOORS, AT EVERY RULE, whatever
     # severity Sonar itself gave them — and Sonar's own severities are routinely P3
@@ -4623,20 +7201,113 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         return (key in exempt
                 or severity_at_least(severity.get(key, SEVERITIES[0]), floor))
 
+    held = frozenset(k for k in escalated if k)
+    # The escalated keys THIS round actually saw. The register is a property of
+    # the cycle and only grows; what is blocking is a property of the round, and
+    # conflating them meant one stale or mistyped key made every later round of
+    # the cycle non-confident forever — including rounds that were genuinely dry,
+    # and including after a human had answered the premise and the code moved.
+    # A permanently vetoed cycle is the "loud and wrong" a reader learns to
+    # ignore, which is worse than the jam this whole rule closes.
+    blocking = held & ({*new_keys} | {c.key for c in outstanding})
+    # #615's fourth outcome, and the SECOND filter in front of the four rules. A
+    # `narrowed` finding is one the fix pass answered AT THE POINT IT WAS RAISED,
+    # declaring the general form a separate change — so unlike an escalation it is
+    # answered rather than forbidden, and it CLEARS: it is not outstanding, rule 3
+    # does not count it, and no veto line is owed for it.
+    #
+    # Why it has to clear rather than merely soften the stop: the vocabulary was
+    # `fixed | refuted | deferred` plus escalation, and none of those is "I fixed this
+    # one and not its class". A fixer with no way to answer a finding partially
+    # answers it MAXIMALLY — which is what makes a pass touch files the finding never
+    # named (#619), and the files a fix pass pulls in are where the next round's
+    # findings come from. Measured on lexray#1780: one finding about one route became
+    # server-level nginx `gzip`, and the round after that was a P1. Leaving `narrowed`
+    # as a flavour of "still outstanding" would leave rule 3 holding the cycle open
+    # until somebody wrote the class-wide fix, which is the same pressure under a
+    # kinder name.
+    #
+    # A SONAR HARD-GATE ISSUE CANNOT BE NARROWED, and the guard is here rather than in
+    # a rule for the reason the `exempt` comment above gives: the exemption is a
+    # property of the KEY. Narrowing is a judgement about how far to fix a judged
+    # finding; a red quality gate is not a judgement and keeps the PR unmergeable at
+    # any severity, so "answered at the point it was raised" is not something a caller
+    # gets to say about one. Subtracting it would end the cycle confident with the
+    # gate still red — the exact bug `outstanding = to_fix + sonar` was written to fix,
+    # arriving through a third door.
+    answered = frozenset(k for k in narrowed if k) - exempt
+    #: The narrowed keys THIS round actually raised, on `blocking`'s terms and for its
+    #: reason: the register is a property of the cycle and what was subtracted is a
+    #: property of the round, and a payload that reported the first would go on
+    #: crediting a narrowing long after the code moved.
+    narrowed_cleared = answered & ({*new_keys} | {c.key for c in outstanding})
+    #: #665's register, and the only collection here that is NOT narrowed to the
+    #: keys this round raised. The docstring argues that at length; the short of it
+    #: is that `blocking`'s bound exists because an escalation waits on a human who
+    #: may have answered it since, while a declined correction waits on a fix pass
+    #: this cycle can see the output of — and under `increment` scope the round that
+    #: would have seen it never re-reads the file. Sorted where it is published, for
+    #: `escalated_outstanding`'s reason: the artifact's bytes must not move with the
+    #: order of the flags.
+    #:
+    #: Subtracted from nothing. It appears in no filter, in `cleared_out`, in
+    #: `work`, or in any of the four rules — the greps that would show otherwise are
+    #: the review this feature is owed.
+    unfixed = frozenset(k for k in declined if k)
+    # The work a fix round can actually clear, under names of their own. The
+    # subtraction happens ONCE, before the rules, because every rule below asks
+    # "is there work outstanding" and an escalated finding is precisely work the
+    # cycle has been forbidden to do — and a narrowed one is work it has already
+    # done — but the parameters keep meaning what they are called, so the cap
+    # message and anything else downstream that wants "what the cycle still has to
+    # clear, escalations and all" can still say so.
+    #
+    # ONE subtracted set for the rules and TWO reported ones, because the rules ask
+    # the same question of both ("is there work here a fix round can clear?") and a
+    # reader asks different ones ("what is a human owed?" against "what did the fixer
+    # decline to generalise?"). Folding them into one name would make an escalation
+    # and a narrowing indistinguishable in the payload; keeping two subtractions would
+    # be two places for the filter to fall out of step.
+    cleared_out = held | answered
+    clearable_new = [k for k in new_keys if k not in cleared_out]
+    clearable = [c for c in outstanding if c.key not in cleared_out]
     #: New findings that buy a round, and the ones that were raised and do not.
     triggering = [k for k in clearable_new if above(k, trigger_floor)]
     quiet_new = [k for k in clearable_new if not above(k, trigger_floor)]
+    # Rule 3, at the TRIGGER floor and not the cleared one (#621). The rule is "would
+    # this finding have bought a round when it was new?", and a finding that never
+    # bought one does not start buying them by being raised twice. Bounded by
+    # `cleared_floor` it did: at a fix floor low enough for a budget to reach P3/P4,
+    # one unpaid sub-trigger finding is outstanding every round by construction, and
+    # the only move that closes it is the fixer writing lines — which is what authors
+    # the next round's findings. Rules 2 and the disposal keep the cleared floor;
+    # `exempt` still carries a Sonar gate issue past both, and `held`/`answered` are
+    # still subtracted in front of all four.
     repeats = len({k for k in repeated
-                   if k and k not in held and above(k, fix_floor)})
-    # Rule 2. The hardcoded ``("P1", "P2")`` is what makes the exemption necessary
-    # HERE as well as in `above`: without the first clause a P3 gate issue could not
-    # be a blocker at all, however red the gate, so a still-open one had to fall
-    # through to rule 3 and would be lost with it the moment `repeated` did not
-    # carry the key (a round whose baseline could not be attributed, for one).
+                   if k and k not in cleared_out and above(k, trigger_floor)})
+    #: What the new floor stood down on: an earlier round raised them, they are still
+    #: outstanding, and they are under the trigger floor. Counted so that the stop can
+    #: SAY so. #621's decision is that these are "reported and do not go again", and
+    #: the reporting half is not optional — a round holding one is not dry, and letting
+    #: it fall through to the dry branch would put a judge-confirmed defect the fixer
+    #: was told about behind the word this whole payload is organised against. #165's
+    #: below-floor branch for NEW findings already settled the shape: a policy stop
+    #: names what it left, keeps its confidence, and takes no veto line, because the
+    #: repo said which findings are worth a round and the round obeyed.
+    quiet_repeats = {k for k in repeated
+                     if k and k not in cleared_out and not above(k, trigger_floor)}
+    # Rule 2. The hardcoded ``("P1", "P2")`` — :data:`panel_core.BLOCKING_SEVERITIES`
+    # since #78, named rather than spelled because the corroboration threshold has to
+    # read the same set to know which findings it may never stand down — is what makes
+    # the exemption necessary HERE as well as in `above`: without the first clause a
+    # P3 gate issue could not be a blocker at all, however red the gate, so a
+    # still-open one had to fall through to rule 3 and would be lost with it the moment
+    # `repeated` did not carry the key (a round whose baseline could not be attributed,
+    # for one).
     blockers = [c for c in clearable
                 if c.key in exempt
-                or (c.severity in ("P1", "P2")
-                    and severity_at_least(c.severity, fix_floor))]
+                or (c.severity in BLOCKING_SEVERITIES
+                    and severity_at_least(c.severity, cleared_floor))]
     #: How many of them are gate issues rather than judged P1/P2s — the `reason`
     #: has to be true of what it counted, and "P1/P2 still outstanding" is not true
     #: of a P3 `python:S1128`.
@@ -4654,19 +7325,21 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # `outstanding`), so the union changes nothing there and closes the gap for every
     # other caller.
     work = ({c.key for c in outstanding} | {k for k in new_keys if k}
-            | {k for k in repeated if k}) - held
-    #: Split by the FIX floor at both rules, never the trigger floor. #165's two dials
-    #: answer different questions — which findings buy another ROUND, and which a fix
-    #: pass was asked to CLEAR — and a disposal is the second question. A finding above
-    #: the trigger floor and below the fix floor bought this cycle its rounds and was
-    #: never work anybody was asked to do.
-    fixable = sorted(k for k in work if above(k, fix_floor))
+            | {k for k in repeated if k}) - cleared_out
+    #: Split by the CLEARED floor on both sides, never the trigger floor. #165's two
+    #: dials answer different questions — which findings buy another ROUND, and which a
+    #: fix pass was asked to CLEAR — and a disposal is the second question. Since #621
+    #: moved rule 3 onto the trigger floor this is the ONLY reader of the cleared floor
+    #: besides rule 2, and it is why the two are still separate dials: a finding above
+    #: the cleared floor and below the trigger one is work a fix pass can take and no
+    #: reason to spend another round, which is exactly what `fixable` is for.
+    fixable = sorted(k for k in work if above(k, cleared_floor))
     #: Reported, not fixed here, and NOT handed to anybody — the repo's own policy.
     #: #165 is explicit that a below-floor stop is a POLICY stop and not a failure, so
     #: listing these as work awaiting a fixer would re-open a decision the repo has
     #: already taken. They are named because the alternative is silence, and silence
     #: about them is what lets a below-floor stop read as a dry one.
-    below_floor = sorted(k for k in work if not above(k, fix_floor))
+    below_floor = sorted(k for k in work if not above(k, cleared_floor))
     if triggering:
         stop, reason = False, (f"{len(triggering)} finding(s) no earlier round raised")
     elif blockers:
@@ -4685,12 +7358,76 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         stop, reason = True, (
             f"{len(quiet_new)} new finding(s), none at or above the "
             f"{trigger_floor} round trigger floor — reported, not fixed here")
+    elif quiet_repeats:
+        # After `quiet_new` for its own reason one rule up — the most specific true
+        # thing wins, and "this round found something new" says more than "this round
+        # still carries something old". Before the escalation stop and the dry branch
+        # because both would be false here.
+        stop, reason = True, (
+            f"{len(quiet_repeats)} finding(s) an earlier round raised are still "
+            f"outstanding, none at or above the {trigger_floor} round trigger floor "
+            "— reported, not fixed here")
     elif blocking:
         # Not "dry": something WAS raised and is unanswered. A reader reconciling
         # "dry" against a PR carrying an open premise question would be told
         # something untrue about why the loop stopped.
         stop, reason = True, (f"nothing left that a fix round can clear — "
                               f"{len(blocking)} escalated finding(s) await a human")
+    elif narrowed_cleared:
+        # #615's own stop, and it is `quiet_repeats`' argument applied to the fourth
+        # outcome. A narrowing CLEARS — that is the whole of the feature and nothing
+        # here revisits it — but a round that stopped because a fix pass declared
+        # findings answered AT THE POINT THEY WERE RAISED did not stop because
+        # nothing was raised, and "dry" is the one word this payload is organised
+        # against lending to a round that was not.
+        #
+        # The keys here are repeats by construction. `--narrowed` is passed on the
+        # round that follows the pass which declared it and on no other
+        # (`panel-review-pr.md`), and `narrowed_cleared` is bounded to the keys THIS
+        # round raised — so every key in it is a finding a fresh panel put up again
+        # after the fix pass said it had answered it. Without this branch the loudest
+        # such round there is, a judge-confirmed P1 cleared on the fixer's own
+        # say-so, reported "dry — nothing raised that an earlier round had not" with
+        # `converged: True` beside it.
+        #
+        # The trigger-floor count is said OUT LOUD, because it is the one number that
+        # separates a P1 answered narrowly from a P4 answered narrowly and nothing
+        # else in the reason carries it. It costs no confidence: see the docstring —
+        # an escalation is an open question a human owes an answer to, a narrowing is
+        # an answer already given, and charging it a veto rebuilds the pressure to
+        # write the class-wide fix that #615 exists to remove.
+        #
+        # BELOW `blocking` and below the two floor stops, on the chain's own rule
+        # that the most specific TRUE thing wins: each of those names work that is
+        # still open, and an answer already given says less than an open question.
+        # Above the dry branch, which is the only one it must never fall through to.
+        loud = sorted(k for k in narrowed_cleared if above(k, trigger_floor))
+        stop, reason = True, (
+            f"nothing left that a fix round can clear — {len(narrowed_cleared)} "
+            "finding(s) were answered at the point they were raised and the general "
+            "form declined"
+            + (f", {len(loud)} of them at or above the {trigger_floor} round trigger "
+               "floor" if loud else ""))
+    elif unfixed:
+        # #665, and the branch the issue asks for in as many words: a cycle ending
+        # with declarations outstanding has not converged, and must not read as a
+        # dry round. This is the case the register was filed over — the pass
+        # declined two corrections, the round after it re-read only the fix commit,
+        # found nothing, and would have reported "dry" over a defect one of its own
+        # actors had already written down.
+        #
+        # LAST in the chain, under every branch that names open work, on the chain's
+        # own rule that the most specific TRUE thing wins. Each branch above says
+        # what THIS round observed; this one says what an EARLIER round declared, and
+        # a live observation says more. It is above the dry branch, which is the only
+        # one it must never fall through to — and every round it catches would
+        # otherwise have landed there, because a declared finding this round raises
+        # again is a repeat and one of the branches above has it.
+        stop, reason = True, (
+            "nothing raised that an earlier round had not — but this cycle carries "
+            f"{len(unfixed)} correction(s) an earlier fix pass declared it could not "
+            "make, so it did not converge: it ran out of corrections anybody was "
+            "willing to make, which is not the same as running out of defects")
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -4774,6 +7511,17 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # and it cannot keep it going — a REMEDY is not a rule — so it hangs entirely off
     # `injected` below and adds one veto line beside the one that already fired.
     reverting = revert_state(REVERT_NOT_ASKED) if revert is None else revert
+    # #627's excision beside it, built by the caller for the same reason and read here
+    # in exactly one place: the payload. It changes no verdict either, and the reason
+    # is not #506's. That proposal decides nothing because reverting a whole pass is a
+    # human's call; this one decides nothing because it is a CORRECTION rather than a
+    # rule — #627's own words are that it is "not an escalation, not a stop, and not a
+    # human's decision", so a rung that ended a cycle on it would be the expensive
+    # reading of a cheap fact. It cannot relax one either: the caused finding is still
+    # outstanding to every rule in this function, so a round that names an excision
+    # goes again exactly as it would have without one, which is what "the cycle
+    # continues" asks for.
+    excising = (excision_state(REVERT_NOT_ASKED) if excision is None else excision)
     # `going_again` below, and NOT #506's original `not stop and triggering`:
     # #505 named the corrected rule-1 bound after codex found the old form
     # let either rung end a cycle that was going again for a P1 an earlier
@@ -4802,6 +7550,111 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"`escalate_on.new_findings_not_falling` limit of {flattening['limit']} — "
             "the count is not coming down, and a human triages what is left rather "
             "than another fix pass")
+    # #618's rung, applied BETWEEN #505's and #554's, on the chain's ordering rule that
+    # the more specific truth wins the `reason`. `flat` says only that the work is not
+    # shrinking; this says HOW MUCH guard work the last pass wrote; `unchecked` says the
+    # pass wrote no refereed line at all, which is the sharper claim about the same
+    # quantity and takes the reason from it; `injected` names that pass as the author of
+    # this round's findings.
+    #
+    # **Two conditions the four rungs beside it do not have, and both are #67.** The
+    # ceiling has to be SET — it ships `None`, because one cycle is not a calibration —
+    # and `escalate_on.guard_lines` has to be ARMED, because a repo may reasonably set a
+    # ceiling to watch it. `over` is recorded either way (`guard_churn_state` keeps the
+    # measurement apart from the arming for `referee_state`'s reason), so a round that
+    # crossed a watched ceiling says so in the payload and in the report without ending
+    # anything.
+    #
+    # `going_again` carries the same two bounds its siblings take: `not stop` is the
+    # guarantee that it can only make a `go again` into a STOP, and the rest of it keeps
+    # the rule inside its own justification — the argument is about rule 1's input, so it
+    # may not cancel the repair round for a P1 an earlier round raised and this fix pass
+    # did not clear. That is a deliberate difference from `max_fix_growth`, which the
+    # CALLER applies unbounded: that ceiling has years of measurement behind it and this
+    # one has a single PR, so it takes the narrower of the two available shapes.
+    guarding = (guard_churn_state(None, None, False) if guard_churn is None
+                else guard_churn)
+    overguarded = bool(guarding["over"] and guarding["armed"] and going_again)
+    if overguarded:
+        stop, reason = True, (
+            f"the fix pass before this round churned {guarding['lines']} line(s) of "
+            f"test and prose, past the `max_fix_guard_lines` ceiling of "
+            f"{guarding['limit']} — that is guard work this round would be reviewing "
+            "instead of the change, and a human decides what of it was wanted")
+    # #622's rung, applied BETWEEN #618's and #554's on the chain's ordering rule that
+    # the more specific truth wins the `reason`. Both of the rungs above it are volume
+    # claims — `flat` says the work is not shrinking, `overguarded` says how much of one
+    # bucket the pass wrote against a ceiling — and this is the volume claim that comes
+    # with an attribution PROOF: every entry in the last round's To fix list was read
+    # and every one of them was budgeted, so any line of the pass that answered that
+    # list was budget spend and the pass went past a number this repo wrote. The word
+    # is EVERY ENTRY and not "every finding", and the distinction is not pedantry — a
+    # brief with one record this round cannot read is a brief whose premise is unknown,
+    # and :func:`budgeted_brief` declines it rather than counting the readable ones.
+    # `unchecked` still takes the reason from it, because what KIND of work a pass did
+    # says more than how much of it there was, and `injected` takes it from both by
+    # naming the pass as the author of this round's findings.
+    #
+    # **`breach` and NOT `within`, and the difference is the whole of the rule.**
+    # `within: False` means the round could not SHOW the budget was kept; it is true of
+    # any round that cleared two P1s with three hundred production lines, and ending a
+    # cycle on it would be a machine calling an honest fix pass a spendthrift. `breach`
+    # is `False` inverted under a premise that makes the inversion sound
+    # (:func:`budgeted_brief`), and it is `None` — never `False` — wherever that premise
+    # could not be established. So this rung fires on a proof, and the proof is only as
+    # good as the reader that establishes it: it holds while every one of that
+    # function's seven conditions declines rather than guesses, and PR #694's first cut
+    # shipped with a malformed bucket entry silently dropped, which manufactured the
+    # premise out of a brief nobody could read in full. The guarantee lives there, not
+    # here.
+    #
+    # **No arming flag, and that is not the same omission `fix_surface` makes.** #67's
+    # instrument-before-gate rule applies to a measurement whose threshold nobody has
+    # calibrated; there is no threshold here that anybody chose for this feature. The
+    # limit is `low_severity_fix_lines`, which the repo wrote; the band is the one its
+    # two floors already carve out; and the premise is proved rather than assumed. An
+    # `escalate_on` key would be the 29th dial #621 refuses, and what it would buy is
+    # the option of ignoring an arithmetic breach of the repo's own policy.
+    #
+    # `going_again` carries the same two bounds every rung on this chain takes: `not
+    # stop` is the guarantee that it can only turn a `go again` into a STOP, and the
+    # rest keeps the rule inside its own justification — the argument is about rule 1's
+    # input, so it may not cancel the repair round for a P1 an earlier round raised and
+    # this pass did not clear. A round it stops is a round that was going again only for
+    # findings the budget itself says are not worth one.
+    #
+    # **WHICH MEANS THIS RUNG ENFORCES AN EXCEPTIONAL LIFECYCLE AND NOT THE ORDINARY
+    # BUDGETED-FIX PATH, and a reader who believes otherwise will trust a brake that
+    # mostly does not fire.** The two conditions pull against each other by
+    # construction: `going_again` needs new triggering findings and no held-over
+    # blocker or repeat, while the premise needs the PRIOR round's whole To fix list to
+    # have been budgeted — and a round whose list is wholly below the trigger floor is
+    # a round rules 1, 2 and 3 all stop. The practical routes in are rule 2's Sonar
+    # hard-gate exemption, which keeps a cycle going at ANY severity, and a cycle a
+    # caller continued by hand (`--round N --baseline`, #617's shape).
+    #
+    # That is stated rather than fixed. Widening the rung to reach the ordinary path
+    # would mean dropping or loosening `going_again`, and that bound is the only thing
+    # standing between this and a rule that can cancel the repair round for a P1 — a
+    # strictly worse trade than a brake with a narrow domain. The honest reading is
+    # that it closes a hole (there was NO input that reported a breach) rather than
+    # that it polices every fix pass.
+    budgeting = (fix_budget_state(None, None, 1, False) if fix_budget is None
+                 else fix_budget)
+    # `.get` on the one key, and index on the rest: a `fix_budget` block written before
+    # this field existed carries no `breach`, and reading it with `[]` would turn a
+    # replayed older payload into a KeyError inside the stop rule. Once `breach` is
+    # true the block came from `fix_budget_state` and every other key is there by
+    # construction, which is why the reason and the veto below index freely.
+    overspent = bool(budgeting.get("breach") and going_again)
+    if overspent:
+        stop, reason = True, (
+            f"the fix pass before this round priced {budgeting['spend']} line(s) "
+            f"against the {budgeting['limit']}-line `low_severity_fix_lines` budget, "
+            f"and every one of the {budgeting['brief']['findings']} finding(s) it was "
+            "sent to answer was budgeted — so that spend WAS the budgeted spend and "
+            "the budget was broken, not merely unproven. A human decides what of it "
+            "was wanted, not another fix pass")
     # #554, applied BETWEEN #505's rung and #489's so that the ordering matches what
     # each one knows. `flat` says only that the work is not shrinking; this says what
     # KIND of work the last pass did; `injected` names that pass as the author of this
@@ -4875,6 +7728,33 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         veto = [*veto, f"{len(blocking)} finding(s) escalated instead of patched are "
                        "outstanding and no round can close them — a human answers "
                        "these, not another fix pass"]
+    # #665, and on the same "only on a STOP" rule as the two above. This is the
+    # whole of what the register costs, and it is deliberately the least it could
+    # cost: no rule changed its answer, no finding was subtracted, and the round
+    # went exactly as far as it would have gone. What it loses is `confident`, and
+    # with it `converged` — a cycle that ends holding a correction its own fix pass
+    # said it could not make is not a clean finish, and until this line the payload
+    # had no way to say so.
+    #
+    # Says the reasons out loud, because the word is what a reader acts on: a
+    # correction priced out under a ceiling is a budget conversation, and a finding
+    # the fixer refuted is an argument with the panel. Both were "not fixed" before.
+    # AND THIS IS A LANDING HOLD, not only a withheld word — said here because the
+    # consequence is two files away and a reader of this line will not find it.
+    # `confident` below requires an empty veto, so this sets `stop_confident: false`,
+    # which `preland`'s `_round_stop_earned` turns into a FAILED check rather than a
+    # warning under `--require-earned-stop` — the mode `/panel-review-pr` §7 uses
+    # precisely when it is about to offer to land. So a cycle holding one declaration
+    # cannot land strictly until the declaration is gone, and nothing retracts one
+    # (#674): a fresh cycle is the only exit. That is the intended direction — a
+    # correction the loop admitted it could not make is not a clean landing — but it
+    # is a bigger cost than "the cycle does not report converged", and a key typed
+    # into `--declined` that names nothing is retained too, so a typo holds the PR.
+    if unfixed and stop:
+        veto = [*veto, f"{len(unfixed)} correction(s) an earlier fix pass identified "
+                       "and declared it could not make are still on record for this "
+                       "cycle — this stop is the end of what the loop was willing to "
+                       "attempt, not the end of what it found (#665)"]
     # #505, and BEFORE #489's line for the reason the stop below it is applied first:
     # a reader coming down the veto list meets the count, then the attribution that
     # explains part of it. Unconditional for `injected`'s reason — `flat` is only ever
@@ -4897,6 +7777,48 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                        "and not from provenance, so unlike `fix_injection` a rebase "
                        "between rounds cannot have disarmed it (#500): this stop is "
                        "that count, not convergence (#505)"]
+    # #618, and BEFORE #554's line for the reason its stop is applied first: a reader
+    # coming down the veto list meets how much the pass wrote, then what kind of work it
+    # was, then what it cost. Unconditional for `injected`'s reason — `overguarded` is
+    # only ever true on a round this rule itself stopped, so there is no `go again` round
+    # it can fire on.
+    #
+    # It says the ceiling is UNCALIBRATED out loud. Every other veto here rests on a
+    # number with a measurement behind it, and a reader deciding what to do about this
+    # stop needs to know that this one rests on a number their own repo wrote — which is
+    # also the honest reading of #67 on the one rung that could not satisfy it.
+    if overguarded:
+        veto = [*veto, f"the fix pass before this round churned {guarding['lines']} "
+                       "line(s) of test and prose — past the `max_fix_guard_lines` "
+                       f"ceiling of {guarding['limit']}, counted over THAT PASS and "
+                       "nothing earlier, so a quiet round cannot have funded it. The "
+                       "ceiling is a number this repo wrote and not one anybody has "
+                       "calibrated (#67): the shipped value is null, and this stop is "
+                       "that count against that number, not convergence (#618)"]
+    # #622, and in the same place in this list as its rung is in the chain above, for
+    # the reason given there. Unconditional for `overguarded`'s reason — `overspent` is
+    # only ever true on a round this rule itself stopped.
+    #
+    # It says out loud that this one is a BREACH and not an unproven crossing, because
+    # that is the distinction the whole feature turns on and it is the one a reader
+    # skimming a veto list will otherwise supply from the other budget sentence they
+    # have seen — the report's line under `within: false`, which says the opposite in
+    # almost the same words. The premise is spelled out rather than cited: what makes
+    # the number binding here is that the fixer had no mandatory work to spend on, and
+    # a reader who cannot see that has been handed an accusation to take on trust.
+    if overspent:
+        veto = [*veto, f"the fix pass before this round priced "
+                       f"{budgeting['spend']} line(s) — {budgeting['production']} "
+                       f"production + {budgeting['unrefereed']} unrefereed at "
+                       f"x{budgeting['weight']} — against the {budgeting['limit']}-line "
+                       "`low_severity_fix_lines` budget it was given. Every one of the "
+                       f"{budgeting['brief']['findings']} finding(s) in round "
+                       f"{budgeting['brief']['round']}'s To fix list was in the 💸 band, "
+                       "so there was no mandatory work for that spend to belong to and "
+                       "the priced total IS the budgeted spend. That is a BREACH of a "
+                       "number this repo wrote, not the ordinary `within: false` that "
+                       "only means the budget could not be shown to have been kept: "
+                       "this stop is that breach, not convergence (#622)"]
     # #554, and BEFORE #489's line for the reason its stop is applied first: a reader
     # coming down the veto list meets what the pass WAS, then the attribution saying
     # what it cost. Unconditional for `injected`'s reason — `unchecked` is only ever
@@ -5053,7 +7975,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # disposal a fixer's is that no rule said otherwise, not that one particular rule
     # fired, so a stop added later inherits the safe answer by saying so in this list
     # rather than by being remembered here.
-    futile = bool(flat or unchecked or injected or circling or unobservable)
+    #
+    # `overspent` (#622) is in the list because its own `reason` ends "a human decides
+    # what of it was wanted, not another fix pass", and that sentence and this variable
+    # have to agree or the payload contradicts itself in the same round. `overguarded`
+    # is NOT here and this change deliberately leaves it where it was: that is #618's
+    # question, its wording is not identical, and quietly widening a second rung's
+    # disposal under a #622 branch is the kind of drive-by this file's own rule about
+    # surgical diffs exists to refuse.
+    futile = bool(flat or unchecked or injected or circling or unobservable
+                  or overspent)
     if not stop:
         # The cycle is going again, so there is no disposal to make: §5's ordinary
         # path hands this round's findings to the next fix pass and the round after
@@ -5094,8 +8025,24 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         why = ("nothing is outstanding — the cycle ends with nothing to hand on"
                if not below_floor else
                f"{len(below_floor)} finding(s) are outstanding and every one is under "
-               f"the {fix_floor} fix floor: the repo's own policy is that these are "
-               "reported and not fixed here, so nothing is handed on (#165)")
+               f"the {cleared_floor} cleared floor: the repo's own policy is that "
+               "these are reported and not fixed here, so nothing is handed on (#165)")
+        # #665, appended rather than branching: the disposal is still `nobody` — a
+        # declined correction is by definition one no fix pass would take, so there
+        # is nobody in the loop to hand it to — but "nothing is outstanding" is not
+        # a true sentence to end on while the cycle holds one, and this branch's
+        # `why` is the sentence a relay repeats. The keys are in `outstanding.declined`
+        # beside it.
+        if unfixed:
+            why += (f". {len(unfixed)} correction(s) an earlier fix pass declared it "
+                    "could not make are still on record: nothing in the loop takes "
+                    "them, so they land with the PR unless a human decides otherwise "
+                    "(#665)")
+    # Computed here rather than inline in the payload so that `converged` below is
+    # built FROM it and cannot drift out of step with it: a capped or vetoed stop is
+    # then unable to read as a clean finish by construction rather than by two
+    # expressions agreeing.
+    confident = bool(stop and not capped and not veto and baseline_ok)
     return {
         "stop": stop,
         "reason": reason,
@@ -5106,10 +8053,55 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # question wants the second. Sorted, so a round that declares the same set
         # twice writes the same bytes and a diff means something changed.
         "escalated_outstanding": sorted(blocking),
+        # #665's register as this round was given it, sorted for
+        # `escalated_outstanding`'s reason. Not narrowed to the keys this round
+        # raised — the docstring argues why, and the field name says "the cycle's",
+        # which is what it is.
+        "declined_outstanding": sorted(unfixed),
+        # What this ROUND cleared narrowly (#615), on `escalated_outstanding`'s terms:
+        # the register it was given, narrowed to the keys this round raised. These are
+        # the findings that did NOT count at any rule and are not in `outstanding`
+        # below, so a reader reconciling this round's finding count against the
+        # disposal would otherwise find them missing from both and conclude the payload
+        # had dropped them. No veto is owed and none is taken: a narrowing is an answer,
+        # not an open question — the two lines of justification and the board row it
+        # owes are the caller's (`panel-review-pr.md`), and an issue is owed only where
+        # the general form is itself a claim-miss.
+        "narrowed": sorted(narrowed_cleared),
         # "Nothing left to find" is a claim; "the counter hit zero" is not the
         # same claim, and the difference is exactly what a reader of a clean
         # verdict needs to see.
-        "confident": bool(stop and not capped and not veto and baseline_ok),
+        "confident": confident,
+        # #626, and it is the number this whole convergence epic is judged on: the
+        # share of cycles ending in a confident dry round. Every field it is built
+        # from was already here and a reader had to ASSEMBLE it — `stop` and
+        # `confident` and an empty `veto` and an empty `outstanding.fixable` and an
+        # empty `escalated_outstanding` — which is four joins to answer one question,
+        # and four places to get it wrong in the direction that flatters the loop.
+        #
+        # `confident` carries the first four conjuncts (a stop, not capped, no veto,
+        # a baseline that loaded), so a CAPPED stop and a VETOED stop are both false
+        # here by construction — that is the guarantee, and it is why this is computed
+        # off `confident` rather than beside it: the two cannot disagree.
+        #
+        # The rest is "and nothing was left": nothing a fix pass could take
+        # (`fixable`), nothing under the cleared floor either (`below_floor`), and no
+        # escalation being held (`blocking`). That is exactly the disposal's own
+        # "nothing is outstanding — the cycle ends with nothing to hand on", and it is
+        # deliberately STRICTER than `confident`. A below-floor policy stop is a
+        # legitimate configured convergence and keeps its confidence (#165 argues that
+        # at length and nothing here revisits it) — but its `reason` is "reported, not
+        # fixed here" rather than "dry", and a metric that counted it would be counting
+        # a cycle that ended with real findings unfixed by policy as a clean finish.
+        # False here costs such a round nothing; a false TRUE would be the one reading
+        # this field exists to make impossible.
+        # `unfixed` is already carried by `confident` through the veto line above,
+        # and it is named here as well for the reason `blocking` is: this flag is
+        # what the epic is judged on, and a reader checking it against the payload
+        # must be able to see every conjunct rather than reconstruct one from a veto
+        # string. The two cannot disagree — both read the same local.
+        "converged": bool(confident and not fixable and not below_floor
+                          and not blocking and not unfixed),
         "veto": veto,
         "round": round_no,
         "max_rounds": max_rounds,
@@ -5119,9 +8111,24 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # is the count that would otherwise be invisible: those findings ARE in
         # the payload's buckets, and nothing else says they were new and did not
         # buy a round.
+        # #549: the second is `Dials.cleared_floor` and is published under that name.
+        # It used to be published as `fix_floor` while `Dials.fix_floor` — live, one
+        # module over, with its own docstring — held a DIFFERENT value at the shipped
+        # defaults (`P2` here against `P3` there). An orchestrator briefing a fixer
+        # from the JSON rather than from the report briefed the wrong floor and
+        # silently dropped a whole band out of the round's work. Concept three under
+        # concept two's name is not two concepts sharing a name loosely; the test at
+        # `test_panel_dials.py::test_the_dials_answer_the_three_floor_questions_separately`
+        # already writes the invariant down and only the serialisation disagreed.
         "trigger_floor": trigger_floor,
-        "fix_floor": fix_floor,
+        "cleared_floor": cleared_floor,
         "new_below_trigger_floor": sorted(quiet_new),
+        # #621's counterpart to the line above, and there for its reason: these
+        # findings ARE in the payload's buckets, and nothing else says an earlier
+        # round raised them and they still did not buy this one. The pair is what
+        # lets an aggregator tell a repo that its trigger floor is where the cycle's
+        # unfinished work is going, rather than only that the cycle stopped.
+        "repeated_below_trigger_floor": sorted(quiet_repeats),
         # #84's register as this round read it, and ALWAYS present — an absent key
         # and "nothing was declared" are different claims, and a consumer that had
         # to tell them apart would be reading a payload's age rather than a cycle's
@@ -5138,6 +8145,21 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
               # answered the question.
               "undecidable": list(premises.get("undecidable") or []),
               "undecidable_brake": bool(premises.get("undecidable_brake")),
+              # #560. `wired` is whether this round was handed a register at all,
+              # kept apart from `undeclared_rounds` on exactly the terms
+              # `undecidable_brake` is kept apart from `undecidable`: one is what
+              # the cycle said and the other is whether it was ever in a position
+              # to say it. `retroactive` is the declarations this cycle's own
+              # records place after the pass they explain — evidence about the
+              # cycle, not a rung, and not a proof: each entry rests on a reading
+              # taken in the actor's environment. Nothing here stops anything,
+              # deliberately: the
+              # brake's whole claim is that it runs before the patch, and a stop
+              # taken on a round is the late half that `repeated` and
+              # `undecidable` already occupy.
+              "wired": bool(premises.get("wired")),
+              "stamped": int(premises.get("stamped") or 0),
+              "retroactive": list(premises.get("retroactive") or []),
               "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
         # #489's measurement as this round read it, and ALWAYS present for the reason
         # `premises` is: a payload with no key and a round with nothing to attribute
@@ -5168,6 +8190,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # AND a commit range could be named, so this round is putting a revert to a
         # human. Every other round records what it knows and proposes nothing.
         "revert": {**reverting, "offered": offered},
+        # #627's excision, ALWAYS present for `revert`'s reason and with its
+        # vocabulary: `kind` carries `_fix_range_diff`'s own verdict, so a consumer
+        # reading `count: null` never has to guess whether the branch was rebased, the
+        # round was the first one, or the checkout could not be read — `why` says.
+        #
+        # There is no `offered` counterpart here, and its absence is the design.
+        # `revert.offered` marks the round that is putting a decision to a human;
+        # nothing about an excision is conditioned on a verdict, because the rule
+        # applies to a round whether or not the cycle is ending — a sub-floor fix that
+        # caused a finding is excised on the round that found it, and the cycle carries
+        # on. `count` is what a consumer acts on and it is a measurement.
+        "excision": excising,
         # #505's measurement, ALWAYS present for the reason `fix_injection` beside it
         # is: a payload with no key and a cycle with nothing to compare are different
         # claims. `counts` is the whole series the verdict was taken over rather than
@@ -5197,6 +8231,46 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # escalation, a round going again for a P1 under rule 2. `fired` is the
         # property of the VERDICT.
         "unrefereed_fix": {**refereeing, "fired": unchecked},
+        # #618's measurement, ALWAYS present for the reason its siblings are: a payload
+        # with no key and a round that measured no guard churn are different claims.
+        # `limit` is null on every repo that has not written one, which is every repo
+        # today, and that is the field a consumer reads to tell "under the ceiling" from
+        # "there was no ceiling". `over` is the measurement and `armed` is the policy,
+        # kept apart on `referee_state`'s terms; `fired` is the verdict, kept apart from
+        # both on `fix_injection`'s.
+        "guard_churn": {**guarding, "fired": overguarded},
+        # #622's measurement, ALWAYS present for the reason its siblings are, and it
+        # carries TWO verdicts about one number because they are two different claims.
+        #
+        # `within` is the upper bound and it is THREE-STATE on purpose — true is "the
+        # pass priced under the budget", false is "that could NOT BE SHOWN", null is
+        # "nothing was measured or no budget was in force". A reader that treats false
+        # as a breach is wrong about a round that cleared two P1s, and nothing above
+        # reads it to move `stop` in either direction.
+        #
+        # `breach` is the strict verdict and it is the one this block gained: true only
+        # where the whole of the prior round's To fix list was budgeted, so the priced
+        # total IS the budgeted spend and going past the limit is a fact rather than an
+        # unproven crossing. `brief` beside it carries the premise — which round, how
+        # many findings, how many of them budgeted — so a reader can check the claim
+        # instead of taking it. Null is the ordinary case and means no strict verdict
+        # was available, never a pass and never a failure.
+        #
+        # `fired` is the property of the VERDICT, kept apart from `breach` on
+        # `fix_injection`'s terms: `breach: true` is true of every round that committed
+        # one, including the rounds this rung is deliberately bounded out of — one that
+        # had already stopped for something else, or one going again for a P1 an
+        # earlier round raised and this pass did not clear.
+        "fix_budget": {**budgeting, "fired": overspent},
+        # #619's measurement, and the ONE block here whose key can be null: the files
+        # the last fix pass touched that no earlier round had read. Reported and not
+        # gated — #67's instrument-before-gate rule, and the gate has not been decided
+        # — so unlike its four siblings it has no `fired` field, because there is no
+        # verdict to have. Null where it could not be measured (round 1, or no readable
+        # fix range), never a zero: `fix_surface_state` has the argument, and the short
+        # of it is that "no pass opened a new file" and "nobody looked" are different
+        # claims and only one of them is ever true of round 1.
+        "fix_surface": fix_surface_state(surface),
         # #42, and it is the only block here that is not about whether to go again.
         # Every other field answers "should another PANEL run"; this one answers the
         # second question `stop` was being read as answering and was never computed
@@ -5226,6 +8300,20 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             "fixable": fixable,
             "below_floor": below_floor,
             "escalated": sorted(blocking),
+            # #615, and here for the same reason `escalated` is repeated here: this
+            # block is the whole answer to "who gets what is left", and a narrowed
+            # finding is the one class that is in none of the three lists above
+            # because it was ANSWERED. Absent, a reader joining the round's findings
+            # against this block would find them nowhere and read the gap as a
+            # dropped finding rather than as a fixer's declared decision.
+            "narrowed": sorted(narrowed_cleared),
+            # #665. In this block for the reason `escalated` and `narrowed` are: it
+            # is the whole answer to "who gets what is left", and a known-unfixed
+            # defect is left to whoever lands the PR. It is not a fourth disposal —
+            # a declined finding that is still outstanding is in `fixable` too, and
+            # that is not double counting: `fixable` says a fix pass COULD take it,
+            # this says a fix pass already looked at it and said it would not.
+            "declined": sorted(unfixed),
             # null on a `go again`, where no disposal is being made; otherwise
             # `fixer`, `human` or `nobody`. `why` is the sentence a relay repeats.
             "handed_to": handed_to,
@@ -5243,6 +8331,7 @@ __all__ = [
     "_fold_reports", "_NOT_WORD", "_norm_title", "_key_from_title",
     "_defect_title", "_defect_key", "_finding_id", "Canonical",
     "_KEY_RE", "_key_norm", "_is_key", "_key_gist",
+    "DECLINE_REASONS", "DECLINE_UNSTATED", "declination_or_none", "Declination",
     "_unmerged", "_judge_listing", "_parse_verdicts", "adjudicate",
     "MAX_RECURRENCE_FINDINGS", "RECURRENCE_TITLE_CHARS", "recurrence_brief",
     "REWORD_RATIO", "_TITLE_NOISE", "_stem", "_same_words",
@@ -5250,20 +8339,30 @@ __all__ = [
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
     "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
     "_introduced", "_trend_row",
-    "_inherit", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
+    "_inherit", "DECLINED_COST", "_inherit_declined", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
     "CI_NOT_APPLICABLE", "round_stop",
     "CLAIM_KEY_PREFIX", "CLAIM_KEY_RE", "_claim_norm", "claim_key",
     "is_claim_key", "Obligation", "CoverageRuling", "_coverage_ruling",
     "reached_obligations",
+    "DECLARATION_KEY_PREFIX", "DECLARATION_KEY_RE", "declaration_key",
+    "is_declaration_key", "Declaration", "ASSESSED_UNATTESTED", "Assessment",
+    "assessment_or_none", "ASSESSED_COST", "_inherit_assessed",
+    "reached_declarations",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
+    "sub_floor_brief", "_names_finding", "excision_seams", "_read_once",
+    "excision_state",
+    "FIX_PASS_COUNTS", "FIX_PASS_GAPS", "fix_pass_record",
     "_no_command_why",
     "NOT_FALLING_MIN_NEW", "not_falling_limit", "not_falling_state",
-    "unrefereed_fix_brake", "referee_state",
+    "unrefereed_fix_brake", "referee_state", "fix_surface_state", "fix_budget_state",
+    "NO_PRIOR_BRIEF", "budgeted_brief",
+    "guard_lines_brake", "guard_churn_state", "_pass_churn", "churn_cells",
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",
+    "working_head", "retroactive_declarations",
     "premise_report", "declare", "announce_escalation",
 ]

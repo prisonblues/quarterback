@@ -195,6 +195,25 @@ def test_ordinary_ref_transactions_are_untouched(repo, home):
     assert "another" in git(wt, "branch", "--list", home=home).stdout
 
 
+def test_pack_refs_survives_a_non_empty_shared_stash(repo, home):
+    """`git pack-refs` re-states every existing ref with old == new when it
+    migrates loose refs into packed-refs. A guard that reads that as a push onto
+    the stack refuses it, and since git runs pack-refs as an auto-maintenance
+    task the refusal takes `git fetch` down with it — which is how lexray sat on
+    a two-week-old origin/main with no error anyone read."""
+    main, wt = repo
+    install(main, home)
+    (wt / "f.txt").write_text("stashed change\n")
+    git(wt, "stash", "push", "-m", "pre-existing", home=home,
+        QB_ALLOW_SHARED_STASH="1")
+    # The migration only happens while the ref is still LOOSE; once packed there
+    # is no transaction left to refuse and the bug hides.
+    assert (main / ".git" / "refs" / "stash").exists()
+
+    packed = git(main, "pack-refs", "--all", home=home, check=False)
+    assert packed.returncode == 0, packed.stderr
+
+
 def test_the_pop_side_is_not_interceptable(repo, home):
     """Recorded so it is not re-derived, and so the design is not mistaken for
     something stronger than it is: `git stash pop` drops its entry through the

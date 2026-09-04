@@ -35,6 +35,7 @@ phase="${1:-}"
 # stdin is always drained: exiting without reading it hands git a SIGPIPE on a
 # transaction we are perfectly happy with.
 guarded=""
+stash_new=""
 lines=""
 while read -r old new ref; do
     lines+="$old $new $ref"$'\n'
@@ -42,6 +43,7 @@ while read -r old new ref; do
     # something ON the shared stack is refused.
     if [[ "$ref" == "refs/stash" && "$new" == *[!0]* ]]; then
         guarded=1
+        stash_new="$new"
     fi
 done
 
@@ -62,6 +64,24 @@ chain_delegate() {
 
 # Only `prepared` can abort a transaction; the other phases are notifications.
 if [[ "$phase" != "prepared" || -z "$guarded" ]]; then
+    chain_delegate "$phase"
+    exit $?
+fi
+
+# `git pack-refs` migrates loose refs into packed-refs by CREATING each one in
+# the packed backend — `0000..` -> <sha>, which <old> makes indistinguishable
+# from a stash push — and then deleting the loose copy. git runs pack-refs as an
+# auto-maintenance task during `git fetch`, so refusing that create aborted the
+# whole transaction: on a repo with a non-empty refs/stash and linked worktrees
+# every fetch failed with "task 'pack-refs' failed" and no remote-tracking ref
+# ever advanced. One repo here sat two weeks behind that way, silently.
+#
+# <old> cannot separate the two, but the ref's CURRENT value can: mid-migration
+# refs/stash already resolves to the value being written, so nothing is being
+# added to the stack. A real push always moves it somewhere new. This costs a
+# subprocess only once the cheap checks above have already matched refs/stash.
+# Measured on git 2.54.0 — see test_stash_guard.py.
+if [[ -n "$stash_new" && "$(git rev-parse --verify -q refs/stash 2>/dev/null)" == "$stash_new" ]]; then
     chain_delegate "$phase"
     exit $?
 fi

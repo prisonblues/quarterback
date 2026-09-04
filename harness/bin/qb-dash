@@ -1,22 +1,39 @@
 #!/usr/bin/env bash
 # qb-dash — the fleet dashboard: who is alive, what they hold, what is open.
 #
-#   qb-dash              the plain renderer, redrawing in place
-#   qb-dash --tui        the clickable one (what `qb` and `qb-dash-tui` run)
-#   qb-dash --once       one frame and exit
-#   qb-dash --scope all --tui    --tui is recognised wherever it appears
-#   qb-dash --can-tui    exit 0 if the clickable one could run here, else 1
+#   qb-dash                      the dashboard
+#   qb-dash --scope all          every repo the BOARD knows, not just this screen's
+#   qb-dash --repo ~/src/other   point it at a project other than the cwd's
+#   qb-dash --can-tui            exit 0 if it can run here, else 1
 #
-# A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs rich (and
-# textual, for the clickable one), which a plain python3 does not have — so a
-# shebang is the wrong mechanism: patchShebangs rewrites it to a store python3
-# with neither, and the whole thing dies on `import rich` the first time somebody
-# types `qb` after a rebuild.
+# A LAUNCHER, NOT THE DASHBOARD. The dashboard is Python and needs rich and
+# textual, which a plain python3 does not have — so a shebang is the wrong
+# mechanism: patchShebangs rewrites it to a store python3 with neither, and the
+# whole thing dies on `import textual` the first time somebody types `qb` after a
+# rebuild.
 #
 # The nix build sets QB_DASH_PYTHON to an interpreter carrying exactly those two,
 # so an installed harness needs nothing from the host. Run from a checkout it
-# searches instead, and any python3 with rich will do — the board client is
-# stdlib now, deliberately, so that this list stays short.
+# searches instead.
+#
+# ONE RENDERER. There were two, chosen by `--tui`: this clickable Textual app and
+# a plain rich renderer that redrew in place. The plain one was the default until
+# #426 and the fallback afterwards, and a fallback nobody chooses is a second
+# implementation of every panel to keep in step — `qbdata.py` carries its six
+# pairs of near-identical helpers because of exactly that. It is gone.
+#
+# `--tui` IS STILL ACCEPTED, and ignored. It is in muscle memory, it is what
+# `qb-dash-tui` execs, and an installed `qb-seats` older than this file still
+# emits it; a launcher that died on the flag naming the thing it now always does
+# would be a rebuild that breaks the dash pane. `--can-tui` stays for the same
+# reason — it is how that older `qb-seats` asks whether to use `--tui` at all,
+# and "could the clickable one run here" still has an honest yes or no.
+#
+# GONE WITH THE PLAIN RENDERER: `--once`, `--width` and `--interval`, which were
+# its flags and had no caller outside its own tests, and the fallback for a box
+# where textual will not import. There is no lesser thing left to fall back TO,
+# so that case says so and exits 1 — a packaged harness carries its own
+# interpreter, so it is a checkout's problem and QB_DASH_PYTHON is its answer.
 set -uo pipefail
 
 PROG=${0##*/}
@@ -41,34 +58,37 @@ BIN_DIR="$(self_dir "$0")" || {
   exit 1
 }
 
-# `textual` only matters for the clickable one, so the plain renderer still runs
-# on an interpreter that has rich but no textual. Reads $MODE, so every caller
-# below sets that before asking.
-usable() {
-  [ -x "$1" ] || return 1
-  if [ "$MODE" = tui ]; then
-    "$1" -c 'import rich, textual' >/dev/null 2>&1
-  else
-    "$1" -c 'import rich' >/dev/null 2>&1
-  fi
-}
+# One question now, where there were two: the plain renderer ran on rich alone,
+# so `usable` had to know which renderer was being asked about and read a $MODE
+# to find out. With one renderer there is one answer.
+usable() { [ -x "$1" ] && "$1" -c 'import rich, textual' >/dev/null 2>&1; }
 
 # The interpreter search, as a function with ONE caller per question rather than
 # a straight-line block. `--can-tui` asks the same question the launch path asks
 # and must not answer it differently — a second copy would drift, and the box it
-# drifted on would be told the clickable dash was available and then shown the
-# error instead, in the pane least able to afford it. Sets $PY; empty means none.
+# drifted on would be told the dash was available and then shown the error
+# instead, in the pane least able to afford it. Sets $PY; empty means none.
 find_python() {
   local candidate
-  CANDIDATES=(
-    "${QB_DASH_PYTHON:-}"
-    "${QUARTERBACK_REPO:-}/mcp/.venv/bin/python"
-    "$BIN_DIR/../../mcp/.venv/bin/python"
-    "$HOME/source/quarterback/mcp/.venv/bin/python"
-  )
+  # Built by APPENDING only the candidates that exist, which is how `qb-board`
+  # builds the same list and for the reasons its comment gives. The fixed-list
+  # form this replaces skipped its empties with a `case` naming them literally —
+  # a sentinel string that stops matching the moment the expression above it is
+  # edited, leaving a bogus path probed on every launch.
+  #
+  # It also read `$HOME` unguarded under `set -u`, so a launch with HOME unset
+  # died on `HOME: unbound variable` before it could try `python3` — which might
+  # have worked. A cron job, a systemd unit and `env -i` all define no HOME, and
+  # the message a person got was a line number rather than the dependency error
+  # this script exists to print.
+  CANDIDATES=()
+  [ -n "${QB_DASH_PYTHON:-}" ] && CANDIDATES+=("$QB_DASH_PYTHON")
+  [ -n "${QUARTERBACK_REPO:-}" ] && CANDIDATES+=("$QUARTERBACK_REPO/mcp/.venv/bin/python")
+  CANDIDATES+=("$BIN_DIR/../../mcp/.venv/bin/python")
+  [ -n "${HOME:-}" ] && CANDIDATES+=("$HOME/source/quarterback/mcp/.venv/bin/python")
   PY=""
-  for candidate in "${CANDIDATES[@]}"; do
-    case "$candidate" in ""|"/mcp/.venv/bin/python") continue ;; esac
+  # `${arr[@]+…}`: bash before 4.4 treats an empty array as unset under `set -u`.
+  for candidate in ${CANDIDATES[@]+"${CANDIDATES[@]}"}; do
     usable "$candidate" && { PY="$candidate"; return 0; }
   done
   command -v python3 >/dev/null 2>&1 && usable "$(command -v python3)" \
@@ -76,41 +96,30 @@ find_python() {
   return 1
 }
 
-# --can-tui: answer whether the clickable renderer could run on this machine, and
-# run nothing. It exists so `qb-seats` can DEFAULT to the clickable dash and fall
-# back only where textual is genuinely absent, without carrying its own idea of
-# what "available" means. A question, not a flag, so it is answered before the
-# argument loop and never reaches a renderer.
+# A question, not a flag, so it is answered before the argument loop and never
+# reaches the dashboard.
 if [ "${1:-}" = "--can-tui" ]; then
-  MODE=tui
   find_python >/dev/null 2>&1 && exit 0 || exit 1
 fi
 
-# --tui ANYWHERE, not only first. It used to be `case "${1:-}"`, which was fine
-# while the plain renderer owned every flag — but both renderers take `--scope`
-# and `--repo` now, so `qb-dash --scope all --tui` is a thing a person will type,
-# and it silently ran the PLAIN renderer and then died on argparse's "unrecognized
-# arguments: --tui". Removed from the list rather than passed through, because the
-# choice of renderer is this script's to make and neither Python program knows the
-# flag. Everything after a `--` is left alone: it belongs to the target.
-MODE=plain
+# `--tui` ANYWHERE, not only first, and DROPPED rather than passed through: the
+# Python has never known the flag, and `qb-dash --scope all --tui` has to reach
+# it as the same argv `qb-dash --scope all` does. Everything after a `--` is left
+# alone: it belongs to the target.
 ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --tui) MODE=tui ;;
+    --tui) ;;
     --) ARGS+=("$@"); break ;;
     *) ARGS+=("$1") ;;
   esac
   shift
 done
 set -- ${ARGS+"${ARGS[@]}"}
-case "$PROG" in *-tui) MODE=tui ;; esac
-[ "$MODE" = tui ] && TARGET="$BIN_DIR/qb-dash-tui.py" || TARGET="$BIN_DIR/qb-dash.py"
 
 if ! find_python; then
   cat >&2 <<EOF
-$PROG: no Python here can import what the dashboard needs
-        (rich$([ "$MODE" = tui ] && printf ', textual')).
+$PROG: no Python here can import what the dashboard needs (rich, textual).
 
         An installed harness carries its own; from a checkout, point
         QB_DASH_PYTHON at any interpreter that has them:
@@ -120,4 +129,4 @@ EOF
   exit 1
 fi
 
-exec "$PY" "$TARGET" "$@"
+exec "$PY" "$BIN_DIR/qb-dash-tui.py" "$@"

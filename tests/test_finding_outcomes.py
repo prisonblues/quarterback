@@ -342,7 +342,8 @@ async def test_precision_after_is_fixed_over_fixed_plus_refuted(client):
         {"key": "p4", "outcome": "deferred"},
     ])
     m = row(await stats(client, "ratio"))
-    assert m["outcome"] == {"fixed": 2, "refuted": 1, "deferred": 1, "superseded": 0}
+    assert m["outcome"] == {"fixed": 2, "narrowed": 0, "refuted": 1, "deferred": 1,
+                            "superseded": 0}
     assert m["precision_after"] == round(2 / 3, 3)
     # Judgement-time precision is untouched: the two are published together
     # because the GAP between them is the measurement.
@@ -442,7 +443,8 @@ async def test_dismissed_findings_are_outside_the_measure(client):
     assert c["drop"]["outcome"]["outcome"] == "refuted"
 
     s = await stats(client, "dismissed")
-    assert row(s)["outcome"] == {"fixed": 1, "refuted": 0, "deferred": 0, "superseded": 0}
+    assert row(s)["outcome"] == {"fixed": 1, "narrowed": 0, "refuted": 0, "deferred": 0,
+                                "superseded": 0}
     assert s["by_outcome"]["refuted"] == 0
     assert row(s)["confirmed_defects"] == 1
 
@@ -963,3 +965,214 @@ async def test_a_targetless_deferral_still_retires_the_finding_from_needs_human(
         f"/review/needs-human?repo={quote(repo_of('no-target-nh'))}&pr=1", headers=AGENT)
     assert after.status_code == 200, after.text
     assert after.json()["items"] == []
+
+
+# ----------------------------------- a fix that says how far it went (#615)
+
+async def test_a_narrowed_outcome_is_stored_and_reads_back_on_the_chain(client):
+    """`narrowed` is the fifth word: the finding is real, this pass fixed it at the
+    point it was raised, and the general form is not this pass's work. The four it
+    joins all answer *whether* to act and none of them answered *how far*, so with
+    no word for the narrow fix the maximal one was the only answer that satisfied
+    the fixer brief — which is what makes a pass edit files the finding never
+    named, and those files are where the next round's findings come from.
+
+    So the word has to survive the round trip, on the same chain view a reader and
+    the next round both read: an outcome the API accepts and the chain renders as
+    something else is a distinction that exists only in the table.
+    """
+    await record(client, "narrow", to_fix=[finding("w1")])
+    res = await outcomes(client, "narrow", [
+        {"key": "w1", "outcome": "narrowed",
+         "note": "the class fix is a lint rule over every proxy stanza"}])
+    assert res["recorded"] == ["w1"]
+    assert res["rejected"] == []
+    o = (await chains(client, "narrow"))["w1"]["outcome"]
+    assert o["outcome"] == "narrowed"
+    assert o["note"] == "the class fix is a lint rule over every proxy stanza"
+
+
+async def test_narrowed_without_a_note_is_refused_and_the_message_names_what_is_missing(client):
+    """The note IS the general form the fix did not take, and it is the only thing
+    distinguishing this row from a `fixed` one — so a bare `narrowed` is a `fixed`
+    that has lost the word's whole content, and would be the cheap exit this
+    outcome must not create.
+
+    The message has to name the missing thing rather than say "invalid": the caller
+    is a fix pass holding the patch it declined to write, and it can only supply
+    the sentence if it is told which sentence is wanted."""
+    await record(client, "narrow-bare", to_fix=[finding("w2"), finding("w3")])
+    res = await outcomes(client, "narrow-bare", [
+        {"key": "w2", "outcome": "narrowed"},
+        {"key": "w3", "outcome": "narrowed", "note": "   "},
+    ], expect=422)
+    assert res["recorded"] == []
+    reasons = [r["reason"] for r in res["rejected"]]
+    assert [r["key"] for r in res["rejected"]] == ["w2", "w3"]
+    for reason in reasons:
+        assert "narrowed" in reason and "note" in reason, reason
+        # ...and it says WHICH note, because "narrowed needs a note" alone reads as
+        # a form field and invites a restatement of the fix.
+        assert "general form" in reason, reason
+    # Nothing landed, so neither key is on the chain wearing a half-recorded answer.
+    c = await chains(client, "narrow-bare")
+    assert c["w2"]["outcome"] is None and c["w3"]["outcome"] is None
+
+
+async def test_the_database_refuses_a_bare_narrowing_too(client):
+    """The same boundary rule as the refutation's, for writers that are not this
+    API — a backfill, an admin script, the next write path. Both halves of the
+    CHECK matter: a CHECK passes when its expression is NULL, so the trim test
+    alone would let a null note through.
+
+    And it is refused by its OWN constraint. The rules are required for different
+    reasons, so a violation quoting `refuted_note` at somebody recording a narrowed
+    row would name a rule that does not exist."""
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    # One transaction per attempt: a failed statement aborts its transaction, so a
+    # loop inside one `begin()` fails the second case on the first case's rollback
+    # state rather than on the constraint.
+    for note in ("NULL", "''", "'   '", r"E'\t'", r"E'\n'"):
+        with pytest.raises(IntegrityError) as caught:
+            async with engine.begin() as conn:
+                await conn.execute(text(
+                    "INSERT INTO review_finding_outcomes "
+                    "(repo, pr, finding_key, outcome, note, set_by) VALUES "
+                    f"('acme/direct3', 1, 'k', 'narrowed', {note}, 'laptop/hand')"))
+        assert "ck_review_finding_outcomes_narrowed_note" in str(caught.value)
+        assert "ck_review_finding_outcomes_refuted_note" not in str(caught.value)
+
+    # ...and it must refuse WHITESPACE, not letters — the vertical tab in the
+    # character set is `\013` and not `\v`, which Postgres does not define, so a
+    # note of "v" would have been trimmed to empty and refused.
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO review_finding_outcomes "
+            "(repo, pr, finding_key, outcome, note, set_by) VALUES "
+            "('acme/direct3', 2, 'k', 'narrowed', 'v', 'laptop/hand')"))
+
+
+async def test_the_database_admits_the_word_at_all(client):
+    """The vocabulary CHECK is frozen in a migration and declared again in live app
+    code, and #615 widened both. A `narrowed` the API accepts and the table refuses
+    is the drift that would surface as a 500 on the fix pass's last call."""
+    from sqlalchemy import text
+
+    from app.db import engine
+
+    async with engine.begin() as conn:
+        await conn.execute(text(
+            "INSERT INTO review_finding_outcomes "
+            "(repo, pr, finding_key, outcome, note, set_by) VALUES "
+            "('acme/direct4', 1, 'k', 'narrowed', 'the class fix is a separate change', "
+            "'laptop/hand')"))
+    # ...and the widening is exactly one word wide: a sixth value is still refused,
+    # so this test cannot pass by the CHECK having been dropped.
+    with pytest.raises(IntegrityError) as caught:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "INSERT INTO review_finding_outcomes "
+                "(repo, pr, finding_key, outcome, set_by) VALUES "
+                "('acme/direct4', 2, 'k', 'escalated', 'laptop/hand')"))
+    assert "ck_review_finding_outcomes_vocabulary" in str(caught.value)
+
+
+async def test_narrowed_is_its_own_bucket_and_leaves_precision_after_where_it_was(client):
+    """`narrowed` IS a judgement that the finding was right, so on that sentence
+    alone it belongs in `precision_after` — and it is held out anyway, because of
+    which way the error runs. Folding it in moves numerator and denominator
+    together and RAISES every ratio it touches, so an unsettled measurement is
+    taken on the unflattering side: published as its own bucket, where a reader can
+    see it and count it, and not spent on a headline percentage.
+
+    That is a decision about a published figure, so it is pinned rather than left
+    to be inferred from a passing suite. Widening `OUTCOMES_SCORED` wants its own
+    decision, and this test is what makes that visible."""
+    await record(client, "narrow-ratio",
+                 to_fix=[finding(k) for k in ("q1", "q2", "q3", "q4")])
+    await outcomes(client, "narrow-ratio", [
+        {"key": "q1", "outcome": "fixed"},
+        {"key": "q2", "outcome": "refuted", "note": "the branch it named is unreachable"},
+        {"key": "q3", "outcome": "narrowed", "note": "the class fix is a helper over all four"},
+        {"key": "q4", "outcome": "narrowed", "note": "server-wide gzip is a separate change"},
+    ])
+    s = await stats(client, "narrow-ratio")
+    m = row(s)
+    assert m["outcome"] == {"fixed": 1, "narrowed": 2, "refuted": 1, "deferred": 0,
+                            "superseded": 0}
+    assert s["by_outcome"]["narrowed"] == 2
+    # Fixed over fixed-plus-refuted, with the two narrowings in neither half. Folded
+    # in it would read 3/4 — the direction that flatters, from a word that costs the
+    # fixer two lines.
+    assert m["precision_after"] == 0.5
+    assert m["outcomes_scored"] == 2
+    # Recorded coverage still counts all four: the record is wider than the
+    # statistic, and `outcomes_scored` is the population the ratio is over.
+    assert m["outcomes_recorded"] == 4
+
+
+async def test_narrowed_is_attested_and_counted_like_any_other_answer(client):
+    """The signed-off subset is published beside the raw one so an unattended
+    agent's own verdicts cannot be read as adjudicated. A new outcome that fell
+    out of `by_outcome_attested` would be a fixer grading itself with no way for a
+    reader to tell."""
+    await record(client, "narrow-attest", to_fix=[finding("a1"), finding("a2")])
+    await outcomes(client, "narrow-attest", [
+        {"key": "a1", "outcome": "narrowed", "note": "the class fix is a lint rule",
+         "attested_by": "rich"},
+        {"key": "a2", "outcome": "narrowed", "note": "the general form is a schema change"},
+    ])
+    s = await stats(client, "narrow-attest")
+    assert s["by_outcome"]["narrowed"] == 2
+    assert s["by_outcome_attested"]["narrowed"] == 1
+    m = row(s)
+    assert m["outcome"]["narrowed"] == 2
+    assert m["outcome_attested"]["narrowed"] == 1
+
+
+async def test_narrowing_a_finding_retires_it_from_needs_human(client):
+    """#279's rule is that any recorded outcome retires a flagged defect, because
+    somebody has acted. `narrowed` is the outcome where acting is least in doubt —
+    the code changed — so a queue that kept holding it would be asking a human to
+    look at a defect that has already been repaired."""
+    await record(client, "narrow-nh",
+                 to_fix=[finding("h1", needs_human=True, needs_human_class="decision",
+                                 needs_human_reason="how wide should the fix go")])
+    before = await client.get(
+        f"/review/needs-human?repo={quote(repo_of('narrow-nh'))}&pr=1", headers=AGENT)
+    assert before.status_code == 200, before.text
+    assert [i["key"] for i in before.json()["items"]] == ["h1"]
+
+    await outcomes(client, "narrow-nh", [
+        {"key": "h1", "outcome": "narrowed",
+         "note": "the general form is a rule over every caller, not this change"}])
+    after = await client.get(
+        f"/review/needs-human?repo={quote(repo_of('narrow-nh'))}&pr=1", headers=AGENT)
+    assert after.status_code == 200, after.text
+    assert after.json()["items"] == []
+
+
+async def test_the_published_buckets_are_the_whole_vocabulary_and_nothing_else(client):
+    """The one guard that makes the literals above safe to write out.
+
+    Every `by_outcome` assertion in this file spells the buckets as a dict literal,
+    which is what makes them readable and what makes them go stale together: a sixth
+    outcome added to the vocabulary and not to the page would be published as a
+    silent hole — recorded, counted in `outcomes_recorded`, and in none of the
+    buckets a reader can see. So the keys are asked of the vocabulary itself rather
+    than restated a third time.
+
+    `not_recorded` is the extra one and belongs only to the repo-wide dict: it is
+    every confirmed defect nobody has ruled on, reported rather than omitted so the
+    buckets are not read as the whole picture."""
+    await record(client, "buckets", to_fix=[finding("k1")])
+    await outcomes(client, "buckets", [{"key": "k1", "outcome": "fixed"}])
+    s = await stats(client, "buckets")
+    assert set(s["by_outcome"]) == {*reviews.OUTCOMES, "not_recorded"}
+    assert set(s["by_outcome_attested"]) == set(reviews.OUTCOMES)
+    m = row(s)
+    assert set(m["outcome"]) == set(reviews.OUTCOMES)
+    assert set(m["outcome_attested"]) == set(reviews.OUTCOMES)

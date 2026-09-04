@@ -9,9 +9,8 @@ way it is asked. So it is exercised on written-out snippets rather than only aga
 
 from __future__ import annotations
 
-import pytest
-
 import _flake_sandbox as flake
+import pytest
 
 #: A check region with everything the copy reader has to get right: a commented-out copy, a
 #: `${./x}` in prose, one in an argument that is not a copy at all, both copy commands, a

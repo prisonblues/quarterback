@@ -85,7 +85,7 @@ def test_a_sonar_gate_issue_is_fixable_however_low_its_severity():
     rule. A disposal that filtered by severity would drop the one class of finding
     that keeps the PR unmergeable."""
     gate = _finding("P4", "python:S1481", verdict="sonar")
-    got = panel_rounds.round_stop(2, 2, [], [gate], [], fix_floor="P2")
+    got = panel_rounds.round_stop(2, 2, [], [gate], [], cleared_floor="P2")
     assert got["outstanding"]["fixable"] == [gate.key]
     assert got["outstanding"]["below_floor"] == []
 
@@ -108,18 +108,19 @@ def test_a_below_floor_finding_is_listed_and_is_handed_to_nobody():
     one, and a reader cannot tell "nothing was found" from "four were found and the
     floor held them back" if the payload says the same thing for both."""
     got = panel_rounds.round_stop(2, 5, [], [_finding("P4", "a nit")], [],
-                                  fix_floor="P2", trigger_floor="P2")
+                                  cleared_floor="P2", trigger_floor="P2")
     assert got["stop"] is True
     assert got["outstanding"]["handed_to"] == "nobody"
     assert got["outstanding"]["fixable"] == []
     assert len(got["outstanding"]["below_floor"]) == 1
-    assert "P2 fix floor" in got["outstanding"]["why"]
+    assert "P2 cleared floor" in got["outstanding"]["why"]
 
 
 def test_a_dry_stop_says_there_is_nothing_rather_than_saying_nothing():
     got = panel_rounds.round_stop(2, 5, [], [], [])
     assert got["stop"] is True
     assert got["outstanding"] == {"fixable": [], "below_floor": [], "escalated": [],
+                                 "narrowed": [], "declined": [],
                                  "handed_to": "nobody",
                                  "why": "nothing is outstanding — the cycle ends "
                                         "with nothing to hand on"}

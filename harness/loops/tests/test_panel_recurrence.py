@@ -36,11 +36,10 @@ import pytest  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402
+import panel_preflight  # noqa: E402  — the seat predicate the e2e rounds pin
 import panel_rounds  # noqa: E402
 import panel_scope  # noqa: E402
-import panel_preflight  # noqa: E402  — the seat predicate the e2e rounds pin
 from conftest import gh_stub  # noqa: E402
-
 
 #: A fix pass that wrote lines 100-102 of `app/thing.py` and nothing else.
 FIX_ADDED = {"app/thing.py": {100, 101, 102}}

@@ -120,6 +120,11 @@
     background:var(--chip); }
   .oc.fixed { color:var(--good); } .oc.refuted { color:var(--bad); }
   .oc.deferred { color:var(--warn); } .oc.superseded { color:var(--muted); }
+  /* `narrowed` is a fix (#615), so it takes the fixed colour and not the parked
+     one — reading it as a deferral is the mistake the word exists to prevent. It
+     is dimmed rather than tinted differently because the difference from `fixed`
+     is scope, not kind, and the chip already prints the word. */
+  .oc.narrowed { color:var(--good); opacity:.8; }
   /* An outcome nobody signed off. Marked rather than hidden or refused: the API
      records it, so the page has to say which it is. */
   .oc .un { opacity:.75; }
@@ -198,7 +203,8 @@ function ruled(r){ return r.confirmed + r.dismissed; }
 function thin(r){ return r.precision != null && ruled(r) < THIN; }
 // The same rule for the after-the-fact ratio, over its OWN population:
 // `outcomes_scored` (fixed + refuted), which is what `precision_after` divides,
-// and never `outcomes_recorded`, which also counts deferred and superseded. A
+// and never `outcomes_recorded`, which also counts narrowed, deferred and
+// superseded. A
 // member with 1 fixed and 11 deferred has 12 recorded outcomes and one scored
 // defect — keying the marker on the recorded count rendered an unasterisked,
 // confident 100% off that single finding. A marker has to be computed over the
@@ -345,6 +351,7 @@ function provTip(r){
 // and still named, in its own words, the rule `PROV_WORDS` records above.
 const OUTCOME_WORDS = {
   fixed: n => `${n} fixed`,
+  narrowed: n => `${n} fixed where raised — the general form left`,
   refuted: n => `${n} refuted — the finding was wrong`,
   deferred: n => `${n} deferred`,
   superseded: n => `${n} superseded by a later finding`,
@@ -845,7 +852,38 @@ function renderRuns(runs){
   }
 }
 
-function renderTiles(s){
+// #626's headline, and the only tile on this page counted per CYCLE rather than
+// per run, per observation or per defect. It is rendered with its denominator
+// spelled out for that reason: "62%" beside four other percentages over four
+// other populations is a number a reader will compare with the ones next to it.
+//
+// `rate` is null wherever nothing was DECIDED, and the tile is dropped whole
+// rather than shown as 0%. A window of rounds recorded before the column existed
+// has no convergence rate — they sent the field and ingest dropped it — and 0%
+// is the claim "this fleet converges never", which is the worst available way to
+// render "not measured".
+function convergenceTile(c){
+  if (!c || !c.overall || c.overall.rate == null) return "";
+  const o = c.overall;
+  const undecided = o.open + o.unmeasured;
+  // This endpoint's "all time" is not the page's. It classifies a row per CYCLE
+  // in Python rather than aggregating in SQL, so it defaults to a lookback where
+  // `/review/stats` defaults to the whole table — and when the reader picks "all
+  // time" the header above says "since <first run>" while this tile is over a
+  // narrower window. It says which one. A denominator quietly taken over less
+  // than the page claims is the silent truncation this repo does not do.
+  const bounded = !$("days").value && c.window && c.window.since
+    ? ` · window from ${c.window.since.slice(0, 10)}` : "";
+  return `<div class="tile"><div class="n" style="color:${precColor(o.rate)}">${
+    pct(o.rate)}</div>
+    <div class="k">cycles ending in a confident dry round<br>
+      <span class="dim">${o.converged} of ${o.decided} decided${
+        undecided ? ` · ${o.open} still open · ${o.unmeasured} unmeasured` : ""}${
+        bounded}</span>
+    </div></div>`;
+}
+
+function renderTiles(s, convergence){
   $("window").textContent = s.window.since
     ? `since ${s.window.since.slice(0, 10)}`
     : (s.window.first_run ? `since ${s.window.first_run.slice(0, 10)}` : "");
@@ -869,7 +907,12 @@ function renderTiles(s){
   // What survived contact with the code (v2.37). Over `fixed + refuted` only —
   // `deferred` and `superseded` are decisions about what to do next, and putting
   // either in the denominator would let "we never got to it" count as "it was
-  // real". Absent entirely until something has been scored, for the same reason
+  // real". `narrowed` is a judgement about correctness and is still out of this
+  // ratio: it is held out server-side too (`OUTCOMES_SCORED` carries the
+  // argument), and the two have to agree or this tile and `precision_after`
+  // report different percentages of different populations under one heading. It
+  // is printed under the tile beside the other buckets, so it is visible rather
+  // than dropped. Absent entirely until something has been scored, for the same reason
   // the tile above is: a percentage over nothing is the most confident possible
   // way to say nothing was measured.
   const out = s.by_outcome || {};
@@ -898,22 +941,31 @@ function renderTiles(s){
     ${held == null ? "" : `<div class="tile"><div class="n" style="color:${precColor(held / 100)}">${held}%</div>
       <div class="k">held up after the fix<br>
         <span class="dim">${out.fixed || 0} fixed · ${out.refuted || 0} refuted${
-          signedOff}<br>${out.deferred || 0} deferred · ${out.superseded || 0} superseded
-          · ${out.not_recorded || 0} unruled</span></div></div>`}`;
+          signedOff}<br>${out.narrowed || 0} narrowed · ${out.deferred || 0} deferred
+          · ${out.superseded || 0} superseded · ${out.not_recorded || 0} unruled</span></div></div>`}
+    ${convergenceTile(convergence)}`;
 }
 
 async function load(){
   const judgedOnly = $("judged").checked;
-  const [statsRes, runsRes] = await Promise.all([
+  const [statsRes, runsRes, convRes] = await Promise.all([
     fetch("/review/stats?" + qs({ judged_only: judgedOnly }), { headers: { Accept: "application/json" } }),
     fetch("/reviews?" + qs({ limit: 50 }), { headers: { Accept: "application/json" } }),
+    // No `judged_only`: convergence is a property of how the loop FINISHED, and
+    // whether a judge adjudicated the findings is a different question. Passing
+    // the toggle through would make the headline move when a reader flipped a
+    // control that has nothing to do with it.
+    fetch("/review/convergence?" + qs({}), { headers: { Accept: "application/json" } }),
   ]);
   if (!statsRes.ok || !runsRes.ok){
     $("leaderboard").innerHTML = '<div class="empty">could not load review stats</div>';
     return;
   }
   const stats = await statsRes.json();
-  renderTiles(stats);
+  // The one tile that is allowed to be absent without the page failing: the rest
+  // of this view predates it and must still render against a board too old to
+  // serve it. `null` reaches `convergenceTile`, which drops the tile.
+  renderTiles(stats, convRes.ok ? await convRes.json() : null);
   renderLeaderboard(stats.by_model, judgedOnly);
   renderAgents(stats.by_agent);
   renderRuns(await runsRes.json());

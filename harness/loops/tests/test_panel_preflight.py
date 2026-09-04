@@ -42,10 +42,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402
-import panel_scope  # noqa: E402
 import panel_preflight as pf  # noqa: E402
+import panel_scope  # noqa: E402
 from conftest import gh_stub  # noqa: E402
-
 
 # ----------------------------------------------------------------------------- fixtures
 

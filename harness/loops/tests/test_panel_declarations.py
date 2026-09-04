@@ -25,13 +25,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
-import panel_seats  # noqa: E402  — run_cli lives here since #129
-import panel_scope  # noqa: E402  — CI_STATE_WORDS, the vocabulary #546 must cover
 import panel_rounds  # noqa: E402  — patched by name where a test forces a collision
+import panel_scope  # noqa: E402  — CI_STATE_WORDS, the vocabulary #546 must cover
+import panel_seats  # noqa: E402  — run_cli lives here since #129
 from conftest import gh_stub  # noqa: E402
-
-
-
 
 
 def _reports(title, file="a.py", reviewer="codex", line=1, flagged=False):
@@ -2724,13 +2721,17 @@ def _ruling_judge(unresolvable=("the enactment drops to 8.16 MB",)):
 
 
 def _claiming_round(monkeypatch, capsys, tmp_path, *, acknowledge=(), baseline=(),
-                    round_no=1, gaps=("the enactment size",)):
+                    round_no=1, gaps=("the enactment size",),
+                    claim="the enactment drops to 8.16 MB"):
     """One whole cycle round whose single seat declares a gap the judge rules
-    structurally unanswerable. Returns (report, payload)."""
+    structurally unanswerable. Returns (report, payload).
+
+    ``claim`` is the judge's WORDING of that gap, which the next round's judge is
+    free to change without the gap changing — the case #663 is about."""
     _stub_panel(monkeypatch, findings=[])
     monkeypatch.setattr(panel, "review_llm", lambda *a, **k: panel.ReviewerRun(
         [], None, 10, list(gaps)))
-    monkeypatch.setattr(panel, "adjudicate", _ruling_judge())
+    monkeypatch.setattr(panel, "adjudicate", _ruling_judge((claim,)))
     out = tmp_path / f"r{round_no}.json"
     assert panel.run("board", 34, post=False, json_file=str(out), record=False,
                      round_no=round_no, max_rounds=3, baseline=list(baseline),
@@ -2823,6 +2824,51 @@ def test_an_acknowledgement_naming_no_claim_this_round_raised_is_said_out_loud(
                                    acknowledge=["uc-deadbeefcafe"])
     assert any("--acknowledge uc-deadbeefcafe names no unverifiable claim this "
                "round raised" in n for n in got["config_notes"]), got["config_notes"]
+
+
+#: The same gap, worded by the next round's judge the way judges word things twice.
+#: Nothing about what could not be checked has changed; only the sentence has.
+REWORDED = "the enactment shrinks to 8.16 MB once it is deployed"
+
+
+def test_a_reworded_claim_pairs_the_dangling_acknowledgement_with_the_new_key(
+        monkeypatch, capsys, tmp_path):
+    """#663: an acknowledgement that names nothing and a fresh unacknowledged claim,
+    arriving in the same round, are the signature of a re-wording — and until now
+    they were reported apart, so the round paid its confidence for a question a human
+    had already answered under the old key.
+
+    The pairing is a QUESTION with both keys in it, which is what keeps it a report:
+    nothing compares the two claims' words, and the round's confidence is not bought
+    back by asking."""
+    _r1, first = _claiming_round(monkeypatch, capsys, tmp_path,
+                                 acknowledge=[ENACTMENT])
+    assert first["acknowledged"] == {ENACTMENT: 1}
+    report, second = _claiming_round(monkeypatch, capsys, tmp_path, round_no=2,
+                                     baseline=[str(tmp_path / "r1.json")],
+                                     acknowledge=[ENACTMENT], claim=REWORDED)
+    # The question is for a person, so it has to be in what a person reads.
+    assert "are these the same claim" in report
+    minted = panel_rounds.claim_key(REWORDED)
+    assert minted != ENACTMENT
+    assert [c["key"] for c in second["unresolved_claims"]] == [minted]
+    paired = [n for n in second["config_notes"] if "are these the same claim" in n]
+    assert len(paired) == 1, second["config_notes"]
+    assert ENACTMENT in paired[0] and minted in paired[0]
+    # Asked, not answered: the new claim is still unacknowledged and still costs the
+    # round its confidence, which is the whole reason the question is worth printing.
+    assert second["unresolved_claims"][0]["acknowledged"] is False
+    assert second["round_stop"]["confident"] is False
+
+
+def test_a_fresh_claim_with_no_dangling_acknowledgement_asks_nothing(
+        monkeypatch, capsys, tmp_path):
+    """One half of the signal is not the signal. A round that raises an
+    unacknowledged claim and was passed no acknowledgement at all has nothing to pair
+    it with, and asking anyway is how a note becomes something a reader skips."""
+    _report, got = _claiming_round(monkeypatch, capsys, tmp_path)
+    assert got["unresolved_claims"][0]["acknowledged"] is False
+    assert not [n for n in got["config_notes"] if "are these the same claim" in n]
 
 
 @pytest.mark.parametrize("junk", ["", "deadbeefdeadbeef", "uc-", "uc-nothexvalue1",

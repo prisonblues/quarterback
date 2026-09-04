@@ -19,7 +19,7 @@ board reconnects them.**
   ways of working a repo uses — `⌂ CLEANROOM` or `~ JUNGLE` — and exits 3 when the
   tree you are standing in contradicts it, `qb-board`, which
   launches the terminal board client (`qb-board --follow` tails the board to stdout
-  on any host with ssh; see the repo README), `qb-reconcile`, the read-only pass
+  on any host with ssh; see the repo README), `qb-reconcile`, the pass
   that asks whether the board's plan still describes the present, `qb-pace`, which
   says how the shared subscription's five-hour and weekly windows stand and what a
   job of N seats would cost against them, `qb-doctor`, the one command that answers
@@ -156,9 +156,13 @@ repo's open issues are the panel's own deferred-finding overflow. The severity s
 PR and the 67.3% tail beside it is not.
 
 So `.harness-rules.sample` now carries ten `review_panel` dials (#165, #297, #492, #482), and what they
-bound is the tail rather than the signal: `fix_severity_floor` (**P3**) is what a fix round
-is asked to clear, and below it a finding is reported, marked and recorded rather than
-fixed — P4 is 31.3% of findings and the tier that actually ballooned #236;
+bound is the tail rather than the signal: `fix_severity_floor` (**P4** as of 2026-08-30,
+from P3 — #621) is what a fix round is asked to clear, and below it a finding is reported,
+marked and recorded rather than fixed. Admitting P4 — 31.3% of findings, and the tier that
+actually ballooned #236 — adds no obligation: it is not the blocking band and has not been
+since #297, so what changes is that P4 joins P3 INSIDE `low_severity_fix_lines`' budget
+rather than sitting outside every rule, and a count decides cheapest-first which of them a
+round takes;
 `round_trigger_floor` (**P2**) is what a NEW finding needs to buy another round, which is
 the rule that mattered most, because from round 2 the thing under review IS the previous
 round's fix and a termination test fed by its own output can only end on the cap — the
@@ -169,21 +173,35 @@ between the two floors, counted rather than estimated and spent cheapest-first �
 second measurement on 2026-08-21, where PR #188's 185-line feature came out of two fix passes
 at 721 lines, 74% of the PR being review-response code, off a round-2 fix list that was 89%
 below P2; a budget rather than a per-fix cap because #188's round 1 was 408 lines of
-individually reasonable small fixes;
+individually reasonable small fixes, and since #551 `low_severity_fix_full_chars` (**14,325**) is the proportional half of that same budget — the first round's `pr_chars` at or above which the whole 40 lines applies, with anything smaller getting it pro rata and the round spending whichever half is smaller, so a fixed 40 lines can no longer be a bigger share of the change than the change; a **ceiling** and not the floor #664 put under `max_fix_growth`, because the two dials' dangerous ends are opposite and a `max` written here would reintroduce #188; in chars because that is the unit the comparison happens in and the only first-round size a baseline records, and measured rather than converted — the median `pr_chars` of this repo's merged PRs scaled to the ~182 churned lines at which 40 is #551's sane ~22% (n=21, range 9,538-18,604) — with the result clamped at one honest one-line fix (`2 x unrefereed_line_weight`), because since #674 a budget too small to buy anything is a declination, a veto, a lost `stop_confident` and a `preland --require-earned-stop` hold — and the run-time arithmetic is rate-free while the calibration still anchors on a churned-line count, so it is less exposed to #692 rather than immune to it;
 `unrefereed_line_weight` (**2**) is what one churned line of test or prose costs that budget
 against a production line's 1, because a production fix has an external referee in red/green,
 the suite and CI while a test fix has none — nothing tests a test — so a budget that prices
 them alike spends most of itself where nothing can check it (#554);
+`next_door_days` (**7**, `0` for none) is how far back a defect **confirmed on another pull
+request**, in a file this one also touches, may be carried in front of the reviewers as
+context — the per-PR recurrence chain cannot see one file over, and on 2026-08-26 a P1
+confirmed in `app.auth.delegated()` shipped again an hour later in `app.auth.human()` on a
+different PR, into a round 1 with nothing of its own to recur against (#508); it is a hint and
+never a finding, so a seat must find the defect in the diff in front of it before reporting
+one — an instruction the prompt carries and **nothing enforces or measures**, which is said
+plainly rather than dressed up, though the hint TEXT is mechanically flattened and capped
+because it is model output from other PRs quoted into a prompt that instructs a model;
 `max_fix_growth` (**3.0**) stops a cycle whose fix pass has multiplied the change instead of
 fixing it, and `max_fix_growth_chars` (**30,000**) is the absolute half of that same ceiling —
 whichever is crossed first binds, because a pure multiple hands its rope out in proportion to
 the starting size and so lets a 2,000-line PR grow by four thousand lines on the dial that
-stops a 113-line one at 226 (#492); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
+stops a 113-line one at 226 (#492), while `min_fix_growth_chars` (**2,000**) is the floor under the multiple and the one term here that loosens — diff framing is ~430 fixed chars a hunk and the multiple's allowance is not, so below ~413 chars a 3.0x ceiling cannot afford one honest one-file fix, and on the PR that was measured on it priced a real correction out into a regression the next round then found (#664); `reviewer_scope` (**diff**) asks reviewers for defects in the change rather than
 in everything it touches; `fixer_may_defer` (**true**) gives the fixer the third exit it did
-not have; `max_rounds` (**2**) surfaces the existing cap; `file_deferral_issues` (**P2**) decides which
-deferrals get a GitHub issue as well as the board row every deferral gets anyway, which is the
-tail arriving one step downstream of the floor — the floor keeps a P4 out of the fix pass and
-the bookkeeping then filed it as a ticket, twenty times over on this repo alone (#482); and
+not have; `max_rounds` (**6** as of 2026-08-30, from 2 — #621) surfaces the existing cap, which is
+a backstop against a cycle running forever and not a convergence mechanism: what ends a cycle is
+`escalate_on`, `fix_injection` first; `file_deferral_issues` (**shape** as of 2026-08-30, from P2 —
+#620) decides which deferrals get a GitHub issue as well as the board row every deferral gets
+anyway, and it asks what shape the TICKET would be rather than how severe the finding is — a
+category or one substantive named item gets an issue, a batch of a round's leftovers gets rows and
+never one. The tail was arriving one step downstream of the floor: the floor kept a P4 out of the
+fix pass and the bookkeeping then filed it as a ticket, twenty times over on this repo alone, every
+one of them a batch and not one ever closed (#482, #620); and
 `require_failing_test`
 (**false**) reserves the name for #165's evidence contract and reports that it is not built,
 because the reviewer-emitted failing test it needs does not exist yet (#92, #114).
@@ -222,21 +240,49 @@ same row; the fixer owes two justifying lines and the orchestrator still owns th
 **A deferral always gets a board row; `review_panel.file_deferral_issues` decides which ones
 also get a GitHub issue** (#482). The two were being treated as one record and they are not: the
 row chains by finding key across rounds, feeds `/panel` and keeps the leaderboard honest, while
-the issue is a work item on somebody's tracker. Those coincide for a P1 or P2 deferral and do not
-for the P3/P4 tail, which is where the volume is — measured on this repo on 2026-08-26, roughly
-twenty open issues were panel deferred-finding exhaust and nothing else, and #283 is a rescue
-*from* one of them. At or above the gate the orchestrator opens the issue and names it in
-`deferred_to` as before; below it the row carries no `deferred_to` (the column is nullable, the
-API accepts it, and `/panel` renders a targetless row rather than breaking) and a one-line `note`
-instead, which is what makes it worth reading later — `GET /review/findings?repo=&pr=` is the read
-that write exists for. The default is `P2`; `always` is the pre-#482 behaviour and `never` files
+the issue is a work item on somebody's tracker. **Since #620 the gate asks what shape the ticket
+would be, not how severe the finding is**: a CATEGORY — one standing item for a recurring class —
+or a SINGLE NAMED ITEM with real substance behind it gets an issue whatever severity it carries,
+while a BATCH, a round's leftovers swept into one ticket, gets board rows and never an issue,
+whatever its severity mix. Twenty P3s in one issue is not a deferral, it is a transfer of the
+problem to a human. Severity could not express that, because severity is a property of a finding
+and batchness is a property of the ticket, so a cut anywhere on P1..P4 files some batches and
+blocks some single items. The measurement, taken on this repo on 2026-08-26 and re-counted on
+2026-08-30: twenty open issues were panel deferred-finding exhaust and nothing else, carrying 345
+findings, every one of them a batch, and not one had ever been closed — #283 is a rescue *from*
+one of them. **A deferral nobody classified is a batch**, because that is the answer that cannot
+mint a ticket nobody reads. Where an issue is opened the orchestrator names it in `deferred_to` as
+before; where it is not, the row carries no `deferred_to` (the column is nullable, the API accepts
+it, and `/panel` renders a targetless row rather than breaking) and a one-line `note` instead,
+which is what makes it worth reading later — `GET /review/findings?repo=&pr=` is the read that
+write exists for. The default is `shape`; the P1..P4 bands still work and are the way back to the
+severity cut this ran under until 2026-08-30, `always` is the pre-#482 behaviour and `never` files
 none. **An escalation is exempt at every setting**, because its issue asks a question rather than
-filing a task, and if the board write fails the orchestrator files the issue anyway — below the
-gate the row is the only record, so losing both would lose the finding.
+filing a task, and if the board write fails the orchestrator files the issue anyway — without one
+the row is the only record, so losing both would lose the finding.
 
 `harness/tests/test_fixer_escalation.py` guards the wiring rather than the
 judgement: that the permission and its report ship together, that the cross-file references to
 step 3a resolve, and that `deferred` is a value the database accepts.
+
+**Every one of those outcomes is a refusal, and refusing was the expensive road** (#616). The
+brief permitted a false positive and asked nothing at all in support of a fix, so the whole
+burden of proof sat on refusal — and when a finding is wrong, complying is cheaper than
+disproving it, so the pass complies and the churn reads as diligence. Nothing could see it,
+because a fix for a non-defect looks exactly like a fix for a defect. So `review-pr.md`'s step 3
+now owes **one line per finding before its patch**, naming who consumes the code the fix would
+change: the callers, and for anything reaching a response or a stored artefact, the entitlement
+tier it is served to. It lands in a **Consumers** column in the step-6 table, so the summary
+carries it, and it is owed on **every** finding at every severity — the alternative, only the
+findings whose fix touches a response path, asks the fixer to classify its own work before doing
+the work that would tell it, which is the self-policing the requirement exists to remove. The
+measured instance is lexray#1780 round 3: a P2 verified by a seat and confirmed by the judge,
+wrong about what `html_preview` is for, fixed by merging the paid glossary into the anonymous
+teaser, and caught a round later as an entitlement leak. The refutation was one `grep` for
+callers and one docstring. `harness/tests/test_fixer_consumers.py` guards the same kind of wiring
+the escalation suite does — that the requirement is in every brief that runs a fix pass, that
+replacing `/review-pr`'s step 2 with a panel's findings does not take it out, and that the table
+a fixer copies has the column.
 
 The loop knows about it, which took a second change (#221). An escalated finding is outstanding
 and no fixer may touch it, so under the original stopping rule it earned another round every time
@@ -347,6 +393,70 @@ itself reviewed**. Its regression tests are the only thing standing behind it. A
 whose tests pass vacuously has no backstop at all — and that is precisely the pass this
 repo has decided not to review.
 
+### Load-bearing comments — a claim in the diff is reviewable
+
+The same lever, pointed at the other artefact. `REVIEW_PROMPT`'s Documentation dimension asks
+whether a behaviour change left CLAUDE.md, docs, README or docstrings **stale** — a comment the
+diff LEFT BEHIND. Nothing asked about one the diff **wrote**: a comment or docstring stating a
+checkable property of the code beside it — *"this is the only caller"*, *"nothing between here
+and there returns"*, *"this re-reads X rather than trusting the earlier read"*, *"this cannot be
+reached"*. That is a claim, and a claim in a diff is reviewable.
+
+The measurement is 2026-09-03, on the three PRs landed that day. Each had already been through a
+review pass, each was green, and each got one more independent adversarial pass before landing.
+**Two of the three defects that pass found were in the prose**, and the third was a prose claim
+that happened to be true. #719's `qb-reconcile` comment said both facts "are re-asked at the point
+of the WRITE rather than inferred from the finding" — read plainly, a fresh `gh` call immediately
+before mutating the plan, a second safety boundary. There is none; `apply_candidates` reads
+evidence gathered in the earlier pass. Nothing was unsafe, and the comment described a guard that
+does not exist, in the file whose entire thesis is that a check nobody made must not read as a
+check that passed. #715's `panel_seats.PR_HOLD_TTL` comment had its comparison backwards and was
+corrected by an earlier round of its own review.
+
+In most codebases that is a nit, and here it is not, for two reasons. The comments **are** the
+design record — a fifty-line docstring carrying the argument, the measurement and the rejected
+alternative is the normal unit — so a wrong one propagates: the next agent reads it, believes it,
+and builds on it. And it is worse than a wrong test in one specific way. A wrong test can at least
+go red. Nothing ever *executes* a comment, so a wrong one survives every round, every CI run and
+every rebase, indefinitely.
+
+**The severity is conditioned on consequence, not on the artefact being a comment.** #724 argued a
+blanket "at least P2" and the first cut of this shipped one, which is too coarse: severity is what
+the fix pass acts on, so a floor covering every false checkable claim — a stale count, a wrong
+complexity description, a local detail nothing rests on — turns documentation nits into mandatory
+repairs and lengthens rounds. The discriminator is what relying on the claim would cost. A claim
+the change's own correctness argument leans on — a guard's justification, an ordering or
+concurrency property, the reason no `try/finally` was needed — is **P2** when false. A claim
+nothing depends on is **P3**, priced like any other documentation defect. Both tiers name it in the
+severity paragraph, so the scale a seat picks from carries the same rule as the dimension it read.
+
+**Expensive is not impossible, and the bullet has to say which.** #715's `panel.run` carried
+*"there is no early return between the claim and here — the skip and refusal exits are all ABOVE
+the dispatch"*. It is true, and it is what justifies shipping without a `try/finally`; the span is
+~2,600 lines, and what settled it here was an AST walk enumerating every `return` and checking each
+was inside a nested `def`. That was **convenience, not necessity**: grep `return` over the span and
+read the enclosing scopes and you reach the same answer by hand. `CODE_ACCESS_BRIEF` gives a
+code-reading seat Read, Grep and Glob and **no shell**, deliberately (#458, #459) — which makes a
+question like this laborious from the seat's checkout and does not make it unanswerable.
+
+The distinction is the whole of it, and the first draft of this section got it wrong in the
+direction that costs something. `CODE_ACCESS_BRIEF`'s own rule is that a question you can answer by
+opening a file is **not** a coverage gap, and a declared gap costs the round its confident stop
+(`coverage_veto`). A dimension that told seats structural claims are unsettleable would manufacture
+exactly those declarations — paying a real price to record a check nobody attempted. So the bullet
+says to grep the callers and read the enclosing scopes FIRST, and reserves `could_not_assess` for a
+claim the material genuinely cannot settle *after* looking. A load-bearing claim nobody actually
+checked is not better than a false one, just quieter; a claim declared unassessable without anyone
+opening a file is worse than both, because it reads as the check having been attempted.
+
+That residue is also the **measurement** the expensive half is gated on: #724's second proposal is
+to give the seat a shell or a canned set of structural queries, and it is the same shape as #716 (a
+code-reading seat has the files and no history) one step further on. It is not built here, and the
+reason is that the count that would decide between a shell, a fixed query set and nothing does not
+exist yet — the `could_not_assess` entries this bullet produces are how it gets taken, the same way
+#716's was. Quietly undoing "you have NO shell" ahead of that measurement would spend the
+constraint's own argument to buy an answer nobody has yet.
+
 ### `/fix-and-review` and `/fix-and-land` — an issue, end to end
 
 Both take an issue number and come back with a reviewed PR. They differ in exactly one place, and
@@ -386,9 +496,13 @@ commands and the files they touch), or `HOLD` (exit 2, with what is unresolved a
 to resolve it). `--json` for a loop, plain text for a person.
 
 It is not a new gate. It is the gates the harness already had — CI green *now*, the panel's
-newest round read *this* commit and stopped with nothing confirmed, one migration head,
+newest round read *this* commit and stopped owing nothing, one migration head,
 no failing Sonar gate, nobody else landing the same branch — read in one place instead of
-described in two. `/fix-and-land` used to hold about fifty lines of prose about them and
+described in two. "Owing nothing" is the round's own disposal of what it found (#42, #717):
+`fixable + escalated` holds the merge, and findings under the repo's `fix_severity_floor`
+are warned about, because that dial's whole content is that they are reported and not fixed
+here (#165). A round that recorded no disposal is held on its raw confirmed count, as
+before. `/fix-and-land` used to hold about fifty lines of prose about them and
 `/panel-review-pr` held none, which is how they came to disagree; both now call this and
 act on the verdict.
 
@@ -539,6 +653,129 @@ it is the only one that is dry-run by default.
 The commands are thin, guarded drivers over these. The scripts hold the deterministic
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
+
+#### Every category has a fourth state: `NOT CHECKED`
+
+`prune-worktrees` reports six categories, and each of them could come back two ways: none,
+or a list. The third is the one that took until #735 to exist:
+
+```
+✓ Orphan board claims: none                    # asked; the board holds nothing
+Orphan board claims (7): #723 #722 …           # asked; here they are
+? Orphan board claims: NOT CHECKED — `qb-claimed` exited 2 (no board configured,
+                                     or it could not be reached)
+```
+
+Every way the ask could fail produced the first line. The claim sweep ended in `|| true`
+with stderr dropped, so an unreachable board, a rotated token and a payload `jq` declined
+all left an empty answer — which is what a board holding nothing also leaves, and `report`
+prints "none" for an empty array. Observed on two consecutive `/tree-shake` runs with
+nothing changed in between: seven claims, then `✓ … none` and a successful exit, then the
+same seven.
+
+**Claims are where it costs most, and the reason is the clock.** Every other category is
+recoverable by running the sweep again — a leftover directory is still there next time. A
+claim is on an 8h TTL and this sweep is the thing that exists to hand it back early (#337),
+so a false "none" means the claim runs quietly to its fuse: #135's complaint arriving
+through the tool built to prevent it.
+
+**Every external read in the file now captures its status before parsing.** That was the
+mechanical cause and it was not confined to the claim sweep: a producer piped straight into
+a `while read` loop, or into a process substitution, hands this shell no exit status at all —
+so `docker ps` against a stopped daemon, a `psql` listing that failed after the liveness
+probe passed, a port file that exists and cannot be opened, and an nginx config `grep` could
+not read all arrived as *no lines*, which is what an empty answer looks like too. Two of
+those go on to be acted on: `--prune` rewrites `.worktree-ports` from the list it just failed
+to read, and `--remove-nginx` rewrites a config it just failed to parse.
+
+The severe one is the **live worktree list** itself, which is not a category but the input
+every category derives "is this live?" from. `LIVE_LIST_OK` was set from inside the loop, so
+it only ever proved that *one line arrived* — a listing that emitted the main checkout and
+then failed satisfied it, and every other live worktree then looked like debris to a sweep
+whose `--remove-dirs` runs `rm -rf`. The listing is captured whole, with its status, and a
+failure is refused rather than reported.
+
+A **config file that does not parse** reaches the same place from the other side: `cfg` drops
+`jq`'s error and falls back to its default, so one stray comma erases the database engine, the
+nginx path, the worker prefix and the protect patterns — and the categories those configure
+then answer "none" for a reason that has nothing to do with the repo. It is now refused at
+load.
+
+Three consequences, and the last is the one a caller quotes:
+
+- **The database scan carries it too.** Its two "skipping DB scan" paths — no DB user, no
+  container answering as that user — ended with an empty list and a green `Orphan
+  databases: none`. That is the failure the caveat at the foot of this file records, where a
+  misresolved container reported none over a hundred orphans in the real one. The loud
+  warning it grew then stays, for the candidate list; the report line no longer contradicts
+  it.
+- **`--prune` says outright that it swept no claims.** Every other line in the apply pass
+  reports an action, so silence there reads as claims handed back. `--remove-nginx` gets the
+  same treatment: its `awk … && mv` chain was followed by an unconditional "removed nginx
+  block", so under no `-e` a rewrite that never happened still reported as one — and nginx was
+  then restarted to pick up a config nothing had changed.
+- **`Nothing to prune. Clean.` is a statement about all six categories**, so a run that
+  looked at four of them does not print it, and names the ones it could not look at instead.
+  That sentence is precisely what a caller reads as "the sweep ran and found nothing".
+
+**A category that does not apply is not unknown**, and keeping those apart is what stops the
+new line appearing on every run of a repo that has no board. A project naming no database
+engine, and a host carrying neither `qb-claimed` nor `qb-release`, were told there is nothing
+there — as opposed to being stopped from looking. One half of that pair present and the other
+missing is the reverse: a partial install is where a false `none` hides, because the half that
+is there says claims are being taken on this host.
+
+This is `qb-doctor`'s four verdicts (below) in the sweep, and the same argument: `?` is not
+`ok`, and a tool that reports a clean result because it could not look is worse than one
+that does not check, because it launders ignorance into assurance.
+
+#### Databases the sweep must not touch — `.database.protect`
+
+`prune-worktrees` calls a database orphaned when no live worktree maps to it, and the
+mapping is per-worktree (`<project>_<create-name>`). Anything a project generates on some
+*other* axis therefore matches nothing and is reported as debris on every run.
+
+`.worktree.json`'s `database.protect` is the escape hatch, and its entries are **glob
+patterns**:
+
+```json
+"database": {
+  "engine": "postgresql",
+  "protect": ["myapp_test_tmpl_*"]
+}
+```
+
+They are patterns rather than literals because the databases worth protecting are almost
+never one fixed name. The case that set the shape: a test suite that copies each run's
+database from a pre-migrated template, `<project>_test_tmpl_<migration head>`, so a run
+costs ~45ms instead of ~1.5s. A template belongs to a *migration head*, not to a checkout,
+so it matches no worktree by construction and every sweep offers to drop it.
+
+Naming those exactly does not work, and it is worth being precise about why, because the
+attempt looks reasonable: the live heads are spread across branches — one on the integration
+branch, another on some unmerged feature branch — and no single checkout can see all of
+them. So a hand-pinned list cannot be verified from anywhere, and the day a migration lands
+it protects two dead templates while the live one goes back to being swept. That failure is
+silent and in the unhelpful direction. It also pushes per-branch state into a shared
+base-branch config file, which makes editing `.worktree.json` a step in landing a migration.
+`myapp_test_tmpl_*` has none of those properties.
+
+Two things follow from patterns:
+
+- **A literal entry still means exactly what it did.** A pattern with no metacharacters is
+  an exact match, so lists written before this are unaffected.
+- **Every match is reported**, with the pattern that caused it, under `Protected by
+  .database.protect`. A pattern is the one thing here that can suppress a *genuine* orphan,
+  and a too-broad one would otherwise do it invisibly — which is a worse failure than the
+  staleness patterns exist to remove.
+
+The two built-in protections — `<project>` and `<project>_test` — stay exact, and stay
+silent. Those names are minted by these scripts, so there is nothing to go stale and nothing
+to be surprised by.
+
+`.database.protect` is only consulted for databases under the `<project>_` prefix, because
+that prefix is the whole of what the sweep considers. An entry outside it is inert rather
+than wrong: nothing outside the prefix was ever going to be dropped.
 
 ### `check-db-isolation` — which database is this checkout actually pointed at?
 
@@ -1006,6 +1243,30 @@ answer to an outage and no answer at all to a misconfiguration.
 `qb-claim` prints the claim id on **stdout** and everything else on stderr, so a caller can
 capture the id for `claim/renew` and `claim/release` without parsing prose.
 
+**A claim is a pickup unless you say otherwise, and `--no-plan-item` is how you say it.**
+Taking a claim on an issue or a PR writes that repo's plan item at rank 1, because picking work
+up is the one act that should put work on the board (#427). A panel review round claims the PR
+it is reading, and that is a true exclusivity record and a false pickup: the round wrote the PR
+in at rank 1, released the claim when it finished, and left the row open, unclaimed and
+unblocked at the top of the plan — so `next` handed the following agent a review that had
+already happened (#722). Pass the flag when you are holding a key rather than starting the work.
+It writes no item and it retires none, the claim is exclusive exactly as any other, and it
+implies `--no-gh-title` since the plan item was the title's only consumer.
+
+**Roll the board out FIRST, then the harness** — this is a protocol change and the two halves
+ship separately, so for as long as they disagree one of these is what happens. It is the same
+split as the reference-vs-live units under `qb-reconcile` below: what is in this repo is not
+what a host is running.
+
+| what is newer | what happens | what you see |
+| --- | --- | --- |
+| the tool | `ClaimIn` takes pydantic's `extra="ignore"`, so an old board discards `plan_item` and writes the rank-1 row anyway | `qb-claim` reads the answer back and says `WARNING: --no-plan-item was IGNORED` on stderr; a round carries it into `config_notes`. The claim stands — nothing out here can un-write the row |
+| the board | nothing: an old `qb-claim` never sends the field, and the board's default is unchanged | the ordinary pickup item, exactly as before |
+| the round, not its `qb-claim` | argparse refuses the unknown flag and exits 2 | `hold_pr` tells that refusal apart from a board's and asks again without the flag, noting that the claim was taken **with** a plan item. A visible imperfect record beats no record, which is what the round had before #715 |
+
+The order follows from the middle row: a newer board is invisible to every old caller, and a
+newer tool is not.
+
 **`create-worktree` takes the claim for you.** It derives the issue number from the branch
 it is about to make (`feat/issue-172`, `fix/issue-114`, `feat/issue-135-qb-next`) and
 claims it *before* the tree exists, so a refusal costs nothing to unwind:
@@ -1081,7 +1342,7 @@ was meant to be:
 | --- | --- |
 | the land step | `/review-pr`, `/panel-review-pr` and `/fix-and-land` run `qb-release issue <n>` after `gh pr merge` — the common case and the cheapest |
 | `remove-worktree` | step 8, releasing what the create-name names (so `/drop-worktree` covers it too). `--keep-claim` opts out, for a teardown that is not the end of the work |
-| `prune-worktrees --prune` | claims whose note names a worktree that is no longer live — the debris case, matched on the note `create-worktree` writes and nothing else does |
+| `prune-worktrees --prune` | claims whose note names a worktree that is no longer live — the debris case, matched on the note `create-worktree` writes and nothing else does. A board it could not ask is reported as `NOT CHECKED` rather than as no claims (#735) |
 
 ### `qb-admit` — is there room to start? (#337)
 
@@ -1579,7 +1840,8 @@ A remote whose refspec does not bring back `refs/heads/*`, a negative refspec, a
 destination outside `refs/remotes/`, a ref under `refs/remotes/` that no remote's refspec
 writes to — each means the tracking refs this is measured against are not the set it
 trusts, so the sweep prints one `!` line saying which, and no worktree line claims
-anything about stranded work. An empty note would be indistinguishable from a clean
+anything about stranded work. **`qb-doctor`'s `unpushed` row refuses on the same four
+(#611)**, so the two tools no longer reach opposite verdicts about one disk. An empty note would be indistinguishable from a clean
 answer, which is how a safety claim gets made by accident.
 
 **A fetch that failed warns, and does not reassure.** It used to refuse the question
@@ -2072,10 +2334,10 @@ would close a seat and leave the board holding its lease for the rest of a TTL.
 
 #### The dash — WORK IN PROGRESS
 
-`qb-dash-tui` is a fourth pane for the right-hand side: fleet state, where the board pane
-along the bottom (the **tape**) is the event stream. `qb-dash` is the same views rendered
-without interaction, for a box that cannot import `textual` — which is the whole of what it
-is for since #426. It is not a lesser default any more; it is the fallback.
+`qb-dash` is a fourth pane for the right-hand side: fleet state, where the board pane
+along the bottom (the **tape**) is the event stream. There was a second renderer of the same
+views without interaction, for a box that cannot import `textual`; it is gone, and
+`qb-dash-tui` is now a second name for the one that is left rather than a second thing.
 
 **TWO TABLES, because there are two questions** ([#589](https://github.com/prisonblues/quarterback/issues/589)):
 
@@ -2454,9 +2716,27 @@ outside a checkout, a fleet-wide plan item, a `plan:<uuid>` claim this process h
 resolved — is kept, because no repo is not evidence of another repo and hiding it drops a
 live peer; it wears a `?` in front of its title, since the repo cell (`—`, `fleet`) was
 the only thing that ever said so and the narrow view is exactly the view that drops it.
+**The chip bar narrows the fleet to one repo.** One line of clickable chips above the
+tables, a chip per repo the live fleet is actually in — not per repo the board knows, because
+a chip with nobody behind it filters to an empty table. The same chip sets and clears, so a
+bar clipped by a narrow pane cannot strand you with a filter and no way out; the unfiltered
+count stays on the title (`AGENTS · 3 of 16 · lexray`) so a filter reads as a filter rather
+than as the fleet having shrunk; and the bar hides itself below two repos, which makes it
+mostly a fleet-wide-scope control — the scope that needed it. It does **not** narrow WORK:
+`gh` is only ever asked about the watched repos, so filtering those rows would show all of
+them or none.
+
 The SEAT ROWS of AGENTS are not scoped: `tmux_seats()` lists every seat pane on the whole
 tmux server, so another screen's seat is a pane you can still close, and narrowing it away
-would take the `✕` with it. Nor is the liveness a claim row is judged against — an agent the
+would take the `✕` with it. It returns `(seats, error)` rather than a bare list, because an
+empty list is a fact about the SCREEN and a failure is a fact about the MACHINE: a shim on
+PATH ahead of the real tmux once made every call exit 127, and the panel reported "no seat
+screen on this server" beside a screen with three seats in it while the `＋` declined to add
+one. A tmux that cannot be reached now rides the AGENTS title as `tmux: <what went wrong>`
+and the `＋` says the panel is blind rather than empty. Being **outside** tmux is not an
+error and deliberately reports none — the dashboard full-screen in a bare terminal is a
+first-class way to run it, and a complaint that fires whenever nothing is wrong is how the
+real failures get buried. Nor is the liveness a claim row is judged against — an agent the
 scope hid is still alive, and calling its claim `gone` because this pane is narrow would be
 stating a fact about somebody's work on the strength of a filter. A claim whose holder the
 scope hid keeps a row of its own, marked `elsewhere`, because it is in scope and its holder
@@ -2499,8 +2779,8 @@ setting: the repo supplies a default, the board states the value in force, and t
 that answered is part of the answer ([#305](https://github.com/prisonblues/quarterback/issues/305)).
 Until [#477](https://github.com/prisonblues/quarterback/issues/477) **no screen showed one**
 — a dial was set from an endpoint and read back by one function in `panel_seats.py`, so the
-value governing every round on the fleet was invisible on `qb-dash`, `qb-dash-tui`,
-`qb-board` and the web board alike. That was tolerable while a dial only configured what a
+value governing every round on the fleet was invisible on the dashboard, `qb-board`
+and the web board alike. That was tolerable while a dial only configured what a
 review round costs; it stops being tolerable with `tempo` (#474), which is the answer to
 *"is this fleet working right now, and how hard"*.
 
@@ -2918,25 +3198,24 @@ is the only place it can surface at all. Do not read a quiet dashboard as a uniq
 `qb-seats` builds it. A screen is seats across the top, the dash down the right, and the
 tape full width along the bottom — the dash reports what is true now, the tape what just
 happened, and a screen wants both. `QB_SEATS_DASH` names the command; **set it to the
-empty string for a screen with no dash**. The default is the clickable `qb-dash-tui`
-since #426, falling back to the plain `qb-dash` on a box where `textual` cannot be
-imported.
+empty string for a screen with no dash**. It runs `qb-dash`, and there is nothing to
+choose: one renderer, so `dash_cmd` no longer probes for one.
 
-It was the other way round for four days longer than it should have been. The plain
-one was the default because the TUI keyed its seat rows by seat NAME, every screen
-numbers its seats from 1, and a second screen anywhere on the box turned that pane
-into a `DuplicateKey` traceback — a pane you look at when something is wrong must
-not be the thing that breaks first. #208 and #209 closed that on 2026-08-20 (seat
-rows key on the tmux pane id now, which is unique box-wide) and nothing pointed back
-at the decision the fix released, so the workaround simply stayed.
+It took a while to get there. The plain renderer held this slot until #426, because
+the clickable one keyed its seat rows by seat NAME, every screen numbers its seats
+from 1, and a second screen anywhere on the box turned that pane into a `DuplicateKey`
+traceback — a pane you look at when something is wrong must not be the thing that
+breaks first. #208 and #209 closed that on 2026-08-20 (seat rows key on the tmux pane
+id now, which is unique box-wide), and nothing pointed back at the decision the fix
+released, so the workaround stayed four days longer than it should have.
 
-**The probe is now a dependency check rather than a crash check**, and the inversion
-is the point. `dash_cmd` asks `qb-dash --can-tui`, which runs the launcher's own
-interpreter search and so cannot disagree with the launch that follows — one search,
-not two that drift. `qb-dash` on PATH is still the gate: a partial install carrying
-only the TUI entry point falls to the placeholder rather than being promoted, and
-with neither installed the pane holds a shell and a line saying which command to
-set, rather than the screen quietly being one pane short.
+**The `--can-tui` probe is gone with the renderer it chose between.** It asked whether
+`textual` could be imported here, which was worth asking only while there was a lesser
+thing to fall back to. Losing it also loses the trap it carried: it resolved `qb-dash`
+on PATH a second time, so a checkout's `bin` ahead of the installed profile could have
+the probe answer for one install while a different one did the running. `qb-dash` on
+PATH is still the gate — with none installed the pane holds a shell and a line saying
+which command to set, rather than the screen quietly being one pane short.
 
 `QB_SEATS_DASH_SIZE` is its width in columns, default 78 — what the dashboard's own table
 wants before it wraps — **and never more than a third of the window**. That ceiling is
@@ -3094,6 +3373,7 @@ qb-reconcile                     # every repo the board's plan names
 qb-reconcile --repo owner/name   # just that one
 qb-reconcile --json              # the whole report, unknowns beside the findings
 qb-reconcile --post              # put the report on the board — when it CHANGED, or aged out
+qb-reconcile --apply             # complete items whose own PR is merged (#552)
 qb-reconcile --include-drafts    # count draft PRs as untracked work too
 qb-reconcile --quiet             # say nothing when there is nothing to say
 ```
@@ -3155,11 +3435,90 @@ disagreements:
 | `note_contradicted` | the item's note asserts a readiness `/review/findings` denies |
 | `untracked_pr` | an open PR no open plan item accounts for |
 
-**No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. It never
-edits the plan: "this item looks done" is a candidate for a human or a `plan_done` call, not
-a state transition to make behind their back — and `dropped` in particular is a *decision*,
-which is why the plan's model keeps it apart from `done`. The only write it can make is one
-board post, and only when asked.
+**No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. The writes
+it can make are one board post (`--post`) and one plan transition (`--apply`), both opt-in.
+
+**It never *judges* — which is a narrowing of "it never edits the plan", and #552 is why.**
+That was the rule, and it was measured: ranks 1, 2 and 3 of this repo's plan were closed
+work, flagged `done_candidate` and re-confirmed every fifteen minutes for days, while on
+lexray **thirteen finished items sat on top of a thirty-one-item human-ordered plan** with
+every one of their claims already expired. Picking work up writes a plan item (#427) and
+nothing writes it back, and the two halves decay differently: a claim expires on its TTL and
+needs nobody, an item has no TTL at all. So the residue is permanent, and it lands at the
+*top*, because picked-up items rank first. The detector had been right and unheard the whole
+time; what was missing was an actor. `dropped` stays a decision the plan's model keeps apart
+from `done`, and nothing here infers one.
+
+#### `--apply` — the one transition it may make (#552)
+
+It completes an item whose **own ref is a pull request GitHub reports `MERGED`**, and nothing
+else. That the work merged is a fact about the code; recording it is bookkeeping.
+
+**Only that leg, and the `test`-branch flow is the reason.** #552's predicate is three-legged
+— an item is done when its PR merges, or its issue is closed, or the agent releases it — and
+`MERGED` is the only leg that is base-branch agnostic. GitHub says `MERGED` whatever the base,
+so a PR that landed on `test`, or on an `fca` integration branch two merges below it, completes
+its item with no change at all. A closing keyword only fires on a merge into the repository's
+*default* branch, and an item whose ref is an **issue** cannot see the pull request that
+implemented it — the item→PR edge is computed on every pass and stored nowhere (#396). So an
+issue-ref `done_candidate` is **declined by name, in the report, on every tick** rather than
+acted on or quietly skipped: the residue that limb would clear stays readable until #396 makes
+it answerable.
+
+Everything it will not do, it says:
+
+| the report says | what it means |
+|---|---|
+| `COMPLETED` | the item's own PR is merged and the board accepted the write |
+| `NOT COMPLETED` | the pass decided to complete it and the write failed — exit code 1 |
+| `LEFT ALONE` | a `done_candidate` this pass does not complete, with the reason |
+
+Three properties hold it to that. **The merge is re-read from GitHub at the point of the
+write**, not inferred from the condition: `CONDITIONS` is a vocabulary five checks share and
+any of them may widen, and an actor trusting the label would one day complete an item on a
+fact nobody checked, on a fifteen-minute timer. **A run that could not reach GitHub writes
+nothing**, which falls out rather than being special-cased — an unresolved ref is an `unknown`
+and raises no finding, so there is nothing to read as a merge. And **a refused write is
+reported and raises the exit code**: a 409 is the board holding a rule this pass must not route
+around ("a human dropped this item" is the one state `done` refuses), and a rule enforced into
+a silence is a rule nobody learns.
+
+**A claim the board leaves is named.** `POST /plan/item/done` releases the item's claim only
+when it is the caller's, and this pass calls with a machine token and no session — so an item a
+live agent is still holding is recorded done with that claim standing, and the endpoint says so
+in `claim_left`. That is the endpoint's own rule, and the residue this is about is the other
+case entirely: every one of lexray's thirteen claims had already expired. The holder is carried
+into the report anyway, because a row that went done under somebody's hand is the one row a
+reader may want to ask about.
+
+**A row somebody else finished is named, and this pass's receipt is not written twice.** Every
+machine in the fleet runs this timer over the same plan, so two hosts sending the same
+completion is the ordinary case rather than an unlucky one. Since #723 the board settles it:
+`open -> done` is a conditional transition, exactly one caller makes it, and the others are
+answered `changed: false` with `done_by` naming who won — so the report says who got there
+first by reading the answer rather than by comparing the returned timestamp against the moment
+the write went out, which was only ever as good as the agreement between two clocks. Against a
+board older than that there is no `changed` and the line is simply absent: a guess nothing
+supports costs more than the sentence it would explain.
+
+**`qb-next` retires a finished row too, and the two agree on the word.** Walking the plan for
+something to claim, it asks the forge about each candidate and records a row whose ref has
+already closed — `MERGED` for a PR, `CLOSED` for an issue, the same per-kind rule for the same
+reason. That is not a duplicate of this and neither replaces the other. `qb-next` needs an
+agent to be *there*, arriving through `/get-involved` and walking down from the top; the
+residue is precisely what escapes it — lexray's thirteen items were worked through
+`/fix-issue`-shaped routes, so nothing ever walked that plan. And where `qb-next` does retire
+an issue-ref row, it is a row it has just claimed and is about to work, with an agent present
+to read the answer; `--apply` acts across every plan unattended on a timer, which is why it
+takes the narrower leg. A guard holds `APPLY_STATE` against `qb-next`'s `TERMINAL["pr"]`: two
+tools that retire a plan item on the same fact must not disagree about what the fact is.
+
+**An item it completed is withdrawn from the `/plan/reconcile` hand-off**, and only that. Those
+rows exist to tell a reader of the plan that an *open* item looks finished; reported for an item
+this pass just completed, `plan_read` would hang "looks done" off a row that is done, and
+re-assert it every tick — `run` reads open rows only, so it would never find it again to
+withdraw it. A write that *failed* keeps its finding: there the item is still open and the
+disagreement still stands.
 
 **Ref kind is not one of the conditions.** The first two are "the item outlived its work"
 and "the work was abandoned"; whether that work is spelled as a PR or an issue is only how
@@ -3198,13 +3557,19 @@ anyway. The exit code carries the same distinction:
 
 ```
 0   ran, every check completed (a disagreement is the report, not an error)
-1   ran, but at least one check could not be made
+1   ran, but at least one check could not be made — or, under `--apply`, a write it
+    decided on could not be made either
 2   could not run at all: no board, no `gh`, or bad arguments
 ```
 
 Run it on a timer with
 [`loops/systemd/qb-reconcile.{service,timer}`](loops/systemd/) — reference units, like the
-lander's. There is no `--execute` to graduate to, because there is nothing for it to do.
+lander's. The shipped unit runs `--apply --post --quiet`: the timer is what carries the actor,
+because it covers every route work is picked up through and every abnormal ending, including a
+session that died mid-work. **The live units on this fleet come from nix-fleet's
+`home/rich-workstation.nix`** (#695's row is about exactly that split), so a flag added here
+reaches a host only once that config carries it too. The same split is what decides the rollout
+order for a change to the claim protocol — see `--no-plan-item` under `qb-claim` above.
 
 `--json` is what #232's orderer reads: an orderer cannot order a plan that does not describe
 the present, which is why this is the deterministic half of that issue in its cheapest form.
@@ -3480,7 +3845,17 @@ that failed, a configured remote that is not there, and — Codex's finding on t
 remote whose refspec does not bring back `refs/heads/*`, since a single-branch clone would
 otherwise report every feature branch on the server as work that exists only on this disk.
 **Every** remote is refreshed, not only the configured one, because `--not --remotes`
-subtracts the tracking refs of all of them. A remote that fetched cleanly and holds no
+subtracts the tracking refs of all of them.
+
+**And the same four refusals as the sweep, because it is the same question (#611).** A
+negative refspec, a destination outside `refs/remotes/`, a ref under `refs/remotes/` that no
+refspec writes to, and a `config` read that failed as against a remote with nothing
+configured — `qb-catchup` grew all four for #573 and this row grew none of them, so on any of
+those configurations the sweep refused and this answered, about the same commits on the same
+disk. The logic cannot be shared (one tool is shell, the other Python), so what holds them
+together is `test_the_two_tools_refuse_the_same_configurations`, which runs **both** against
+one checkout per configuration and fails the moment either side grows a guard the other
+has not. A remote that fetched cleanly and holds no
 branches is not an unknown: the query succeeded, and the answer is that nothing here has
 ever been pushed.
 
@@ -3513,7 +3888,9 @@ path existing in the checkout.
 shell alias. Three of the six symptoms on #204 are a check that could not run being reported
 as a check that passed: `prune-worktrees` calling a skipped database scan `Nothing to prune.
 Clean.` over a 13 MB orphan, `worktree-holder`'s exit 4 that `/tree-shake` proceeded on, and
-`qb-reconcile`'s `stopped` that the deployed board could not attribute. #324 settled the
+`qb-reconcile`'s `stopped` that the deployed board could not attribute. The first of those
+is now fixed where it happened rather than only here: `prune-worktrees` reports `NOT CHECKED`
+per category and withholds `Clean.` from a run that could not look (#735, above). #324 settled the
 same argument for CI results a day before this landed. **A doctor that prints `ok` because
 it could not look is worse than one that does not check**, because it launders ignorance
 into assurance — and unlike a stale layer, a false green never announces itself later.
@@ -4272,11 +4649,12 @@ work. Two genuinely different flakes still refuse, by name: picking the first wo
 a bump against a directory nobody rebuilds from, which looks exactly like a good proposal
 and does nothing at all.
 
-**The system attribute is not the hostname.** This fleet's `zeus` is
-`nixosConfigurations.desktop`. So the hostname is a first guess checked against the flake's
-own attribute names, and the fallback is to ask each configuration what `networking.hostName`
-it declares — correct, slow, and defeated by a host that does not evaluate here at all, which
-is what `--host` and `programs.quarterback-harness.consumer.attr` are for.
+**The system attribute is not necessarily the hostname.** It is on this fleet — `zeus` is
+`nixosConfigurations.zeus` — and on a fleet like that nothing below ever runs. But it is not a
+rule, so the hostname is a first guess checked against the flake's own attribute names, and the
+fallback is to ask each configuration what `networking.hostName` it declares — correct, slow,
+and defeated by a host that does not evaluate here at all, which is what `--host` and
+`programs.quarterback-harness.consumer.attr` are for.
 
 #### What `--apply` refuses, and why each one
 
@@ -4388,8 +4766,8 @@ to the file that just ran, the name is what gets printed.
   **And it tells the board** (#262). A marker file answers the question for the pane it
   is written on, which is half of what a fleet is: cross-machine it is not there to read,
   and same-machine nothing read it. So the same call POSTs the stage to `/lease/stage`,
-  which puts it on the session's lease — where `/active`, `/overlap`, `/fleet`, `qb-board`,
-  `qb-dash` and `qb-dash-tui` all show it — and emits one `status` post on the live stream
+  which puts it on the session's lease — where `/active`, `/overlap`, `/fleet`, `qb-board`
+  and `qb-dash` all show it — and emits one `status` post on the live stream
   when it *changes*, so a follower hears about a transition rather than polling for it.
   `qb-stage` is the right place to say it because it is the only thing in the system that
   is *told* the stage; the lifecycle hook reading this marker on each heartbeat would need
@@ -4843,7 +5221,8 @@ Read these before adopting rather than after.
   On a host also running self-hosted CI it originally picked a runner's throwaway
   `<hex>_postgres16_<hex>` service, which made `create-worktree` fail with `role "..." does
   not exist` and, worse, made `prune-worktrees` report `Orphan databases: none` while a
-  hundred orphans sat in the real container. An explicit name (as in
+  hundred orphans sat in the real container (that line now reads `NOT CHECKED` — #735 — but
+  the wrong container is still the wrong container). An explicit name (as in
   `worktree.example.json`) removes the ambiguity entirely.
 - **`/fix-issue` does not stop to ask.** It plans, implements, pushes and opens a PR in one
   run. That is the point of it, and it is also the reason to read it before pointing it at

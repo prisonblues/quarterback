@@ -45,12 +45,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness_rules  # noqa: E402
 import panel  # noqa: E402
 import panel_core  # noqa: E402
+import panel_propose  # noqa: E402
 import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
-import panel_propose  # noqa: E402
-import harness_rules  # noqa: E402
 
 DEFAULT_BLOCK = harness_rules.DEFAULTS["review_panel"]
 
@@ -599,7 +599,8 @@ def test_the_default_is_on_and_is_the_one_the_rules_file_documents():
                                             "premise_undecidable": True,
                                             "fix_injection": 0.5,
                                             "new_findings_not_falling": 1,
-                                            "unrefereed_fix": True}
+                                            "unrefereed_fix": True,
+                                            "guard_lines": False}
     assert panel_rounds.unrefereed_fix_brake(DEFAULT_BLOCK, []) is True
 
 
@@ -777,7 +778,7 @@ def test_a_below_floor_policy_stop_keeps_its_own_reason_and_its_confidence():
     the cap back its monopoly on ending the loop."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   unrefereed=_unrefereed())
     assert got["stop"] is True and got["confident"] is True
     assert "round trigger floor" in got["reason"]
@@ -907,11 +908,12 @@ def test_the_weight_is_on_the_dials_line_the_fixers_brief_is_built_from():
     own, because it is not a second setting a reader weighs separately — a line saying
     "40 lines" beside one saying "x2" leaves the reader to work out what 40 buys."""
     gist = panel_seats.resolve_dials({}, None, []).gist()
-    assert "below-P2 fix budget 40 lines, unrefereed x2" in gist
+    assert ("below-P2 fix budget 40 lines, in full at 14,325+ chars of round 1 and "
+            "pro rata below, unrefereed x2") in gist
     # Printed at `1` too: a dial that vanishes from the line at some settings is one a
     # reader cannot tell from a dial that was never applied.
     off = panel_seats.resolve_dials({"unrefereed_line_weight": 1}, None, []).gist()
-    assert "40 lines, unrefereed x1" in off
+    assert "pro rata below, unrefereed x1" in off
     # ...and suppressed where the budget is off, where it is a unit of nothing.
     none = panel_seats.resolve_dials(
         {"low_severity_fix_lines": None}, None, []).gist()
@@ -932,7 +934,12 @@ def test_the_budget_NOTE_carries_the_weight_into_the_fixers_brief(
                          [("app/mirror.py", 2, "a nit worth one line")],
                          head="a" * 40, compare=UNREFEREED_COMPARE,
                          config={"fix_severity_floor": "P4",
-                                 "round_trigger_floor": "P1"})
+                                 "round_trigger_floor": "P1",
+                                 # #551's proportional half off: this asserts what the
+                                 # note says about the WEIGHT, and the fixture PR is
+                                 # small enough that the proportion would cut the
+                                 # number the sentence quotes.
+                                 "low_severity_fix_full_chars": None})
     note = next(line for line in capsys.readouterr().out.splitlines()
                 if "budget for the WHOLE round" in line)
     assert "2x a line of production code" in note
@@ -961,6 +968,7 @@ def test_the_brief_tells_the_fixer_to_multiply_rather_than_to_forecast():
 # ------------------------------------------------------------------------- the reach
 
 import json  # noqa: E402
+
 import panel_preflight  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 

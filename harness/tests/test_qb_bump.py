@@ -372,9 +372,10 @@ def test_the_config_parser_agrees_with_qb_doctors(tmp_path):
 # --------------------------------------------------------------------------- #
 
 def test_the_attribute_is_matched_by_hostname_not_assumed_to_be_it(monkeypatch, tmp_path):
-    """This fleet's `zeus` is `nixosConfigurations.desktop`. Assuming the attribute is the
-    hostname fails on the machine this was written for, and assuming the wrong one hands a
-    person a command that switches their desktop onto a laptop's configuration."""
+    """The fixture is a fleet whose attribute names are not its hostnames: `desktop`
+    declares hostName `zeus`. Assuming the attribute IS the hostname fails on a fleet
+    shaped like that, and assuming the wrong one hands a person a command that switches
+    their desktop onto a laptop's configuration."""
     monkeypatch.setattr(qb.socket, "gethostname", lambda: "zeus.local")
 
     def fake_nix(*args, **kw):
@@ -559,7 +560,7 @@ def test_nothing_in_the_agent_path_ever_runs_nixos_rebuild(consumer_repo, quarte
 # --------------------------------------------------------------------------- #
 
 @pytest.fixture
-def prepared(consumer_repo, monkeypatch) -> "qb.Proposal":
+def prepared(consumer_repo, monkeypatch) -> qb.Proposal:
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix("b" * 40))
     proposal, _, _ = qb.prepare(qb.Consumer(consumer_repo, "quarterback", "quarterback", "a" * 40, "--flake"),

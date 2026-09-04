@@ -4,7 +4,7 @@ it the moment its source changes.
 
 The problem it solves is not "Textual has no hot reload" — it is that the thing
 on the seat screen is not the thing you are editing. `qb-dash` on PATH resolves
-to /nix/store/…-quarterback-harness/bin/qb-dash.py, so an edit to
+to /nix/store/…-quarterback-harness/bin/qb-dash-tui.py, so an edit to
 harness/bin/qb-dash-tui.py is invisible until a home-manager switch. This runs
 the launcher OUT OF THE CHECKOUT instead, where the same script finds
 ../../mcp/.venv/bin/python beside itself and imports the source you just saved.
@@ -14,9 +14,8 @@ and both apps here declare `CSS = \"\"\"…\"\"\"` inline — so there is nothin
 disk for it to watch, and a full relaunch is the honest mechanism. It costs the
 app's cursor position and selected pane, which is the trade being made.
 
-  harness/dev/tui-watch dash      the clickable dashboard  (harness/bin/qb-dash --tui)
+  harness/dev/tui-watch dash      the dashboard             (harness/bin/qb-dash)
   harness/dev/tui-watch board     the full-screen board client (harness/bin/qb-board)
-  harness/dev/tui-watch plain     the non-Textual dash, for comparing the two halves
   harness/dev/tui-watch dash --scope all      trailing args go to the target
   harness/dev/tui-watch -- ./some/other/thing extra args
 
@@ -58,16 +57,12 @@ RESET = "\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?25h"
 #: repo-relative; a directory is walked, a file is watched as itself.
 TARGETS = {
     "dash": {
-        "cmd": ["harness/bin/qb-dash", "--tui"],
+        "cmd": ["harness/bin/qb-dash"],
         "watch": ["harness/bin/qb-dash-tui.py", "harness/bin/qbdata.py", "harness/bin/qb-dash"],
     },
     "board": {
         "cmd": ["harness/bin/qb-board"],
         "watch": ["mcp/mcp_server/board", "mcp/mcp_server/client.py", "harness/bin/qb-board"],
-    },
-    "plain": {
-        "cmd": ["harness/bin/qb-dash"],
-        "watch": ["harness/bin/qb-dash.py", "harness/bin/qbdata.py", "harness/bin/qb-dash"],
     },
 }
 

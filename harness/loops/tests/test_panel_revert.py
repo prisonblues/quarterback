@@ -44,9 +44,9 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_core  # noqa: E402
+import panel_preflight as pf  # noqa: E402
 import panel_rounds  # noqa: E402
 import panel_scope  # noqa: E402
-import panel_preflight as pf  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
 
@@ -504,7 +504,7 @@ def test_a_below_floor_policy_stop_is_over_the_rate_and_still_proposes_nothing()
     to one would arrive on a confident, converged verdict."""
     quiet = [_finding("P4", key_from=f"nit {i}") for i in range(4)]
     got = panel_rounds.round_stop(2, 5, [c.key for c in quiet], quiet, [],
-                                  trigger_floor="P2", fix_floor="P2",
+                                  trigger_floor="P2", cleared_floor="P2",
                                   injection=_injection(9, 1), revert=_armed())
     assert got["fix_injection"]["over"] is True
     assert got["fix_injection"]["fired"] is False

@@ -55,7 +55,7 @@ def test_a_git_option_that_takes_a_value_does_not_hide_the_verb(cmd):
     assert destructive(cmd), cmd
 
 
-def test_a_dry_run_in_one_clause_does_not_excuse_another(): 
+def test_a_dry_run_in_one_clause_does_not_excuse_another():
     """447-F14. `git clean -n` removes nothing, and the exemption for it was
     tested against the WHOLE command — so a harmless first clause excused a
     destructive second one."""

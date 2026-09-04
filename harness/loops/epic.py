@@ -32,14 +32,22 @@ import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 from appetite import label_names, refusal_verdict  # noqa: E402
 from harness_rules import (  # noqa: E402
-    DEFAULTS, RepoNotFound, agent_failure, agent_gist, ci_report, cli_failure_gist,
-    describe, resolve_repo, run_agent, tail_gist,
+    DEFAULTS,
+    RepoNotFound,
+    agent_failure,
+    agent_gist,
+    ci_report,
+    cli_failure_gist,
+    describe,
+    resolve_repo,
+    run_agent,
+    tail_gist,
 )
 from needs_human import announce, class_or_none  # noqa: E402
 
@@ -195,7 +203,7 @@ def load_repo_cfg(name: str) -> dict:
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 # ----------------------------------------------------------------- run state

@@ -12,10 +12,9 @@ suites, and for the one thing a declaration-based contract cannot catch.
 
 from __future__ import annotations
 
-import pytest
-
 import _flake_sandbox as flake
 import _prose_sandbox as contract
+import pytest
 
 
 @pytest.fixture(scope="module")
@@ -241,6 +240,7 @@ def test_every_member_gates_the_reads_it_does_declare(member):
     # The gates take what their own suite naturally passes — a repo-relative path, a bare brief
     # filename — so this asks each one for something it must accept rather than a uniform shape.
     accepted = {"test_fixer_escalation": lambda: gate(sorted(reads)[0]),
+                "test_fixer_consumers": lambda: gate(sorted(reads)[0]),
                 "test_regression_test_redgreen": lambda: gate("review-pr.md"),
                 "test_commands_wired": lambda: gate("harness/hm-module.nix")}[member]
     assert accepted() is not None

@@ -424,6 +424,65 @@ def _no_escalation_posts(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_board_reads(monkeypatch):
+    """No test READS a real board either, and this is the read half of the two
+    fixtures above.
+
+    `board_terminal_verdict` (#617) is called on every round, unconditionally and
+    before any gate — so every panel test that does not stub it puts an HTTPS
+    request to whatever board THIS host's site config names. On an enrolled
+    workstation that is a live board, which makes the whole suite depend on a
+    remote service being up: under `-n 8` it answers some of those requests with a
+    503, the round appends *"the board could not be asked …"* to `config_notes`,
+    and the several tests asserting `config_notes == []` go red in a different
+    combination on every run. Nothing is wrong with the code under test, and
+    nothing about the failure says so.
+
+    The answer given is `{"runs": []}` — a board that holds no recorded run for
+    this PR, which is what the live board says for the fictional repos this suite
+    uses, and which `board_terminal_verdict` reads as "no cycle ended here" in
+    silence. So the fixture changes no assertion; it only stops them depending on
+    the network.
+
+    A test about the board answers for itself: `monkeypatch` inside the test runs
+    after this and wins, which is how `test_panel_prior_cycle` drives every verdict
+    in this module.
+    """
+    monkeypatch.setattr(panel, "board_get", lambda path, params: ({"runs": []}, ""))
+
+
+@pytest.fixture(autouse=True)
+def _no_next_door_fetch(monkeypatch):
+    """No test asks a real board what was confirmed next door (#508).
+
+    Autouse and unconditional, on `_no_escalation_posts`' rule and for exactly its
+    failure mode: `board_next_door` runs on EVERY round, resolves the board out of
+    this HOST's site config, and on an enrolled machine therefore makes a live HTTP
+    call per round — while the header of this file says in capitals that the suite
+    does not talk to a board. In the nix sandbox there is no board and nothing
+    happens, which is why CI would never have found it.
+
+    It was not found by reading, either. It surfaced as four unrelated e2e panel
+    tests going red on an assertion about `config_notes` being empty, because the
+    live board answered 422 (it predates the endpoint) and the round dutifully
+    reported that it could not fetch. A leak that announces itself in somebody
+    else's assertion is the good case; the same call succeeding against a real
+    board would have made these tests mean different things on two machines, which
+    is the leak this whole file exists to close.
+
+    Stubbed at `board_next_door` rather than at `board_request` so that the reason
+    a round has no hints is "nothing was asked", not "the board said no" — the
+    second would put a note in every report and change what the e2e tests assert.
+
+    `test_panel_next_door.py` is the file this would blind, and it restores the
+    real function explicitly (`_the_real_fetch`) rather than opting out: a test of
+    this function that silently ran against the stub would assert on `([], "")` and
+    pass whatever the function did.
+    """
+    monkeypatch.setattr(panel, "board_next_door", lambda *a, **k: ([], ""))
+
+
+@pytest.fixture(autouse=True)
 def recorded_runs(monkeypatch):
     """No test records a real run on a real board (#94), and here is the list of
     what it would have recorded.
@@ -459,4 +518,47 @@ def recorded_runs(monkeypatch):
     # other is exactly how a guard like this comes to cover nothing.
     monkeypatch.setattr(panel, "record_run", _record)
     monkeypatch.setattr(panel_seats, "record_run", _record)
+    return seen
+
+
+@pytest.fixture(autouse=True)
+def pr_claims(monkeypatch):
+    """No test claims a real PR on a real board (#253), and here is what it would
+    have claimed.
+
+    Autouse and unconditional, for `recorded_runs`' argument exactly: `hold_pr`
+    shells out to `qb-claim`, `qb-claim` resolves the board out of THIS host's
+    site config, and it is on the PATH of every enrolled workstation. A test that
+    reaches it there takes a live claim on a live PR — green suite, and an agent
+    somewhere is then told the PR it is reviewing is held by a test run — while in
+    the nix sandbox, which carries no `qb-claim`, nothing happens at all. Quietly
+    correct on the one box nobody develops on is the failure both these fixtures
+    exist to rule out.
+
+    Worse than the record it copies, in one way worth stating: a spurious run on
+    the board is bad data, and a spurious CLAIM is bad data that REFUSES somebody.
+    `create-worktree --require-claim` and the plan's pickup gate both stop for
+    one.
+
+    Yields what was taken and handed back, in order, so a test can assert the pair
+    rather than only the first half — a claim taken and never released is the
+    failure mode `release_pr` exists for. Both return "", which is what the real
+    pair return when the board answered.
+    """
+    seen: list[tuple] = []
+
+    def _hold(repo_path, pr_number, round_no) -> tuple[str, bool]:
+        seen.append(("hold", str(repo_path), int(pr_number), int(round_no)))
+        return "", True
+
+    def _release(repo_path, pr_number) -> str:
+        seen.append(("release", str(repo_path), int(pr_number)))
+        return ""
+
+    # Both names, for the reason `recorded_runs` gives: `panel` star-imports these
+    # into its own namespace and `panel_seats` is where they are defined, so a
+    # guard on one name and a call site on the other covers nothing.
+    for mod in (panel, panel_seats):
+        monkeypatch.setattr(mod, "hold_pr", _hold)
+        monkeypatch.setattr(mod, "release_pr", _release)
     return seen

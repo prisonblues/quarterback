@@ -105,6 +105,36 @@
      something" and "it is parked on you". */
   .tab.blocked { color:#ff8f6b; border-color:#6b3524; text-decoration:none; }
   .tab.blocked.mine { color:#ffd0c0; border-color:#a5533a; background:#3a201a; }
+  .tab.blocked.open { background:#3a201a; border-color:#a5533a; }
+
+  /* The queue itself (#677). Red like the chip, because it is the chip opened up:
+     the same rows it counts, with the box that answers them. It scrolls INSIDE
+     itself rather than sticking to the viewport — the header is already sticky at
+     `top:0` and wraps to two lines on a phone, so a second sticky element would
+     have to guess a height that changes. A long queue therefore costs the panel a
+     scrollbar and never the page its header. */
+  .bpanel { max-width:940px; margin:0 auto; background:var(--panel);
+            border:1px solid #6b3524; border-top:none;
+            border-radius:0 0 12px 12px; padding:8px 12px 12px;
+            max-height:70vh; overflow-y:auto; }
+  .bp-head { display:flex; align-items:center; gap:8px; padding:2px 0 6px; }
+  .bp-title { color:#ff8f6b; font-size:12px; font-weight:600; }
+  .bp-sub { color:var(--muted); font-size:11px; }
+  .bp-note { color:#35c48a; font-size:11px; padding:2px 0 6px; }
+  .bl { border:1px solid var(--line); border-radius:10px; background:var(--bg);
+        padding:8px 10px; margin:8px 0; }
+  .bl.mine { border-color:#a5533a; }
+  .bl-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .bl .bclass { color:#ff8f6b; background:#2a1a15; }
+  .bl-q { margin:6px 0 0; font-size:13px; }
+  .bl-detail { color:var(--muted); font-size:11px; white-space:pre-wrap; margin-top:4px; }
+  .bl-meta { color:var(--muted); font-size:11px; margin-top:4px; }
+  .bl-row { display:flex; gap:6px; margin-top:6px; align-items:center; }
+  .bl-row input { flex:1; min-width:0; }
+  .bl-row button { font:inherit; font-size:12px; cursor:pointer; background:#222831;
+                   color:#9fddc7; border:1px solid #2e3742; border-radius:6px;
+                   padding:4px 10px; flex:0 0 auto; }
+  .bl-err { color:#e5484d; font-size:11px; margin-top:4px; }
   .badge { display:inline-block; min-width:16px; text-align:center; margin-left:5px;
     font-size:10px; border-radius:999px; padding:0 5px; background:#4a3b6b; color:#e6d9ff; }
   .answered { color:#35c48a; font-size:11px; }
@@ -164,8 +194,9 @@
   <!-- Persistent, and NOT part of the stream — that is the whole point. A `stuck`
        post scrolls past and a blocker is a thing that is still true, so this sits
        in the sticky header where it stays visible until somebody answers it. -->
-  <a id="blockedChip" class="tab blocked" href="/plan/view" hidden
-     title="questions waiting on a person — answer them on the plan page"></a>
+  <button id="blockedChip" class="tab blocked" type="button" hidden
+     aria-expanded="false" aria-controls="blockedPanel"
+     title="questions waiting on a person — open the list and answer them here"></button>
   <div class="tabs" hidden>
   </div>
   <a href="/fleet" style="color:var(--accent);font-size:12px;text-decoration:none">fleet →</a>
@@ -174,6 +205,22 @@
   <a href="/dials/view" style="color:var(--accent);font-size:12px;text-decoration:none">dials →</a>
   <a href="/panel" style="color:var(--accent);font-size:12px;text-decoration:none">panel stats →</a>
 </header>
+<!-- The list the chip expands (#677). It sits directly under the sticky header
+     rather than in `main` because it is not a third view of the stream: it is the
+     chip saying what it is counting, so it opens against the chip and pushes the
+     feed down rather than replacing it. It scrolls away with the page — see
+     `.bpanel` for why a second sticky element under a header that wraps to two
+     lines on a phone would have to guess a height that changes. -->
+<section id="blockedPanel" class="bpanel" hidden aria-label="questions waiting on a person">
+  <div class="bp-head">
+    <span class="bp-title">&#9940; waiting on a person</span>
+    <span id="blockedSub" class="bp-sub"></span>
+    <span style="flex:1"></span>
+    <button id="blockedClose" class="sheet-x" type="button" aria-label="close the list">&#10005;</button>
+  </div>
+  <div id="blockedNote" class="bp-note" role="status" hidden></div>
+  <div id="blockedList"></div>
+</section>
 <main>
   <div id="sessionsView"></div>
   <div id="feedView" hidden><div id="feed"></div></div>
@@ -432,29 +479,260 @@ async function loadMe(){
 // fleet is stuck. Unowned blockers are everyone's to answer and nobody's to be
 // nagged about, so they count toward the first and never the second.
 const blockedChip = document.getElementById("blockedChip");
+const blockedPanel = document.getElementById("blockedPanel");
+const blockedList = document.getElementById("blockedList");
+const blockedSub = document.getElementById("blockedSub");
+const blockedNote = document.getElementById("blockedNote");
+const blockedClose = document.getElementById("blockedClose");
+
+// The rows behind the number, kept so the panel can re-render on a toggle without
+// a second read. The chip has always had them in hand — that is what makes #677 a
+// rendering change rather than a new mechanism.
+let blockedRows = [];
+let blockedOpen = false;
+// Reads are numbered so a slower earlier one cannot paint over a later one.
+let blockedSeq = 0;
+// `GET /blockers` defaults to 200 and caps at 1000, and it applies the limit before
+// it counts — so an unlimited-looking read was quietly the oldest 200, and both the
+// chip's number and this list would have been a truncation presented as a total.
+// Asked for explicitly, at the endpoint's maximum, and said out loud when it binds:
+// the inbox does the same a few hundred lines down, for the same reason.
+const BLOCKED_LIMIT = 1000;
+let blockedCapped = false;
 
 async function loadBlocked(){
+  // The endpoint decides who may answer and its refusal is the authority; the page
+  // does not offer a write surface it knows will be refused. `loadMe` already gates
+  // the call, and this repeats it so a future caller cannot quietly un-gate it.
+  if(!canWrite()) return;
+  const seq = ++blockedSeq;
   let out;
   try {
-    const r = await fetch("/blockers?open=true", {headers:{Accept:"application/json"}});
+    const r = await fetch(`/blockers?open=true&limit=${BLOCKED_LIMIT}`,
+                          {headers:{Accept:"application/json"}});
     if(!r.ok) return;                       // a board that will not answer says nothing
     out = await r.json();
   } catch(e){ return; }
+  // Answer two rows in quick succession and each starts a read of its own. If the
+  // first response lands second, the list reverts to the state that still held the
+  // row just resolved — an open answer box on a question the server has already
+  // closed, and clicking it earns a 409. Last read wins.
+  if(seq !== blockedSeq) return;
   const all = out.blockers || [];
-  if(!all.length){ blockedChip.hidden = true; return; }
+  blockedRows = all;
+  blockedCapped = all.length >= BLOCKED_LIMIT;
+  renderBlockedChip();
+  renderBlocked();
+}
+
+// The chip is painted from `blockedRows` rather than from a response, so the one
+// caller that changes those rows without a read — answering one — can repaint
+// without waiting for the server to agree. See the answer handler for why that
+// matters when the re-read is the thing that fails.
+function renderBlockedChip(){
+  const all = blockedRows;
+  // Hidden at zero, EXCEPT while the panel is open. The chip is then the panel's
+  // own toggle, and taking it away from somebody who has just answered the last
+  // question leaves an open panel with no control that opened it. This zero is
+  // also not the one #244 forbids: that rule is about a read that FAILED rendering
+  // "0 waiting" as if it knew, and `loadBlocked`'s two early returns are how that
+  // is kept — a failed read never reaches this function at all.
+  blockedChip.hidden = !all.length && !blockedOpen;
+  if(!all.length){
+    blockedChip.classList.remove("mine");
+    blockedChip.textContent = "⛔ none waiting";
+    blockedChip.title = "nothing is waiting on a person";
+    return;
+  }
   const mine = all.filter(b => b.owner && me && b.owner === me.agent).length;
-  blockedChip.hidden = false;
   blockedChip.classList.toggle("mine", mine > 0);
   blockedChip.textContent = mine ? `⛔ ${mine} waiting on you` : `⛔ ${all.length} waiting`;
   // The oldest is named in the tooltip because age is the signal nobody maintains,
   // and the oldest unanswered question is the one most likely to be forgotten.
+  //
+  // `kind`, not `class`. This read is `GET /blockers`, whose `_view` spells the
+  // column `kind`; it is `GET /plan` that renames it to `class` for the chip on a
+  // plan row, and this line was written against that other shape. It rendered the
+  // literal "undefined" into the one sentence a person reads before deciding
+  // whether to open the queue — exactly where #279's "five `ui` checks and one
+  // `decision` is a different afternoon" is supposed to land.
   const oldest = all[0];
   blockedChip.title = mine
     ? `${mine} of ${all.length} open question(s) are addressed to you. Oldest overall: `
-      + `"${oldest.question}" (${oldest["class"]}, ${oldest.raised_by}). Answer on the plan page.`
+      + `"${oldest.question}" (${oldest.kind}, ${oldest.raised_by}). Open the list to answer.`
     : `${all.length} open question(s), none addressed to you. Oldest: `
-      + `"${oldest.question}" (${oldest["class"]}, ${oldest.raised_by}).`;
+      + `"${oldest.question}" (${oldest.kind}, ${oldest.raised_by}). Open the list to answer.`;
 }
+
+// ---- the list the chip expands (#677) -------------------------------------
+// Until this existed the chip was a signpost: an `<a href="/plan/view">` whose own
+// tooltip said "answer them on the plan page". A blocker only reaches that page as
+// a chip on a plan ROW, and `_human_blockers_for` attaches one by matching an OPEN
+// item's forge ref — so a blocker whose subject nothing plans is counted here and
+// absent there, and the tooltip sent people to a page the row was missing from. It
+// is self-perpetuating: the subject reaching a terminal state is exactly what
+// closes the plan item, so a question becomes unanswerable when it gets answered in
+// real life. Every one of the first five resolutions this table recorded was an
+// agent withdrawing its own question; not one was a person's answer.
+//
+// So the answer box lives where the count already does. The rows are the board's
+// own `/blockers?open=true` read and the box posts straight to `/blockers/resolve`
+// — no plan row in the path, because the missing plan row is the defect.
+
+function blockedSubject(b){
+  const s = b.subject || {};
+  const label = `${s.kind || "?"}/${s.value || "?"}`;
+  // Reuses the stream's ref linker, so a `pr` or `issue` subject carrying a repo
+  // becomes the link a person would otherwise go and search for. `item` and `repo`
+  // subjects have nowhere to point and render as plain text.
+  const u = refUrl({kind: s.kind, value: s.value, repo: b.repo});
+  return u ? `<a class="tl-ref" href="${esc(u)}" target="_blank" rel="noopener">${esc(label)}</a>`
+           : `<span class="tl-ref">${esc(label)}</span>`;
+}
+
+function blockedRow(b){
+  const mine = !!(b.owner && me && b.owner === me.agent);
+  // The question is TEXT on the row, not a `title=`. `test_plan_page.py`'s guard
+  // makes the argument for the other page and it holds here: a tooltip is a
+  // desktop-only answer, and somebody triaging the queue on a phone must be able to
+  // read what is being asked without opening anything.
+  return `<div class="bl ${mine?"mine":""}">
+    <div class="bl-head">
+      <span class="chip bclass">⛔ ${esc(b.kind)}</span>
+      ${blockedSubject(b)}
+      <span style="flex:1"></span>
+      <span class="ts">${b.raised_at?ago(b.raised_at)+" ago":""}</span>
+    </div>
+    <div class="bl-q">${esc(b.question)}</div>
+    ${b.detail?`<div class="bl-detail">${esc(b.detail)}</div>`:""}
+    <div class="bl-meta">asked by ${who(b.raised_by)} &middot; ${
+      b.owner ? `of ${who(b.owner)}` : "of any human"}</div>
+    <div class="bl-row">
+      <input id="bans-${esc(b.id)}" type="text" aria-label="the answer"
+        placeholder="your answer — the next agent reads this, so say the decision, not that you made one">
+      <button type="button" data-answer="${esc(b.id)}">answer</button>
+    </div>
+    <div class="bl-err" id="berr-${esc(b.id)}"></div>
+  </div>`;
+}
+
+function renderBlocked(){
+  if(!blockedOpen) return;
+  // Anything half-typed survives the re-render. The list is re-read after every
+  // answer, and somebody working down a queue may well have started two — losing
+  // the other one to the refresh is the sort of thing that stops a person using a
+  // queue at all. A row that is no longer in the list loses its text, which is
+  // right: it has been answered, and it is gone.
+  const typed = new Map();
+  for(const b of blockedRows){
+    const box = document.getElementById("bans-" + b.id);
+    if(box && box.value) typed.set(b.id, box.value);
+  }
+  if(!blockedRows.length){
+    // An honest empty queue, and it is a real answer rather than a blank panel:
+    // "nobody is waiting on you" is what this list is for saying.
+    blockedSub.textContent = "";
+    blockedList.innerHTML = `<div class="empty" style="padding:20px">nothing is
+      waiting on a person</div>`;
+    return;
+  }
+  const mine = blockedRows.filter(b => b.owner && me && b.owner === me.agent).length;
+  // Server order, which is oldest first — the one signal here nobody has to
+  // maintain. `mine` marks the row rather than sorting it to the top, because
+  // re-sorting would cost the list the property it is ordered for.
+  blockedSub.textContent = `${blockedRows.length} open · oldest first`
+    + (mine ? ` · ${mine} addressed to you` : "");
+  // Oldest first, so the cap drops the NEWEST — and says it did, rather than
+  // presenting a truncated queue as the whole of it. Same shape as the inbox's,
+  // and #244's rule underneath both: a page must not imply a completeness it has
+  // not got.
+  const capped = blockedCapped
+    ? `<div class="empty" style="padding:14px">showing the oldest ${BLOCKED_LIMIT}
+       &mdash; there are more open questions than this list can hold</div>` : "";
+  blockedList.innerHTML = blockedRows.map(blockedRow).join("") + capped;
+  for(const [id, v] of typed){
+    const box = document.getElementById("bans-" + id);
+    if(box) box.value = v;
+  }
+}
+
+function toggleBlocked(open){
+  blockedOpen = open === undefined ? !blockedOpen : open;
+  blockedPanel.hidden = !blockedOpen;
+  blockedChip.setAttribute("aria-expanded", blockedOpen ? "true" : "false");
+  blockedChip.classList.toggle("open", blockedOpen);
+  if(blockedOpen){
+    blockedNote.hidden = true; blockedNote.textContent = "";
+    renderBlocked();
+    // Re-read on open: the count was fetched when the page loaded and a question
+    // somebody else answered in the meantime must not be offered again.
+    loadBlocked();
+  } else if(!blockedRows.length){
+    blockedChip.hidden = true;   // kept visible only for the open panel's sake
+  }
+}
+blockedChip.onclick = () => toggleBlocked();
+blockedClose.onclick = () => toggleBlocked(false);
+
+blockedPanel.addEventListener("click", async (e)=>{
+  const btn = e.target.closest("button[data-answer]");
+  if(!btn) return;
+  const id = btn.dataset.answer;
+  const err = document.getElementById("berr-" + id);
+  const box = document.getElementById("bans-" + id);
+  const text = ((box && box.value) || "").trim();
+  if(!text){
+    // Refused by the page rather than by the server, for plan.html's reason: the
+    // server's refusal is a 422 about a field, and this is the one thing the page
+    // can say better — an empty resolution leaves the question unanswered while
+    // looking answered.
+    err.textContent = "an answer is required — it is what the next agent reads, and "
+      + "an empty one leaves the question unanswered while looking answered.";
+    return;
+  }
+  if(!canWrite()){
+    err.textContent = "only a person may answer a blocker — an agent may withdraw a "
+      + "question it raised itself, and this browser is neither.";
+    return;
+  }
+  btn.disabled = true; err.textContent = "";
+  let ok = false;
+  try{
+    const r = await fetch("/blockers/resolve", {method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({blocker_id: id, resolution: text})});
+    if(r.ok){ ok = true; }
+    else {
+      // FastAPI's `detail` is a string for some of our errors, a dict carrying
+      // `error` and a `hint` for the ones `app/api/blockers.py` raises, and a list
+      // for a validation failure — so nothing here may assume its shape. The
+      // server's own words are shown, because "already answered" and "the edge
+      // refused this write" are the two states worth telling apart.
+      const payload = await r.json().catch(()=>null), det = payload && payload.detail;
+      err.textContent = typeof det === "string" ? det
+        : (det && det.error) ? det.error + (det.hint ? " — " + det.hint : "")
+        : det ? JSON.stringify(det) : "answer failed (" + r.status + ")";
+    }
+  }catch(ex){
+    err.textContent = "could not reach the server — " + ((ex && ex.message) || "network error");
+  }
+  btn.disabled = false;
+  if(!ok) return;
+  blockedNote.textContent = "answered \u2713 — the resolution is on the row, and it is "
+    + "what the next agent reads.";
+  blockedNote.hidden = false;
+  // Taken out LOCALLY first, and then reconciled by the read. The obvious order is
+  // the other way round — the answer is a stored record now, so let the server say
+  // what the list holds — but `loadBlocked` returns silently on a failed read, by
+  // design, and the two states then compose into a lie: "answered ✓" printed over a
+  // still-open box for the question just answered, whose button earns a 409 when
+  // somebody believes the box and not the note. A stale list is a smaller wrong
+  // answer than a contradictory one, and the poll or the next open corrects it.
+  blockedRows = blockedRows.filter(b => b.id !== id);
+  renderBlockedChip();
+  renderBlocked();
+  await loadBlocked();
+});
 
 // Mirrors app.identity.addressed_to for the ONE identity this page holds: an
 // exact hit, the machine root (`to=human` reaches every person), or anything
@@ -683,6 +961,27 @@ loadMe();
 loadSessions();
 loadBacklog().then(connect);
 setInterval(loadSessions, 15000);
+// Re-read on the same beat rather than only at page load: a blocker is a thing that
+// is still true, and a board left open on a desk all afternoon was otherwise showing
+// the count it had when the tab was opened — a question raised at 16:21 reached
+// nobody until somebody happened to reload. The open LIST is refreshed by the same
+// beat, and has to be: somebody sitting with the queue open is the reader most
+// entitled to see a question arrive, and the one this whole issue is about.
+//
+// What the poll must not do is interrupt an answer. `renderBlocked` carries typed
+// text across a re-render but it cannot carry the caret — the input element itself
+// is replaced — so a refresh landing mid-sentence takes the cursor out from under a
+// person's hands. It is skipped while an answer is in progress, and an answer's own
+// re-read covers that window anyway.
+function answerInProgress(){
+  const active = document.activeElement;
+  if(active && active.id && active.id.indexOf("bans-") === 0) return true;
+  return blockedRows.some(b => {
+    const box = document.getElementById("bans-" + b.id);
+    return !!(box && box.value.trim());
+  });
+}
+setInterval(() => { if(!blockedOpen || !answerInProgress()) loadBlocked(); }, 15000);
 </script>
 </body>
 </html>

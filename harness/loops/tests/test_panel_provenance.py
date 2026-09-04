@@ -34,13 +34,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
-import panel_scope  # noqa: E402  — scope/range readers moved here in #129
-import panel_seats  # noqa: E402
 import panel_core  # noqa: E402  — `sh` is defined here since #129
 import panel_preflight as pf  # noqa: E402  — the pre-flight verdict (#138)
+import panel_scope  # noqa: E402  — scope/range readers moved here in #129
+import panel_seats  # noqa: E402
 from conftest import gh_stub  # noqa: E402
-
-
 
 TWO_FILES = (
     "diff --git a/a.py b/a.py\n"
@@ -709,6 +707,16 @@ def _cfg(**budgets) -> dict:
             "review_panel": {**CFG.get("review_panel", {}),
                              "refuse_over_cap_multiple": 0,
                              "manifest_moves": False},
+            #
+            # Each budget is stated as DIFF CHARS and reaches the seat as exactly that
+            # many, which is worth saying because #550 puts a claim block in the same
+            # slot and charges it to the same budget. It costs nothing HERE: the block
+            # may take at most a quarter of the tightest budget in the panel and is
+            # dropped whole below the floor, and every budget in this file is a
+            # truncation device far under it. So these rounds send no claim, the cut
+            # arithmetic below is measured against the diff alone, and a change that
+            # made the claim bite would show up as a `config_notes` line rather than as
+            # silently shorter material.
             "reviewers": {
                 name: {"enabled": True, "model": "sonnet",
                        **({} if budget is None else {"max_diff_chars": budget})}
@@ -716,9 +724,15 @@ def _cfg(**budgets) -> dict:
 
 
 def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
-                 cfg=None, compare=None, moves_to=None, compare_diff=""):
+                 cfg=None, compare=None, moves_to=None, compare_diff="",
+                 max_rounds=2):
     """One panel run with every subprocess replaced, so what is under test is the
-    payload the panel builds rather than any CLI."""
+    payload the panel builds rather than any CLI.
+
+    `max_rounds` stays at 2 — the cap every test in this file was written under —
+    and is a parameter only because #559 needs a THIRD round to have anything to
+    compare against: its filter reads the rounds before the anchor, and round 3 is
+    the first that has one. `run()` refuses a round past its cap outright."""
     # One shared double (conftest.gh_stub) rather than a bespoke one: it knows
     # every `gh` call panel.py makes, so a call added later is answered here
     # instead of falling through and degrading the round in silence (128-F09).
@@ -758,7 +772,8 @@ def _panel_round(monkeypatch, tmp_path, round_no, findings, head, baseline=(),
     monkeypatch.setattr(panel, "adjudicate", fake_adjudicate)
     out = tmp_path / f"r{round_no}.json"
     assert panel.run("e2e", 77, post=False, json_file=str(out), record=False,
-                     round_no=round_no, baseline=list(baseline), max_rounds=2) == 0
+                     round_no=round_no, baseline=list(baseline),
+                     max_rounds=max_rounds) == 0
     return str(out), json.loads(out.read_text())
 
 
