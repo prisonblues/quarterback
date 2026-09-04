@@ -160,8 +160,10 @@ def test_a_nested_shell_is_looked_inside():
     ("git worktree list", False),
     ("grep -rn 'git reset --hard' harness/", False),
     ("echo git reset --hard", False),
-    ("git stash", False),          # guarded a layer down, deliberately not here
+    ("git stash", False),          # the PUSH is guarded a layer down (#210)
     ("git stash list", False),
+    ("git stash pop", True),       # the pop is guarded by nobody else (#739)
+    ("git stash apply", True),
 ])
 def test_the_verb_table(cmd, want):
     assert destructive(cmd) is want, cmd
@@ -228,3 +230,113 @@ def test_a_named_path_is_not_a_sweep():
     whatever a peer left lying about; `git add app.py` stages what you named."""
     assert not destructive("git add app.py")
     assert destructive("git add .")
+
+
+# ------------------------------------------------ the harm that fell between the gates
+
+
+@pytest.mark.parametrize("cmd", [
+    "git stash pop",
+    "git stash apply",
+    "git stash pop stash@{2}",
+    "git stash apply --index stash@{1}",
+    "git stash branch hotfix",              # applies the entry, then drops it
+    "git -C /peer stash pop",
+    "git status && git stash pop",          # the clause, not the command
+    "bash -c 'git stash pop'",
+])
+def test_taking_from_the_shared_stash_is_a_harm(cmd):
+    """#739. `refs/stash` lives in the COMMON git dir, so every worktree of a repo
+    shares one stack and `stash@{0}` is whatever the last pusher meant — from any
+    worktree, not necessarily this one.
+
+    #210 refuses pushes onto it and CANNOT refuse a pop: a pop deletes its entry
+    through the reflog, which raises no ref transaction while another entry
+    remains underneath. The protection there is to keep the stack empty, and the
+    gap is what happens when it is not — an agent hits the push refusal and pops
+    next, which where the files do not clash applies a sibling's work into its
+    tree and drops the entry from under them.
+
+    This layer is the only one that can see a pop at all: it reads the command
+    string before git runs, so the reflog fact that makes a pop unhookable does
+    not apply to it."""
+    assert classify(cmd)["harm"] == "takes", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git stash",                            # a bare stash is a push — #210's job
+    "git stash push -u",
+    "git stash list",
+    "git stash show -p stash@{0}",
+    "git stash drop",                       # deletions are how a dirty stack drains
+    "git stash clear",
+])
+def test_the_rest_of_the_stash_verb_is_left_alone(cmd):
+    """Two of these are deliberate and worth stating. `push` belongs to the
+    reference-transaction hook, which is better placed for it — it catches a
+    stash typed outside Claude Code entirely. And `drop`/`clear` take nothing
+    into a tree: they are the one route out of a stack that already has
+    somebody's pre-guard entries on it, and a guard that closed it would strand
+    them for good."""
+    assert not destructive(cmd), cmd
+
+
+def test_the_tree_hatch_does_not_open_the_stash_hazard():
+    """One hatch per HAZARD, not one per gate. A shared working tree and a shared
+    stash stack are different configurations and are consented to separately, so
+    an agent that has settled the tree question with its peer has said nothing
+    about whose entry sits at stash@{0}."""
+    assert classify("QB_ALLOW_SHARED_TREE=1 git stash pop")["allowed_by"] is None
+    assert classify("QB_ALLOW_SHARED_STASH=1 git reset --hard")["allowed_by"] is None
+
+
+def test_the_stash_hatch_is_the_same_name_the_lower_gate_honours():
+    """The standing objection to guarding stash here was that two gates on one
+    command means two escape hatches under different names. It is answered by
+    there being one name: `QB_ALLOW_SHARED_STASH` is what the
+    reference-transaction hook already reads for the push side."""
+    hatch = "QB_ALLOW_SHARED_STASH=1"
+    assert classify(f"{hatch} git stash pop")["allowed_by"] == hatch
+    assert classify(f"{hatch} bash -c 'git stash pop'")["allowed_by"] == hatch
+
+
+def test_a_hatch_on_another_clause_does_not_excuse_a_pop():
+    """The clause-scoping property, held against the new harm. Every exemption in
+    this file is scoped to the clause it was found in, and a third harm arriving
+    later is exactly how that stops being true."""
+    assert classify("QB_ALLOW_SHARED_STASH=1 echo hi\ngit stash pop")["allowed_by"] is None
+    assert destructive("QB_ALLOW_SHARED_STASH=1 echo hi; git stash pop")
+
+
+def test_a_hatch_on_one_clause_does_not_speak_for_the_next():
+    """Found by an independent reviewer on the change that added the third harm,
+    and it is the clause-scoping defect again — surviving in the one place a
+    clause's verdict is allowed to stand for the whole command.
+
+    Returning at the FIRST harmful clause carried that clause's hatch out with it,
+    and the hook reads `allowed_by` and stands down. So a consented reset excused
+    an unconsented pop behind it. Every other exemption here is clause-scoped;
+    this one was not, and a third harm with a hatch of its own is what made it
+    reachable across two different hazards rather than one."""
+    v = classify("QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop")
+    assert (v["harm"], v["allowed_by"]) == ("takes", None)
+
+    # The same shape within one hazard, which predates the third harm.
+    v = classify("QB_ALLOW_SHARED_TREE=1 git reset --hard; git add .")
+    assert (v["harm"], v["allowed_by"]) == ("sweeps", None)
+
+    # And pointed the other way, so this is not a rule about which harm is first.
+    v = classify("QB_ALLOW_SHARED_STASH=1 git stash pop; git reset --hard")
+    assert (v["harm"], v["allowed_by"]) == ("destroys", None)
+
+
+def test_a_command_whose_every_harm_is_hatched_still_reports_the_hatch():
+    """The other half, and the one that keeps the hatch working at all. `allowed_by`
+    is how the hook is told to stand down, so a command with nothing unconsented
+    left in it has to come back carrying one — otherwise fixing the leak above
+    would have turned every escape hatch into a refusal."""
+    assert classify("QB_ALLOW_SHARED_TREE=1 git reset --hard")["allowed_by"]
+    assert classify("QB_ALLOW_SHARED_TREE=1 git reset --hard; git status")["allowed_by"]
+    both = classify(
+        "QB_ALLOW_SHARED_TREE=1 git reset --hard; QB_ALLOW_SHARED_STASH=1 git stash pop")
+    assert both["allowed_by"] == "QB_ALLOW_SHARED_TREE=1"

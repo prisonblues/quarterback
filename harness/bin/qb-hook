@@ -932,14 +932,22 @@ _publish_push() {   # announce HEAD if a push just put it on the tracking branch
 # The verbs. Every one of these can destroy uncommitted work that this session
 # did not write, and none of them is recoverable from git alone once run.
 #
-# `git stash` is deliberately NOT here, though it belongs to the same family and
-# has taken two working trees on this fleet. It is already refused one layer
-# down, by the `reference-transaction` hook `qb-hooks` installs — and that guard
-# is strictly better for it: it catches a hand-typed stash outside Claude Code
-# entirely, where no PreToolUse exists, and it does not wait for a peer to be
-# live, because the shared `refs/stash` stack is a hazard whether or not anyone
-# is in the tree right now. A second gate on the same command would only give it
-# a second escape hatch under a different name. Use `qb-stash`.
+# `git stash push` is deliberately NOT here. It is refused one layer down, by the
+# `reference-transaction` hook `qb-hooks` installs — and that guard is genuinely
+# better for it: it catches a hand-typed stash outside Claude Code entirely, where
+# no PreToolUse exists, and it does not wait for a peer to be live, because the
+# shared `refs/stash` stack is a hazard whether or not anyone is in the tree.
+#
+# That argument was written down as if it covered `git stash`, and it covers the
+# PUSH (#739). The reference-transaction hook cannot refuse a POP — its own header
+# says so, because a pop deletes its entry through the reflog and raises no ref
+# transaction — so `pop`/`apply` fell between the two gates and were guarded by
+# nobody. They are guarded here now, by `_shared_stash_guard` and NOT by this
+# list, because they answer a different question: not "is a peer in my tree" but
+# "does this repo have linked worktrees, and is there anything on the shared
+# stack to take". The old objection — a second gate means a second escape hatch
+# under a different name — is answered by using the SAME name, so
+# `QB_ALLOW_SHARED_STASH=1` is one hatch enforced in two places. Use `qb-stash`.
 #
 # `git switch -f|--discard-changes` is the modern spelling of `checkout -f` and
 # was missing from the first cut of this list, which is exactly the failure mode
@@ -1030,8 +1038,54 @@ _tree_peers() {   # _tree_peers <path>: live peers whose lease names this path
   return 0
 }
 
+_shared_stash_guard() {   # _shared_stash_guard <repo root>: the `takes` harm (#739)
+  # A DIFFERENT PREDICATE, because it is a different hazard. The tree guard asks
+  # whether a peer is standing where you are standing; this asks whether the
+  # repo's ONE `refs/stash` — it lives in the common git dir, not the per-worktree
+  # one — has anything on it that a sibling worktree put there. A pop is dangerous
+  # in an empty tree with nobody else live, and harmless in a shared one with an
+  # empty stack, so borrowing the tree guard's three facts would have been wrong
+  # in both directions.
+  #
+  # Two facts, and each is a let-through when false:
+  #   1. the repo has linked worktrees   (a solo checkout's stack is nobody else's)
+  #   2. `refs/stash` is not empty       (nothing to take; a pop errors on its own,
+  #                                       and refusing it would be crying wolf)
+  local root=$1 common linked entries n
+  common=$(timeout 3 git -C "$root" rev-parse --path-format=absolute \
+             --git-common-dir 2>/dev/null) || return 0
+  [ -n "$common" ] || return 0
+  # A de-registered worktree leaves its dir behind until `git worktree prune`, so
+  # this can read yes for a moment longer than it is true — which errs toward
+  # refusing, the same way the reference-transaction hook does.
+  linked=$(ls -A "$common/worktrees" 2>/dev/null | head -n 1)
+  [ -n "$linked" ] || return 0
+
+  entries=$(timeout 3 git -C "$root" stash list 2>/dev/null) || return 0
+  [ -n "$entries" ] || return 0
+  n=$(printf '%s\n' "$entries" | grep -c '' 2>/dev/null || echo 0)
+  entries=${entries:0:2000}
+
+  _deny "quarterback: refusing this — refs/stash is SHARED across every worktree of this repo.
+
+$root has $n entr(y/ies) on that one stack, and this repo has linked worktrees — so stash@{0} resolves to whatever the LAST PUSHER meant, from any worktree of it, not necessarily this one:
+
+$entries
+
+A pop or apply puts one of those into THIS tree, and a pop drops it from the stack as well. Where its files do not clash with yours it succeeds silently — and somebody else's uncommitted work is now in your tree, where a later 'git add -A' commits it under your name. That is #210, and it has taken two working trees on this fleet.
+
+If you got here from a REFUSED 'git stash push': that refusal left your tree untouched and put nothing on the stack, so there is nothing of yours down there to get back.
+
+What to do instead, cheapest first:
+  1. Your own stash, per-worktree and invisible to siblings: qb-stash push / qb-stash pop
+  2. Look before you take: git stash list; git stash show -p stash@{N}   — both are reads
+  3. Keep a patch instead: git diff > /tmp/mine.patch
+
+Deliberate, and you accept that stash@{0} may not be yours: QB_ALLOW_SHARED_STASH=1 git stash pop"
+}
+
 _shared_tree_guard() {
-  local cmd verdict target root cwdroot dirty names n hatch
+  local cmd verdict target root cwdroot dirty names n hatch harm
 
   cmd=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)
   [ -n "$cmd" ] || return 0
@@ -1076,6 +1130,17 @@ _shared_tree_guard() {
   root=$(_tree_root "$target") || return 0
   [ -n "$root" ] || return 0
 
+  # THREE HARMS, TWO PREDICATES. `destroys` and `sweeps` are both about the tree
+  # you are standing in, and everything below asks about that. `takes` is about
+  # the repo's shared stash stack, which is a hazard with nobody else live and no
+  # local changes at all — so it branches off here, BEFORE the dirty check, and
+  # asks its own questions.
+  harm=$(printf '%s' "$verdict" | jq -r '.harm // "destroys"' 2>/dev/null)
+  if [ "$harm" = "takes" ]; then
+    _shared_stash_guard "$root"
+    return 0
+  fi
+
   # Is there anything to lose? A hard reset in a clean tree destroys nothing
   # uncommitted, and refusing it would be the gate crying wolf on the safest
   # instance of the verb it watches.
@@ -1116,7 +1181,7 @@ _shared_tree_guard() {
   # a message saying the work was not theirs. Nothing was destroyed and its
   # author still lost it. Telling that caller their commit will "destroy" work
   # would be wrong, and being wrong here is how a guard gets read as noise.
-  if [ "$(printf '%s' "$verdict" | jq -r '.harm // "destroys"' 2>/dev/null)" = "sweeps" ]; then
+  if [ "$harm" = "sweeps" ]; then
     _deny "quarterback: refusing this in a SHARED working tree.
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names
