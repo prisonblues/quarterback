@@ -27,12 +27,20 @@ has a test below saying what happens when it is not:
 Plus the two properties that keep a refusal from becoming a wall: the escape
 hatch, and failing open when the board cannot be reached.
 
-`git stash` is the one member of this family the guard leaves alone, and there is
-a test pinning that. It is already refused by the `reference-transaction` hook
-`qb-hooks` installs, which is strictly better for it — that one catches a stash
-typed outside Claude Code, and it does not wait for a peer to be live, because a
-shared `refs/stash` stack is a hazard either way. Two gates on one command would
-only mean two escape hatches under different names.
+`git stash push` is the one member of this family the guard leaves alone, and
+there is a test pinning that. It is already refused by the `reference-transaction`
+hook `qb-hooks` installs, which is better placed for it — that one catches a stash
+typed outside Claude Code, and it does not wait for a peer to be live.
+
+The POP is a different matter and it is guarded here (#739). That hook cannot
+refuse one — a pop deletes its entry through the reflog, raising no ref
+transaction — so for a long time nothing did, while the reason for leaving stash
+out of this guard was written down as though it covered the whole verb. The three
+facts above are the wrong three for it, and it does not use them: a pop takes a
+sibling's work whether or not anyone is live in your tree and whether or not your
+tree is dirty. Its own two are below, under "the shared stash". The old objection
+— two gates means two escape hatches under different names — is answered by there
+being one name, `QB_ALLOW_SHARED_STASH`, which both gates read.
 
 These drive the real script as a subprocess against a stub board — the same
 technique as `test_qb_hook_end.py`, and for the same reason: asserting on the
@@ -184,6 +192,25 @@ class Guarded:
         self.match.write_text(
             f"cwd={quote(str(in_tree), safe='')}\ncwd={in_tree}\n"
             if in_tree is not None else "cwd=\ncwd=\n"
+        )
+
+    def linked_worktree(self, name: str = "sibling") -> Path:
+        """A second worktree off the same `.git` — the configuration that makes
+        `refs/stash` a shared stack, and the one `create-worktree` produces on
+        purpose many times over."""
+        d = self.root / name
+        self._git("worktree", "add", "-q", str(d), "-b", name)
+        return d
+
+    def stash_from(self, wt: Path, name: str, body: str, message: str) -> None:
+        """Put an entry on the SHARED stack, pushed from the worktree that owns
+        it. No guard is installed in this fixture's repo, so this is the
+        pre-guard residue the reference-transaction hook cannot drain."""
+        (wt / name).write_text(body)
+        subprocess.run(
+            ["git", "-c", "user.email=t@test", "-c", "user.name=t", "-C", str(wt),
+             "stash", "push", "-q", "-m", message],
+            check=True, capture_output=True,
         )
 
     def other_checkout(self, name: str = "private") -> Path:
@@ -346,9 +373,10 @@ def test_the_verbs_that_destroy_a_peers_uncommitted_work(shared, cmd):
     "git checkout -b feat/x",
     "git checkout main",
     "git checkout main && git status",           # the match must not run past &&
-    "git stash",                                 # guarded one layer down, by qb-hooks
+    "git stash",                                 # the PUSH is guarded by qb-hooks
     "git stash push -u",
     "git stash list",
+    "git stash pop",                             # this repo has no linked worktrees
     "git clean -n",
     "git clean --dry-run",                       # `--d` is not the `-d` flag
     "git worktree remove ../wt",                 # without --force, git refuses on its own
@@ -883,3 +911,230 @@ def test_the_note_names_both_harms_now(moded):
     note = moded.start()
     assert "git commit -a" in note
     assert "take it into YOUR commit" in note
+
+
+# --------------------------------------------------------------- the shared stash
+
+
+@pytest.fixture
+def shared_stash(guard):
+    """A repo with a linked worktree and that worktree's work on the ONE stack.
+
+    This is what `create-worktree` produces many times over, plus a single entry
+    that predates the guard — the state `qb-doctor` reports as `N pre-guard
+    entries remain` and that no installer can drain.
+    """
+    guard.commit("app.py", "original\n")
+    sibling = guard.linked_worktree()
+    guard.stash_from(sibling, "app.py", "SIBLING WORK\n", "sibling wip")
+    guard.peers(ALONE)
+    return guard
+
+
+def test_a_pop_from_the_shared_stash_is_refused(shared_stash):
+    """#739, and the hole it came through. `refs/stash` lives in the COMMON git
+    dir, so `stash@{0}` here is the sibling's entry — and a pop applies it into
+    this tree and drops it from under them. The reference-transaction hook refuses
+    the push and cannot refuse this; before now, neither could anything else."""
+    d = shared_stash.decision(shared_stash.bash("git stash pop"))
+    assert d is not None, "the pop was allowed through"
+    assert d["permissionDecision"] == "deny"
+
+
+def test_apply_is_refused_too(shared_stash):
+    """It leaves the entry in place, so nothing is lost from the stack — and the
+    sibling's uncommitted work is in this tree all the same, where the next
+    `git add -A` commits it under the wrong name."""
+    assert shared_stash.decision(shared_stash.bash("git stash apply"))[
+        "permissionDecision"] == "deny"
+
+
+def test_the_refusal_shows_what_is_actually_on_the_stack(shared_stash):
+    """A stash entry carries no author, no worktree and no session, so the guard
+    cannot say whose it is. What it can do is print the list, which is the only
+    thing a reader has to go on — and `git stash show -p` from there."""
+    reason = shared_stash.decision(shared_stash.bash("git stash pop"))[
+        "permissionDecisionReason"]
+    assert "sibling wip" in reason
+    assert "qb-stash" in reason
+
+
+def test_a_pop_is_refused_with_nobody_live_and_a_clean_tree(guard):
+    """THE POINT OF A SECOND PREDICATE. The tree guard's three facts are the wrong
+    three here: this tree is clean and this agent is alone in it, so all of them
+    are false, and the sibling's entry is still taken. Reusing them would have
+    left the case that actually happens unguarded."""
+    guard.commit("app.py", "committed and clean\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(ALONE)
+    assert guard.decision(guard.bash("git stash pop"))["permissionDecision"] == "deny"
+
+
+def test_an_empty_shared_stack_is_not_refused(guard):
+    """Nothing to take. A pop here fails on its own with `No stash entries found`,
+    and refusing it would be the gate crying wolf on a harmless mistake — which
+    is how a gate on this hot a path gets turned off wholesale."""
+    guard.commit("app.py", "x\n")
+    guard.linked_worktree()
+    guard.peers(ALONE)
+    assert guard.decision(guard.bash("git stash pop")) is None
+
+
+def test_a_repo_with_no_linked_worktrees_pops_normally(guard):
+    """The hazard is the SHARED stack, and a single checkout does not have one.
+    Its stash is its own, `stash@{0}` means what it pushed, and the guard has no
+    business in it — the same line the reference-transaction hook draws."""
+    guard.commit("app.py", "v1\n")
+    (guard.cwd / "app.py").write_text("v2\n")
+    guard._git("stash", "push", "-q", "-m", "my own")
+    guard.peers(ALONE)
+    assert guard.decision(guard.bash("git stash pop")) is None
+
+
+def test_the_stash_hatch_lets_a_deliberate_pop_through(shared_stash):
+    """Somebody who has read `git stash list`, worked out whose the entry is and
+    decided to take it needs a way through — and the name is the one the
+    reference-transaction hook already honours, so this is one hatch enforced
+    twice rather than two hatches."""
+    assert shared_stash.decision(
+        shared_stash.bash("QB_ALLOW_SHARED_STASH=1 git stash pop")) is None
+
+
+def test_the_tree_hatch_does_not_let_a_pop_through(shared_stash):
+    """One hatch per hazard. Settling the shared-TREE question with a peer says
+    nothing about whose work is sitting at `stash@{0}`, and a hatch that spanned
+    both would let an agent consent to a hazard it had not been told about."""
+    assert shared_stash.decision(
+        shared_stash.bash("QB_ALLOW_SHARED_TREE=1 git stash pop"))[
+            "permissionDecision"] == "deny"
+
+
+@pytest.mark.parametrize("cmd", [
+    "git stash",                    # a bare stash is a push — the other gate's
+    "git stash push -u",
+    "git stash list",               # reads are how you find out whose it is
+    "git stash show -p stash@{0}",
+    "git stash drop",               # the one route out of a stack already dirty
+])
+def test_the_rest_of_the_stash_verb_still_sails_through(shared_stash, cmd):
+    assert shared_stash.decision(shared_stash.bash(cmd)) is None, cmd
+
+
+def test_the_guard_fails_open_when_the_stack_cannot_be_listed(shared_stash):
+    """The contract everywhere else in this hook. If `git stash list` cannot run,
+    the guard knows nothing about the stack and must not dress that up as
+    knowledge — a hook whose whole promise is that it cannot block a session does
+    not get to start blocking one when git has a bad day.
+
+    The stub fails `stash list` and ONLY `stash list`: a git that failed
+    everything would return at `_tree_root` two branches earlier, and the test
+    would pass without the branch it names ever running."""
+    assert shared_stash.decision(shared_stash.bash("git stash pop")) is not None, (
+        "baseline: with a real git this refuses, or the assertion below means nothing")
+    real = shutil.which("git")
+    stub_git = shared_stash.stub / "git"
+    stub_git.write_text(
+        "#!/bin/sh\n"
+        'for a in "$@"; do [ "$a" = "stash" ] && exec false; done\n'
+        f'exec {real} "$@"\n'
+    )
+    stub_git.chmod(0o755)
+    assert shared_stash.decision(shared_stash.bash("git stash pop")) is None
+
+
+# ------------------------------------------- two harms, two predicates, one command
+
+
+def test_a_stash_harm_does_not_mask_a_reset_behind_it(guard):
+    """THE REGRESSION AN INDEPENDENT REVIEW CAUGHT. Before `takes` existed the
+    classifier reported the reset in `git stash pop; git reset --hard`, because
+    it had nothing else to report, and the tree guard refused it. Once stash was
+    classified, the summary became `takes` — and a guard that found nothing on
+    the stash stack returned, letting the reset through unexamined.
+
+    That is protection this repo already had, removed by the change that added
+    the third harm. One verdict cannot answer two independent questions."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("a peer's in-flight edit\n")
+    guard.linked_worktree()                       # linked worktrees, but...
+    guard.peers(PEER, in_tree=guard.cwd)          # ...an EMPTY shared stack
+    d = guard.decision(guard.bash("git stash pop; git reset --hard"))
+    assert d is not None, "the reset was masked by a stash harm that did not fire"
+    assert d["permissionDecision"] == "deny"
+    assert "hermes/seat-quarterback-4" in d["permissionDecisionReason"], (
+        "it refused, but for the stash rather than the reset")
+
+
+def test_a_reset_harm_does_not_mask_a_pop_behind_it(guard):
+    """The mirror, and not a regression — nothing guarded the pop before. A clean
+    tree with nobody live makes the reset's three facts false, and the pop behind
+    it is still taking a sibling's entry."""
+    guard.commit("app.py", "committed and clean\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(ALONE)
+    d = guard.decision(guard.bash("git reset --hard; git stash pop"))
+    assert d is not None, "the pop was masked by a reset harm that did not fire"
+    assert "refs/stash is SHARED" in d["permissionDecisionReason"]
+
+
+def test_a_hatch_on_one_harm_does_not_consent_to_the_other(guard):
+    """The two halves of the walk have to hold at once: a hatched harm is SKIPPED
+    rather than ending it. Consenting to a reset in a shared tree says nothing
+    about whose work is at `stash@{0}`, and before the walk existed the hatch on
+    the first clause stood for the whole command."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("dirty\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(PEER, in_tree=guard.cwd)
+    d = guard.decision(
+        guard.bash("QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop"))
+    assert d is not None, "the tree hatch consented to the pop as well"
+    assert "refs/stash is SHARED" in d["permissionDecisionReason"]
+
+
+def test_a_command_whose_every_harm_is_hatched_still_runs(guard):
+    """And the walk must not become a wall. Both hatches present, both hazards
+    live, nothing refused — otherwise fixing the masking would have turned every
+    compound command with an escape hatch into a refusal."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("dirty\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(PEER, in_tree=guard.cwd)
+    assert guard.decision(guard.bash(
+        "QB_ALLOW_SHARED_TREE=1 git reset --hard; "
+        "QB_ALLOW_SHARED_STASH=1 git stash pop")) is None
+
+
+def test_an_older_classifier_that_emits_no_harms_still_guards_one(guard):
+    """This hook and the classifier beside it are separate files on separate
+    update paths, so a box can carry a new hook and an old classifier. The walk
+    falls back to the top-level summary rather than reading an absent `harms` as
+    'nothing harmful' — one harm guarded beats none."""
+    # NO SHEBANG, and that is not an omission. The hook runs the classifier as
+    # `python3 "$_QB_CLASSIFY"`, so this is never exec'd directly and the line
+    # would be a comment — while `test_runtime_stub_shebangs.py` forbids a
+    # runtime-written stub naming `/usr/bin/env`, which does not exist inside a
+    # nix build sandbox. It must still be real Python: a `/bin/sh` body would make
+    # python3 exit non-zero, the guard would fail open, and this test would pass
+    # by letting the command through — the opposite of what it asserts.
+    old = guard.bin / "qb-classify-command"
+    old.write_text(
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'destructive': True, 'harm': 'destroys', 'target': None,\n"
+        "                  'verb': 'reset', 'allowed_by': None, 'parsed': True}))\n"
+    )
+    old.chmod(0o755)
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("a peer's edit\n")
+    guard.peers(PEER, in_tree=guard.cwd)
+    assert guard.decision(guard.bash("git reset --hard"))["permissionDecision"] == "deny"
+
+
+def test_qb_stashs_own_idiom_is_not_refused(shared_stash):
+    """`qb-stash apply`/`pop` — the replacement this guard's refusal recommends —
+    run `git stash apply <refs/worktree/...>`, which is per-worktree and nobody
+    else's by construction. Refusing that spelling because an unrelated entry sits
+    on `refs/stash` would have the guard refusing the one command it advises."""
+    assert shared_stash.decision(
+        shared_stash.bash("git stash apply refs/worktree/qb-stash/fix-x")) is None

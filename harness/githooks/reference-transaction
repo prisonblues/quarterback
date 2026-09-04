@@ -23,6 +23,13 @@
 # through, so entries pushed before the guard was installed can still be popped
 # and dropped by whoever wants to clear them.
 #
+# WHERE THAT LEAVES A STACK THAT IS ALREADY DIRTY, and why this message says so.
+# Installing the guard drains nothing, so on a repo with pre-guard entries the
+# refusal below is itself the thing that produces a pop: an agent whose plan was
+# push/work/pop hits it and pops next, and takes a sibling's entry (#739). The
+# `takes` branch of `qb-hook`'s guard refuses that inside Claude Code; the last
+# paragraph of this message is for everywhere else.
+#
 # Refusing in the `prepared` phase leaves the working tree untouched — the stash
 # commit exists as an unreferenced object, but nothing was reverted and nothing
 # was pushed onto the shared stack.
@@ -86,7 +93,12 @@ if [[ -n "$stash_new" && "$(git rev-parse --verify -q refs/stash 2>/dev/null)" =
     exit $?
 fi
 
-if [[ "${QB_ALLOW_SHARED_STASH:-}" == "1" ]]; then
+# `1` and `true`, because `qb-classify-command` has always read both and this is
+# meant to be ONE hatch that two guards honour identically. While this accepted
+# only `1`, `QB_ALLOW_SHARED_STASH=true git stash pop` was let through by the
+# pre-tool guard and `…=true git stash push` was refused here — one spelling
+# consenting to half a hazard. `1` stays the documented spelling.
+if [[ "${QB_ALLOW_SHARED_STASH:-}" == "1" || "${QB_ALLOW_SHARED_STASH:-}" == "true" ]]; then
     chain_delegate "$phase"
     exit $?
 fi
@@ -128,6 +140,12 @@ REFUSED: refs/stash is shared across every worktree of this repo.
   For red/green work, capture a patch file instead (see harness/README.md).
 
   Your working tree is untouched; nothing was stashed.
+
+  DO NOT NOW RUN 'git stash pop'. Nothing of yours went onto the stack, so a pop
+  cannot give you anything back — it can only hand you an entry somebody else
+  pushed, and drop it from under them. Check with 'git stash list' if you want to
+  see what is down there; that is a read.
+
   Deliberate, and you accept the race: QB_ALLOW_SHARED_STASH=1 git stash ...
 
 MSG

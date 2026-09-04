@@ -886,10 +886,23 @@ the shared stack, and a single checkout does not have one.
 
 **It stops the push, not the pop, and that is a real limit rather than an oversight.**
 Measured on git 2.54.0: `git stash pop` removes its entry through the **reflog**, which
-raises no ref transaction at all while another entry remains underneath, so no hook can
-see a pop. The protection works by keeping the shared stack empty — with nothing on it,
-there is nothing for a sibling to take. Deletions of `refs/stash` are deliberately let
-through so entries that predate the guard stay droppable.
+raises no ref transaction at all while another entry remains underneath, so no *git hook*
+can see a pop. The protection here works by keeping the shared stack empty — with nothing
+on it, there is nothing for a sibling to take. Deletions of `refs/stash` are deliberately
+let through so entries that predate the guard stay droppable.
+
+**And installing it drains nothing, which is where the pop side became a hole (#739).** A
+repo carrying pre-guard entries — `qb-doctor`'s `N pre-guard entries remain` — still has a
+loaded stack, and on one the refusal above is itself what produces a pop: an agent whose
+plan was push/work/pop hits `REFUSED` and pops next, or pops to undo a stash it believes
+happened. Four in a row did exactly that. Where the entry's files do not clash with the
+agent's own, the apply succeeds silently and drops it, and a sibling's uncommitted work is
+now in a tree that never asked for it — where `epic.py`'s and `lander.py`'s blanket `git
+add -A` commits it under the wrong author, which is #210's own failure through the door
+#210 left open. Two things close it: the refusal message now says **not** to pop, and
+`qb-hook` refuses the pop outright (the `takes` harm, below). The reflog fact does not
+constrain that second one at all — a PreToolUse hook reads the command string before git
+runs and never has to observe a ref transaction.
 
 **`QB_ALLOW_SHARED_STASH=1` is the escape hatch**, for somebody doing this on purpose. One
 env var, per command, so the guard does not become the thing people turn off wholesale.
@@ -923,7 +936,8 @@ fixes while they were still writing them.
 
 `qb-hook` gates `Bash` at `PreToolUse`. Three facts have to be true **together**:
 
-- the command entangles you with a peer's uncommitted work, in one of **two** ways:
+- the command entangles you with a peer's uncommitted work, in one of **two** ways (a third,
+  `takes`, is below and is gated differently):
   - it **destroys** it — `reset --hard|--merge`, `checkout` of a path or with `-f`,
     `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
     `rm -f`, `worktree remove --force`, the `--abort` of an in-progress merge/rebase/cherry-pick;
@@ -937,6 +951,42 @@ fixes while they were still writing them.
 Take any one away and nothing happens. A clean tree is never refused. Alone in a tree, your own
 uncommitted work stays yours to throw away. `--help` is never refused, and neither is a dry run:
 `git clean -n`, `-fdn` and `--dry-run` print what they would remove and remove nothing.
+
+**There is a third harm, and it deliberately does not use those three facts.** `git stash pop`
+and `git stash apply` **take** a peer's work rather than destroying or absorbing it (#739), and
+what makes that possible is not a shared working tree but a shared `refs/stash` — one stack per
+*repo*, in the common git dir, which every worktree of it reads. A pop takes a sibling's entry
+with your tree clean and nobody else live in it, so all three facts above are false in exactly
+the case that happens. Its own two are:
+
+- the repo has **linked worktrees** — a solo checkout's stash is nobody else's, and stashes
+  there as it always did;
+- and **`refs/stash` is not empty** — with nothing on the stack a pop fails on its own with
+  `No stash entries found`, and refusing it would be the gate crying wolf.
+
+`push` is not here: it is refused a layer down, by the `reference-transaction` hook, which
+catches it outside Claude Code too. `list`, `show`, `drop` and `clear` are not here either —
+the first two are reads, and the second two are the only way anyone drains a stack that already
+has entries on it. Nor is an **explicit object that is not on the shared stack**: `qb-stash
+apply`/`pop`, the replacement this guard's own refusal recommends, run `git stash apply
+<refs/worktree/…>`, and a guard that refused the command it advises would be worth nothing.
+
+**Neither fact proves the entry is somebody else's, and the refusal does not say it does.** A
+stash entry carries no author, no worktree and no session — the owner of the one that prompted
+#210 was identified from a *board claim*, not from git — so this is a conservative policy rather
+than a deduction. It over-refuses a stack holding only your own deliberately hatch-pushed
+entries, and it under-refuses one whose pusher's worktree has since been pruned away. The hatch
+answers the first; the second is the honest limit, and it is why `git stash list` is in the
+message rather than a claim about whose the entry is.
+
+**Every harm on the command is asked its own question, not just the first.** The moment the
+harms stopped sharing a predicate, one verdict stopped being able to answer for a whole command:
+`git stash pop; git reset --hard` summarises as `takes`, and a guard that found nothing on the
+stash stack would return, letting the reset through unexamined — which is protection this repo
+had *before* `takes` existed. So `qb-classify-command` reports `harms`, every harmful clause in
+order with its own target and its own hatch, and the hook walks them and refuses on the first
+predicate that fires. A hatched harm is skipped rather than ending the walk, which is what keeps
+`QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop` from consenting to the pop as well.
 
 **The command is tokenised, not matched.** A panel round found nine P1 bypasses in the regex that
 used to decide this, and they were one premise wearing nine faces — a regular expression cannot
@@ -1011,11 +1061,31 @@ of a false positive is one refusal with a named escape hatch rather than a lost 
 structural fix is one worktree per agent, which is what the ⚠️ startup note pushes people
 towards; this is defence in depth behind that.
 
-**`git stash` is not in that list**, though it belongs to the family. It is already refused by
-the `reference-transaction` hook above, which is strictly better for it: that one catches a
+**`git stash push` is not in that list**, though it belongs to the family. It is already refused by
+the `reference-transaction` hook above, which is better placed for it: that one catches a
 stash typed outside Claude Code entirely, and it does not wait for a peer to be live, because
-a shared `refs/stash` stack is a hazard either way. Two gates on one command would only mean
-two escape hatches under different names.
+a shared `refs/stash` stack is a hazard either way.
+
+**That paragraph used to say `git stash`, and the difference cost the pop side (#739).** The
+argument is sound about the push and false about the verb: the hook it defers to says in its own
+header that it cannot refuse a pop. So `pop` and `apply` fell between the two gates and were
+guarded by nothing, while the reason for the gap read like a reason for the whole verb. They are
+guarded now, as a **third harm** — `takes`, beside `destroys` and `sweeps` — and *not* through the
+verb list above, because the three facts that gate it are the wrong three: a pop takes a sibling's
+work whether or not anyone is live in your tree and whether or not your tree is dirty. Its own
+two facts are that the repo has linked worktrees and that `refs/stash` is not empty; when either
+is false a pop is somebody's own business and sails through. `drop` and `clear` stay out — they
+take nothing into a tree, and they are the only route out of a stack that is already dirty.
+
+The "two gates means two escape hatches under different names" objection is answered by there
+being one name. `QB_ALLOW_SHARED_STASH=1` is what the `reference-transaction` hook already reads,
+and it is what `qb-hook` reads for `takes`, so this is one hatch enforced in two places — and
+both now read the same *values*, `1` and `true`. While the git hook took only `1`, that claim was
+not quite true: `QB_ALLOW_SHARED_STASH=true git stash pop` was let through by the pre-tool guard
+and `…=true git stash push` was refused, one spelling consenting to half a hazard.
+`QB_ALLOW_SHARED_TREE=1` deliberately does **not** open it: settling the shared-tree question with
+a peer says nothing about whose work is sitting at `stash@{0}`, and a hatch spanning both would
+let an agent consent to a hazard nobody had told it about.
 
 **One spelling of "take a worktree", and one note says it (#464).** #178's mode note and this one
 both told the reader to take a worktree, in two different commands — and `create-worktree` is not a

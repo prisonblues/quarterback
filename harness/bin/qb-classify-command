@@ -72,12 +72,27 @@ eighty-four findings that never touched three of the five incidents.
 
 Reads the command on stdin. Writes one JSON object on stdout:
 
-    {"destructive": bool,       # does a clause destroy OR absorb uncommitted work?
-     "harm": str|null,          # "destroys" or "sweeps" — they need different words
+    {"destructive": bool,       # does a clause destroy, absorb OR take uncommitted work?
+     "harm": str|null,          # "destroys", "sweeps" or "takes" — different words
      "target": str|null,        # the tree that clause names (-C / --work-tree), if any
      "verb": str|null,          # what it was, for the refusal message
-     "allowed_by": str|null,    # the escape hatch, if the matched clause carried it
-     "parsed": bool}            # false when the command could not be tokenised
+     "allowed_by": str|null,    # the escape hatch for THIS harm, if the clause carried it
+     "parsed": bool,            # false when the command could not be tokenised
+     "harms": [{...}]}          # EVERY harmful clause, in order
+
+`allowed_by` is per-harm, because the harms are not one hazard. A shared working
+tree and a shared `refs/stash` are different configurations, they are escaped by
+different env vars, and a hatch for one must not open the other — see `HATCHES`.
+
+**`harms` is the real answer and the top-level fields are its summary.** They
+name the first harm nobody consented to, or the first one they did if every harm
+was hatched. That is enough for a caller with one question and wrong for a caller
+with two: since the harms stopped sharing a predicate — `destroys`/`sweeps` ask
+about the tree you are standing in, `takes` asks about the repo's stash stack — a
+summary naming one harm hides the others behind a question that was never put to
+them. `git stash pop; git reset --hard` summarises as `takes`, and a caller that
+finds nothing on the stack must still ask about the reset. Each entry carries
+`harm`, `target`, `verb` and its own `allowed_by`.
 
 `parsed: false` is NOT a refusal. The hook's contract is fail-open and an
 unparseable command is a command we know nothing about, which is the one state
@@ -118,7 +133,23 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 
 SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
 
-HATCH = "QB_ALLOW_SHARED_TREE"
+# One hatch per HAZARD, not one per gate. `destroys` and `sweeps` are both about
+# standing in a tree somebody else is also standing in; `takes` is about a stash
+# stack every worktree of the repo shares, which is a hazard whether or not
+# anyone else is in your tree right now.
+#
+# `QB_ALLOW_SHARED_STASH` is deliberately the SAME name the `reference-transaction`
+# hook already honours for the push side (#210), and that is what makes this a
+# second enforcement point for one gate rather than a second gate. The standing
+# objection to guarding stash here — "two gates on one command is two escape
+# hatches under different names" — is an objection to a second NAME, and there
+# is not one.
+HATCHES = {
+    "destroys": "QB_ALLOW_SHARED_TREE",
+    "sweeps": "QB_ALLOW_SHARED_TREE",
+    "takes": "QB_ALLOW_SHARED_STASH",
+}
+HATCH_NAMES = set(HATCHES.values())
 HATCH_ON = {"1", "true"}
 
 
@@ -145,24 +176,30 @@ def _clauses(tokens: list[str]) -> list[list[str]]:
     return [c for c in out if c]
 
 
-def _strip_assignments(clause: list[str]) -> tuple[list[str], str | None]:
-    """Peel `VAR=value` prefixes off a clause; report the escape hatch if present.
+def _strip_assignments(clause: list[str]) -> tuple[list[str], dict[str, str]]:
+    """Peel `VAR=value` prefixes off a clause; report the escape hatches present.
 
     The hatch has to be a real leading assignment ON THIS CLAUSE. Under grep its
     `^` was a line anchor, so a hatch on line 1 of a multi-line command excused a
     reset on line 2 — and `echo QB_ALLOW_SHARED_TREE=1; git reset --hard`, which
     assigns nothing at all, excused itself.
+
+    Every recognised hatch on the clause is collected and the CALLER picks the one
+    its harm answers to. Returning whichever came first would let
+    `QB_ALLOW_SHARED_TREE=1 git stash pop` through — a hatch for a hazard the
+    command does not have, which is precisely the confusion between the two that
+    left the pop unguarded (#739).
     """
-    hatch = None
+    hatches: dict[str, str] = {}
     i = 0
     while i < len(clause) and "=" in clause[i] and not clause[i].startswith("-"):
         name, _, value = clause[i].partition("=")
         if not name or not name.replace("_", "").isalnum():
             break
-        if name == HATCH and value in HATCH_ON:
-            hatch = f"{name}={value}"
+        if name in HATCH_NAMES and value in HATCH_ON:
+            hatches[name] = f"{name}={value}"
         i += 1
-    return clause[i:], hatch
+    return clause[i:], hatches
 
 
 def _git_args(clause: list[str]) -> tuple[list[str], dict] | None:
@@ -235,10 +272,15 @@ def _short_flags(args: list[str]) -> set[str]:
 def _destroys(verb: str, args: list[str], tree: str | None) -> bool:
     """Does `git <verb> <args>` overwrite work that is not committed?
 
-    Deliberately absent: `stash`. It belongs to this family and is already
-    refused a layer down by the reference-transaction hook `qb-hooks` installs,
-    which catches it outside Claude Code too and does not wait for a peer to be
-    live. Two gates on one command is two escape hatches under different names.
+    Deliberately absent: `git stash push`. It is refused a layer down by the
+    reference-transaction hook `qb-hooks` installs, which is genuinely better for
+    it — that one catches a stash typed outside Claude Code entirely, where no
+    PreToolUse hook exists, and it does not wait for a peer to be live.
+
+    That argument covers the PUSH and nothing else, and for a long time it was
+    written down as if it covered the verb (#739). The pop side is `_takes`,
+    below; the reference-transaction hook cannot reach it and says so in its own
+    header.
     """
     flags = _short_flags(args)
     positional = [a for a in args if not a.startswith("-")]
@@ -301,9 +343,66 @@ def _sweeps(verb: str, args: list[str]) -> bool:
     return False
 
 
+def _takes(verb: str, args: list[str]) -> bool:
+    """Does `git <verb> <args>` take an entry OFF the shared stash stack? (#739)
+
+    The third harm, and the one that fell between the two gates. `refs/stash`
+    lives in the COMMON git dir, so every worktree of a repo shares one stack and
+    `stash@{0}` resolves to whatever the last pusher meant — from any worktree,
+    not necessarily this one. #210 refuses pushes onto it and CANNOT refuse a
+    pop: measured on git 2.54.0, a pop deletes its entry through the reflog,
+    which raises no ref transaction while another entry remains underneath.
+
+    So the protection there is to keep the stack empty, and the gap is what
+    happens when it is not. An agent runs `git stash push`, gets REFUSED, and
+    runs `git stash pop` next — because that was always the plan, or to undo a
+    stash it believes happened. Where its dirty files do not clash with the
+    entry's, the apply succeeds silently and DROPS it: a sibling's uncommitted
+    work is now in a tree that did not ask for it, and `git add -A` — which
+    `epic.py` and `lander.py` both run — commits it under the wrong author.
+
+    `pop`, `apply` and `branch` all read the shared stack. `push`, `list`, `show`
+    and `store` do not take anything off it, and `drop`/`clear` deliberately are
+    not here: deletions are how somebody clears entries that predate the guard,
+    which is the one route out of a stack that is already dirty.
+
+    AN EXPLICIT OBJECT THAT IS NOT ON THE SHARED STACK IS NOT THIS HARM, and that
+    is not a nicety — it is `qb-stash`, the replacement this guard's own refusal
+    tells people to use. `qb-stash apply`/`pop` run `git stash apply <ref>` against
+    a `refs/worktree/` ref, which is per-worktree and invisible to every sibling.
+    Refusing that spelling because some unrelated entry sits on `refs/stash` would
+    have the guard refusing the one command it recommends. The default — no
+    argument at all — is `stash@{0}` on the shared stack, and that is the case
+    every one of these incidents was.
+    """
+    if verb != "stash":
+        return False
+    subs = [a for a in args if not a.startswith("-")]
+    # A bare `git stash` is `git stash push`, which is the other gate's business.
+    if not subs or subs[0] not in ("pop", "apply", "branch"):
+        return False
+    # `git stash branch <newbranch> [<stash>]` names the stash second; the other
+    # two name it first. No name at all means the default, which is the shared
+    # stack's top entry.
+    named = subs[2:3] if subs[0] == "branch" else subs[1:2]
+    return not named or _is_shared_stash(named[0])
+
+
+def _is_shared_stash(ref: str) -> bool:
+    """Does this argument name an entry on the repo's ONE shared `refs/stash`?
+
+    `stash@{N}` and `refs/stash` do. A raw commit sha does not — not because it
+    cannot BE a stash commit, but because looking one up means the caller already
+    ran `git stash list` or `show` and chose it, which is the deliberate act the
+    escape hatch exists for. `refs/worktree/...` is `qb-stash`'s own namespace and
+    is nobody else's by construction.
+    """
+    return ref == "stash" or ref.startswith(("stash@{", "refs/stash"))
+
+
 def classify(command: str, depth: int = 0) -> dict:
     miss = {"destructive": False, "harm": None, "target": None, "verb": None,
-            "allowed_by": None, "parsed": True}
+            "allowed_by": None, "parsed": True, "harms": []}
 
     # LINE BY LINE FIRST, and this is not a nicety. `shlex` counts a newline as
     # ordinary whitespace, so tokenising the whole string welds every line into
@@ -329,8 +428,29 @@ def classify(command: str, depth: int = 0) -> dict:
             # saying so is the only honest answer — see the module docstring.
             return {**miss, "parsed": False}
 
+    # EVERY HARMFUL CLAUSE, IN ORDER — `harms` — and not just the winner.
+    #
+    # Two rounds of independent review landed on the same place from opposite
+    # sides. The first: returning at the first harmful clause let ITS hatch speak
+    # for every clause after it, so `QB_ALLOW_SHARED_TREE=1 git reset --hard; git
+    # stash pop` reported the reset carrying the reset's hatch, and the hook stood
+    # down over a pop nobody had consented to. The second: reporting only the
+    # first UNHATCHED harm masks every later one, and the harms no longer share a
+    # predicate — `destroys`/`sweeps` ask about the tree you are in, `takes` asks
+    # about the repo's stash stack. So `git stash pop; git reset --hard` on an
+    # empty stack reported `takes`, the hook found nothing to take, and the reset
+    # went through unexamined. That is a REGRESSION of the guard that existed
+    # before this file knew what a stash was, and one verdict cannot avoid it:
+    # a single answer cannot feed two independent questions.
+    #
+    # So the caller gets the list and asks each one. The top-level fields stay as
+    # they were — the first unhatched harm, else the first hatched one — because
+    # they are the summary, and a reader with an older hook still gets an answer
+    # rather than nothing.
+    found: list[dict] = []
+
     for clause in _clauses(tokens):
-        clause, hatch = _strip_assignments(clause)
+        clause, hatches = _strip_assignments(clause)
         if not clause:
             continue
 
@@ -339,28 +459,44 @@ def classify(command: str, depth: int = 0) -> dict:
             idx = clause.index("-c")
             if idx + 1 < len(clause):
                 inner = classify(clause[idx + 1], depth + 1)
-                if inner["destructive"]:
-                    return {**inner, "allowed_by": hatch or inner["allowed_by"]}
-            continue
+                # Flattened, not summarised: the inner command's harms are this
+                # command's harms, each keeping its own hatch state. The OUTER
+                # hatch counts too — `QB_ALLOW_SHARED_TREE=1 bash -c '…'` is a
+                # deliberate act — but only for the harm it answers to. Looked up
+                # defensively: `harm` is set with `destructive` and cannot be
+                # absent, and a KeyError would take the classifier down over it.
+                for h in inner["harms"]:
+                    outer = hatches.get(HATCHES.get(h["harm"] or "", ""))
+                    found.append({**h, "allowed_by": outer or h["allowed_by"]})
+        else:
+            parsed = _git_args(clause)
+            if parsed is None:
+                continue
+            args, globals_ = parsed
+            if not args:
+                continue
+            verb, rest = args[0], args[1:]
+            # `--help` on THIS clause, and only this one. Asking a verb to explain
+            # itself is not running it.
+            if _has(rest, "--help", "-h") or "--help" in globals_ or "-h" in globals_:
+                continue
+            tree = _target(globals_)
+            harm = ("destroys" if _destroys(verb, rest, tree)
+                    else "sweeps" if _sweeps(verb, rest)
+                    else "takes" if _takes(verb, rest) else None)
+            if harm:
+                found.append({"harm": harm, "target": tree, "verb": verb,
+                              "allowed_by": hatches.get(HATCHES[harm])})
 
-        parsed = _git_args(clause)
-        if parsed is None:
-            continue
-        args, globals_ = parsed
-        if not args:
-            continue
-        verb, rest = args[0], args[1:]
-        # `--help` on THIS clause, and only this one. Asking a verb to explain
-        # itself is not running it.
-        if _has(rest, "--help", "-h") or "--help" in globals_ or "-h" in globals_:
-            continue
-        tree = _target(globals_)
-        harm = ("destroys" if _destroys(verb, rest, tree)
-                else "sweeps" if _sweeps(verb, rest) else None)
-        if harm:
-            return {"destructive": True, "harm": harm, "target": tree, "verb": verb,
-                    "allowed_by": hatch, "parsed": True}
-    return miss
+    if not found:
+        return miss
+    # The summary: the first harm nobody consented to, else the first one they
+    # did. A command whose every harm is hatched must still come back carrying a
+    # hatch — that is what tells a caller to stand down rather than to refuse.
+    primary = next((h for h in found if not h["allowed_by"]), found[0])
+    return {"destructive": True, "parsed": True, "harms": found,
+            "harm": primary["harm"], "target": primary["target"],
+            "verb": primary["verb"], "allowed_by": primary["allowed_by"]}
 
 
 def main() -> int:

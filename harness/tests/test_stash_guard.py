@@ -19,6 +19,14 @@ a pop. The guard therefore keeps the shared stack EMPTY (it refuses writes TO
 `refs/stash`) rather than policing reads from it, and `test_the_pop_side_is_not
 _interceptable` records that limit so nobody re-derives it.
 
+THAT LIMIT IS COVERED ELSEWHERE NOW, AND ONLY ELSEWHERE (#739). Installing this
+guard drains nothing, so on a repo carrying pre-guard entries the refusal below
+is itself what produces a pop: an agent whose plan was push/work/pop hits it and
+pops next. `qb-hook`'s `takes` branch refuses that inside Claude Code, where a
+PreToolUse hook can read the command before git runs; here, where it cannot, the
+refusal says in words not to. `test_the_refusal_says_not_to_pop` pins that
+sentence, because it is the whole of the protection outside Claude Code.
+
 Run: pytest harness/tests/test_stash_guard.py
 """
 
@@ -120,6 +128,24 @@ def test_a_linked_worktree_cannot_push_to_the_shared_stash(repo, home):
     assert git(main, "stash", "list", home=home).stdout.strip() == ""
 
 
+def test_the_refusal_says_not_to_pop(repo, home):
+    """#739. The refusal is the last thing an agent reads before it decides what
+    to do next, and four in a row decided on `git stash pop` — because that was
+    always the plan, or to undo a stash they thought had happened. Nothing of
+    theirs is on the stack; a pop can only hand them somebody else's entry and
+    drop it from under them.
+
+    `qb-hook` refuses that inside Claude Code. This message is the only thing
+    standing between a hand-typed stash and the same mistake, so the sentence is
+    a test rather than a nicety."""
+    main, wt = repo
+    install(main, home)
+    (wt / "f.txt").write_text("SIDE-AGENT-WORK\n")
+    r = git(wt, "stash", "push", "-m", "wip", home=home, check=False)
+    assert "DO NOT NOW RUN 'git stash pop'" in r.stderr
+    assert "git stash list" in r.stderr, "it has to say how to look, not just what not to do"
+
+
 def test_the_working_tree_survives_a_refusal(repo, home):
     """A guard that aborted mid-stash and ate the change would be worse than the
     bug it prevents, so this is the property to pin rather than the message."""
@@ -218,8 +244,13 @@ def test_the_pop_side_is_not_interceptable(repo, home):
     """Recorded so it is not re-derived, and so the design is not mistaken for
     something stronger than it is: `git stash pop` drops its entry through the
     REFLOG while another entry remains, which raises no ref transaction, so no
-    hook sees it. Keeping the stack empty is the protection; refusing pops is not
-    available."""
+    hook sees it. Keeping the stack empty is the protection HERE; refusing pops is
+    not available to a git hook at all.
+
+    What must not be read off this test is that refusing pops is unavailable
+    everywhere, which is how it went unguarded (#739). A PreToolUse hook reads the
+    command string before git runs, so the reflog has nothing to do with it —
+    `test_qb_hook_shared_tree.py`'s "the shared stash" section is that half."""
     main, wt = repo
     (main / "f.txt").write_text("A\n")
     git(main, "stash", "push", "-q", "-m", "A", home=home)
@@ -391,3 +422,30 @@ def test_no_marker_is_left_when_there_is_nothing_to_chain_to(repo, home):
     common = Path(git(main, "rev-parse", "--path-format=absolute", "--git-common-dir",
                       home=home).stdout.strip())
     assert not (common / "qb-hooks" / "reference-transaction.delegate").exists()
+
+
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_both_guards_read_the_same_hatch_values(repo, home, value):
+    """One hatch, two enforcement points, and they have to agree on what turns it
+    on or it is two hatches wearing one name. `qb-classify-command` has always
+    read `1` and `true`; this read only `1`, so `QB_ALLOW_SHARED_STASH=true git
+    stash pop` was let through by the pre-tool guard while `…=true git stash push`
+    was refused here — one spelling consenting to half a hazard."""
+    main, wt = repo
+    install(main, home)
+    (wt / "f.txt").write_text(f"deliberate {value}\n")
+    git(wt, "stash", "push", "-q", "-m", f"on purpose {value}", home=home,
+        QB_ALLOW_SHARED_STASH=value)
+    assert f"on purpose {value}" in git(wt, "stash", "list", home=home).stdout
+
+
+def test_an_unset_or_wrong_hatch_value_still_refuses(repo, home):
+    """The other half of widening it: `0`, `yes` and an empty value are not
+    consent, and a hatch that accepted anything truthy-looking would be no hatch."""
+    main, wt = repo
+    install(main, home)
+    for value in ("0", "yes", ""):
+        (wt / "f.txt").write_text(f"not consent {value}\n")
+        r = git(wt, "stash", "push", "-m", "nope", home=home, check=False,
+                QB_ALLOW_SHARED_STASH=value)
+        assert r.returncode != 0 and "REFUSED" in r.stderr, value
