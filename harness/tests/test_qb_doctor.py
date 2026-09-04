@@ -2187,19 +2187,54 @@ def _stuck(n: int, minutes: float = 5) -> tuple[int, list]:
     They carry a `ts` because the row dates them itself: `window_min` is a request the
     board is free to over-answer, so a post with no readable timestamp is not evidence
     about any window. See `_aged_stuck`.
+
+    Each names a DISTINCT issue in its refs, because #737 made the subject the join:
+    post `i` is about issue `i`, so `_stored` can vouch for a chosen prefix of them and
+    a test can say which posts are accounted for rather than only how many.
     """
-    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes)} for i in range(n)]
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes),
+                  "refs": [{"kind": "issue", "value": str(i)}]} for i in range(n)]
 
 
 def _aged_stuck(*minutes: float) -> tuple[int, list]:
     """Stuck posts at named ages — for the floor, which serves them regardless of age."""
-    return 200, [{"id": i, "type": "stuck", "ts": _ago(m)}
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(m),
+                  "refs": [{"kind": "issue", "value": str(i)}]}
                  for i, m in enumerate(minutes)]
 
 
+def _unsubjected_stuck(n: int, minutes: float = 5) -> tuple[int, list]:
+    """`n` stuck posts whose refs name no subject — announced and NOT stored by design.
+
+    #523: a row whose subject is "something, somewhere" answers "what is waiting on me"
+    with noise, so `_subject_from` returns None and `announce` posts without storing.
+    These are the posts that must stay out of the denominator.
+    """
+    return 200, [{"id": i, "type": "stuck", "ts": _ago(minutes), "refs": []}
+                 for i in range(n)]
+
+
 def _stored(*ages: float) -> tuple[int, dict]:
-    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(a)}
+    """Open blocker rows at the named ages, vouching for `_stuck`'s posts in order.
+
+    Row `i` carries issue `i` as its subject, so `_stored(10)` accounts for the first of
+    `_stuck(5)`'s posts and no others. The ages are kept as parameters even though #737
+    stopped matching on them, because two tests still turn on age: the future-dated row,
+    and the guarantee that an OLD row still vouches.
+    """
+    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(a),
+                               "subject": {"kind": "issue", "value": str(i)},
+                               "resolved_at": None}
                               for i, a in enumerate(ages)]}
+
+
+def _stored_about(*subjects: str, age: float = 9000) -> tuple[int, dict]:
+    """Open rows about NAMED subjects — for the mismatch cases, where the count is
+    right and the subjects are wrong."""
+    return 200, {"blockers": [{"id": str(i), "raised_at": _ago(age),
+                               "subject": {"kind": "issue", "value": s},
+                               "resolved_at": None}
+                              for i, s in enumerate(subjects)]}
 
 
 def test_posts_with_no_rows_is_the_severed_producer(monkeypatch, landing_host):
@@ -2213,7 +2248,7 @@ def test_posts_with_no_rows_is_the_severed_producer(monkeypatch, landing_host):
 
     assert check.verdict == "fail"
     assert "4 stuck post(s)" in check.detail
-    assert check.extra["posts"] == 4 and check.extra["rows"] == 0
+    assert check.extra["storable"] == 4 and check.extra["accounted"] == 0
 
 
 def test_a_quiet_day_is_not_a_severed_producer(monkeypatch, landing_host):
@@ -2238,7 +2273,8 @@ def test_fewer_rows_than_posts_is_the_designed_behaviour_and_not_a_finding(
     check = qd.check_escalations(landing_host)
 
     assert check.verdict == "ok"
-    assert check.extra == {"posts": 5, "rows": 1, "window_minutes": 1440}
+    assert check.extra == {"posts": 5, "storable": 5, "accounted": 1,
+                           "open_rows": 1, "window_minutes": 1440}
 
 
 def test_rows_without_posts_is_not_a_fault_either(monkeypatch, landing_host):
@@ -2251,21 +2287,141 @@ def test_rows_without_posts_is_not_a_fault_either(monkeypatch, landing_host):
     assert check.verdict == "ok"
 
 
-def test_rows_older_than_the_window_do_not_answer_for_todays_stuck(
+def test_a_row_older_than_the_window_STILL_answers_for_todays_stuck(
         monkeypatch, landing_host):
-    """The two counts have to describe the same span. A table full of last month's
-    blockers would otherwise vouch for a producer that has been severed since."""
+    """#737, and this test is the inversion of the one that shipped the bug.
+
+    Its predecessor asserted that rows aged 4000 and 9000 minutes could not answer for
+    today's posts, on the reasoning that the two counts have to describe the same span.
+    That reasoning is right about counts and wrong about these two writes.
+    `_raise_blocker` stores a standing question ONCE — re-raising is a no-op on the
+    partial unique index — so the row is written the first time and every announcement
+    after it returns "already an open blocker". Requiring a row inside the window makes
+    the verdict a function of how long a human has left the question unanswered, and it
+    was FAIL on a healthy live board for days.
+    """
     _board_paths(monkeypatch, {"/board": _stuck(3), "/blockers": _stored(4000, 9000)})
 
     check = qd.check_escalations(landing_host)
 
+    assert check.verdict == "ok"
+    assert check.extra["accounted"] == 2
+
+
+def test_rows_about_OTHER_subjects_do_not_vouch_for_todays_stuck(
+        monkeypatch, landing_host):
+    """The concern the age check was reaching for, kept and made exact.
+
+    A table full of last month's blockers must not vouch for a producer severed since —
+    but what makes it fail to vouch is that the rows are about something else, not that
+    they are old. Matching on subject keeps the guarantee and drops the false alarm; an
+    age test could only have had one or the other.
+    """
+    _board_paths(monkeypatch, {"/board": _stuck(3),
+                               "/blockers": _stored_about("91", "92", age=30)})
+
+    check = qd.check_escalations(landing_host)
+
     assert check.verdict == "fail"
-    assert check.extra["rows"] == 0
+    assert check.extra["accounted"] == 0 and check.extra["open_rows"] == 2
+
+
+def test_a_resolved_row_cannot_account_for_a_post_still_being_made(
+        monkeypatch, landing_host):
+    """An answered question is not a standing one. If the producer went on announcing
+    after a row was resolved, the row behind those posts is gone and the escalation is
+    once again unrecorded — which is the fault, not the history."""
+    body = {"blockers": [{"id": "0", "raised_at": _ago(400),
+                          "subject": {"kind": "issue", "value": "0"},
+                          "resolved_at": _ago(100)}]}
+    _board_paths(monkeypatch, {"/board": _stuck(1), "/blockers": (200, body)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.extra["open_rows"] == 0
+
+
+def test_posts_that_name_no_subject_are_excluded_and_never_the_fault(
+        monkeypatch, landing_host):
+    """#523's by-design exclusion, in the denominator rather than in prose.
+
+    These posts could never have had a row, so counting them against the row half would
+    trade #737's false alarm for a fresh one — a producer working exactly as designed,
+    reported as severed because it declined to store noise.
+    """
+    _board_paths(monkeypatch, {"/board": _unsubjected_stuck(6),
+                               "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert "storable by design" in check.detail
+    assert check.extra["posts"] == 6 and check.extra["storable"] == 0
+
+
+def test_a_subjectless_post_does_not_mask_a_severed_producer(
+        monkeypatch, landing_host):
+    """The other half of the exclusion: it takes posts out of the denominator, and it
+    must not take them out of the fault. A run carrying both shapes still fails on the
+    storable ones."""
+    subjectless = _unsubjected_stuck(4)[1]
+    both = 200, subjectless + _stuck(2)[1]
+    _board_paths(monkeypatch, {"/board": both, "/blockers": _stored()})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "fail"
+    assert check.extra["posts"] == 6 and check.extra["storable"] == 2
+
+
+def test_the_subject_preference_matches_the_producers(monkeypatch, landing_host):
+    """The copied tuple, held to the one `announce` actually uses.
+
+    `qb-doctor` imports nothing from `harness/loops`, so `ESCALATION_SUBJECT_PREFERENCE`
+    is a second spelling of `needs_human._SUBJECT_PREFERENCE` — and a second spelling is
+    how a matcher silently stops matching, which is the reasoning `headline` is factored
+    out under. Divergence here would leave every post looking unaccounted for: #737's
+    false alarm, arriving by a different route.
+    """
+    source = (Path(qd.__file__).resolve().parent.parent / "loops" / "needs_human.py")
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    declared = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", "") == "_SUBJECT_PREFERENCE" for t in node.targets))
+
+    assert declared == qd.ESCALATION_SUBJECT_PREFERENCE
+
+
+def test_a_pr_ref_outranks_the_issue_beside_it(monkeypatch, landing_host):
+    """Preference order is load-bearing, not decoration: `_raise_blocker` files the row
+    under the most specific subject the refs name, so a reader picking a different one
+    would look up a row that exists under another key and report it missing."""
+    post = {"id": 1, "type": "stuck", "ts": _ago(5),
+            "refs": [{"kind": "issue", "value": "10"},
+                     {"kind": "pr", "value": "20"}]}
+    row = {"blockers": [{"id": "0", "raised_at": _ago(900),
+                         "subject": {"kind": "pr", "value": "20"},
+                         "resolved_at": None}]}
+    _board_paths(monkeypatch, {"/board": (200, [post]), "/blockers": (200, row)})
+
+    check = qd.check_escalations(landing_host)
+
+    assert check.verdict == "ok"
+    assert check.extra["accounted"] == 1
 
 
 def test_a_row_raised_in_the_future_is_not_evidence_of_health(monkeypatch, landing_host):
     """Clock skew or bad data. `_age_minutes` returns it negative rather than clamping,
-    and this row discards it — the same rule the queue row applies to arrivals."""
+    and this row discards it — the same rule the queue row applies to arrivals.
+
+    Deliberately survives #737. That change drops the window's UPPER bound, because a
+    row legitimately outlives the posts it accounts for; it keeps this floor, because a
+    row dated after the moment it is read is not a fact about anything. Losing this
+    guarantee would have been a silent cost of the fix rather than part of it.
+    """
     _board_paths(monkeypatch, {"/board": _stuck(2), "/blockers": _stored(-90)})
 
     check = qd.check_escalations(landing_host)
@@ -2323,7 +2479,8 @@ def test_a_board_answering_nonsense_elements_is_reported_not_raised(
     check = qd.check_escalations(landing_host)
 
     assert check.verdict == "ok"
-    assert check.extra == {"posts": 0, "rows": 0, "window_minutes": 1440}
+    assert check.extra == {"posts": 0, "storable": 0, "accounted": 0,
+                           "open_rows": 0, "window_minutes": 1440}
 
 
 def test_a_board_without_blockers_deployed_has_not_severed_anything(
