@@ -340,3 +340,78 @@ def test_a_command_whose_every_harm_is_hatched_still_reports_the_hatch():
     both = classify(
         "QB_ALLOW_SHARED_TREE=1 git reset --hard; QB_ALLOW_SHARED_STASH=1 git stash pop")
     assert both["allowed_by"] == "QB_ALLOW_SHARED_TREE=1"
+
+
+# ------------------------------------------------- every harm, not just the winner
+
+
+def test_every_harmful_clause_is_reported_in_order():
+    """The summary names one harm; `harms` names them all. Since the harms stopped
+    sharing a predicate, a caller with two questions cannot use the summary — it
+    hides the later harms behind a question that was never put to them."""
+    v = classify("git stash pop; git reset --hard")
+    assert [h["harm"] for h in v["harms"]] == ["takes", "destroys"]
+    assert v["harm"] == "takes", "the summary is still the first unhatched harm"
+
+    v = classify("git reset --hard; git stash pop; git add .")
+    assert [h["harm"] for h in v["harms"]] == ["destroys", "takes", "sweeps"]
+
+
+def test_each_harm_carries_its_own_hatch_and_target():
+    """The two facts a walk needs per clause, and neither survives a summary: two
+    clauses can name two different trees, and a hatch consents to one hazard."""
+    v = classify("QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop")
+    assert [h["allowed_by"] for h in v["harms"]] == ["QB_ALLOW_SHARED_TREE=1", None]
+
+    v = classify("git -C /a reset --hard; git -C /b add .")
+    assert [h["target"] for h in v["harms"]] == ["/a", "/b"]
+
+
+def test_a_nested_shells_harms_are_flattened_not_summarised():
+    """`bash -c '…'` used to contribute one harm however many it held, so a command
+    inside it could be masked the same way. Its harms are this command's harms,
+    each keeping its own hatch state."""
+    v = classify("bash -c 'git reset --hard; git stash pop'")
+    assert [h["harm"] for h in v["harms"]] == ["destroys", "takes"]
+
+    v = classify("QB_ALLOW_SHARED_STASH=1 bash -c 'git reset --hard; git stash pop'")
+    assert [h["allowed_by"] for h in v["harms"]] == [None, "QB_ALLOW_SHARED_STASH=1"]
+
+
+def test_nothing_harmful_reports_an_empty_harms_list():
+    """The shape has to be stable, because the reader indexes it. `parsed: false`
+    included — a command we could not tokenise has no harms to list, and an absent
+    key would read to a `jq` walk as a harm it could not see."""
+    assert classify("git status")["harms"] == []
+    assert classify('git reset --hard "')["harms"] == []
+
+
+@pytest.mark.parametrize("cmd", [
+    "git stash apply refs/worktree/qb-stash/fix-issue-739",
+    "git stash pop refs/worktree/qb-stash/fix-issue-739",
+    "git stash apply deadbeef1234",
+    "git stash branch hotfix refs/worktree/qb-stash/x",
+])
+def test_an_explicit_object_off_the_shared_stack_is_not_this_harm(cmd):
+    """`qb-stash apply`/`pop` — the replacement this guard's own refusal advises —
+    run `git stash apply <refs/worktree/...>`. That namespace is per-worktree and
+    invisible to every sibling, so refusing it because some unrelated entry sits on
+    `refs/stash` would be the guard refusing the command it recommends.
+
+    A raw sha is out for a different reason: looking one up means the caller
+    already ran `git stash list` or `show` and chose it, which is the deliberate
+    act the hatch exists for."""
+    assert not destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git stash pop",                    # no argument at all — the default is shared
+    "git stash apply",
+    "git stash branch hotfix",
+    "git stash pop stash@{0}",
+    "git stash apply stash@{2}",
+    "git stash branch hotfix stash@{1}",
+    "git stash pop refs/stash",
+])
+def test_the_shared_stack_is_still_named_however_it_is_spelled(cmd):
+    assert classify(cmd)["harm"] == "takes", cmd

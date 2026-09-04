@@ -1040,3 +1040,101 @@ def test_the_guard_fails_open_when_the_stack_cannot_be_listed(shared_stash):
     )
     stub_git.chmod(0o755)
     assert shared_stash.decision(shared_stash.bash("git stash pop")) is None
+
+
+# ------------------------------------------- two harms, two predicates, one command
+
+
+def test_a_stash_harm_does_not_mask_a_reset_behind_it(guard):
+    """THE REGRESSION AN INDEPENDENT REVIEW CAUGHT. Before `takes` existed the
+    classifier reported the reset in `git stash pop; git reset --hard`, because
+    it had nothing else to report, and the tree guard refused it. Once stash was
+    classified, the summary became `takes` — and a guard that found nothing on
+    the stash stack returned, letting the reset through unexamined.
+
+    That is protection this repo already had, removed by the change that added
+    the third harm. One verdict cannot answer two independent questions."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("a peer's in-flight edit\n")
+    guard.linked_worktree()                       # linked worktrees, but...
+    guard.peers(PEER, in_tree=guard.cwd)          # ...an EMPTY shared stack
+    d = guard.decision(guard.bash("git stash pop; git reset --hard"))
+    assert d is not None, "the reset was masked by a stash harm that did not fire"
+    assert d["permissionDecision"] == "deny"
+    assert "hermes/seat-quarterback-4" in d["permissionDecisionReason"], (
+        "it refused, but for the stash rather than the reset")
+
+
+def test_a_reset_harm_does_not_mask_a_pop_behind_it(guard):
+    """The mirror, and not a regression — nothing guarded the pop before. A clean
+    tree with nobody live makes the reset's three facts false, and the pop behind
+    it is still taking a sibling's entry."""
+    guard.commit("app.py", "committed and clean\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(ALONE)
+    d = guard.decision(guard.bash("git reset --hard; git stash pop"))
+    assert d is not None, "the pop was masked by a reset harm that did not fire"
+    assert "refs/stash is SHARED" in d["permissionDecisionReason"]
+
+
+def test_a_hatch_on_one_harm_does_not_consent_to_the_other(guard):
+    """The two halves of the walk have to hold at once: a hatched harm is SKIPPED
+    rather than ending it. Consenting to a reset in a shared tree says nothing
+    about whose work is at `stash@{0}`, and before the walk existed the hatch on
+    the first clause stood for the whole command."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("dirty\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(PEER, in_tree=guard.cwd)
+    d = guard.decision(
+        guard.bash("QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop"))
+    assert d is not None, "the tree hatch consented to the pop as well"
+    assert "refs/stash is SHARED" in d["permissionDecisionReason"]
+
+
+def test_a_command_whose_every_harm_is_hatched_still_runs(guard):
+    """And the walk must not become a wall. Both hatches present, both hazards
+    live, nothing refused — otherwise fixing the masking would have turned every
+    compound command with an escape hatch into a refusal."""
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("dirty\n")
+    guard.stash_from(guard.linked_worktree(), "app.py", "SIBLING\n", "theirs")
+    guard.peers(PEER, in_tree=guard.cwd)
+    assert guard.decision(guard.bash(
+        "QB_ALLOW_SHARED_TREE=1 git reset --hard; "
+        "QB_ALLOW_SHARED_STASH=1 git stash pop")) is None
+
+
+def test_an_older_classifier_that_emits_no_harms_still_guards_one(guard):
+    """This hook and the classifier beside it are separate files on separate
+    update paths, so a box can carry a new hook and an old classifier. The walk
+    falls back to the top-level summary rather than reading an absent `harms` as
+    'nothing harmful' — one harm guarded beats none."""
+    # NO SHEBANG, and that is not an omission. The hook runs the classifier as
+    # `python3 "$_QB_CLASSIFY"`, so this is never exec'd directly and the line
+    # would be a comment — while `test_runtime_stub_shebangs.py` forbids a
+    # runtime-written stub naming `/usr/bin/env`, which does not exist inside a
+    # nix build sandbox. It must still be real Python: a `/bin/sh` body would make
+    # python3 exit non-zero, the guard would fail open, and this test would pass
+    # by letting the command through — the opposite of what it asserts.
+    old = guard.bin / "qb-classify-command"
+    old.write_text(
+        "import json, sys\n"
+        "sys.stdin.read()\n"
+        "print(json.dumps({'destructive': True, 'harm': 'destroys', 'target': None,\n"
+        "                  'verb': 'reset', 'allowed_by': None, 'parsed': True}))\n"
+    )
+    old.chmod(0o755)
+    guard.commit("app.py", "original\n")
+    (guard.cwd / "app.py").write_text("a peer's edit\n")
+    guard.peers(PEER, in_tree=guard.cwd)
+    assert guard.decision(guard.bash("git reset --hard"))["permissionDecision"] == "deny"
+
+
+def test_qb_stashs_own_idiom_is_not_refused(shared_stash):
+    """`qb-stash apply`/`pop` — the replacement this guard's refusal recommends —
+    run `git stash apply <refs/worktree/...>`, which is per-worktree and nobody
+    else's by construction. Refusing that spelling because an unrelated entry sits
+    on `refs/stash` would have the guard refusing the one command it advises."""
+    assert shared_stash.decision(
+        shared_stash.bash("git stash apply refs/worktree/qb-stash/fix-x")) is None

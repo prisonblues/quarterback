@@ -93,7 +93,12 @@ if [[ -n "$stash_new" && "$(git rev-parse --verify -q refs/stash 2>/dev/null)" =
     exit $?
 fi
 
-if [[ "${QB_ALLOW_SHARED_STASH:-}" == "1" ]]; then
+# `1` and `true`, because `qb-classify-command` has always read both and this is
+# meant to be ONE hatch that two guards honour identically. While this accepted
+# only `1`, `QB_ALLOW_SHARED_STASH=true git stash pop` was let through by the
+# pre-tool guard and `…=true git stash push` was refused here — one spelling
+# consenting to half a hazard. `1` stays the documented spelling.
+if [[ "${QB_ALLOW_SHARED_STASH:-}" == "1" || "${QB_ALLOW_SHARED_STASH:-}" == "true" ]]; then
     chain_delegate "$phase"
     exit $?
 fi

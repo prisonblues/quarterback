@@ -1051,14 +1051,35 @@ _shared_stash_guard() {   # _shared_stash_guard <repo root>: the `takes` harm (#
   #   1. the repo has linked worktrees   (a solo checkout's stack is nobody else's)
   #   2. `refs/stash` is not empty       (nothing to take; a pop errors on its own,
   #                                       and refusing it would be crying wolf)
-  local root=$1 common linked entries n
+  #
+  # NEITHER FACT PROVES THE ENTRY IS SOMEBODY ELSE'S, and the refusal does not
+  # claim they do. A stash entry carries no author, no worktree and no session —
+  # the owner of the one that prompted #210 was identified from a board claim, not
+  # from git — so ownership is not knowable here and this is a conservative policy
+  # rather than a deduction. It over-refuses a stack holding only your own
+  # deliberately hatch-pushed entries, and it under-refuses one whose pusher's
+  # worktree has since been pruned away. The hatch is the answer to the first; the
+  # second is the honest limit, and it is why `git stash list` is in the message.
+  local root=$1 common linked entries n _wt
   common=$(timeout 3 git -C "$root" rev-parse --path-format=absolute \
              --git-common-dir 2>/dev/null) || return 0
   [ -n "$common" ] || return 0
-  # A de-registered worktree leaves its dir behind until `git worktree prune`, so
-  # this can read yes for a moment longer than it is true — which errs toward
-  # refusing, the same way the reference-transaction hook does.
-  linked=$(ls -A "$common/worktrees" 2>/dev/null | head -n 1)
+  # The same directory test the reference-transaction hook makes, spelled the
+  # same way on purpose: two guards on one hazard that disagree about whether the
+  # hazard exists are worse than either alone.
+  #
+  # A de-registered worktree leaves its dir here until `git worktree prune`, so
+  # this can read yes for a moment longer than it is literally true. That is the
+  # direction to be wrong in, and NOT for the usual fail-safe reason: a stale
+  # entry means this repo HAD a sibling, and the entries on the stack may well be
+  # that sibling's, still ownerless. Asking git for live worktrees instead would
+  # allow exactly that case.
+  linked=""
+  if [ -d "$common/worktrees" ]; then
+    for _wt in "$common/worktrees"/*/; do
+      [ -d "$_wt" ] && { linked=1; break; }
+    done
+  fi
   [ -n "$linked" ] || return 0
 
   entries=$(timeout 3 git -C "$root" stash list 2>/dev/null) || return 0
@@ -1083,63 +1104,11 @@ What to do instead, cheapest first:
 
 Deliberate, and you accept that stash@{0} may not be yours: QB_ALLOW_SHARED_STASH=1 git stash pop"
 }
-
-_shared_tree_guard() {
-  local cmd verdict target root cwdroot dirty names n hatch harm
-
-  cmd=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)
-  [ -n "$cmd" ] || return 0
-
-  # Fast path, and the only one almost every call takes.
-  printf '%s' "$cmd" | grep -Eq "$_QB_MAYBE" || return 0
-
-  # Now pay for an answer. Fail-open on every way this can go wrong: an install
-  # without python3, a classifier that errors, output that will not parse.
-  [ -n "$_QB_CLASSIFY" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  verdict=$(printf '%s' "$cmd" \
-            | timeout 5 python3 "$_QB_CLASSIFY" 2>/dev/null) || return 0
-  [ -n "$verdict" ] || return 0
-
-  case $(printf '%s' "$verdict" | jq -r '.destructive // false' 2>/dev/null) in
-    true) ;; *) return 0 ;;
-  esac
-  # A command we could not tokenise is a command we know nothing about, and the
-  # one thing that must never be dressed up as knowledge.
-  case $(printf '%s' "$verdict" | jq -r '.parsed // false' 2>/dev/null) in
-    true) ;; *) return 0 ;;
-  esac
-  # The escape hatch, as a real leading assignment ON THE CLAUSE THAT MATCHED —
-  # which is a fact only the tokeniser has.
-  hatch=$(printf '%s' "$verdict" | jq -r '.allowed_by // empty' 2>/dev/null)
-  [ -n "$hatch" ] && return 0
-
-  [ -n "$cwd" ] || return 0
-
-  # WHICH TREE IS THIS COMMAND GOING TO TOUCH? Not necessarily the one we are
-  # standing in — `git -C ../peer-tree reset --hard` destroys somebody else's
-  # while the payload cwd stays clean and unshared, and refusing its mirror image
-  # (a private tree, from a shared cwd) is the same defect pointed the other way.
-  target=$(printf '%s' "$verdict" | jq -r '.target // empty' 2>/dev/null)
-  if [ -n "$target" ]; then
-    case "$target" in /*) ;; *) target="$cwd/$target" ;; esac
-  else
-    target="$cwd"
-  fi
-
-  root=$(_tree_root "$target") || return 0
-  [ -n "$root" ] || return 0
-
-  # THREE HARMS, TWO PREDICATES. `destroys` and `sweeps` are both about the tree
-  # you are standing in, and everything below asks about that. `takes` is about
-  # the repo's shared stash stack, which is a hazard with nobody else live and no
-  # local changes at all — so it branches off here, BEFORE the dirty check, and
-  # asks its own questions.
-  harm=$(printf '%s' "$verdict" | jq -r '.harm // "destroys"' 2>/dev/null)
-  if [ "$harm" = "takes" ]; then
-    _shared_stash_guard "$root"
-    return 0
-  fi
+_shared_tree_harm_guard() {   # _shared_tree_harm_guard <harm> <root>: `destroys` / `sweeps`
+  # The tree half, unchanged in substance and now reachable per-clause. Both of
+  # these harms ask the same two questions of the same tree, which is why they
+  # share a function and `takes` does not.
+  local harm=$1 root=$2 dirty n names cwdroot
 
   # Is there anything to lose? A hard reset in a clean tree destroys nothing
   # uncommitted, and refusing it would be the gate crying wolf on the safest
@@ -1207,6 +1176,95 @@ What to do instead, cheapest first:
   3. Save theirs and yours before you swing: qb-stash push   (or git diff > /tmp/tree.patch)
 
 If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of the command and it will run."
+}
+_shared_tree_guard() {
+  local cmd verdict harms one harm target root hatch
+
+  cmd=$(printf '%s' "$IN" | jq -r '.tool_input.command // empty' 2>/dev/null)
+  [ -n "$cmd" ] || return 0
+
+  # Fast path, and the only one almost every call takes.
+  printf '%s' "$cmd" | grep -Eq "$_QB_MAYBE" || return 0
+
+  # Now pay for an answer. Fail-open on every way this can go wrong: an install
+  # without python3, a classifier that errors, output that will not parse.
+  [ -n "$_QB_CLASSIFY" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  verdict=$(printf '%s' "$cmd" \
+            | timeout 5 python3 "$_QB_CLASSIFY" 2>/dev/null) || return 0
+  [ -n "$verdict" ] || return 0
+
+  case $(printf '%s' "$verdict" | jq -r '.destructive // false' 2>/dev/null) in
+    true) ;; *) return 0 ;;
+  esac
+  # A command we could not tokenise is a command we know nothing about, and the
+  # one thing that must never be dressed up as knowledge.
+  case $(printf '%s' "$verdict" | jq -r '.parsed // false' 2>/dev/null) in
+    true) ;; *) return 0 ;;
+  esac
+  [ -n "$cwd" ] || return 0
+
+  # EVERY HARM ON THE COMMAND, IN ORDER — not just the one the classifier
+  # summarised. The three harms no longer share a predicate, and the moment they
+  # stopped, one verdict stopped being able to answer for the command: `git stash
+  # pop; git reset --hard` summarises as `takes`, and a guard that found nothing
+  # on the stash stack then returned, letting the reset through unexamined. That
+  # is a regression of the protection that existed before `takes` did — the
+  # classifier used to report the reset, because it had nothing else to report.
+  #
+  # So ask each harm its own question and refuse on the first that says yes. A
+  # harm carrying its own hatch is skipped rather than ending the walk, which is
+  # what stops `QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop` from
+  # consenting to the pop as well.
+  #
+  # A HEREDOC AND NOT A PIPE, deliberately: `_deny` ends the process, and a
+  # `while` on the right of a pipe runs in a subshell where `exit` would end only
+  # the subshell — the refusal would be written and the tool call allowed anyway.
+  #
+  # `.harms` is read with a fallback to the top-level fields, because this hook
+  # and the classifier beside it are separate files that can be updated
+  # separately: against an older classifier that emits no `harms`, the summary is
+  # still a real answer, and one harm guarded beats none.
+  harms=$(printf '%s' "$verdict" | jq -c '
+      if (.harms | type) == "array" and (.harms | length) > 0 then .harms[]
+      else {harm, target, verb, allowed_by} end' 2>/dev/null) || return 0
+  [ -n "$harms" ] || return 0
+
+  while IFS= read -r one; do
+    [ -n "$one" ] || continue
+
+    # The escape hatch, as a real leading assignment ON THE CLAUSE THAT MATCHED,
+    # and for THIS harm's hazard — both facts only the tokeniser has.
+    hatch=$(printf '%s' "$one" | jq -r '.allowed_by // empty' 2>/dev/null)
+    [ -n "$hatch" ] && continue
+
+    harm=$(printf '%s' "$one" | jq -r '.harm // "destroys"' 2>/dev/null)
+
+    # WHICH TREE IS THIS CLAUSE GOING TO TOUCH? Not necessarily the one we are
+    # standing in — `git -C ../peer-tree reset --hard` destroys somebody else's
+    # while the payload cwd stays clean and unshared, and refusing its mirror
+    # image (a private tree, from a shared cwd) is the same defect pointed the
+    # other way. Per clause, because two clauses can name two different trees.
+    target=$(printf '%s' "$one" | jq -r '.target // empty' 2>/dev/null)
+    if [ -n "$target" ]; then
+      case "$target" in /*) ;; *) target="$cwd/$target" ;; esac
+    else
+      target="$cwd"
+    fi
+    root=$(_tree_root "$target") || continue
+    [ -n "$root" ] || continue
+
+    # THREE HARMS, TWO PREDICATES. `destroys` and `sweeps` are both about the
+    # tree you are standing in. `takes` is about the repo's shared stash stack,
+    # which is a hazard with nobody else live and no local changes at all.
+    if [ "$harm" = "takes" ]; then
+      _shared_stash_guard "$root"
+    else
+      _shared_tree_harm_guard "$harm" "$root"
+    fi
+  done <<HARMS
+$harms
+HARMS
 }
 
 

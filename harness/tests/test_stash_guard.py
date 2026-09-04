@@ -422,3 +422,30 @@ def test_no_marker_is_left_when_there_is_nothing_to_chain_to(repo, home):
     common = Path(git(main, "rev-parse", "--path-format=absolute", "--git-common-dir",
                       home=home).stdout.strip())
     assert not (common / "qb-hooks" / "reference-transaction.delegate").exists()
+
+
+@pytest.mark.parametrize("value", ["1", "true"])
+def test_both_guards_read_the_same_hatch_values(repo, home, value):
+    """One hatch, two enforcement points, and they have to agree on what turns it
+    on or it is two hatches wearing one name. `qb-classify-command` has always
+    read `1` and `true`; this read only `1`, so `QB_ALLOW_SHARED_STASH=true git
+    stash pop` was let through by the pre-tool guard while `…=true git stash push`
+    was refused here — one spelling consenting to half a hazard."""
+    main, wt = repo
+    install(main, home)
+    (wt / "f.txt").write_text(f"deliberate {value}\n")
+    git(wt, "stash", "push", "-q", "-m", f"on purpose {value}", home=home,
+        QB_ALLOW_SHARED_STASH=value)
+    assert f"on purpose {value}" in git(wt, "stash", "list", home=home).stdout
+
+
+def test_an_unset_or_wrong_hatch_value_still_refuses(repo, home):
+    """The other half of widening it: `0`, `yes` and an empty value are not
+    consent, and a hatch that accepted anything truthy-looking would be no hatch."""
+    main, wt = repo
+    install(main, home)
+    for value in ("0", "yes", ""):
+        (wt / "f.txt").write_text(f"not consent {value}\n")
+        r = git(wt, "stash", "push", "-m", "nope", home=home, check=False,
+                QB_ALLOW_SHARED_STASH=value)
+        assert r.returncode != 0 and "REFUSED" in r.stderr, value

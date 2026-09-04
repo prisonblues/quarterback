@@ -967,7 +967,26 @@ the case that happens. Its own two are:
 `push` is not here: it is refused a layer down, by the `reference-transaction` hook, which
 catches it outside Claude Code too. `list`, `show`, `drop` and `clear` are not here either —
 the first two are reads, and the second two are the only way anyone drains a stack that already
-has entries on it.
+has entries on it. Nor is an **explicit object that is not on the shared stack**: `qb-stash
+apply`/`pop`, the replacement this guard's own refusal recommends, run `git stash apply
+<refs/worktree/…>`, and a guard that refused the command it advises would be worth nothing.
+
+**Neither fact proves the entry is somebody else's, and the refusal does not say it does.** A
+stash entry carries no author, no worktree and no session — the owner of the one that prompted
+#210 was identified from a *board claim*, not from git — so this is a conservative policy rather
+than a deduction. It over-refuses a stack holding only your own deliberately hatch-pushed
+entries, and it under-refuses one whose pusher's worktree has since been pruned away. The hatch
+answers the first; the second is the honest limit, and it is why `git stash list` is in the
+message rather than a claim about whose the entry is.
+
+**Every harm on the command is asked its own question, not just the first.** The moment the
+harms stopped sharing a predicate, one verdict stopped being able to answer for a whole command:
+`git stash pop; git reset --hard` summarises as `takes`, and a guard that found nothing on the
+stash stack would return, letting the reset through unexamined — which is protection this repo
+had *before* `takes` existed. So `qb-classify-command` reports `harms`, every harmful clause in
+order with its own target and its own hatch, and the hook walks them and refuses on the first
+predicate that fires. A hatched harm is skipped rather than ending the walk, which is what keeps
+`QB_ALLOW_SHARED_TREE=1 git reset --hard; git stash pop` from consenting to the pop as well.
 
 **The command is tokenised, not matched.** A panel round found nine P1 bypasses in the regex that
 used to decide this, and they were one premise wearing nine faces — a regular expression cannot
@@ -1060,7 +1079,10 @@ take nothing into a tree, and they are the only route out of a stack that is alr
 
 The "two gates means two escape hatches under different names" objection is answered by there
 being one name. `QB_ALLOW_SHARED_STASH=1` is what the `reference-transaction` hook already reads,
-and it is what `qb-hook` reads for `takes`, so this is one hatch enforced in two places.
+and it is what `qb-hook` reads for `takes`, so this is one hatch enforced in two places — and
+both now read the same *values*, `1` and `true`. While the git hook took only `1`, that claim was
+not quite true: `QB_ALLOW_SHARED_STASH=true git stash pop` was let through by the pre-tool guard
+and `…=true git stash push` was refused, one spelling consenting to half a hazard.
 `QB_ALLOW_SHARED_TREE=1` deliberately does **not** open it: settling the shared-tree question with
 a peer says nothing about whose work is sitting at `stash@{0}`, and a hatch spanning both would
 let an agent consent to a hazard nobody had told it about.
