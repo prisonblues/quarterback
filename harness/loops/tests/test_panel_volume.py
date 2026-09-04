@@ -5,10 +5,12 @@ this suite exists **beside** it rather than over it. That one asks *did the fix 
 this?* — the fraction of a round's new outstanding findings that
 `panel_scope._provenance` attributed to the previous fix pass. This one asks the
 question a human asked on #480, over a cycle of this board's own: *is the count still
-falling?* Three rounds produced 44 findings, then 15 new, then 18 new; he stopped the
-cycle and triaged the rest.
+falling?* Three rounds produced 44 findings, then 38 new, then 41 new; he stopped the
+cycle and triaged the rest. (The comment used to quote that cycle as 44 -> 15 -> 18 and
+the board records 44 -> 38 -> 41; #710 corrected it, and the floor moved on the
+correction.)
 
-The two are not the same question and do not have the same answer. Those 18 need not
+The two are not the same question and do not have the same answer. Those 41 need not
 be attributable to the fix at all — a reviewer reading deeper, a seat that woke up, a
 scope that widened, a vendor added mid-cycle — and `_provenance` under-counts the ones
 that are, by its own documented design. So a genuinely diverging cycle can sit under
@@ -24,7 +26,8 @@ in the shape `test_panel_injection.py` pins its sibling:
   every repo that did not configure it;
 * the MEASUREMENT — a streak counted backwards over the rounds' own `new_findings`,
   where an unknown resets rather than being guessed, a flat series counts, and a noise
-  floor stops 1 -> 2 from ending a cycle;
+  floor — MEASURED over the whole board at 17 (#710) — stops 1 -> 2 and 16 -> 25 from
+  ending a cycle;
 * the STOP — never dressed up as convergence, ahead of the cap in the `reason`, behind
   `fix_injection` in it, bounded to rule 1, and able to make exactly ONE transition:
   `go again` -> stop;
@@ -84,7 +87,7 @@ def test_the_shipped_window_can_fire_before_the_shipped_cap_ends_the_cycle():
     cap = DEFAULT_BLOCK["max_rounds"]
     # The shortest cycle the shipped window can fire on: one round to set the count and
     # `limit` more that fail to fall below it.
-    series = [(r, 9) for r in range(1, limit + 2)]
+    series = [(r, 20) for r in range(1, limit + 2)]
     fires = panel_rounds.not_falling_state(series, limit)
     assert fires["streak"] == limit and fires["over"] is True
     assert len(series) <= cap, (
@@ -191,13 +194,25 @@ def test_the_board_may_set_it_and_may_switch_it_off():
 # ----------------------------------------------------------------- the measurement
 
 def test_the_cycle_the_rule_was_stated_over():
-    """#480, and the whole point of the rung. 44 findings, then 15 new, then 18 new:
-    round 2 fell and bought round 3, round 3 did not and ends the cycle — which is
-    where the human ended it."""
+    """#480, and the whole point of the rung. Three rounds: 44 findings, then 38 new,
+    then 41 new — round 2 fell and bought round 3, round 3 did not and ends the cycle,
+    which is where the human ended it.
+
+    **The series is the one the BOARD records, not the one the comment used to quote
+    (#710).** `GET /reviews?limit=500` filtered to `prisonblues/quarterback` pr 480 is
+    cycle `a64ec1c4` at 44, 38, 41. No cycle on the board has a 44 -> 15 -> 18 series;
+    the only 15 -> 18 pair on it is quarterback#61 rounds 2 and 3, eleven days earlier
+    and a different cycle. The correction is load-bearing rather than cosmetic: read as
+    15 and 18 the founding case caps `NOT_FALLING_MIN_NEW` at 15, which conflicts with
+    sparing quarterback#161's 16 -> 25 and would have made this issue a decision
+    request; read as 38 and 41 it caps it at 38 and there is no conflict."""
     assert panel_rounds.not_falling_state([(1, 44)], 1)["over"] is False
-    assert panel_rounds.not_falling_state([(1, 44), (2, 15)], 1)["over"] is False
-    got = panel_rounds.not_falling_state([(1, 44), (2, 15), (3, 18)], 1)
-    assert (got["count"], got["was"], got["streak"], got["over"]) == (18, 15, 1, True)
+    assert panel_rounds.not_falling_state([(1, 44), (2, 38)], 1)["over"] is False
+    got = panel_rounds.not_falling_state([(1, 44), (2, 38), (3, 41)], 1)
+    assert (got["count"], got["was"], got["streak"], got["over"]) == (41, 38, 1, True)
+    # ...and it survives the whole window the two constraints leave open, which is what
+    # "the founding case must still fire" means as an assertion rather than a promise.
+    assert panel_rounds.NOT_FALLING_MIN_NEW <= 38
 
 
 def test_round_one_is_never_a_not_falling_round():
@@ -211,17 +226,17 @@ def test_a_FLAT_series_counts_because_flat_is_not_converging():
     """`>=`, not `>`. A cycle producing fifteen new findings a round forever is not
     converging, and a rule that only caught the rise would let it run to the cap —
     which is the failure this rung exists to remove."""
-    assert panel_rounds.not_falling_state([(1, 15), (2, 15)], 1)["over"] is True
+    assert panel_rounds.not_falling_state([(1, 38), (2, 38)], 1)["over"] is True
 
 
 def test_a_round_below_the_noise_floor_cannot_end_a_cycle():
     """`NOT_FALLING_MIN_NEW`. One new finding then two is a rise of 100% and is a cycle
     that is very nearly done; what #505 is about is the shape where both ends of the
     comparison are volumes."""
-    assert panel_rounds.NOT_FALLING_MIN_NEW == 4
-    assert panel_rounds.not_falling_state([(1, 9), (2, 2)], 1)["over"] is False
-    assert panel_rounds.not_falling_state([(1, 9), (2, 3)], 1)["over"] is False
-    assert panel_rounds.not_falling_state([(1, 9), (2, 9)], 1)["over"] is True
+    assert panel_rounds.NOT_FALLING_MIN_NEW == 17
+    assert panel_rounds.not_falling_state([(1, 20), (2, 9)], 1)["over"] is False
+    assert panel_rounds.not_falling_state([(1, 20), (2, 16)], 1)["over"] is False
+    assert panel_rounds.not_falling_state([(1, 20), (2, 20)], 1)["over"] is True
 
 
 def test_the_floor_is_on_BOTH_ends_of_the_comparison():
@@ -236,11 +251,11 @@ def test_the_floor_is_on_BOTH_ends_of_the_comparison():
     exactly the false positive this rule's own docstring names, an earlier round that
     under-read, and the answer is to require the comparison to be between two
     measurements rather than to make an exception for one fixture."""
-    assert panel_rounds.not_falling_state([(1, 1), (2, 4)], 1)["over"] is False
+    assert panel_rounds.not_falling_state([(1, 1), (2, 17)], 1)["over"] is False
     assert panel_rounds.not_falling_state([(1, 1), (2, 400)], 1)["over"] is False
-    # ...and the cycle the rule was stated over is untouched: 15 and 18 are both
+    # ...and the cycle the rule was stated over is untouched: 38 and 41 are both
     # volumes, which is the shape the rung is about.
-    assert panel_rounds.not_falling_state([(1, 44), (2, 15), (3, 18)], 1)["over"] is True
+    assert panel_rounds.not_falling_state([(1, 44), (2, 38), (3, 41)], 1)["over"] is True
 
 
 def test_an_unknown_count_resets_the_streak_rather_than_being_guessed():
@@ -248,19 +263,19 @@ def test_an_unknown_count_resets_the_streak_rather_than_being_guessed():
     than the field. An unknown is not a fall and is not a rise; it is the absence of the
     comparison, and every unknown in this module fails in the direction that does not
     stop a cycle."""
-    assert panel_rounds.not_falling_state([(1, 9), (2, None), (3, 9)], 1)["streak"] == 0
-    assert panel_rounds.not_falling_state([(1, 9), (2, 9), (3, None)], 1)["streak"] == 0
+    assert panel_rounds.not_falling_state([(1, 20), (2, None), (3, 20)], 1)["streak"] == 0
+    assert panel_rounds.not_falling_state([(1, 20), (2, 20), (3, None)], 1)["streak"] == 0
     # ...and the streak resumes on the far side of one, rather than being poisoned for
     # the rest of the cycle.
-    assert panel_rounds.not_falling_state([(1, 9), (2, None), (3, 5), (4, 9)], 1)["streak"] == 1
+    assert panel_rounds.not_falling_state([(1, 20), (2, None), (3, 18), (4, 20)], 1)["streak"] == 1
 
 
 def test_the_streak_is_counted_backwards_from_this_round():
     """A cycle that diverged and then converged is converging. The rung is a claim
     about where the cycle is NOW, so a pair of not-falling rounds three rounds ago
     cannot end it."""
-    assert panel_rounds.not_falling_state([(1, 9), (2, 9), (3, 9), (4, 4)], 1)["streak"] == 0
-    assert panel_rounds.not_falling_state([(1, 4), (2, 9), (3, 9), (4, 9)], 3)["streak"] == 3
+    assert panel_rounds.not_falling_state([(1, 20), (2, 20), (3, 20), (4, 17)], 1)["streak"] == 0
+    assert panel_rounds.not_falling_state([(1, 17), (2, 20), (3, 20), (4, 20)], 3)["streak"] == 3
 
 
 def test_a_MISSING_round_between_two_counts_breaks_the_streak():
@@ -272,23 +287,23 @@ def test_a_MISSING_round_between_two_counts_breaks_the_streak():
 
     The first cut compared adjacent LIST ENTRIES and said so in a comment. A decision
     documented is not a decision defended."""
-    assert panel_rounds.not_falling_state([(1, 9), (3, 9)], 1)["over"] is False
-    assert panel_rounds.not_falling_state([(1, 9), (2, 9), (4, 9)], 1)["over"] is False
+    assert panel_rounds.not_falling_state([(1, 20), (3, 20)], 1)["over"] is False
+    assert panel_rounds.not_falling_state([(1, 20), (2, 20), (4, 20)], 1)["over"] is False
     # ...and the streak resumes on the near side of the gap, rather than the whole
     # cycle being poisoned by one lost payload.
     assert panel_rounds.not_falling_state(
-        [(1, 9), (3, 4), (4, 9), (5, 9)], 2)["streak"] == 2
+        [(1, 20), (3, 17), (4, 20), (5, 20)], 2)["streak"] == 2
 
 
 def test_the_rounds_ride_beside_the_counts_so_the_gap_is_readable():
     """A reader checking `streak` against `counts` has to be able to see WHY it stopped
     where it did, and "there is a round missing here" is invisible in a bare series."""
-    got = panel_rounds.not_falling_state([(1, 9), (3, 9)], 1)
-    assert (got["rounds"], got["counts"]) == ([1, 3], [9, 9])
+    got = panel_rounds.not_falling_state([(1, 20), (3, 20)], 1)
+    assert (got["rounds"], got["counts"]) == ([1, 3], [20, 20])
 
 
 def test_a_brake_that_is_off_never_fires_however_flat_the_series():
-    got = panel_rounds.not_falling_state([(1, 9), (2, 9), (3, 9)], None)
+    got = panel_rounds.not_falling_state([(1, 20), (2, 20), (3, 20)], None)
     assert got["streak"] == 2 and got["over"] is False and got["limit"] is None
 
 
@@ -303,7 +318,7 @@ def test_nothing_in_the_measurement_comes_from_provenance():
     independence rather than describing it: the same series decides the same way with
     every provenance tally the panel can produce, including the empty one a disarmed
     round records."""
-    verdict = panel_rounds.not_falling_state([(1, 44), (2, 15), (3, 18)], 1)
+    verdict = panel_rounds.not_falling_state([(1, 44), (2, 38), (3, 41)], 1)
     for counts in ({}, {"introduced": 0, "missed": 0, "missed-unread": 0,
                         "unknown": 9}):
         got = panel_rounds.round_stop(
@@ -317,7 +332,7 @@ def test_nothing_in_the_measurement_comes_from_provenance():
 
 # ------------------------------------------------------------------- the stop rule
 
-def _flat(series=(9, 9), limit=1, first=1):
+def _flat(series=(20, 20), limit=1, first=1):
     """A `(round, count)` series starting at round `first` — the shape `run()` builds
     off the trend rows."""
     return panel_rounds.not_falling_state(
@@ -325,12 +340,12 @@ def _flat(series=(9, 9), limit=1, first=1):
 
 
 def test_a_cycle_whose_count_has_stopped_falling_ends():
-    """The whole point. Nine new findings would buy another round under rule 1; the
-    round before produced nine too, so another round buys another nine."""
+    """The whole point. Twenty new findings would buy another round under rule 1; the
+    round before produced twenty too, so another round buys another twenty."""
     got = panel_rounds.round_stop(2, 5, ["k1", "k2", "k3", "k4"], [], [],
                                   not_falling=_flat())
     assert got["stop"] is True
-    assert "9 new finding(s) this round against 9 the round before" in got["reason"]
+    assert "20 new finding(s) this round against 20 the round before" in got["reason"]
     assert "escalate_on.new_findings_not_falling" in got["reason"]
     assert "a human triages what is left" in got["reason"]
 
@@ -355,7 +370,7 @@ def test_the_veto_says_the_rebase_could_not_have_disarmed_it():
                                   not_falling=_flat())
     line = next(v for v in got["veto"] if "new_findings_not_falling" in v)
     assert "not from provenance" in line and "#500" in line
-    assert "9 -> 9" in line
+    assert "20 -> 20" in line
 
 
 def test_the_volume_stop_is_not_the_cap_and_does_not_say_it_is():
@@ -512,12 +527,12 @@ def test_the_measurement_rides_in_the_payload_whether_it_fired_or_not():
     off = panel_rounds.round_stop(2, 5, [], [], [])
     assert off["new_findings_not_falling"] == {
         "limit": None, "rounds": [], "counts": [], "count": None, "was": None,
-        "streak": 0, "min_new": 4, "over": False, "fired": False}
+        "streak": 0, "min_new": 17, "over": False, "fired": False}
     on = panel_rounds.round_stop(2, 5, ["k1"], [], [],
-                                 not_falling=_flat((44, 15)))
+                                 not_falling=_flat((44, 38)))
     assert on["new_findings_not_falling"] == {
-        "limit": 1, "rounds": [1, 2], "counts": [44, 15], "count": 15, "was": 44,
-        "streak": 0, "min_new": 4, "over": False, "fired": False}
+        "limit": 1, "rounds": [1, 2], "counts": [44, 38], "count": 38, "was": 44,
+        "streak": 0, "min_new": 17, "over": False, "fired": False}
 
 
 # ------------------------------------------------------------------------ the reach
@@ -529,8 +544,8 @@ def test_the_series_the_gate_reads_is_the_one_the_trend_block_prints():
     verdict was taken over, rather than against a second reading that can disagree."""
     rows = [panel_rounds._trend_row(r, {"reviewed": True, "round": r,
                                         "new_findings": n})
-            for r, n in ((1, 44), (2, 15), (3, 18))]
-    assert [r.new_findings for r in rows] == [44, 15, 18]
+            for r, n in ((1, 44), (2, 38), (3, 41))]
+    assert [r.new_findings for r in rows] == [44, 38, 41]
     assert panel_rounds.not_falling_state(
         [(r.round, r.new_findings) for r in rows], 1)["over"] is True
 
@@ -623,3 +638,259 @@ def test_the_payload_carries_the_column_without_the_block_growing_one():
     assert panel._trend_record(row, 100)["new_findings"] == 5
     assert "new" not in panel.TREND_COLUMNS
     assert "5" not in panel._trend_cells(row)
+
+
+# ------------------------------------------- #710: the floor, and how it was derived
+#
+# The population, and every figure below reproduces from it:
+#
+#     curl -sH "Authorization: Bearer $QUARTERBACK_TOKEN" \
+#          "$QUARTERBACK_BASE_URL/reviews?limit=500"
+#
+# taken 2026-09-02: 115 runs, 90 in a cycle and reviewed, 42 cycles, 37 multi-round.
+# A cycle is (repo, pr, cycle) and its series is each round's own `new_findings` —
+# the same population `GET /review/convergence`'s `marginal_by_round` publishes, which
+# is why #710 needed no new instrument. `MEASURED` below is every cycle #710 names,
+# transcribed from that response.
+
+#: The five cycles the derivation turns on, as the board records them.
+MEASURED = {
+    # The founding case. #505 quotes it as 44 -> 15 -> 18; the board says otherwise,
+    # and #710's answer turns on the difference.
+    "quarterback#480": [(1, 44), (2, 38), (3, 41)],
+    # The three that would actually have lost rounds at a floor of 4 — the only
+    # firings on the whole board with a round recorded after them.
+    "quarterback#161": [(1, 16), (2, 25), (3, 17)],
+    "lexray#1709": [(1, 8), (2, 14), (3, 15), (4, 8)],
+    "lexray#1697": [(1, 10), (2, 13), (3, 9), (4, 12), (5, 9)],
+    # The whole post-`max_rounds: 6` population.
+    "lexray#1813": [(1, 7), (2, 13)],
+}
+
+#: Every `new_findings` count recorded inside a multi-round cycle, all 85 of them,
+#: sorted. The floor's own denominator: what "a volume" is on this board.
+COUNTS = [
+    7, 8, 8, 9, 9, 10, 10, 12, 13, 13, 13, 13, 13, 14, 15, 15, 15, 16, 16, 16,
+    17, 17, 17, 17, 18, 18, 19, 19, 19, 19, 20, 20, 22, 22, 22, 23, 24, 24,
+    24, 25, 25, 25, 25, 25, 26, 26, 27, 28, 28, 28, 29, 29, 29, 30, 30, 31,
+    31, 32, 33, 33, 34, 34, 36, 36, 37, 37, 37, 38, 38, 38, 39, 39, 40, 40,
+    41, 41, 42, 43, 43, 43, 43, 44, 44, 47, 67,
+]
+
+
+def _first_fire(series, floor, limit=1):
+    """The earliest round `not_falling_state` would fire on, replaying the cycle round
+    by round the way `run()` feeds it — `None` for a cycle it never ends.
+
+    Parameterised on the floor so the sweep can be run against values the module does
+    not hold, which is the only way to assert that 17 is the SMALLEST value with the
+    property rather than merely a value that has it."""
+    real = panel_rounds.NOT_FALLING_MIN_NEW
+    panel_rounds.NOT_FALLING_MIN_NEW = floor
+    try:
+        for i in range(1, len(series) + 1):
+            if panel_rounds.not_falling_state(series[:i], limit)["over"]:
+                return series[i - 1][0]
+        return None
+    finally:
+        panel_rounds.NOT_FALLING_MIN_NEW = real
+
+
+def test_the_floor_is_seventeen_and_the_limit_beside_it_did_not_move():
+    """#710's decision in one assertion, and both halves of it.
+
+    The issue asked whether `escalate_on.new_findings_not_falling` stays at 1. It
+    does — the lever chosen for "leave enough room to fix things" is the floor, so
+    that the rung may still fire at round 2 but only on counts large enough to be a
+    trend. A test that pinned only the floor would pass identically on the answer that
+    was NOT taken (move the limit to 2), and the two are opposite policies."""
+    assert panel_rounds.NOT_FALLING_MIN_NEW == 17
+    assert DEFAULT_BLOCK["escalate_on"]["new_findings_not_falling"] == 1
+
+
+def test_the_floor_it_replaced_had_never_excluded_a_single_round():
+    """The finding that makes this a recalibration rather than a preference.
+
+    4 was not merely uncalibrated — its own comment says four was chosen to match
+    `FIX_INJECTION_MIN_NEW` because two unmeasured floors differing by one would be
+    "two things to defend and one of them would be defended by 'it is not the other
+    one'". It was INOPERATIVE: the smallest new-finding count ever recorded inside a
+    cycle on this board is 7, so in the whole history of the rung the floor of 4 never
+    once stopped a comparison. #637 found the same of `FIX_INJECTION_MIN_NEW` next
+    door ("the floor bound nothing in this population"), and this is that finding
+    arriving here."""
+    assert min(COUNTS) == 7
+    assert sum(1 for n in COUNTS if n < 4) == 0
+    # ...and 17 is a floor that does bind, at roughly the bottom quartile of what a
+    # round on this board actually produces.
+    assert sum(1 for n in COUNTS if n < 17) == 20
+    assert len(COUNTS) == 85
+
+
+def test_the_founding_cycle_still_fires_where_the_human_stopped_it():
+    """Constraint 1, and it is the one a floor can get wrong catastrophically: a floor
+    that switches off the cycle the rule was read off is wrong whatever else it
+    achieves.
+
+    quarterback#480 is 44 -> 38 -> 41. Round 2 falls and buys round 3; round 3 does
+    not fall and ends the cycle, which is where the human ended it. The rung fires on
+    the TERMINAL round, so the founding case forgoes nothing — and it keeps that
+    property at every floor up to 38."""
+    s = MEASURED["quarterback#480"]
+    assert _first_fire(s, panel_rounds.NOT_FALLING_MIN_NEW) == 3 == s[-1][0]
+    assert _first_fire(s, 38) == 3
+    assert _first_fire(s, 39) is None
+
+
+def test_seventeen_is_the_smallest_floor_that_clears_every_CHECKABLE_firing():
+    """The derivation, and the reason it is a derivation rather than a pick.
+
+    A firing is CHECKABLE when the cycle has a round recorded after the one it fired
+    on — otherwise the board says nothing at all about whether the rung was right, and
+    19 of the 22 firings at a floor of 4 are of that kind. The three that are checkable
+    are the three #710 names, and on every one of them the count came back DOWN before
+    the cycle ended: the series was still converging when the rung would have stopped
+    it. Two fell on the very next round (quarterback#161 25 -> 17, lexray#1697
+    13 -> 9); lexray#1709 rose once more and then fell 15 -> 8, which is why a floor
+    that merely silences it at round 2 buys nothing — at 9 to 14 it simply fires a
+    round later and is wrong there instead.
+
+    So the floor is set by the largest of the three, not by taste. quarterback#161
+    compares 16 and 25, so 17 is the first value that silences it; lexray#1709 is
+    silent from 15 and lexray#1697 from 11. At 16 there is still one observed false
+    positive; at 17 there are none, and that is the whole of why the number is 17 and
+    not 16 or 18."""
+    named = ["quarterback#161", "lexray#1709", "lexray#1697"]
+    for name in named:
+        s = MEASURED[name]
+        r = _first_fire(s, 4)
+        assert r is not None, name
+        # The cycle went on to converge below the count the rung fired on, which is
+        # what makes the firing a false positive rather than a judgement call.
+        assert s[-1][1] < dict(s)[r], f"{name}: the count never came back down"
+    # ...and the intermediate floors do not escape it: lexray#1709 keeps firing from 9
+    # to 14, one round later and on a pair that falls at round 4.
+    assert _first_fire(MEASURED["lexray#1709"], 4) == 2
+    assert _first_fire(MEASURED["lexray#1709"], 10) == 3
+    assert _first_fire(MEASURED["lexray#1709"], 15) is None
+    # Below 17 at least one of the three still fires; at 17 none does.
+    for floor in range(1, 17):
+        assert any(_first_fire(MEASURED[n], floor) is not None for n in named), floor
+    assert all(_first_fire(MEASURED[n], 17) is None for n in named)
+
+
+def test_the_two_constraints_do_NOT_conflict_once_the_founding_figure_is_corrected():
+    """#710's crux, and the reason this PR lands a number instead of a decision
+    request.
+
+    Read as 44 -> 15 -> 18 the founding case caps the floor at 15, because 15 is the
+    smaller of its two compared ends. Sparing quarterback#161's 16 -> 25 needs 17. The
+    two are then irreconcilable and the honest answer would be to name the conflict
+    and stop.
+
+    The board records the founding cycle as 44 -> 38 -> 41, which caps the floor at 38
+    instead, and [17, 38] is not empty. The conflict was an artefact of a figure that
+    does not reproduce — no cycle on the board has a 44 -> 15 -> 18 series — and this
+    pins the arithmetic on both readings, so that a reader who prefers the quoted one
+    can see exactly what it costs."""
+    lo = 17            # quarterback#161's 16 -> 25, the largest observed false positive
+    quoted_hi = 15     # the founding case as #505 quoted it
+    recorded_hi = 38   # the founding case as the board records it
+    assert lo > quoted_hi, "under the quoted figure the window is empty"
+    assert lo <= panel_rounds.NOT_FALLING_MIN_NEW <= recorded_hi
+    # The quoted ends are a real pair on the board — just not this cycle's. They are
+    # quarterback#61's rounds 2 and 3, eleven days earlier.
+    assert _first_fire([(2, 15), (3, 18)], 15) == 3
+    assert _first_fire([(2, 15), (3, 18)], 17) is None
+
+
+def test_it_was_not_fitted_to_the_one_cycle_in_the_new_population():
+    """The failure #637 refused, and #710 asks for it to be refused again by name.
+
+    lexray#1813 (7 -> 13) is the only cycle started since `f53bdcd` raised the cap,
+    and it crosses the rung at round 2 of a possible 6. A floor of 8 clears it — and
+    choosing 8 for that reason is fitting to n=1, and to a firing that is not even
+    checkable: nothing on the board says whether ending #1813 there would have been
+    right.
+
+    17 does silence it, and this pins that it is silenced for a reason that is not
+    that cycle: 8 would silence #1813 and leave all three of the checkable false
+    positives firing."""
+    assert _first_fire(MEASURED["lexray#1813"], 4) == 2
+    assert _first_fire(MEASURED["lexray#1813"], 8) is None
+    fitted = [n for n in ("quarterback#161", "lexray#1709", "lexray#1697")
+              if _first_fire(MEASURED[n], 8) is not None]
+    assert len(fitted) == 3, "a floor of 8 buys nothing the evidence asked for"
+    assert _first_fire(MEASURED["lexray#1813"], panel_rounds.NOT_FALLING_MIN_NEW) is None
+
+
+def test_the_floor_costs_no_round_anywhere_on_the_board_and_the_block_says_so():
+    """The honest limitation, pinned so it cannot quietly fall out of the comment.
+
+    At 17 the rung fires on 13 of the 37 multi-round cycles and every one of those
+    firings lands on the cycle's LAST recorded round. On this population it therefore
+    takes nothing away — which also means it cannot be shown to be wrong and cannot be
+    shown to do anything. That is #706's finding arriving here rather than a property
+    of 17: the population was gathered under `max_rounds: 2`, where round 2 was the
+    round the cap was ending anyway, and `converged` is TRUE on no cycle on this
+    board, so there is no healthy cycle for a false positive to have interrupted.
+
+    Asserted on the three that DID lose rounds, which are the whole of the evidence:
+    at 17 none of them fires at all."""
+    for name in ("quarterback#161", "lexray#1709", "lexray#1697"):
+        assert _first_fire(MEASURED[name], panel_rounds.NOT_FALLING_MIN_NEW) is None
+    block = _not_falling_constant_block()
+    assert "cannot be shown to be wrong" in block
+    assert "cannot be shown to do anything" in block
+
+
+def _not_falling_constant_block() -> str:
+    """`NOT_FALLING_MIN_NEW`'s own `#:` comment block, as text.
+
+    Read as text for `test_panel_injection._fix_injection_block`'s reason: the artefact
+    under test is the ARGUMENT. A test on the value passes identically whether the
+    block above it says "four, and nobody has measured it" or "seventeen, and here is
+    the population it was measured over", and those are opposite states of the same
+    constant."""
+    src = Path(panel_rounds.__file__).read_text()
+    start = src.index('#: New outstanding findings a round needs before "the count did not fall"')
+    return src[start:src.index("NOT_FALLING_MIN_NEW = ", start)]
+
+
+def test_the_constant_records_the_measurement_rather_than_asking_for_it():
+    """The block used to nominate itself: `NOT_FALLING_MIN_NEW` was "the number to look
+    at first if the first cycles under `max_rounds: 6` stop early on counts nobody
+    would have called a trend". The first cycle under the new cap did exactly that, so
+    the block now has to say what was found instead of what to do."""
+    block = _not_falling_constant_block()
+    assert "#710" in block
+    assert "reviews?limit=500" in block, "the query every figure reproduces from"
+    assert "37 multi-round" in block, "the population, named rather than counted"
+    assert "the number to look at first" not in block, \
+        "the standing instruction outlived its own answer"
+
+
+def test_the_block_stops_defending_the_floor_by_its_sibling():
+    """The specific defect #710 quotes: 4 was chosen to match `FIX_INJECTION_MIN_NEW`
+    so that there would be one argument rather than two, which is a number defended by
+    "it is not the other one".
+
+    They no longer match, so the block owes a real difference — and there is one: that
+    floor is the DENOMINATOR of a rate, this one bounds a comparison of two volumes."""
+    assert panel_rounds.NOT_FALLING_MIN_NEW != panel_rounds.FIX_INJECTION_MIN_NEW
+    block = _not_falling_constant_block()
+    assert "denominator" in block.lower()
+    assert "not a dial" in block, "still a constant, and #621 says why"
+
+
+def test_nothing_measured_asks_for_this_to_be_repo_specific():
+    """#710's scope note, kept as an assertion rather than a promise: the constant is
+    not promoted to a 29th dial, and the reason is that nothing in the population
+    argues for one.
+
+    The three observed false positives span two repositories and the founding case a
+    third, so the evidence is not repo-shaped. If a later population is, that is a
+    finding for a PR body and not a dial to build."""
+    assert "review_panel.escalate_on.new_findings_not_falling" in harness_rules.BOARD_DIALS
+    assert not any("min_new" in name or "not_falling_min" in name
+                   for name in harness_rules.BOARD_DIALS)

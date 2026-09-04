@@ -354,7 +354,7 @@ def test_the_SHAPE_of_the_pass_is_the_more_specific_truth_than_its_SIZE():
 def test_it_is_the_more_specific_truth_than_the_count_not_falling():
     """The other side of that ordering: #505's rung says only that the work is not
     shrinking, and this says how much of it the last pass wrote."""
-    flat = panel_rounds.not_falling_state([(1, 9), (2, 9)], 1)
+    flat = panel_rounds.not_falling_state([(1, 20), (2, 20)], 1)
     got = panel_rounds.round_stop(
         2, 5, _new(), [], [], not_falling=flat,
         guard_churn=_guard(test=380, limit=250, armed=True))

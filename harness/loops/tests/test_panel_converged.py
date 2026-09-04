@@ -152,7 +152,7 @@ def test_every_futility_rung_ends_the_cycle_without_converging_it(rung, kwargs):
     state = {
         "fix_injection": {"injection": panel_rounds.injection_state(_counts(), 0.5)},
         "new_findings_not_falling": {
-            "not_falling": panel_rounds.not_falling_state([(1, 9), (2, 9)], 1)},
+            "not_falling": panel_rounds.not_falling_state([(1, 20), (2, 20)], 1)},
         "unrefereed_fix": {"unrefereed": panel_rounds.referee_state(
             {"test": 90, "prose": 10, "production": 0, "churn": 100}, True)},
     }[rung]

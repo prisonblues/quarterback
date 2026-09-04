@@ -753,7 +753,7 @@ def test_the_attribution_rung_is_the_more_specific_truth_and_wins_the_reason():
 def test_it_is_the_more_specific_truth_than_the_count_not_falling():
     """The other side of the same ordering. #505's rung says only that the work is not
     shrinking; this says what kind of work it was."""
-    flat = panel_rounds.not_falling_state([(1, 9), (2, 9)], 1)
+    flat = panel_rounds.not_falling_state([(1, 20), (2, 20)], 1)
     got = panel_rounds.round_stop(2, 5, ["k1", "k2", "k3", "k4"], [], [],
                                   not_falling=flat, unrefereed=_unrefereed())
     assert "production code" in got["reason"]

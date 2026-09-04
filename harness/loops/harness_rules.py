@@ -1823,9 +1823,9 @@ DEFAULTS: dict = {
         # new-finding count did not decrease before the cycle ends.
         #
         # **The rule is Rich's, stated on #480 over a cycle this codebase ran**: three
-        # rounds produced 44 findings, then 15 new, then 18 new — stop the cycle and
+        # rounds produced 44 findings, then 38 new, then 41 new — stop the cycle and
         # triage the remainder rather than running a fourth. Read as attribution that
-        # cycle says nothing: the 18 need not have been created by the fix at all. A
+        # cycle says nothing: the 41 need not have been created by the fix at all. A
         # reviewer reading deeper, a seat that woke up, a scope that widened and a
         # vendor added mid-cycle all produce news no fix pass wrote, and `_provenance`
         # UNDER-counts by design on top of that (a defect introduced by DELETING a
@@ -1845,9 +1845,24 @@ DEFAULTS: dict = {
         # cap was the round the cycle was ending on anyway and under the cap of 6 is
         # four rounds before it.
         #
-        # 1 is also exactly the rule as it was stated: 44 -> 15 falls and buys round
-        # 3; 15 -> 18 does not fall and ends the cycle there, which is where the human
+        # 1 is also exactly the rule as it was stated: 44 -> 38 falls and buys round
+        # 3; 38 -> 41 does not fall and ends the cycle there, which is where the human
         # ended it.
+        #
+        # **THE FIGURE USED TO READ 44 -> 15 -> 18 AND DID NOT REPRODUCE (#710).** The
+        # board records quarterback#480's cycle `a64ec1c4` as 44, 38, 41 — three rounds
+        # and a round-1 count of 44, as quoted, but 38 and 41 where the comment said 15
+        # and 18. Reproduce it with
+        # `GET /reviews?limit=500`, filter to repo `prisonblues/quarterback`, pr 480:
+        # no cycle anywhere on the board has a 44 -> 15 -> 18 series, and the only
+        # 15 -> 18 pair on it is quarterback#61 rounds 2 and 3, eleven days earlier and
+        # a different cycle. The ARGUMENT above is untouched by the correction — it is
+        # the same shape at different magnitudes, a fall then a non-fall, ending where
+        # the human ended it — which is why `1` still stands. What the wrong figure did
+        # move is the floor: read as 15 and 18 the founding case caps
+        # `panel_rounds.NOT_FALLING_MIN_NEW` at 15 and conflicts with sparing
+        # quarterback#161 (16 -> 25, which needs 17); read as 38 and 41 it caps it at 38
+        # and there is no conflict. #710's whole answer turns on that.
         #
         # **The same three properties earned it the same default-on**, and they are
         # the test a rung has to pass rather than a form of words — but as of
@@ -1861,7 +1876,7 @@ DEFAULTS: dict = {
         #     so a default-on bought a better `reason` and one more veto line rather
         #     than an earlier finish. At 6 it is one of the rules that ACTUALLY ENDS
         #     CYCLES, and on the rung's own evidence it is the one that ends them
-        #     earliest: 44 -> 15 -> 18 stops at round 3 of a possible 6, so the three
+        #     earliest: 44 -> 38 -> 41 stops at round 3 of a possible 6, so the three
         #     rounds it forgoes are real rounds of review and not a formality the cap
         #     was about to perform. That is the trade this default now makes;
         #   - a false positive costs one printed question — the stop is vetoed and
@@ -1870,16 +1885,23 @@ DEFAULTS: dict = {
         #     given before the cycle continues, where under the old cap there was
         #     nothing left to continue to.
         #
-        # **AND THE COUNT IT WATCHES IS ABOUT TO CHANGE UNDER IT**, which is
-        # `fix_injection`'s recalibration arriving here as well. `1` was read off a
-        # cycle counted in NEW FINDINGS of every kind — 44, then 15, then 18. With
-        # observations no longer counted as outstanding work (#623) and a `narrowed`
-        # outcome clearing rather than accumulating (#615), the counts this compares
-        # are smaller and more serious, and a small count is where "did not fall" is
-        # most easily noise: 2 -> 2 is not divergence. `panel_rounds.NOT_FALLING_MIN_NEW`
-        # is the floor that stands between this rung and that, it is a constant rather
-        # than a dial, and it is the number to look at first if the first cycles under
-        # `max_rounds: 6` stop early on counts nobody would have called a trend.
+        # **THE COUNT IT WATCHES CHANGED UNDER IT, AND THE FLOOR HAS NOW MOVED FOR
+        # IT — #710, Rich's decision of 2026-09-02.** `1` was read off a cycle counted
+        # in NEW FINDINGS of every kind — 44, then 38, then 41. With observations no
+        # longer counted as outstanding work (#623) and a `narrowed` outcome clearing
+        # rather than accumulating (#615), the counts this compares are smaller and
+        # more serious, and a small count is where "did not fall" is most easily noise:
+        # 2 -> 2 is not divergence. This block used to say
+        # `panel_rounds.NOT_FALLING_MIN_NEW` was "the number to look at first if the
+        # first cycles under `max_rounds: 6` stop early on counts nobody would have
+        # called a trend". The first cycle under `max_rounds: 6` did exactly that
+        # (lexray#1813, 7 -> 13), it was looked at, and the floor moved 4 -> 17. The
+        # measurement is in that constant's own comment: over the whole board, all
+        # time, 37 multi-round cycles, no round count below 7 (so 4 had never excluded
+        # anything), and 17 the smallest floor at which no firing that could be checked
+        # against a later round came out wrong. `1` was NOT moved and this rung still
+        # fires at round 2 — on volumes rather than on arithmetic, which is what the
+        # floor was always for.
         #
         # **And one property `fix_injection` cannot claim.** This is computed from the
         # ROUNDS' OWN COUNTS and never from provenance, so #500 — rebasing between
@@ -1899,10 +1921,14 @@ DEFAULTS: dict = {
         #
         # `null` (or `false`) switches it off in one line, like its sibling. `0` is
         # REFUSED: zero consecutive not-falling rounds is every round, which is a
-        # brake with no discrimination in it. `panel_rounds.NOT_FALLING_MIN_NEW` is
-        # the noise floor and is a constant rather than a dial, for the reason
-        # `FIX_INJECTION_MIN_NEW` is: 1 -> 2 is arithmetic, not divergence, and a
-        # second number nobody can calibrate is worse than one documented floor.
+        # brake with no discrimination in it. `panel_rounds.NOT_FALLING_MIN_NEW` (17
+        # since #710) is the noise floor and is a constant rather than a dial: 1 -> 2
+        # is arithmetic, not divergence, and #621 is explicit that this work is "not a
+        # 29th dial". It is no longer `FIX_INJECTION_MIN_NEW`'s number, which it used
+        # to match so that two unmeasured floors would be one argument instead of two.
+        # This one is measured now and that one is not, so they guard different
+        # quantities for stated reasons — a rate's denominator there, a comparison of
+        # two volumes here.
         # #554's rung, and the FIFTH thing that can end a cycle. It asks a question
         # none of the four above ask: not how many findings the last fix pass
         # produced, nor how big it was, but whether ANYTHING CAN CHECK WHAT IT WROTE.
