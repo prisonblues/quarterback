@@ -2432,3 +2432,243 @@ def test_a_session_id_cannot_be_read_as_another_agents_holder():
     [row_b] = [r for r in rows if r["who"] == "other-agent"]
     assert row_a["what"][0] == "Panel review PR rework", "A must not get B's claim"
     assert row_b["what"][0].startswith("quarterback#7 · ")
+
+
+# ---- pinning gh-dash to one item (#250) -------------------------------------
+#
+# The dashboard's ▥ opens a row's detail view in a pane instead of a browser, and
+# `gh-dash` cannot be told to open item N — its entire CLI on 4.24.1 is `--config`,
+# `--debug` and `--cpuprofile`. So the handle is a generated config whose one
+# section is narrow enough that the item is the only row in it, and everything
+# load-bearing about that is here rather than in the dashboard: the pin, the
+# clipping, the YAML quoting and the filename.
+#
+# NOTHING HERE RUNS `gh-dash`, and that is deliberate rather than convenient. Its
+# detail view nil-derefs in `markdown.GetMarkdownRenderer` whenever the terminal is
+# not real — reproduced under tmux with no attached client, `script -qec`, and a
+# bare `pty.fork()` — so a test that asserted on the sidebar by running it would
+# fail on every machine that has no human watching, which is all of them in CI.
+# What quarterback controls is the config and the argv, so those are the assertions.
+
+def _pr_row(**over) -> dict:
+    row = {"kind": "pr", "pr": None, "entry": None, "item": None, "issue": None,
+           "repo": "prisonblues/quarterback", "title": ""}
+    row.update(over)
+    return row
+
+
+def test_a_pr_row_is_pinned_by_its_head_branch():
+    """`head:` is exact and free — `fetch_prs` already asks for `headRefName`.
+
+    The obvious pin is the number and it is the one that cannot be used: GitHub's
+    search has no `number:` qualifier, and a bare `827` matches nothing at all.
+    """
+    pin = qd.gh_dash_pin(_pr_row(pr={"repo": "prisonblues/quarterback", "number": 247,
+                                     "headRefName": "chore/review-policy-p1-p2",
+                                     "title": "some title"}))
+    assert pin["view"] == "prs"
+    assert pin["filters"] == ("repo:prisonblues/quarterback "
+                              "head:chore/review-policy-p1-p2")
+    assert pin["name"] == "pr-247"
+    # NOT `is:pr`: gh-dash prepends the one its section belongs to, so a second
+    # copy narrows nothing and spends characters the 256-char query budget counts.
+    assert "is:pr" not in pin["filters"]
+
+
+def test_an_issue_row_is_pinned_by_its_exact_title():
+    """The titles in this repo are the hard case and need no handling at all.
+
+    Colons, backticks, apostrophes and em-dashes all survive: a quoted phrase is
+    matched over TOKENS, and punctuation is not one.
+    """
+    pin = qd.gh_dash_pin(_pr_row(
+        kind="issue",
+        issue={"repo": "prisonblues/quarterback", "number": 603,
+               "title": "The dashboard's glyphs carry most of the meaning and "
+                        "`?` explains none of them"}))
+    assert pin["view"] == "issues"
+    assert pin["filters"] == (
+        'repo:prisonblues/quarterback in:title "The dashboard\'s glyphs carry most '
+        'of the meaning and `?` explains none of them"')
+    assert pin["name"] == "issue-603"
+
+
+def test_a_pr_with_no_gh_row_falls_back_to_the_title_on_its_queue_entry():
+    """A real case rather than a defensive one: a queue entry outlives one refresh
+    of the PR list. The title on it is the PR's OWN, which is what makes it usable
+    as a pin — see the plan-item test below for the title that is not."""
+    pin = qd.gh_dash_pin(_pr_row(entry={"repo": "prisonblues/quarterback", "pr": 270,
+                                        "title": "a PR the queue is waiting on"}))
+    assert pin["view"] == "prs"
+    assert pin["filters"] == ('repo:prisonblues/quarterback '
+                              'in:title "a PR the queue is waiting on"')
+    assert pin["name"] == "pr-270"
+
+
+def test_a_plan_item_pointing_at_a_pr_takes_the_branch_off_the_open_pr_list():
+    """Where most of those branches actually are.
+
+    `work_rows` hangs a `gh` row off a PR only when the review queue named it, so a
+    plan item whose ref is a `pr` carries none — while the open-PR list on the same
+    screen is holding its `headRefName`. Not looking there was the difference
+    between an exact pin and a guess.
+    """
+    row = _pr_row(kind="plan",
+                  item={"item_id": "a", "repo": "prisonblues/quarterback",
+                        "title": "the plan's own wording for this work",
+                        "ref": {"kind": "pr", "value": "397"}})
+    prs = [{"repo": "prisonblues/quarterback", "number": 397,
+            "headRefName": "feat/some-branch", "title": "what the PR is called"},
+           {"repo": "prisonblues/quarterback", "number": 12,
+            "headRefName": "other", "title": "not this one"}]
+    pin = qd.gh_dash_pin(row, prs=prs)
+    assert pin["filters"] == "repo:prisonblues/quarterback head:feat/some-branch"
+    assert pin["name"] == "pr-397"
+
+
+def test_a_plan_items_own_title_is_never_used_to_pin_a_pr():
+    """It is the plan's wording for the work, not what the PR is called, so a pin
+    built from it matches nothing — and an EMPTY gh-dash reads exactly like a fetch
+    that failed. A dim ▥ says "this cannot be pinned", which is the true thing."""
+    row = _pr_row(kind="plan",
+                  item={"item_id": "a", "repo": "prisonblues/quarterback",
+                        "title": "the plan's own wording for this work",
+                        "ref": {"kind": "pr", "value": "397"}})
+    assert qd.gh_dash_pin(row, prs=[]) is None
+    assert qd.gh_dash_pin(row) is None
+    # Nor a blocker row's, which is the question's wording rather than the PR's.
+    assert qd.gh_dash_pin(_pr_row(kind="blocker", title="revert this?",
+                                  subject={"kind": "pr", "value": "270"})) is None
+
+
+def test_a_plan_item_pointing_at_an_issue_opens_that_issue():
+    """The shortest path from "what is next" to reading it, and the ⚒'s own rule:
+    an item takes the kind of what it references."""
+    pin = qd.gh_dash_pin(_pr_row(
+        kind="plan",
+        item={"item_id": "a", "repo": "prisonblues/quarterback",
+              "title": "make the board work without a forge",
+              "ref": {"kind": "issue", "value": "327"}}))
+    assert pin["view"] == "issues" and pin["name"] == "issue-327"
+    assert 'in:title "make the board work without a forge"' in pin["filters"]
+
+
+def test_a_row_that_names_no_work_has_nothing_to_open():
+    """A line of plan with no ref, and a question about the repo itself. Both draw
+    a dim ▥ rather than a live one that explains itself after the click."""
+    assert qd.gh_dash_pin(_pr_row(kind="plan", title="tidy the harness",
+                                  item={"item_id": "a", "ref": None,
+                                        "repo": "prisonblues/quarterback",
+                                        "title": "tidy the harness"})) is None
+    assert qd.gh_dash_pin(_pr_row(kind="blocker", title="the fleet is stuck",
+                                  subject={"kind": "repo", "value": "x"})) is None
+
+
+def test_a_question_about_a_pr_still_opens_the_pr_it_names():
+    """The row least likely to be findable any other way: the PR is on the table
+    only because somebody owes an answer about it. Pinned off the open-PR list,
+    because the row's own title is the question rather than the PR."""
+    pin = qd.gh_dash_pin(
+        _pr_row(kind="blocker", title="revert this?", repo="acme/one",
+                subject={"kind": "pr", "value": "270"}),
+        prs=[{"repo": "acme/one", "number": 270, "headRefName": "fix/thing"}])
+    assert pin["view"] == "prs" and pin["name"] == "pr-270"
+    assert pin["filters"] == "repo:acme/one head:fix/thing"
+
+
+def test_a_title_carrying_a_double_quote_drops_it_rather_than_breaking_the_pin():
+    """The pin IS a quoted phrase and GitHub's search has no escape inside one, so
+    a `"` left in ends the phrase early and the rest of the title becomes loose
+    terms. Dropping it is safe where escaping is not available — the phrase is
+    matched over tokens and a quote is not one."""
+    pin = qd.gh_dash_pin(_pr_row(
+        kind="issue", issue={"repo": "acme/one", "number": 5,
+                             "title": 'the "obvious" fix'}))
+    assert pin["filters"] == 'repo:acme/one in:title "the obvious fix"'
+    assert pin["filters"].count('"') == 2, pin["filters"]
+
+
+def test_a_pin_too_long_for_the_search_api_is_clipped_on_a_word_boundary():
+    """GitHub refuses a query over 256 characters and this repo's titles reach it.
+
+    Clipped rather than refused, because a phrase PREFIX still matches the title
+    it was cut from — a wider net, not an empty one. On a word boundary for the
+    one reason that matters: half a word is a token that appears in no title, and
+    that is how a clip turns the wide net into nothing.
+    """
+    title = " ".join(f"word{n}" for n in range(60))
+    pin = qd.gh_dash_pin(_pr_row(kind="issue",
+                                 issue={"repo": "acme/one", "number": 5, "title": title}))
+    assert len(pin["filters"]) <= qd.GH_DASH_QUERY
+    phrase = pin["filters"].split('"')[1]
+    assert title.startswith(phrase), phrase
+    # Whole words only — a trailing `word4` cut to `wor` matches nothing.
+    assert all(w.startswith("word") and w[4:].isdigit() for w in phrase.split()), phrase
+
+
+def test_a_row_with_no_title_and_no_branch_cannot_be_pinned_at_all():
+    """Better a dim icon than a section filtered to nothing, which renders as an
+    empty gh-dash and reads exactly like the fetch having failed."""
+    assert qd.gh_dash_pin(_pr_row(entry={"repo": "acme/one", "pr": 9, "title": ""})) is None
+
+
+def test_the_generated_config_pins_one_view_and_empties_the_other():
+    """`[]` rather than absent, because gh-dash reads a missing key as "use the
+    defaults" and would draw its own five sections beside the one asked for —
+    which is the opposite of a pin."""
+    pin = qd.gh_dash_pin(_pr_row(pr={"repo": "acme/one", "number": 7,
+                                     "headRefName": "feat/x", "title": "t"}))
+    text = qd.gh_dash_config(pin)
+    assert "issuesSections: []" in text
+    assert "prSections:\n  - title: 'PR #7'" in text
+    assert "view: prs" in text
+    # THE SIDEBAR IS THE POINT. A table row is what the dashboard already shows;
+    # what the browser was being opened for is Overview / Activity / Commits /
+    # Checks / Files Changed, and that is the preview pane.
+    assert "open: true" in text
+
+
+def test_the_section_title_is_quoted_so_the_number_survives_yaml():
+    """`#` opens a comment in YAML wherever a space precedes it, so a bare
+    `title: PR #247` parses as the string `PR` — losing, silently, the number in
+    the one field a reader checks to see the pin landed on the right row."""
+    pin = qd.gh_dash_pin(_pr_row(pr={"repo": "acme/one", "number": 247,
+                                     "headRefName": "feat/x", "title": "t"}))
+    line = next(l for l in qd.gh_dash_config(pin).splitlines()
+                if l.strip().startswith("- title:"))
+    assert line.strip() == "- title: 'PR #247'"
+
+
+def test_the_config_quotes_the_filter_so_a_title_is_not_read_as_yaml():
+    """The filter carries `"` and `:` and would be a mapping to a YAML parser
+    unquoted. Single quotes with their own doubled is the whole of YAML's
+    single-quoted escaping, and this repo's titles are full of apostrophes."""
+    pin = qd.gh_dash_pin(_pr_row(
+        kind="issue", issue={"repo": "acme/one", "number": 5,
+                             "title": "the board's own answer: it depends"}))
+    line = next(l for l in qd.gh_dash_config(pin).splitlines()
+                if l.strip().startswith("filters:"))
+    assert line.strip() == (
+        "filters: 'repo:acme/one in:title \"the board''s own answer: it depends\"'")
+
+
+def test_the_config_is_named_for_the_item_so_a_second_click_rewrites_one_file():
+    """`/tmp` is the fallback when `$XDG_RUNTIME_DIR` is unset and it is not
+    cleared at logout, so a fresh name per click would leave a permanent directory
+    of dead configs behind."""
+    row = _pr_row(pr={"repo": "prisonblues/quarterback", "number": 247,
+                      "headRefName": "chore/x", "title": "t"})
+    assert qd.gh_dash_pin(row)["slug"] == qd.gh_dash_pin(row)["slug"]
+    assert qd.gh_dash_pin(row)["slug"] == "pr-prisonblues-quarterback-247"
+    # A slug is a FILENAME: the repo slug's `/` must not become a directory nobody
+    # created, which is an OSError on the write and a dim button with no reason.
+    assert "/" not in qd.gh_dash_pin(row)["slug"]
+
+
+def test_the_config_lands_somewhere_that_gets_collected(monkeypatch):
+    """`$XDG_RUNTIME_DIR` first because it is cleared when the session ends, and a
+    config for a PR that merged last week is litter with a plausible name."""
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/999")
+    assert qd.gh_dash_config_path("pr-x-1") == "/run/user/999/qb-dash/pr-x-1.yml"
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    assert qd.gh_dash_config_path("pr-x-1").endswith("/qb-dash/pr-x-1.yml")
