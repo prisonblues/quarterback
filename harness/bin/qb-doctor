@@ -3011,15 +3011,70 @@ def _spell_prs(numbers: list[int]) -> str:
 #: `/blockers` pages oldest-first, where a full page can exclude the window entirely.
 _BOARD_PAGE = 1000
 
-#: The window both halves of the `escalations` row are counted over. 24h is not a
-#: tuning choice — it is the largest `window_min` the board's own read accepts, and
-#: the two counts have to come from the same span or the comparison says nothing.
+#: How far back the `stuck` posts are read. 24h is not a tuning choice — it is the
+#: largest `window_min` the board's own read accepts.
+#:
+#: It bounds ONE side only, and #737 is what happens when it bounds both. This row
+#: used to require a blocker row RAISED inside the same span, on the reasoning that
+#: the two counts have to come from one span or the comparison says nothing. The
+#: reasoning is sound about counts and wrong about these two: a standing question is
+#: announced repeatedly and stored ONCE, so its row ages out of the window while the
+#: posts keep arriving. Measured on the live board 2026-09-04: 25 rows, newest 34.5h
+#: old, 28 posts inside the window, and the row had been FAIL for days against a
+#: producer that was working. Rows are matched by SUBJECT now, at any age.
 ESCALATION_WINDOW_MINUTES = 1440
 
 #: The post type `needs_human.announce()` writes. Named here rather than spelled at
 #: the call site because this row's entire claim is that these two writes come from
 #: one function, and a typo would make it report a severed producer forever.
 ESCALATION_POST = "stuck"
+
+#: How `needs_human._subject_from` picks the ONE subject a `stuck` post's refs name,
+#: most specific first. Copied rather than imported because `qb-doctor` imports
+#: nothing from `harness/loops`, and kept honest the way the `needs_human` classes
+#: next door are: `tests/test_qb_doctor_escalations.py` reads the tuple out of
+#: `harness/loops/needs_human.py` and fails if the two ever disagree. A silent
+#: divergence here would make every post look unaccounted for, which is the same
+#: false alarm #737 is about, arriving by a different route.
+ESCALATION_SUBJECT_PREFERENCE = ("item", "pr", "issue", "repo")
+
+
+def _escalation_subject(refs: object) -> tuple[str, str] | None:
+    """``(kind, value)`` for the row this post should have, or None if it names none.
+
+    None is not a fault: an escalation whose refs name no subject is announced and
+    deliberately NOT stored (#523, `_subject_from`), because a row whose subject is
+    "something, somewhere" answers "what is waiting on me" with noise. Those posts
+    are excluded from the question rather than counted against it — if they were
+    counted, the fixed row would acquire a new false positive in place of the old.
+    """
+    if not isinstance(refs, list):
+        return None
+    by_kind: dict[str, str] = {}
+    for r in refs:
+        if not isinstance(r, dict):
+            continue
+        kind, value = str(r.get("kind") or ""), str(r.get("value") or "")
+        if kind and value:
+            by_kind.setdefault(kind, value)
+    for kind in ESCALATION_SUBJECT_PREFERENCE:
+        if kind in by_kind:
+            return kind, by_kind[kind]
+    return None
+
+
+def _escalation_subject_of_row(row: dict) -> tuple[str, str] | None:
+    """``(kind, value)`` for a `/blockers` row, in the shape posts are keyed by.
+
+    The endpoint nests it — `{"subject": {"kind": …, "value": …}}` — where a post
+    carries a flat `refs` list, so the two are put into one shape here rather than
+    compared field by field at the call site.
+    """
+    subject = row.get("subject")
+    if not isinstance(subject, dict):
+        return None
+    kind, value = str(subject.get("kind") or ""), str(subject.get("value") or "")
+    return (kind, value) if kind and value else None
 
 
 def check_escalations(host: Host) -> Check:
@@ -3034,16 +3089,35 @@ def check_escalations(host: Host) -> Check:
 
     So the question is asked as a PAIR, the way `landed` asks its own. A blockers
     table with nothing in it is not a fault: it is the correct state of a day nobody
-    got stuck. `stuck` posts with nothing in the table is the fault, and it is only
+    got stuck. `stuck` posts with nothing behind them is the fault, and it is only
     visible because ONE function makes both writes — `announce()` posts and then
-    stores, so a post without a row in the same window is that function's second
-    half failing, or never having been deployed.
+    stores, so a post with no row behind it is that function's second half failing,
+    or never having been deployed.
+
+    **BEHIND, not beside — #737.** The pairing used to be a post in the window
+    against a row RAISED in the window, and that reads a healthy fleet as a broken
+    one. `_raise_blocker` stores a standing question ONCE: the partial unique index
+    on (subject, class, condition) makes re-raising a no-op, so the row is written
+    the first time and every later announcement returns "already an open blocker".
+    Once that row is a day old, every subsequent post lands in the window and no row
+    ever does again — and the row goes FAIL for as long as the question goes
+    unanswered, which is exactly backwards. Measured on the live board 2026-09-04:
+    25 rows, none raised inside the window, newest 34.5h; 28 posts inside it, every
+    one a re-announcement of a question that already had an open row. Two of the 25
+    were this row escalating about itself.
+
+    So a post is ACCOUNTED FOR when an OPEN row of any age carries its subject, and
+    the fault is a post that should have produced a row and has none. That keeps
+    every case the row was built to catch — #328 deployed with no producer,
+    `_raise_blocker` failing, a board predating the table — because in all three
+    there is no row to match, whatever its age.
 
     STRICTLY ANY-VERSUS-NONE, and not a ratio, because rows are legitimately fewer
     than posts. An escalation whose refs name no subject is announced and
-    deliberately not stored (#523), so `posts > rows` is the designed behaviour and
-    a proportional test here would fail on correct data. Zero rows against any post
-    is the only divergence that cannot be explained by the design.
+    deliberately not stored (#523), so those posts are excluded from the question
+    rather than counted against it — counting them would trade #737's false alarm
+    for a new one. Zero accounted-for posts against any storable post is the only
+    divergence that cannot be explained by the design.
 
     A board with no `/blockers` at all reads `unknown`, not `fail`: an image
     predating #328 has not severed anything, it has not been redeployed, and those
@@ -3098,45 +3172,75 @@ def check_escalations(host: Host) -> Check:
     span = _spell_age(window)
     if len(stored) >= _BOARD_PAGE:
         # `/blockers` orders by raised_at ASCENDING and then truncates, so a full page is
-        # the OLDEST rows and every row raised today can sit beyond it. Left unsaid, this
-        # row would count zero fresh rows against a real escalation and report the
-        # producer severed — the precise false alarm it exists to make trustworthy. An
-        # honest `unknown` is the only verdict available until the endpoint can be asked
-        # for a window rather than a page.
+        # the OLDEST rows and the row answering today's post can sit beyond it. Still
+        # `unknown` after #737 and for a sharper reason than before: the matching is by
+        # subject now, so a truncated page is an INCOMPLETE subject set, and a post that
+        # looks unaccounted for may simply have its row past the cut. Reporting a severed
+        # producer off a partial set is the precise false alarm this row exists to be
+        # trusted about.
         return Check("escalations", host.base_url or "-",
                      f"the board returned a full page of {_BOARD_PAGE} blocker(s) and it "
-                     "pages oldest-first, so rows raised in the last "
-                     f"{span} can lie beyond it — this row cannot tell a severed producer "
-                     "from a long table", "unknown",
-                     manual="give /blockers a raised-after filter or a newest-first order, "
-                            "then count the window instead of the page",
+                     "pages oldest-first, so the row behind a post can lie beyond it — "
+                     "this row cannot tell a severed producer from a long table",
+                     "unknown",
+                     manual="give /blockers a newest-first order or a raised-after filter, "
+                            "then match the whole table instead of one page",
                      extra={"posts": len(raised), "page": len(stored),
                             "window_minutes": window})
-    fresh = [b for b in stored
-             if isinstance(b, dict)
-             and (age := _age_minutes(b.get("raised_at"))) is not None
-             and 0 <= age <= window]
-    if raised and not fresh:
-        return Check("escalations", host.base_url or "-",
-                     f"{len(raised)} {ESCALATION_POST} post(s) in the last {span} and not "
-                     "one blocker row — the escalation path is ringing the bell and "
-                     "recording nothing, so nothing can answer 'what is waiting on me'",
-                     "fail",
-                     manual="run one escalation by hand and read the note it returns: "
-                            "`announce()` states which half failed on the line it returns "
-                            "(harness/loops/needs_human.py)",
-                     extra={"posts": len(raised), "rows": 0, "window_minutes": window})
-    if not raised and not fresh:
+    # OPEN rows only, at any age up to now (#737). A resolved row is an answered
+    # question and cannot account for a post still being made; an old one is the normal
+    # case, since a standing question is announced many times and stored once.
+    #
+    # #737 removes the window's UPPER bound and keeps its floor. A row dated in the
+    # future is clock skew or bad data, and the row it replaced already refused to read
+    # that as health — the same rule the queue row applies to arrivals. Dropping that
+    # guarantee is not part of this fix and would be a quiet cost of it: an unreadable
+    # or impossible `raised_at` is a board answering nonsense, and nonsense must not
+    # vouch for a producer.
+    held = {subject for b in stored
+            if isinstance(b, dict) and not b.get("resolved_at")
+            and (age := _age_minutes(b.get("raised_at"))) is not None and age >= 0
+            and (subject := _escalation_subject_of_row(b)) is not None}
+    # #523's by-design exclusion, applied to the DENOMINATOR rather than argued about
+    # in prose: a post whose refs name no subject could never have had a row, so it is
+    # not evidence either way.
+    storable = [p for p in raised if _escalation_subject(p.get("refs")) is not None]
+    unstorable = len(raised) - len(storable)
+    accounted = [p for p in storable
+                 if _escalation_subject(p.get("refs")) in held]
+    extra = {"posts": len(raised), "storable": len(storable),
+             "accounted": len(accounted), "open_rows": len(held),
+             "window_minutes": window}
+    if not raised:
         return Check("escalations", host.base_url or "-",
                      f"nothing escalated in the last {span}, so an empty blockers table is "
                      "the state of a quiet day and not evidence of a severed producer",
-                     "ok", extra={"posts": 0, "rows": 0, "window_minutes": window})
-    # Rows and no posts is not a fault either: a person can raise one by hand, and the
-    # window is a day while an unanswered blocker outlives it.
+                     "ok", extra=extra)
+    if not storable:
+        # Announced and deliberately not stored, all of them. Named rather than passed
+        # over silently: it is the one shape in which "posts and no rows" is correct,
+        # and a reader who is not told will read the zero as the fault it is not.
+        return Check("escalations", host.base_url or "-",
+                     f"{len(raised)} {ESCALATION_POST} post(s) in the last {span} and not "
+                     "one of them names a subject, so none was storable by design (#523) "
+                     "— this says nothing about the row half either way", "ok",
+                     extra=extra)
+    if not accounted:
+        return Check("escalations", host.base_url or "-",
+                     f"{len(storable)} {ESCALATION_POST} post(s) in the last {span} name a "
+                     "subject and not one has an open blocker row behind it — the "
+                     "escalation path is ringing the bell and recording nothing, so "
+                     "nothing can answer 'what is waiting on me'", "fail",
+                     manual="run one escalation by hand and read the note it returns: "
+                            "`announce()` states which half failed on the line it returns "
+                            "(harness/loops/needs_human.py)",
+                     extra=extra)
+    aside = (f", and {unstorable} that named no subject and were not storable (#523)"
+             if unstorable else "")
     return Check("escalations", host.base_url or "-",
-                 f"{len(fresh)} blocker row(s) recorded against {len(raised)} "
-                 f"{ESCALATION_POST} post(s) in the last {span}", "ok",
-                 extra={"posts": len(raised), "rows": len(fresh), "window_minutes": window})
+                 f"{len(accounted)} of {len(storable)} {ESCALATION_POST} post(s) in the "
+                 f"last {span} have an open blocker row behind them{aside}", "ok",
+                 extra=extra)
 
 
 def check_generated(host: Host) -> Check:
