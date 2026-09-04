@@ -318,23 +318,44 @@ SCOPE_WIDE = ("all", "fleet", "wide")
 def repo_name(value: str | None) -> str | None:
     """A repo in the one form these panels can be compared in, or None.
 
-    THREE spellings reach this dashboard for one repository. A lease reports a
-    bare ``quarterback``, because what it saw was the checkout's directory; the
-    plan and `gh` both report ``prisonblues/quarterback``; and a hand-written plan
-    item reports whichever the human typed. Folded to the bare name, lowercased,
+    THREE spellings reach this dashboard for one repository. A lease reports
+    ``prisonblues/quarterback`` off its origin remote — or, from a checkout with no
+    GitHub remote and from any lifecycle hook older than #714, the bare
+    ``quarterback`` it saw as the checkout's directory; the plan and `gh` both
+    report the slug; and a hand-written plan item reports whichever the human
+    typed. Folded to the bare name, lowercased,
     so what gets compared is repositories rather than spellings — comparing the
     slugs would put a seat's own FLEET row out of its own scope.
     """
     return short_repo((value or "").strip()).lower() or None
 
 
+#: What separates a repo from a number in a PR's claim key — `app/claimkey.py`'s
+#: `PR_SIGIL`. Named here because two functions in this file have to recognise it:
+#: :func:`claim_repo`, to read the repo off a PR's key, and :func:`_unprefixed`, to
+#: respell it. Not imported: this file runs on a box that has the harness and no
+#: server, and one character duplicated across that boundary is cheaper than a
+#: dashboard that cannot start without `app/` on the path.
+PR_SIGIL = "!"
+
+
 def claim_repo(key: str | None, plan: list[dict] | None = None) -> str | None:
     """Which repo a claim is against, or None when its key cannot say.
 
-    Three key shapes are in use and only two of them carry a repo: ``owner/repo#12``
-    (an issue), ``owner/repo:2.40`` (a release number), and ``plan:<uuid>`` — which
-    names an item and not a repo, so the plan is consulted when the caller has it
-    and the claim is left unattributed when it does not.
+    Four key shapes are in use and three of them carry a repo: ``owner/repo#12``
+    (an issue), ``owner/repo!12`` (a PR — a different sigil because an issue and a
+    PR can share a number), ``owner/repo:2.40`` (a release number), and
+    ``plan:<uuid>`` — which names an item and not a repo, so the plan is consulted
+    when the caller has it and the claim is left unattributed when it does not.
+
+    **The PR sigil was missing here and the claim it belongs to disappeared.**
+    `agent_rows` narrows claims by this function before joining them, so a key this
+    could not split returned the WHOLE key as the repo — a definite mismatch rather
+    than the "cannot say" that is treated as in scope — and a scoped dashboard,
+    which is the default, dropped every PR claim before anything could draw it. The
+    cell then fell back to the prompt title, which is indistinguishable from the
+    defect #253 is about. Found by review, not by the tests: the live check that
+    passed used an ISSUE claim, whose key this always split.
 
     None means "cannot say", and every caller treats that as in scope. A claim
     whose repo is unknown is not evidence that it belongs to another project, and
@@ -350,7 +371,7 @@ def claim_repo(key: str | None, plan: list[dict] | None = None) -> str | None:
             if item.get("item_id") == wanted:
                 return item.get("repo") or None
         return None
-    head = key.split("#", 1)[0].split(":", 1)[0]
+    head = key.split("#", 1)[0].split(PR_SIGIL, 1)[0].split(":", 1)[0]
     # A head with no owner is not a repo we can name. `gh` and the plan both spell
     # a claim key with its owner, so a bare word here is some other namespace's
     # key, and reading it as a repo would scope rows against a word that is not one.
@@ -2469,6 +2490,15 @@ def _unprefixed(label: str, scope: Scope | None) -> str:
         return label[len(name):]                  # the '#' stays: it reads as an issue
     if lowered.startswith(f"{name}:"):
         return label[len(name) + 1:]              # the ':' does not: it read as a namespace
+    if lowered.startswith(f"{name}{PR_SIGIL}"):
+        # RESPELLED rather than trimmed, which is what the other two branches do.
+        # `!` is the key's separator for a PR (`app/claimkey.py`: an issue and a PR
+        # can share a number, so they cannot share a sigil) and it is a storage
+        # detail — trimming the repo off `lexray!1780` leaves a bare `!1780`, which
+        # names the right PR in a spelling nothing else on the screen uses. `PR#`
+        # is `plan_ref`'s spelling for the same PR one table over (#272), so a PR
+        # claimed by an agent and a PR ranked on the plan now read alike.
+        return f"PR#{label[len(name) + 1:]}"
     return label
 
 
@@ -2945,16 +2975,67 @@ def claim_summary(claim: dict, items: list[dict] | None = None,
     return f"{label} {words}".strip()
 
 
-def _claim_only_state(holder: str, live: set[str]) -> tuple[str, str]:
+def holding(claim: dict, said: str, items: list[dict] | None = None,
+            scope: Scope | None = None,
+            index: dict[str, dict] | None = None) -> str:
+    """``PR#1780 · Panel review PR rework`` — what an agent is ON, then what it says
+    it is doing.
+
+    The ref goes in FRONT of the words rather than instead of them, and that is the
+    whole of the change. This cell used to hold one or the other: a claim replaced
+    the title outright, so an agent's row answered "which PR is this?" or "what is
+    this agent up to?" and never both — and since nothing on the review path
+    claimed anything (#253), in practice it always answered the second. A reader
+    asking which PR `pine-mist` was reviewing had a prose title, a branch called
+    `test`, and no number anywhere on the screen.
+
+    It is a PREFIX and not a column of its own because the narrow dash is 69
+    columns and this table already spends 13 of them on `who` and 6 on `state`. A
+    column costs that width in every layout; a prefix costs it only on the rows
+    that have something to say, and it says it in the cell a reader is already
+    looking at.
+
+    **A plan or item claim keeps its own words**, because `claim_label` has already
+    resolved those keys to the item's title (`plan #163 Split the fix phase`) — a
+    prefix there would print the same sentence twice, once as the ref and once as
+    the words.
+
+    Without `said` this is :func:`claim_summary` unchanged: a claim held by a
+    machine rather than a session has no agent title to sit beside, and the claim's
+    own note is then the only thing that can fill the cell.
+    """
+    label = claim_label(claim.get("key") or "?", items, scope)
+    if not said or label.startswith("plan "):
+        return claim_summary(claim, items, scope, index)
+    return f"{label} · {said}"
+
+
+def _claim_only_state(holder: str, live: set[str], session: str | None = None,
+                      live_sessions: set[str] | None = None) -> tuple[str, str]:
     """Which of :data:`CLAIM_ONLY_STATE` a holder with no agent row earns.
 
-    Presence is asked first, because "alive and off this pane" is a different
-    answer from either of the others and is the only one that is not a loose end.
-    After that the holder's SHAPE decides, and it is the right test: a claim
-    recorded as ``machine/name`` names an agent, so presence not listing it means
-    that agent has finished; a claim recorded as a bare ``machine`` never named
-    one, so no amount of presence can say who holds it.
+    **A claim that names a session is answered by that session, and the holder is
+    not consulted at all.** The session is the exact identity and the holder is a
+    proxy for it, so where they disagree the proxy is what is wrong: agent names
+    are recycled when an agent finishes, so a stale claim's ``machine/name`` can
+    match a LIVE agent that never held it — and asking presence about the holder
+    first called that claim ``elsewhere``, which reads as "somebody is on this,
+    off your pane" about work whose session ended. ``gone`` is the honest answer
+    and the one that says the claim is a loose end.
+
+    Only a claim naming NO session falls through to the holder, and there the
+    shape decides: ``machine/name`` named an agent, so presence not listing it
+    means that agent finished (``gone``); a bare ``machine`` never named one, so
+    no amount of presence can say who holds it (``machine``) —
+    `create-worktree`'s pre-agent claim being the case that genuinely is.
+
+    ``elsewhere`` is worth telling apart from both because it is the only one of
+    the three that is not a loose end: somebody is alive and working on it, just
+    not on this pane.
     """
+    if session:
+        return CLAIM_ONLY_STATE[
+            "elsewhere" if session in (live_sessions or set()) else "gone"]
     if holder in live:
         return CLAIM_ONLY_STATE["elsewhere"]
     return CLAIM_ONLY_STATE["gone" if "/" in holder else "machine"]
@@ -2974,17 +3055,43 @@ def _seat_label(seat: dict, screens: int) -> str:
     return f"{name} {seat.get('seat')}" if screens > 1 else f"seat {seat.get('seat')}"
 
 
+def _claims_of(agent: dict, mine: dict[str, list[dict]]) -> list[dict]:
+    """The claims this agent holds — by SESSION first, then by holder.
+
+    Two identities reach one agent and the board uses both. An ordinary claim
+    records the MACHINE as its holder (`daedalus`) and names the session
+    separately; a session-owned claim — the plan's, since v2.39 — records
+    `daedalus/sable-dune` and is found by holder. Asking only the second question
+    is what left every `qb-claim issue` and `qb-claim pr` unattributed.
+
+    Session first because it is the exact identity: a machine runs several agents
+    at once and they all authenticate as that machine, so the holder of an
+    ordinary claim cannot say which of them took it and the session can. The
+    holder lookup is not a fallback but the OTHER HALF, and both are asked: an
+    agent can hold one claim of each kind at once — an ordinary claim on the PR it
+    is reviewing and a session-owned one on its plan item — and returning only the
+    first bucket that answered dropped the other claim from the row AND from the
+    `＋N` count, then suppressed it below as already drawn. Concatenated rather
+    than merged because each claim is filed in exactly one bucket, so the two
+    lookups cannot return the same claim twice.
+
+    Both lookups are keyed by a TYPED key, so a session id that happened to equal
+    another agent's holder string cannot cross the two namespaces.
+    """
+    return (mine.get(("session", agent.get("session") or ""), [])
+            + mine.get(("holder", agent.get("holder") or ""), []))
+
+
 def _agent_row(agent: dict, mine: list[dict], items, scope, index) -> dict:
     """The cells an agent contributes, whether or not it is sitting in a pane."""
     word, style = agent_state(agent)
+    # What the agent SAID it was doing, which is what FLEET showed and is all this
+    # cell used to hold.
+    said = agent.get("title") or agent.get("branch") or ""
     if mine:
-        what = (claim_summary(mine[0], items, scope, index), "white")
+        what = (holding(mine[0], said, items, scope, index), "white")
     else:
-        # No claim: what the agent SAID it was doing, which is what FLEET showed.
-        # A claim is the better answer when there is one — it is the fleet's own
-        # record rather than a prompt summary — and the TUI's detail line still
-        # has both.
-        what = (agent.get("title") or agent.get("branch") or "—", "grey70")
+        what = (said or "—", "grey70")
     return {"who": (agent.get("holder") or "?").split("/", 1)[-1],
             "repo": agent.get("repo"),
             "state": (word or "—", style),
@@ -3031,9 +3138,42 @@ def agent_rows(data: dict, scope: Scope | None = None,
     claims, _ = in_scope(claims, scope, lambda c: claim_repo(c.get("key"), items))
     index = plan_index(items)
     live = {a.get("holder") for a in every if a.get("holder")}
-    mine: dict[str, list[dict]] = {}
+    #: Every live agent's session, so a claim that names one can be attributed to
+    #: the agent that took it.
+    live_sessions = {a.get("session") for a in every if a.get("session")}
+    #: Claims indexed BY SESSION where the claim names one, and by holder where it
+    #: does not — which is the join the AGENTS row needs and did not have.
+    #:
+    #: THE HOLDER OF AN ORDINARY CLAIM IS THE MACHINE. `POST /claim` records
+    #: `holder: "daedalus"` with the session in its own field; only a
+    #: session-owned claim (the plan's, v2.39) records `daedalus/sable-dune`. So
+    #: a join on the holder string alone matched plan claims and nothing else:
+    #: every `qb-claim issue` and `qb-claim pr` on the fleet — the two an agent
+    #: actually takes when it picks up work — fell through to a CLAIM-ONLY row
+    #: reading `machine`, beside the very agent holding it, while that agent's own
+    #: row said `main`. Both halves of the answer were on screen, one row apart,
+    #: and nothing joined them.
+    #:
+    #: **The key is TYPED**, `("session", s)` or `("holder", h)`, and not the bare
+    #: string. Nothing enforces that a session id can never equal some other
+    #: agent's holder string — the board bounds the length of both and constrains
+    #: the shape of neither — and one namespace for two identities means such a
+    #: collision hands agent A a claim belonging to agent B, silently. A tuple
+    #: costs nothing and makes the question unaskable.
+    #:
+    #: Each claim lands in exactly ONE bucket, which is what lets :func:`_claims_of`
+    #: concatenate its two lookups without deduplicating: a claim naming a session
+    #: is never also filed under its holder.
+    mine: dict[tuple[str, str], list[dict]] = {}
     for claim in claims:
-        mine.setdefault(claim.get("holder") or "?", []).append(claim)
+        if session := claim.get("session"):
+            mine.setdefault(("session", session), []).append(claim)
+        else:
+            mine.setdefault(("holder", claim.get("holder") or "?"), []).append(claim)
+    #: Which claims ended up on an agent's row, by object identity — see the
+    #: CLAIM-ONLY loop below for why this is the test and a re-derived predicate is
+    #: not.
+    attached: set[int] = set()
 
     by_session = {s: a for a in every if (s := a.get("session"))}
     rows: list[dict] = []
@@ -3049,8 +3189,9 @@ def agent_rows(data: dict, scope: Scope | None = None,
                "label": _seat_label(seat, screens)}
         if agent is not None:
             seated.add(agent.get("holder") or "")
-            row.update(_agent_row(agent, mine.get(agent.get("holder") or "", []),
-                                  items, scope, index))
+            held = _claims_of(agent, mine)
+            attached.update(id(c) for c in held)
+            row.update(_agent_row(agent, held, items, scope, index))
         else:
             row.update({"who": _seat_label(seat, screens),
                         # The pane's DIRECTORY, which is what the SEATS panel's
@@ -3069,24 +3210,35 @@ def agent_rows(data: dict, scope: Scope | None = None,
             continue
         row = {"key": f"agent:{i}", "kind": "agent", "agent": agent,
                "claim": None, "seat": None, "live": True, "label": ""}
-        row.update(_agent_row(agent, mine.get(agent.get("holder") or "", []),
-                              items, scope, index))
+        held = _claims_of(agent, mine)
+        attached.update(id(c) for c in held)
+        row.update(_agent_row(agent, held, items, scope, index))
         rows.append(row)
 
-    drawn = {r["agent"].get("holder") for r in rows if r.get("agent") is not None}
     for i, claim in enumerate(claims):
         holder = claim.get("holder") or "?"
         # A ROW FOR EVERY CLAIM THAT IS NOT ALREADY ON ONE, which is not the same
         # test as "its holder is not live": an agent this pane's scope hid is alive
         # and has no row here, so keying on presence dropped its claim from the
         # table altogether. `_claim_only_state` tells the three cases apart.
-        if holder in drawn:
+        #
+        # ASKED OF WHAT WAS ACTUALLY DRAWN, by identity, rather than re-derived
+        # from the rows. A predicate over holders and sessions has to reproduce
+        # `_claims_of`'s rule exactly or it answers a different question, and the
+        # two ways it can be wrong are both silent: too broad suppresses a claim
+        # nothing drew (an agent name is recycled when its agent finishes, so a
+        # stale `machine/name` claim shares a holder with a LIVE agent that does
+        # not hold it), too narrow draws one twice. Identity is exact and cannot
+        # drift — one list of claim objects reaches both loops.
+        if id(claim) in attached:
             continue
         left = minutes_left(claim.get("expires"))
         rows.append({"key": f"claim:{i}", "kind": "claim", "claim": claim,
                      "agent": None, "seat": None, "live": False, "label": "",
                      "who": holder, "repo": claim_repo(claim.get("key"), items),
-                     "state": _claim_only_state(holder, live),
+                     "state": _claim_only_state(holder, live,
+                                                claim.get("session"),
+                                                live_sessions),
                      "stage": (STAGE_UNREPORTED, "grey50"),
                      "what": (claim_summary(claim, items, scope, index), "yellow"),
                      "extra": 0, "ttl": until(claim.get("expires")),
@@ -3111,9 +3263,9 @@ def chip_repos(rows: list[dict]) -> list[str]:
     built from the rows they filter so every one of them has something behind it.
 
     Folded through :func:`repo_name` because three spellings reach this dashboard
-    for one repository — a lease reports a bare ``quarterback``, the plan and `gh`
-    report ``prisonblues/quarterback`` — and two chips for one repo would be two
-    filters that each hide half of it.
+    for one repository — the plan and `gh` report ``prisonblues/quarterback``, and
+    so does a lease since #714 unless its checkout has no GitHub remote — and two
+    chips for one repo would be two filters that each hide half of it.
 
     Alphabetical, and deliberately not by size: the chips are a place your eye
     goes back to, and an order that reshuffles whenever an agent starts or stops
@@ -4280,11 +4432,12 @@ def dial_scope_refusal(dial: str, repo: str | None, script: str | None = None) -
         return ""
 
 
-def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> list[str]:
+def dial_matches(vocabulary: dict[str, dict], typed: str,
+                 limit: int | None = None) -> list[str]:
     """The dial names worth offering for what has been typed so far.
 
     Substring rather than prefix, because the useful half of a name is in the
-    middle of it: `budget` finds the five `review_panel.budget.*` and `enabled`
+    middle of it: `budget` finds the six `review_panel.budget.*` and `enabled`
     finds the seats, and a prefix filter would answer both with nothing until the
     person had typed `review_panel.` — which is the part they know.
 
@@ -4295,15 +4448,23 @@ def dial_matches(vocabulary: dict[str, dict], typed: str, limit: int = 40) -> li
     decides, and sorting the names alphabetically would open the list on `enabled`,
     the one dial that switches this repo's reviews off and nobody's answer to "what
     did I come here to change".
+
+    `limit` is OPT-IN, and it used to default to 40 — which was the number of dials
+    there were. So the picker's first answer to "which dials are there" was all of
+    them by coincidence, and the 41st dial (`review_panel.budget.tokens_per_round`,
+    #483) silently dropped `spawn.max_sessions_fleet` off the end of a list whose
+    whole claim is completeness. The one caller that wants a bound asks for one
+    (`limit=2`, disambiguating a name typed on the command line); the picker wants
+    every match and puts them in a list that scrolls.
     """
     want = (typed or "").strip().lower()
     names = list(vocabulary)
     if not want:
-        return names[:limit]
+        return names if limit is None else names[:limit]
     rank = {name: i for i, name in enumerate(names)}
     hit = [n for n in names if want in n.lower()]
     hit.sort(key=lambda n: (not n.lower().startswith(want), rank[n]))
-    return hit[:limit]
+    return hit if limit is None else hit[:limit]
 
 
 # ---- the tmux screen ---------------------------------------------------------

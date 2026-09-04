@@ -254,6 +254,12 @@ class ReviewRun(Base):
     #: before, because ``converged``'s below-floor conjunct is cut at
     #: ``cleared_floor`` and that floor lived nowhere on the row.
     #:
+    #: It has its own column since #732 (:attr:`cleared_floor`), and this one is
+    #: not thereby redundant: that column is the panel's ANSWER and this is the
+    #: three dials the answer was computed from. The pair is what lets a reader
+    #: check one against the other — which is exactly what a board-side derivation
+    #: from these dials alone would have made impossible.
+    #:
     #: Not a replacement for :attr:`converged`. A stored answer still beats a
     #: reconstruction, and the migration for that column says why a board-side
     #: derivation would be free to disagree with the panel about the same round.
@@ -322,6 +328,88 @@ class ReviewRun(Base):
     #: only prior round IS the anchor. Not the same as a round that looked for
     #: restored lines and found none, which sends a ``count`` of 0.
     provenance_restored: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: THE FIX PASS THIS ROUND READ (#624) — the artifact for the one actor in this
+    #: loop nothing recorded.
+    #:
+    #: Reviewers have scorecards (:class:`ReviewReviewer`), findings have keys and
+    #: terminal outcomes (:class:`ReviewFindingOutcome`), rounds have this row, and
+    #: the machinery that produced a round has four columns of its own. The pass
+    #: BETWEEN two rounds — which writes the code that produces the next round's
+    #: findings — had nothing. On ``prisonblues/lexray#1780`` its four passes came
+    #: out at +850/-314 across 11 files, +322/-49 across 9, +356/-41 across 12 (7 of
+    #: them files no round had read) and +142/-31 across 7, and every one of those
+    #: numbers had to be reconstructed from ``git`` by hand afterwards to file the
+    #: issue.
+    #:
+    #: What is in it: the commit range and which of three readers supplied the diff,
+    #: which round's To fix list briefed it, the production/test/prose churn split,
+    #: the files it touched and which of them no earlier round had read, which of the
+    #: brief's findings this round no longer raises, how many of this round's
+    #: findings were attributed to it, and — segregated under ``declared`` and named
+    #: as declarations — the ``narrowed``/``declined``/``escalated`` keys the pass
+    #: reported. ``gaps`` is the record's own account of what it cannot say.
+    #:
+    #: **Opaque JSON, on :attr:`rules`' and :attr:`provenance_restored`' rule.** Every
+    #: value in here was derived by the panel from the diff, the commits and the
+    #: payload the pass was given; a board that re-derived one would be a second
+    #: implementation free to disagree with the panel about the same pass. The one
+    #: thing ingest does read is the ``counts`` sub-object, lifted verbatim into
+    #: :attr:`fix_pass_counts` beside it so a run LIST can carry the numbers without
+    #: the path lists — a lift, not an interpretation, and
+    #: ``_fix_pass_counts_or_none`` says so.
+    #:
+    #: **DEFERRED**, for :attr:`rules`' reason: it carries the file list and the
+    #: finding keys, so a ``GET /reviews?limit=500`` that fetched it would have
+    #: Postgres ship five hundred of them to serialise none. ``GET /review/{id}``
+    #: asks with ``undefer()``.
+    #:
+    #: **NOTHING RANKS, SCORES OR GATES ON IT, AND THAT IS A REQUIREMENT OF THE
+    #: FEATURE RATHER THAN A GAP IN IT.** #624's title carries it in the parenthesis
+    #: and its own second opinion supplies the argument: every obvious ratio over a
+    #: fix pass is gameable in a direction worse than the disease — lines per finding
+    #: cleared rewards compressed and superficial fixes, findings introduced per pass
+    #: rewards weakening tests and avoiding the files most likely to be read, new
+    #: files opened rewards refusing a cross-file repair that is genuinely required (a
+    #: P1 left unfixed to protect a metric), and share still standing a round later is
+    #: invalid under increment scope because the later round may never have re-read
+    #: the repair. So the record has no actor key at all — it names the pass by its
+    #: range and the round that briefed it, never the agent, model or session that
+    #: performed it — no endpoint aggregates it, no index invites one, and
+    #: ``GET /review/stats``, which is the leaderboard this table already feeds, does
+    #: not read it. ``tests/test_review_fix_pass.py`` pins each of those.
+    #:
+    #: NULL = there was no pass to record, which is round 1, a run outside a cycle,
+    #: and any round that reviewed nothing. Never ``{}``: a pass that could not be
+    #: read gets a record with nulls in it, because "opened no file and churned no
+    #: line" is the flattering direction on every claim this record makes.
+    fix_pass: Mapped[dict[str, Any] | None] = mapped_column(JSONB, deferred=True)
+    #: The integer summary of :attr:`fix_pass`, lifted out of the record's own
+    #: ``counts`` block so that it can ride the run LIST (#624).
+    #:
+    #: Eleven keys at most and every value a count — a count the board cannot believe
+    #: drops WITH ITS KEY rather than being stored as a JSON null, which is
+    #: ``_tally_or_none``'s standing rule and matters here because zero is a claim
+    #: about a fix pass. So a reader asks this block whether it HAS a key, and a
+    #: record whose churn was not measurable has ten. That is why this one is
+    #: not deferred and its parent is — the same cut :attr:`provenance_counts` and
+    #: ``unread_files_count`` already make on this row, and #112's grouping-key /
+    #: locator cut one field over. A population question about fix passes ("how big
+    #: were the passes on rounds that then attributed nothing to them") is a question
+    #: about thousands of rows, and detail-only would have meant one fetch per run to
+    #: ask it — which is precisely what #624 wants possible, since the issue's own
+    #: instruction is to calibrate against real cycles before anything is scored.
+    #:
+    #: **Counts, and no arithmetic over them.** There is deliberately no share, rate,
+    #: ratio or score in here and no column that is one: the numerators and the
+    #: denominators are both stored, and a consumer that wants a quotient has to
+    #: write it down in its own code where somebody can argue with it. See
+    #: :attr:`fix_pass` for why.
+    #:
+    #: NULL wherever :attr:`fix_pass` is NULL, and also where the record arrived
+    #: without a readable ``counts`` block — a producer this board has not met. Not
+    #: ``{}``: an empty tally would say a pass was measured and every answer was
+    #: zero.
+    fix_pass_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     #: WHICH HARNESS PRODUCED THIS ROUND (#112) — four fields, because no one of
     #: them is true in every case and a field that is sometimes a lie is worse than
     #: three that are each honest about their scope.
@@ -528,6 +616,147 @@ class ReviewRun(Base):
     #: collapsing them would either block landings this repo's own policy allows
     #: or count them as clean finishes they are not.
     converged: Mapped[bool | None] = mapped_column(Boolean)
+    #: WHAT THE CYCLE LEFT BEHIND, counted (#717). ``round_stop.outstanding`` on
+    #: the round payload, as ``{"fixable": n, "below_floor": n, "escalated": n,
+    #: "narrowed": n, "declined": n}`` — the length of each list the panel
+    #: published, and nothing else.
+    #:
+    #: **The counts are what** :attr:`n_confirmed` **is not.** That column is every
+    #: judge-confirmed finding on the round; this is the round's own disposal of
+    #: them, cut at the repo's ``cleared_floor`` and with the escalated and
+    #: narrowed keys already taken out. The two populations are different and a
+    #: reader cannot get from one to the other by subtraction — which is what
+    #: ``preland`` was doing without knowing it, holding every below-floor finding
+    #: against a merge on a repo whose own policy says they are reported and not
+    #: fixed here (#165, #717).
+    #:
+    #: **Three disjoint sets**, and that is a property of the panel rather than a
+    #: hope about it: ``cleared_out`` removes every escalated and narrowed key
+    #: before ``fixable``/``below_floor`` are split at the floor, so
+    #: ``fixable + escalated`` is a sum and not a double count.
+    #: ``panel_rounds.round_stop`` computes it and
+    #: ``harness/loops/tests/test_panel_outstanding.py`` pins it.
+    #:
+    #: **Counted here, never re-derived.** The keys are lists on the payload and
+    #: this is their length; nothing on this board decides which finding is below
+    #: which floor, because the floors are repo dials the board holds as opaque
+    #: JSON and does not interpret — the argument :attr:`converged` and
+    #: ``m6bc45ff1`` make at length, and it applies here with more force: a
+    #: board-side split would be a second reading of the policy that produced the
+    #: verdict stored beside it.
+    #:
+    #: NULL = the panel did not say. Every run recorded before this column, every
+    #: producer too old to send the block, and every payload whose block arrived
+    #: without all three of the counted-and-read keys — a disposal missing one of
+    #: them is not a smaller disposal, it is a false one, so it is refused whole.
+    #: A consumer must read NULL as "how much is owed is unknown" and never as
+    #: zero.
+    outstanding_counts: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    #: WHO the round handed that remainder to (#42, stored by #717) —
+    #: ``fixer``, ``human`` or ``nobody``, out of the panel's own vocabulary
+    #: (:data:`app.api.reviews.HANDED_TO`). The verdict beside the measurement, on
+    #: the terms ``round_stop`` keeps them apart: the counts are a property of the
+    #: ROUND and true of it either way, and this is the property of a round that is
+    #: ENDING a cycle.
+    #:
+    #: NULL by two routes that a reader has to keep apart with the row's own
+    #: ``stopped``: the panel did not say (every pre-column run), or the round went
+    #: again and made no disposal at all. Reading it for truthiness answers "is
+    #: anything owed" with a fact about the payload's age.
+    #:
+    #: Stored as one word and gated on nothing here. ``preland`` rules on the
+    #: counts, which cannot drift from the lists they were taken from; this is what
+    #: a reader of that verdict needs in order to see who the round thought was
+    #: owed the work.
+    handed_to: Mapped[str | None] = mapped_column(Text)
+    #: THE FLOOR THE ROUND WAS REQUIRED TO CLEAR (#732), verbatim from
+    #: ``round_stop.cleared_floor`` — ``P1``..``P4``, or the panel's own
+    #: no-floor token.
+    #:
+    #: Stored because :attr:`outstanding_counts` is SPLIT at it and did not carry
+    #: it. A reader holding ``{"fixable": 2, "below_floor": 11}`` cannot say what
+    #: ``below_floor`` means without re-deriving ``Dials.cleared_floor``, which is
+    #: a function of three separate dials inside :attr:`review_panel`
+    #: (``round_trigger_floor``, ``fix_severity_floor`` and whether a low-severity
+    #: budget is in force). That derivation is the panel's, it moves, and a
+    #: board-side copy of it would be a second reading of the policy that produced
+    #: the verdict stored beside it — the thing :attr:`converged` and
+    #: :attr:`outstanding_counts` both refuse to do. One word from the producer is
+    #: not a second reading; it is the producer's answer.
+    #:
+    #: ``trigger_floor`` deliberately has no column beside this one. It is
+    #: ``Dials.round_trigger_floor`` unchanged — the call site passes exactly that
+    #: — so :attr:`review_panel` already holds it, and a second copy would be one
+    #: dial in two places free to disagree.
+    #:
+    #: NULL = the panel did not say: every run recorded before this column, and
+    #: every producer too old to nest the key.
+    cleared_floor: Mapped[str | None] = mapped_column(Text)
+    #: HOW MANY FINDINGS THIS ROUND RAISED THAT NOBODY HAD RAISED AND THAT DID NOT
+    #: BUY A ROUND (#732) — the length of ``round_stop.new_below_trigger_floor``.
+    #:
+    #: A count and not the keys, on :attr:`outstanding_counts`' rule: ``len()`` of
+    #: the published list cannot disagree with that list, and the keys are already
+    #: on the round's own findings.
+    #:
+    #: Nothing else on this row says it. Those findings ARE in the round's buckets
+    #: and :attr:`new_findings` counts them, but only ``round_stop`` knows which of
+    #: them fell under ``review_panel.round_trigger_floor`` and so did not fire
+    #: rule 1. That difference is exactly what #710 had to reassemble by hand to
+    #: calibrate a trigger floor at all.
+    #:
+    #: NULL = the panel did not say. **Never read as zero**: "no new finding fell
+    #: below the floor" and "this producer does not measure it" are opposite
+    #: readings, and only one of them argues for lowering the floor.
+    new_below_trigger_floor: Mapped[int | None] = mapped_column(Integer)
+    #: The same for findings an EARLIER round had already raised (#621, stored by
+    #: #732) — the length of ``round_stop.repeated_below_trigger_floor``.
+    #:
+    #: Its own column rather than a sum with the one above, because the pair is
+    #: what carries the signal: new-below-floor says the floor is turning work away
+    #: at the door, repeated-below-floor says work already inside the cycle is
+    #: never getting done. A repo whose unfinished work is all in the second is a
+    #: repo with a different problem from one where it is all in the first, and a
+    #: total says neither.
+    repeated_below_trigger_floor: Mapped[int | None] = mapped_column(Integer)
+    #: THE ESCALATION RUNGS AS THIS ROUND MEASURED THEM (#732), verbatim: the nine
+    #: blocks ``round_stop`` publishes beside its verdict, keyed by the names the
+    #: panel gives them (:data:`app.api.reviews.STOP_RUNGS`) — ``fix_injection``,
+    #: ``revert``, ``excision``, ``new_findings_not_falling``, ``unrefereed_fix``,
+    #: ``guard_churn``, ``fix_budget``, ``fix_surface`` and ``premises``.
+    #:
+    #: **Why they are on the row at all.** #712's whole complaint is that every
+    #: rung "is a claim about a cycle's series, and no endpoint serves one"; #710
+    #: is a calibration done by hand against numbers that had to be reassembled
+    #: from report text. Part of why no endpoint served them is that they never
+    #: reached this table: the panel has published all nine on every round payload
+    #: for releases, nested inside ``round_stop``, and ingest's ``extra="ignore"``
+    #: dropped every one in silence. That is #626's and #717's shape, one tier
+    #: down, and ``tests/test_payload_key_drift.py`` is what now fails on it.
+    #:
+    #: **One column and not nine.** Each block is a measurement plus its own
+    #: verdict — ``over`` (the number crossed) kept apart from ``fired`` (this is
+    #: why the cycle stopped) — and which scalar out of each one matters is exactly
+    #: the question #710 has not answered yet. Lifting a column per rung now would
+    #: be this board deciding it, from a position of never having held the numbers.
+    #: Stored whole, the series query #712 wants is one ``ORDER BY round`` over a
+    #: cycle; the columns can be lifted later out of data that exists.
+    #:
+    #: Verbatim and uninterpreted, on :attr:`review_panel`'s terms: nothing here
+    #: reads a rung's name, compares a limit or derives one field from another.
+    #: Refused WHOLE if it will not serialise or is over its cap
+    #: (:data:`app.api.reviews.MAX_STOP_RUNGS_CHARS`) — a rung set short one rung
+    #: does not read as a smaller measurement, it reads as a round where that rung
+    #: did not fire.
+    #:
+    #: ``deferred``, on :attr:`rules`' and :attr:`fix_pass`' argument: it is nine
+    #: objects and no list query needs them, so ``GET /reviews`` must not ship them
+    #: and ``GET /review/{id}`` undefers it.
+    #:
+    #: NULL = the panel sent no rung this board could store — every run recorded
+    #: before this column, every producer too old to nest them, and every set
+    #: refused whole.
+    stop_rungs: Mapped[dict[str, Any] | None] = mapped_column(JSONB, deferred=True)
 
     # Hard gates that sit alongside the LLM panel.
     sonar_gate: Mapped[str | None] = mapped_column(Text)

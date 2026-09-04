@@ -175,7 +175,7 @@ def test_the_sandbox_directory_exists_even_when_git_init_fails(monkeypatch, tmp_
     the actual cause. Degrading to the DOCUMENTED failure is the point."""
     monkeypatch.setattr(panel.subprocess, "run", lambda *a, **k: type(
         "P", (), {"returncode": 1, "stdout": "", "stderr": "fatal: nope"})())
-    made = panel.member_sandbox(tmp_path / "cwd")
+    made = panel.member_sandbox(tmp_path / "seat")
     assert Path(made).is_dir()
 
 
@@ -183,11 +183,110 @@ def test_a_real_sandbox_is_a_real_repo(tmp_path):
     """The one test here that runs git rather than mocking it — the mocked tests
     above all assert plumbing, and plumbing that produces a directory git does not
     recognise would satisfy every one of them while losing the codex seat."""
-    made = panel.member_sandbox(tmp_path / "cwd")
+    made = panel.member_sandbox(tmp_path / "seat")
     assert (Path(made) / ".git").exists()
     inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"],
                             cwd=made, capture_output=True, text=True)
     assert inside.stdout.strip() == "true", inside.stderr
+
+
+# ------------------------------------- what a seat TELLS the board about that repo
+
+def _record_envs(monkeypatch, seen: list):
+    """Every CLI invocation's `env=` kwarg, with the sandbox's own `git init` let
+    through — the same seam `_record_cwds` uses, and for the same reason: the init
+    goes through the `subprocess.run` these tests replace."""
+    def fake_run(argv, **kw):
+        if argv[:2] == ["git", "init"]:
+            Path(argv[-1]).mkdir(parents=True, exist_ok=True)
+            return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        seen.append(kw.get("env"))
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+
+
+def test_a_seat_declares_its_cwd_a_throwaway_to_the_lifecycle_hook(monkeypatch):
+    """`qb-hook` runs inside every seat — a seat is a hooked `claude -p`, and the
+    lifecycle hooks are configured per USER rather than per repo — so the hook fires
+    in the sandbox and reports the checkout it finds there. That checkout exists for
+    one process and one run, so reporting it puts a repository nobody outside this
+    process can name on the fleet's collision index (#714).
+
+    #714 had the hook infer that from the missing origin remote, which is also true
+    of an ordinary local-only repository and took every never-pushed checkout off the
+    index with it (#721). The seat is what KNOWS, because it made the directory, so
+    the seat is what says — and the channel to a child process is an environment
+    variable. Asserted on the kwargs `subprocess.run` is called with, on
+    `_record_cwds`' reasoning: every layer above can hold the right value and still
+    leave the CLI running with the panel's own environment."""
+    seen = []
+    _record_envs(monkeypatch, seen)
+    panel.review_llm("claude", "sonnet", "review this")
+    assert seen, "no seat CLI ran at all"
+    assert all(e and e.get("QB_SANDBOX") == "1" for e in seen), (
+        f"a seat ran without declaring its sandbox: {[bool(e) for e in seen]}")
+
+
+def test_the_seat_environment_is_an_overlay_and_not_a_replacement(monkeypatch):
+    """`subprocess.run`'s `env=` REPLACES the environment rather than adding to it,
+    so handing it the flag alone starts every seat with no PATH (the CLI is not
+    found), no HOME (no vendor config) and none of the API keys the seats
+    authenticate with — a total panel outage in exchange for one field on a lease.
+
+    PATH is asserted because it is the one whose absence would be a *silent*
+    outage: `run_cli` reports an OSError as a seat that flaked, so the panel would
+    report every vendor missing rather than a broken environment."""
+    seen = []
+    _record_envs(monkeypatch, seen)
+    monkeypatch.setenv("PATH", "/sentinel/bin")
+    monkeypatch.setenv("SEAT_CREDENTIAL", "kept")
+    panel.review_llm("claude", "sonnet", "review this")
+    assert seen and all(e is not None for e in seen), f"no env was passed at all: {seen}"
+    assert all(e.get("PATH") == "/sentinel/bin" for e in seen), seen
+    assert all(e.get("SEAT_CREDENTIAL") == "kept" for e in seen), seen
+
+
+def test_a_run_without_a_sandbox_does_not_claim_to_have_one(monkeypatch):
+    """The flag is derived from `cwd`, so the derivation has to answer correctly for
+    the case that has no sandbox. A `run_cli` call with no `cwd` runs in the panel
+    process's own directory — a real checkout — and telling the hook to go quiet
+    there would blind a live agent on the board by a variable it never set.
+
+    `None` is the assertion, not "QB_SANDBOX absent": `env=None` is what makes the
+    child INHERIT, and an env dict that merely lacks the key would still be a
+    replacement."""
+    seen = []
+    _record_envs(monkeypatch, seen)
+    panel.run_cli(["cli", "x"], "label", attempts=1)
+    assert seen == [None], seen
+
+
+def test_the_judge_declares_its_sandbox_too(monkeypatch):
+    """The judge is a seat like any other and gets a sandbox of its own from the
+    same function, but its `run_cli` calls live in `panel_rounds` — a different
+    module, and therefore the place a per-call-site `env=` argument would first be
+    forgotten. Deriving the flag from `cwd` is what makes this test pass without
+    `panel_rounds` knowing anything about it."""
+    seen = []
+    _record_envs(monkeypatch, seen)
+    monkeypatch.setattr(panel_core, "extract_json_value", lambda *a, **k: None)
+    f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
+    panel.adjudicate([[f]], "diff", "sonnet", 34)
+    assert len(seen) == 2, f"expected judge + reparse retry, got {len(seen)}"
+    assert all(e and e.get("QB_SANDBOX") == "1" for e in seen), seen
+
+
+def test_sandbox_env_leaves_the_base_environment_alone(monkeypatch):
+    """A copy, not a mutation. `os.environ` is process-wide, and a version of this
+    that set the key in place would mark the PANEL's own session as a sandbox — the
+    long-lived process whose lease is the one worth having on the board."""
+    base = {"PATH": "/bin"}
+    got = panel_seats.sandbox_env(base)
+    assert got == {"PATH": "/bin", "QB_SANDBOX": "1"}
+    assert base == {"PATH": "/bin"}, "the caller's environment was mutated"
+    assert "QB_SANDBOX" not in panel_seats.os.environ
 
 
 # ------------------------------------------------- the sandbox's cost, recorded

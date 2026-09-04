@@ -2188,3 +2188,247 @@ def test_a_row_with_no_repo_is_dropped_by_a_filter_rather_than_kept():
     describe."""
     rows = [{"repo": "quarterback"}, {"repo": None}]
     assert qd.only_repo(rows, "quarterback") == [{"repo": "quarterback"}]
+
+
+# ---- what an agent is ON, beside what it says it is doing (#253) -------------
+#
+# The AGENTS cell used to hold one or the other. A claim replaced the title
+# outright, and since nothing on the review path claimed anything, in practice it
+# always showed the title — so a reader asking which PR `pine-mist` was reviewing
+# got a prose sentence, a branch called `test`, and no number anywhere on the
+# screen. Measured on this board: five live agents, three reviewing, `/claims`
+# empty.
+#
+# The join was never missing from the dashboard; the data was. These pin the
+# rendering half, so that when `panel.py`'s round-start claim lands the cell reads
+# as both facts rather than as the ref having evicted the words.
+
+PR_KEY = f"{qd.REPO}!1780"
+
+
+def _reviewing(**extra) -> dict:
+    """One live agent, shaped the way `/active` returns one — and carrying no work
+    reference at all, which is the fact #253 is about."""
+    return {"holder": "daedalus/pine-mist", "session": "s-1", "repo": "lexray",
+            "branch": "test", "title": "Panel review PR rework",
+            "state": "working", "expires": _in(1800), **extra}
+
+
+def _held(key: str = PR_KEY, note: str = "panel review round 2") -> dict:
+    return {"holder": "daedalus/pine-mist", "key": key, "note": note,
+            "expires": _in(1800)}
+
+
+def test_a_prs_claim_key_reads_as_a_pr_and_not_as_a_storage_detail():
+    """`!` is the key's separator for a PR because an issue and a PR can share a
+    number (`app/claimkey.py`). Trimming the repo off `quarterback!1780` left a
+    bare `!1780` — the right PR in a spelling nothing else on the screen uses."""
+    assert qd.claim_label(PR_KEY, [], ONE) == "PR#1780"
+    # `PR#` is `plan_ref`'s spelling for the same PR one table over (#272), so a
+    # PR an agent holds and a PR the plan ranks now read alike.
+    assert qd.plan_ref({"ref": {"kind": "pr", "value": "1780"}}) == "PR#1780"
+
+
+def test_the_owner_survives_where_the_scope_cannot_trim_it():
+    """Two watched repos sharing a bare name is the one case where even the owner
+    is load-bearing — the same rule the issue sigil already follows."""
+    assert qd.claim_label(PR_KEY, [], TWO) == "quarterback!1780"
+
+
+def test_the_cell_carries_the_ref_and_what_the_agent_said():
+    assert qd.holding(_held(), "Panel review PR rework", [], ONE) \
+        == "PR#1780 · Panel review PR rework"
+
+
+def test_an_agent_with_nothing_to_say_falls_back_to_the_claims_own_words():
+    """A claim held by a machine rather than a session has no agent title to sit
+    beside, and the claim's note is then the only thing that can fill the cell."""
+    assert qd.holding(_held(), "", [], ONE) == "PR#1780 panel review round 2"
+
+
+def test_a_plan_claim_is_not_prefixed_onto_its_own_title():
+    """`claim_label` has already resolved an item key to the item's title, so a
+    prefix there would print the same sentence twice — once as the ref and once as
+    the words."""
+    plan = [item("Split the fix phase", ref=521)]
+    claim = _held(key=f"item:{plan[0]['item_id']}", note="on it")
+    assert qd.holding(claim, "Plan items above rank 1", plan, ONE) \
+        == "plan #521 Split the fix phase"
+
+
+def test_an_agent_row_joins_its_claim_without_losing_its_title():
+    """The whole point, end to end: the row a person reads.
+
+    `_agent_row` prefers the claim and always did — this asserts that preferring
+    it no longer costs the words beside it, because the complaint was never that
+    the claim was wrong, it was that the cell could only ever answer one of the two
+    questions a reader has.
+    """
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [_held()]})
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    # `quarterback!1780` rather than `PR#1780`: with no scope there is no single
+    # repo to trim against, so `short_key` drops the owner and stops — which is the
+    # wide view's own answer, where the repo is what tells two claims apart.
+    assert row["what"][0] == "quarterback!1780 · Panel review PR rework"
+
+
+def test_an_agent_with_no_claim_reads_exactly_as_it_did_before():
+    """The unclaimed row is the common case and this change must not touch it."""
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": []})
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    assert row["what"][0] == "Panel review PR rework"
+
+
+def test_an_agent_with_neither_still_says_something():
+    rows, _ = qd.agent_rows(
+        {"agents": [_reviewing(title=None, branch=None)], "claims": []})
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    assert row["what"][0] == "—"
+
+
+# ---- and the join itself: two identities reach one agent (#253) --------------
+#
+# The rendering above was only ever half the defect. `POST /claim` records the
+# MACHINE as an ordinary claim's holder — `holder: "daedalus"`, with the session in
+# its own field — and only a session-owned claim (the plan's, v2.39) records
+# `daedalus/sable-dune`. The join asked for the holder alone, so it matched plan
+# claims and nothing else: every `qb-claim issue` and `qb-claim pr` on the fleet
+# became a CLAIM-ONLY row reading `machine`, one line from the agent holding it,
+# whose own row said `main`. Both halves of the answer on screen, unjoined.
+#
+# Verified against the live board on 2026-09-03: claim `415c4b02` on
+# `prisonblues/quarterback#253`, holder `daedalus`, session `ce024170…`, taken by
+# the agent the board was calling `daedalus/sable-dune`.
+
+MACHINE_CLAIM = {"holder": "daedalus", "session": "s-1",
+                 "key": f"{qd.REPO}#253", "note": "on the publish reflex"}
+
+
+def test_an_ordinary_claim_is_attributed_to_the_agent_that_took_it():
+    """The claim `qb-claim` actually writes, joined to the agent that ran it."""
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [MACHINE_CLAIM]})
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    assert row["what"][0] == "quarterback#253 · Panel review PR rework"
+
+
+def test_that_claim_is_drawn_once_and_not_also_as_a_row_of_its_own():
+    """The holder set could not answer "is this already drawn": a machine-held
+    claim joined onto an agent row has a holder (`daedalus`) that is no agent's,
+    so it would have been drawn a second time — the duplicate this join removes,
+    reintroduced by the fix for it."""
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [MACHINE_CLAIM]})
+    assert [r["kind"] for r in rows] == ["agent"]
+
+
+def test_a_session_owned_claim_is_still_found_by_its_holder():
+    """The plan's claims name `machine/name` and carry no session of their own.
+    Session-first must not mean session-only."""
+    owned = {**MACHINE_CLAIM, "holder": "daedalus/pine-mist", "session": None}
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [owned]})
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    assert row["what"][0].startswith("quarterback#253 · ")
+
+
+def test_a_claim_that_names_no_agent_at_all_stays_a_row_of_its_own():
+    """`create-worktree` takes a claim on behalf of a worktree BEFORE the agent
+    that will use it exists, so nothing names one — and a claim nobody answers for
+    is exactly the row the CLAIM-ONLY state exists to draw."""
+    anon = {**MACHINE_CLAIM, "session": None}
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [anon]})
+    claim_rows = [r for r in rows if r["kind"] == "claim"]
+    assert len(claim_rows) == 1
+    assert claim_rows[0]["state"] == qd.CLAIM_ONLY_STATE["machine"]
+
+
+def test_a_machine_claim_whose_session_has_finished_reads_as_gone():
+    """The shape test asked whether the HOLDER named an agent. A machine-held
+    claim carrying a session named one too — so presence not listing it means that
+    agent finished, which is `gone` and not "nobody ever said"."""
+    rows, _ = qd.agent_rows({"agents": [], "claims": [MACHINE_CLAIM]})
+    [row] = rows
+    assert row["state"] == qd.CLAIM_ONLY_STATE["gone"]
+
+
+def test_a_live_agent_the_scope_hid_still_holds_its_claim_from_elsewhere():
+    """`live` is computed over every agent and not the scoped ones (#176), and the
+    session half has to obey the same rule — otherwise a claim held by an agent
+    this pane narrowed away reads as abandoned work."""
+    rows, _ = qd.agent_rows({"agents": [_reviewing(repo="lexray")],
+                             "claims": [MACHINE_CLAIM]}, ONE)
+    [row] = [r for r in rows if r["kind"] == "claim"]
+    assert row["state"] == qd.CLAIM_ONLY_STATE["elsewhere"]
+
+
+# ---- the four the first cut of this got wrong (found in review of PR #715) ----
+
+def test_a_scoped_dashboard_keeps_a_pr_claim():
+    """THE ONE THAT MATTERED. `agent_rows` narrows claims by `claim_repo` before it
+    joins them, and `claim_repo` did not know the PR sigil — so it returned the
+    whole key as the repo, a definite mismatch rather than "cannot say", and the
+    scoped dashboard (the default) dropped every PR claim before anything could
+    draw it. The cell then fell back to the prompt title, which is exactly the
+    defect #253 is about, so the feature failed silently in its own case.
+
+    The live check that passed used an ISSUE claim, whose key always split.
+    """
+    assert qd.claim_repo(PR_KEY) == qd.REPO
+    rows, _ = qd.agent_rows({"agents": [_reviewing(repo="quarterback")],
+                             "claims": [{**MACHINE_CLAIM, "key": PR_KEY}]}, ONE)
+    [row] = [r for r in rows if r["who"] == "pine-mist"]
+    assert row["what"][0] == "PR#1780 · Panel review PR rework"
+
+
+def test_a_release_key_still_splits_now_that_a_third_sigil_exists():
+    """The sigil went into the same chain that reads `#` and `:`, so the two shapes
+    that already worked are the ones a new split can break."""
+    assert qd.claim_repo(f"{qd.REPO}#253") == qd.REPO
+    assert qd.claim_repo(f"{qd.REPO}:2.40") == qd.REPO
+    assert qd.claim_repo("plan:ea9e1623") is None
+
+
+def test_an_agent_holding_one_of_each_kind_of_claim_gets_both():
+    """An agent reviewing a PR while holding its plan item has an ordinary claim
+    (filed by session) and a session-owned one (filed by holder). Returning only
+    the first bucket that answered dropped the second from the row and from the
+    `＋N` count, and then suppressed it below as already drawn."""
+    ordinary = {**MACHINE_CLAIM, "key": PR_KEY}
+    owned = {"holder": "daedalus/pine-mist", "session": None,
+             "key": f"{qd.REPO}#253", "note": "the plan item"}
+    rows, _ = qd.agent_rows({"agents": [_reviewing()],
+                             "claims": [ordinary, owned]})
+    [row] = [r for r in rows if r["kind"] == "agent"]
+    assert row["extra"] == 1, "the second claim is counted, not dropped"
+    assert [r["kind"] for r in rows] == ["agent"], "and not drawn twice"
+
+
+def test_a_claim_from_a_recycled_agent_name_is_still_drawn():
+    """Agent names are recycled when an agent finishes, so a stale `machine/name`
+    claim can share its holder with a LIVE agent that does not hold it. The
+    suppression test therefore asks what was ACTUALLY attached rather than
+    re-deriving it from holders — the re-derived version dropped this row.
+    """
+    stale = {"holder": "daedalus/pine-mist", "session": "a-finished-session",
+             "key": f"{qd.REPO}#99", "note": "the previous pine-mist"}
+    rows, _ = qd.agent_rows({"agents": [_reviewing()], "claims": [stale]})
+    [claim_row] = [r for r in rows if r["kind"] == "claim"]
+    assert claim_row["state"] == qd.CLAIM_ONLY_STATE["gone"]
+    [agent_row] = [r for r in rows if r["kind"] == "agent"]
+    assert agent_row["what"][0] == "Panel review PR rework", \
+        "the live agent must not inherit a finished session's claim"
+
+
+def test_a_session_id_cannot_be_read_as_another_agents_holder():
+    """Nothing enforces that a session id can never equal some other agent's
+    holder string — the board bounds the length of both and the shape of neither —
+    and one namespace for two identities hands agent A a claim belonging to agent
+    B, silently. The index key is typed, so the collision is unaskable."""
+    collide = "daedalus/other-agent"
+    a = _reviewing(holder="daedalus/pine-mist", session=collide)
+    b = _reviewing(holder=collide, session="s-2", title="something else")
+    bs_claim = {"holder": collide, "session": None, "key": f"{qd.REPO}#7",
+                "note": "b's work"}
+    rows, _ = qd.agent_rows({"agents": [a, b], "claims": [bs_claim]})
+    [row_a] = [r for r in rows if r["who"] == "pine-mist"]
+    [row_b] = [r for r in rows if r["who"] == "other-agent"]
+    assert row_a["what"][0] == "Panel review PR rework", "A must not get B's claim"
+    assert row_b["what"][0].startswith("quarterback#7 · ")

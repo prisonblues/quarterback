@@ -111,8 +111,16 @@ PROTECTED_DBS=()
 """
 
 
-def run_scan(databases, *, protect=None, live=(), container="acme-postgres-1", tmp_path):
-    """Run the real scan over `databases`, with a stub `docker` answering for psql."""
+def run_scan(databases, *, protect=None, live=(), container="acme-postgres-1", tmp_path,
+             listing_fails=False):
+    """Run the real scan over `databases`, with a stub `docker` answering for psql.
+
+    `listing_fails` makes the container answer the `SELECT 1` probe and then fail
+    the listing — it went away between the two calls, or the role lost the
+    privilege. That is not the same as a server holding no databases, and the
+    scan read it as one for as long as the listing was piped through process
+    substitution, which discards the exit status (#735).
+    """
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     docker = bindir / "docker"
@@ -124,6 +132,9 @@ def run_scan(databases, *, protect=None, live=(), container="acme-postgres-1", t
     # orphans" rather than as "not scanned". That is the failure mode the script itself
     # calls out in its yellow "NOT SCANNED, not clean" note.
     listing = " ".join(f"'{d}'" for d in databases) or "''"
+    on_listing = "exit 2" if listing_fails else (
+        f'for d in {listing}; do [[ -n "$d" ]] && printf "%s\\n" "$d"; done\n'
+        "            exit 0")
     docker.write_text(
         f"#!{BASH}\n"
         'if [[ "${1:-}" == "ps" ]]; then printf "%s\\n" "acme-postgres-1" "app-1"; '
@@ -132,8 +143,7 @@ def run_scan(databases, *, protect=None, live=(), container="acme-postgres-1", t
         '    for a in "$@"; do\n'
         '        [[ "$a" == "SELECT 1" ]] && exit 0\n'
         '        if [[ "$a" == *pg_database* ]]; then\n'
-        f'            for d in {listing}; do [[ -n "$d" ]] && printf "%s\\n" "$d"; done\n'
-        '            exit 0\n'
+        f'            {on_listing}\n'
         '        fi\n'
         '    done\n'
         '    exit 0\n'
@@ -156,7 +166,12 @@ def run_scan(databases, *, protect=None, live=(), container="acme-postgres-1", t
         + cfg_array_block()
         + db_scan_block()
         + '\nprintf "ORPHAN|%s\\n" "${ORPHAN_DBS[@]:-}"\n'
-        + 'printf "KEPT|%s\\n" "${PROTECTED_DBS[@]:-}"\n')
+        + 'printf "KEPT|%s\\n" "${PROTECTED_DBS[@]:-}"\n'
+        # `:-` so this reads the same against a version of the block that has no
+        # such variable: under `set -u` a bare expansion aborts the script, and
+        # the red half of a red/green run would be a bash error rather than the
+        # assertion that names the defect.
+        + 'printf "UNKNOWN|%s\\n" "${DB_SCAN_UNKNOWN:-}"\n')
 
     got = subprocess.run(
         [BASH, str(script)], capture_output=True, text=True,
@@ -167,7 +182,28 @@ def run_scan(databases, *, protect=None, live=(), container="acme-postgres-1", t
                    if ln.startswith("ORPHAN|") and ln != "ORPHAN|"]
     got.kept = [ln.split("|", 1)[1] for ln in got.stdout.splitlines()
                 if ln.startswith("KEPT|") and ln != "KEPT|"]
+    got.unknown = next((ln.split("|", 1)[1] for ln in got.stdout.splitlines()
+                        if ln.startswith("UNKNOWN|")), "")
     return got
+
+
+# ------------------------------------------------- asked and told vs never asked
+
+def test_a_listing_that_failed_is_not_an_empty_server(tmp_path):
+    """The container answers the liveness probe and then fails the listing. Piped
+    through process substitution the loop simply read nothing, which is what an
+    empty server gives too — and the report printed a green "none" (#735)."""
+    got = run_scan(["acme_debris"], tmp_path=tmp_path, listing_fails=True)
+    assert got.orphans == []
+    assert got.unknown, (
+        "a listing that failed was reported as a server with no orphans on it")
+
+
+def test_a_listing_that_worked_is_not_unknown(tmp_path):
+    """The pair. Without it, a scan that called every run unknown would pass."""
+    got = run_scan(["acme_debris"], tmp_path=tmp_path)
+    assert got.orphans == ["acme_debris"]
+    assert got.unknown == ""
 
 
 # --------------------------------------------------------------- the family case

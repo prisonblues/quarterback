@@ -236,7 +236,18 @@ assertion that the defect is gone, and it will keep passing when the defect retu
 On PR #90 a deliberate, docstring'd regression test passed because its fixture
 happened to list two baselines in the working order, and the defect it was written
 for had to be found a round later in code that was already "covered". Docs that describe changed behaviour
-(CLAUDE.md, docs/, README, docstrings) get updated. Related code — callers,
+(CLAUDE.md, docs/, README, docstrings) get updated. And the comments the diff WRITES
+are read as claims, not as scenery: "this is the only caller", "nothing between here
+and there returns", "this re-reads X" are checkable properties of the code beside them.
+Nothing ever executes a comment, so a wrong one survives every round, every CI run and
+every rebase. Price it by what RESTS on it — a claim the change's own correctness
+argument leans on (a guard's justification, an ordering or concurrency property, the
+reason no `try/finally` was needed) is P2 when false; one nothing depends on is P3, an
+ordinary documentation defect. And checking is usually laborious rather than
+impossible: grep the callers, read the enclosing scopes, and only then decide you
+cannot settle it. What is left after looking goes on the summary's `Unverified claims`
+line — that residue is the measurement that decides whether a reviewer needs more than
+Read, Grep and Glob, and a line nobody looked before writing corrupts it. Related code — callers,
 siblings, parallel implementations — is governed by **`reviewer_scope`**: under
 `repo` it gets made consistent (search the codebase, don't just review the diff);
 under `diff`, the default, you read it to judge the change and file work only where
@@ -501,16 +512,29 @@ Spend it like this, and do not improvise around it:
    rows and no GitHub issue at all, which is the orchestrator's call and not yours
    (#620).
 
-**Land each budgeted fix so it can be taken out on its own.** You are already making
-them one at a time and re-applying them cheapest-first, so the ordering exists; what this
-adds is that each one stays its **own hunk or its own commit**, named in the commit body
-by the finding it answers. The reason is #627: when a later round attributes a new
-finding to a fix that answered a below-`round_trigger_floor` finding, the response is to
-**excise that fix** rather than repair it — and an excision needs something to excise. A
-sub-floor fix smeared through a pass with three others cannot be removed without taking
-them too, and when the cheap correction is unavailable somebody writes a patch instead,
-which is the round this whole page is about. The orchestrator runs that excision; you
-only have to leave it a seam.
+**Land each budgeted fix as its own commit, and name the finding in the commit body.**
+You are already making them one at a time and re-applying them cheapest-first, so the
+ordering exists; what this adds is that each one stays its **own commit**, whose body
+carries the finding's id exactly as the **To fix** list prints it — the `[1609-F03]`
+form. Nothing else is required and the format is not fussy: the id anywhere in the
+message is enough, in a sentence like `Answers 1609-F03.` if you want one. The finding's
+16-character key works too if you have it, but the id is what the report gives you, so
+the id is the expected spelling.
+
+**One finding per commit, and no other finding's id in that body.** A commit naming two
+findings is read as a mixed one and is left alone, which is the same outcome as leaving
+no seam at all: the harness refuses to remove a commit that also carries a fix nobody
+attributed a finding to.
+
+The reason is #627: when a later round attributes a new finding to a fix that answered a
+below-`round_trigger_floor` finding, the response is to **excise that fix** rather than
+repair it — and an excision needs something to excise, aimed by something better than a
+guess. A sub-floor fix smeared through a pass with three others cannot be removed without
+taking them too, and when the cheap correction is unavailable somebody writes a patch
+instead, which is the round this whole page is about. The next round works out which
+commit answered which finding by blaming the line each new finding sits on, publishes
+what it found at `round_stop.excision`, and the orchestrator runs the command; you only
+have to leave the seam and name it.
 
 **A pass that is ALL test and prose ends the cycle, so make the production change
 where there is one to make.** `escalate_on.unrefereed_fix` stops a cycle whose last
@@ -1015,6 +1039,13 @@ Surface — files touched outside the change under review: <none, or one line pe
   file: the path, why the finding could not be answered inside the change, and what
   kept the edit small. This is the declaration step 3 requires; `none` is the
   expected answer and is written out rather than omitted>
+
+Unverified claims — load-bearing comments in the diff this pass could not settle:
+  <none, or one line per claim: the `file:line`, the claim, and what would settle it.
+  Written out rather than omitted, for `Surface`'s reason, and `none` is the expected
+  answer — checking one of these is usually laborious rather than impossible, so a
+  claim you did not grep for is not one of them. This line is the residue AFTER
+  looking, and it is what says whether a reviewer needs more than Read, Grep and Glob>
 
 Tests added: ...
 Docs updated: ... (or "none needed")

@@ -6,7 +6,8 @@
 Run the reviewer panel over a pull request. Each reviewer (and the master judge)
 applies the **same exhaustive bar as `/review-pr`** — full Core / Completeness /
 Craft review (correctness, security, error handling, concurrency, performance,
-test coverage and whether the tests present are load-bearing, docs, related code,
+test coverage and whether the tests present are load-bearing, docs — including whether a
+comment the diff writes is true of the code beside it — related code,
 naming, complexity, style, DRY), ranked P1–P4,
 with the "nothing left to improve" standard. The master keeps every genuine
 finding (style and polish included) and drops only true false positives — the

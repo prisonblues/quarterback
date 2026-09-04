@@ -343,6 +343,36 @@ From its output collect:
   says so on the line. Absent on round 1 and on a round with no readable fix range,
   because there was then no pass to measure and a line of zeroes would claim one
   wrote nothing.
+- **The fix pass this round read** — the line printed under that name
+  (`fix_pass` in the JSON, #624): the record of the pass that landed between the last
+  round and this one, as one artifact rather than as the five rungs of `round_stop`
+  that used to carry its pieces. Its commit range and how many fix phases that range
+  actually `spans`; which round's **To fix** list briefed it and how big that list was;
+  the churn split; the files it touched and which of them no earlier round had read;
+  which of the brief's findings this round no longer raises; and how many of THIS
+  round's findings were attributed to it. `null` where there was no pass — round 1, or
+  a run outside a cycle.
+
+  **Nothing here is a score and you must not turn it into one.** Every number on the
+  record is a count, deliberately: #624 is explicit that every obvious ratio over a fix
+  pass is gameable in a direction worse than the disease, and it names four —
+  lines per finding cleared, findings introduced per pass, new files opened, and share
+  of fixes still standing a round later. So do not compute one, do not rank the rounds
+  of a cycle against each other on it, and do not brief the next fixer as though a
+  previous pass had scored badly. Carry the numbers into §6 the way you carry
+  Guard-to-guarded, which is as a diagnostic.
+
+  **`cleared` is not `verified fixed`.** It means this round did not raise the complaint
+  again, and under the default `increment` scope this round re-read only the fix range —
+  so a complaint in a file it never looked at again is in there too. `scope` sits on the
+  record so the sentence you write can say which it was, and `gaps` is the record's own
+  list of what it cannot say.
+
+  **`declared` is a declaration and the rest is not.** `narrowed`, `declined` and
+  `escalated` are what the pass reported about itself; everything else was derived from
+  the range, the commits and the brief. The record keeps them apart and so should your
+  §6 sentence — the whole reason this exists is that the fixer's own account of its work
+  was the only account there was (#622).
 - **Budget spend of the last fix pass** — the line printed under that name
   (`round_stop.fix_budget` in the JSON, #622): what the pass that landed between the last
   round and this one COST, priced the way `low_severity_fix_lines` is spent — production
@@ -813,6 +843,54 @@ the same claim. It does not compare the two wordings and never re-acknowledges f
 read both in the Unverifiable claims block, and if they are the same claim, pass the new
 key on the next round's `--acknowledge`.
 
+## 4d. The round's coverage declarations — the veto you close by going and looking
+
+The report's **Coverage declared by the reviewers** block is what each seat said it
+could not judge from what it was given, and every line there that a running,
+code-reading seat wrote costs the round its confidence. Each carries a key (`ca-` and
+twelve hex), derived from the declaration's own text the way an obligation's is
+derived from the claim's.
+
+**These are not §4c's claims and the difference decides what you do about one.** An
+unverifiable claim is one the judge ruled *nothing here could ever settle* — it needs a
+deployed system, a browser, data this checkout does not carry — and you discharge it by
+accepting the risk. A coverage declaration is one that simply *was not* settled, and it
+is very often the cheapest veto on the whole round to close, because it names its own
+instrument: the seat says what it could not do, and somebody with a shell does it. The
+claude seat cannot execute anything (#92, and reviewers stay non-executing), so its
+declarations are frequently a suite nobody ran and a question ten minutes at a prompt
+answers outright.
+
+So, per declaration:
+
+1. **Read it and decide whether it is worth closing.** Some are — run the suite, read
+   the file, grep the caller. Some are not, and then the honest outcome is that the
+   round does not stop confidently, which is what the veto is for.
+2. **Go and close it**, and keep what you measured. The measurement is the artefact,
+   not the fact that you looked.
+3. **Then pass the key back** to the next round with what you measured:
+   `--assessed ca-0123456789ab:'ran the DB suite at this head — 2165 passed, the seed
+   produces exactly 10 rows'`, repeatable, and the report prints the exact command. It
+   is inherited through `--baseline`, so you do it once per cycle and not once per
+   round. Add `--assessed-by NAME` when somebody other than this run did the measuring.
+4. **Say who, in the relay.** Without `--assessed-by` the answer is recorded and marked
+   **unattested** — the round that answered the declaration is also the round it was
+   answered for, which is the actor attesting to its own work. It is recorded rather
+   than refused (#40's rule, and `record-outcome`'s `refuted` treatment exactly), the
+   report shows the split, and `attested_by` is a claim you are making and not a
+   signature anything checked.
+
+**Per declaration, never in bulk, and there is no flag that answers them all** — §4c's
+rule, for §4c's reason. A key comes back under a new one when the seat reworded its
+declaration, and the run says so in `config_notes` rather than silently ignoring the
+stale key.
+
+**Do not `--assessed` a declaration you have not actually closed.** It is the one
+exemption in `coverage_veto` the round's own caller can grant, and the thing keeping it
+honest is that the answer is on the record with your name beside it. An assessment with
+no note, or with a note that does not say what was measured, is a veto deleted and
+nothing put in its place.
+
 ## 5. Re-review the fix commit — the round that used to be skipped
 
 Once the fixer has **pushed**, run the panel again over the new commit:
@@ -840,6 +918,11 @@ Add `--acknowledge uc-xxxxxxxx` for each unverifiable claim you accepted in §4c
 once, on the first round after you accepted it; the register is inherited through
 `--baseline` from there. Omit them and the round holds on a question you have already
 answered.
+
+Add `--assessed ca-xxxxxxxx:'<what you measured>'` for each coverage declaration you
+closed in §4d, on the same terms and for the same reason — once, inherited from there,
+and omitting it holds the PR on a question somebody has already answered. Add
+`--assessed-by NAME` when the measuring was somebody else's.
 
 ### Do not rewrite the branch between rounds, and know the cost if you must (#500)
 
@@ -1092,11 +1175,56 @@ to it, and the blocking fix that now rests on it, and let the round proceed norm
 the caused finding handed to a fixer like any other. A forced excision that breaks a P1
 fix has converted the cheapest correction in the loop into the most expensive one.
 
-**And it needs attribution at the granularity of the fix, not the pass.** `_provenance`
-attributes a finding to the fix *pass*; this needs the individual fix. Where the pass
-landed its budgeted fixes as separate hunks or commits, naming the finding each answers,
-you have it. Where it did not, say so and do not guess — an excision aimed at the wrong
-hunk removes work nobody asked to remove.
+**The round works out which fix, and publishes it — you do not have to.** `_provenance`
+attributes a finding to the fix *pass*; an excision needs the individual fix, and
+`round_stop.excision` is that answer:
+
+- **`count`** — how many excisions this round names. `null` is "nobody looked" (round 1,
+  a rebased range, an anchor payload whose trigger floor cannot be read, a checkout that
+  could not list the pass) and `why` says which; `0` is a measured none.
+- **`excise[]`** — one per fix, each carrying the `commit`, its `subject`, the
+  `command` (`git revert --no-commit <sha>` — **run it**), `answered` (the sub-floor
+  finding that goes back on the board unfixed: record it `deferred` with its one-line
+  note, §4b) and `caused` (the findings that go away with it: hand a fixer **none** of
+  them). The report lists the same thing under **Excised, not fixed**, and every caused
+  row in `to_fix` is flagged `excised: true`, so a list pasted out of the report cannot
+  pick one up by accident.
+- **`declined[]`** — a seam it refused, with a sentence: a later commit in the pass built
+  on the fix, the commit answered more than one finding, it is a merge, or the checkout
+  could not be read. Those caused findings are still in the cycle and are fixed like any
+  other finding. **Relay the sentence** — this is the case #627 says to report rather
+  than force.
+- **`seams`** and **`sub_floor`** — how many commits in the pass named exactly one
+  sub-floor finding, against how many sub-floor findings the pass was sent to. `seams: 0`
+  with `sub_floor` above zero means the pass left nothing to excise; that is the fixer
+  brief's instruction not being followed, and it is worth a sentence to the user because
+  the cheap correction was unavailable on this round as a result.
+- **`floor`** — the trigger floor that decided which findings were sub-floor. It is the
+  **anchor** round's, not the round you are reading, so quote it from here rather than
+  from `review_panel`: a floor moved between rounds would otherwise have you naming a cut
+  the classification did not use.
+
+**The excision's churn is churn, and `low_severity_fix_lines` counts it.** The revert
+commit lands in the next round's fix range, and every churn reading there counts it —
+the split, the guard ceiling, the surface count and the budget pricing alike. That is
+#692's unit working as intended, and it means `round_stop.fix_budget.spend` on the NEXT
+round includes the lines this excision removed. An earlier version of this section told
+you not to charge it to that budget; nothing in the harness implements that exemption and
+you cannot apply it by hand, so it is gone. What you can do is SAY SO: if the next round
+prices an overspend whose lines are the excision you were ordered to make, report it as
+the cost of the correction rather than as a fixer spending its budget badly. What comes
+out of the next round's **attribution** is only the lines the revert restored, because
+those sat at an earlier round's head and #559 is what stops a correction reading as the
+disease.
+
+**What it does NOT price is what the excision destroys (#558).** `destroys` names the
+files, the lines and how many of them sit in test or documentation paths, and that is a
+line count rather than a valuation. A sub-floor fix is very often the only test over the
+path it was written for — on lexray#1697 two "P3 findings return" entries were the sole
+coverage of the mechanism the PR existed to build — and `answered` says nothing about
+that. The rule still applies: this is Rich's decision on #621 and it is not conditioned
+on a pricing that does not exist yet. But when `destroys.guard_lines` is most of the
+commit, say so to the user in the same breath as the excision.
 
 ### When the range between the rounds is an integration (#278)
 
@@ -1692,6 +1820,15 @@ Then the part that is new, and is the point of running more than one round:
   the two should agree, and a disagreement is worth a sentence of its own. It gates
   nothing, so this is a report and not a verdict — but a P1 in a file that entered the PR
   through a fix pass is the shape both halves of this exist to make visible.
+- **The fix pass (#624):** `fix_pass` from each round that read one — range, `spans`,
+  brief size, churn split, surface, `cleared`/`still_open` and `introduced`. Report it as
+  a description of the pass and never as a verdict on it: no ratio, no ranking of the
+  cycle's rounds against each other, and no "this pass was worse than that one". Where
+  the fixer's own summary described its pass and the record describes it differently, say
+  both — that is the disagreement the record exists to make visible, and it is the same
+  reason the budget count moved out of the fixer. Where `spans` is greater than 1 the
+  word "pass" is wrong about that row and you should say how many phases it covers.
+  A `null` record means there was no pass to describe, never that a pass did nothing.
 - **Budget spend (#622):** `fix_budget` from each round that measured one. Report
   `within: true` as what it is — the pass was shown from outside to fit inside the round's
   budget — and `within: false` as what it is not: the budget could not be shown to have
@@ -1707,12 +1844,15 @@ Then the part that is new, and is the point of running more than one round:
   lifecycle (a Sonar hard-gate issue keeping the cycle alive, or a cycle continued by
   hand) rather than the ordinary budgeted-fix path. Do not report a `null` here as
   evidence that a pass stayed inside its budget.
-- **A sub-floor fix excised (#627):** if a round attributed a finding to a fix that
-  answered a below-`round_trigger_floor` finding and you reverted that fix, say so: which
-  fix, which finding it answered (now back on the board as reported-and-not-fixed), and
-  which finding went away with it. Say it too when the excision was **declined** because
-  a blocking fix had built on it — that is the case where a caused finding is still in
-  the cycle and a reader needs to know why.
+- **A sub-floor fix excised (#627):** `round_stop.excision` from each round that named
+  one. Say which fix (the commit and its subject), which finding it answered — now back
+  on the board as reported-and-not-fixed — and which findings went away with it, plus
+  what `destroys` says came out with it and that its worth is unpriced (#558). Say it too
+  when the excision was **declined**, with the sentence `declined[].why` gives: a
+  blocking fix built on it, the commit answered more than one finding, or the checkout
+  could not be read. That is the case where a caused finding is still in the cycle and a
+  reader needs to know why. A `count: null` is not evidence that nothing was excisable —
+  it is the round saying nobody could look.
 - **A revert proposed (#506):** if `round_stop.revert.offered` is true, relay it as
   a decision the user has to take, not as a footnote — the commit range, what
   reverting it would remove, what it would cost, and that nothing has run it. If the

@@ -519,3 +519,46 @@ def recorded_runs(monkeypatch):
     monkeypatch.setattr(panel, "record_run", _record)
     monkeypatch.setattr(panel_seats, "record_run", _record)
     return seen
+
+
+@pytest.fixture(autouse=True)
+def pr_claims(monkeypatch):
+    """No test claims a real PR on a real board (#253), and here is what it would
+    have claimed.
+
+    Autouse and unconditional, for `recorded_runs`' argument exactly: `hold_pr`
+    shells out to `qb-claim`, `qb-claim` resolves the board out of THIS host's
+    site config, and it is on the PATH of every enrolled workstation. A test that
+    reaches it there takes a live claim on a live PR — green suite, and an agent
+    somewhere is then told the PR it is reviewing is held by a test run — while in
+    the nix sandbox, which carries no `qb-claim`, nothing happens at all. Quietly
+    correct on the one box nobody develops on is the failure both these fixtures
+    exist to rule out.
+
+    Worse than the record it copies, in one way worth stating: a spurious run on
+    the board is bad data, and a spurious CLAIM is bad data that REFUSES somebody.
+    `create-worktree --require-claim` and the plan's pickup gate both stop for
+    one.
+
+    Yields what was taken and handed back, in order, so a test can assert the pair
+    rather than only the first half — a claim taken and never released is the
+    failure mode `release_pr` exists for. Both return "", which is what the real
+    pair return when the board answered.
+    """
+    seen: list[tuple] = []
+
+    def _hold(repo_path, pr_number, round_no) -> tuple[str, bool]:
+        seen.append(("hold", str(repo_path), int(pr_number), int(round_no)))
+        return "", True
+
+    def _release(repo_path, pr_number) -> str:
+        seen.append(("release", str(repo_path), int(pr_number)))
+        return ""
+
+    # Both names, for the reason `recorded_runs` gives: `panel` star-imports these
+    # into its own namespace and `panel_seats` is where they are defined, so a
+    # guard on one name and a call site on the other covers nothing.
+    for mod in (panel, panel_seats):
+        monkeypatch.setattr(mod, "hold_pr", _hold)
+        monkeypatch.setattr(mod, "release_pr", _release)
+    return seen

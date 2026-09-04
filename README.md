@@ -239,7 +239,8 @@ GET   /review/stats      ?repo=&author=&days=&judged_only=       -> {by_model, b
                           population) and confirmed_defects, never outcomes_recorded
 GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by_repo, by_size,
                                                                      by_kind, by_shape, by_rounds,
-                                                                     marginal_by_round}
+                                                                     marginal_by_round,
+                                                                     injection_by_round}
                           the share of review CYCLES that ended in a confident dry round
                           (#626) — the number the convergence epic is judged on. One cycle
                           is one (repo, pr, cycle), its ending is its TERMINAL round's, and
@@ -256,7 +257,26 @@ GET   /review/convergence ?repo=&author=&days=&since=            -> {overall, by
                           that way. A caps refusal is NOT among them: it ends the cycle and
                           counts `unconverged`, as `preland` and the review queue already
                           call it. `by_rounds` is keyed `final_round`, the terminal round's
-                          NUMBER rather than a count of rounds recorded. **`days` defaults
+                          NUMBER rather than a count of rounds recorded.
+                          `injection_by_round` (#637) is the OTHER population: per round
+                          number, the distribution of `provenance_counts.introduced` over
+                          every bucket — the quantity `escalate_on.fix_injection` divides,
+                          at the grain it divides it, which `marginal_by_round` (counts) and
+                          `/review/stats` (a ratio of sums across a window) both miss. Read
+                          `rate_min`/`rate_p25`/`rate_median`/`rate_p75`/`rate_max` and not
+                          `pooled_rate`: the rule weights a 4-finding round like a
+                          44-finding one and a pooled ratio does not. Every SUM and RATE is
+                          over `rated_runs` (a non-zero denominator existed), which is
+                          smaller than `attributed_runs` (the panel sent a tally) and
+                          smaller again than `rounds`; those three are the markers, not
+                          figures over it. `dial_runs` counts the RATED rounds carrying a
+                          `rules` record — the only field that says what the threshold WAS
+                          while the round ran — and it read 1 of 38 on 2026-09-02; it
+                          shares `rated_runs`' population deliberately, a marker over any
+                          other being worse than none. **No threshold
+                          and no minimum denominator is applied**: the dial is a repo's and
+                          `FIX_INJECTION_MIN_NEW` is the harness's, so the board publishes
+                          the population and never the verdict. **`days` defaults
                           to 90** where the rest of `/review/*` defaults to all time: this
                           one classifies a row per cycle in Python rather than aggregating
                           in SQL, and the applied boundary is always in `window.since`
@@ -437,6 +457,12 @@ POST  /plan/item/claim   { item_id, ttl=3600, session?, note?, force? }
                           claim blocks, it is not a note to read past
 POST  /plan/item/release { item_id, session? }         (idempotent)
 POST  /plan/item/done    { item_id, session?, note? }  (records that the ISSUE closed)
+                          `open -> done` is a conditional UPDATE, so of two callers
+                          racing the same row exactly one transitions it. The other is
+                          answered 200 with `changed: false`, `done_by` naming who won,
+                          and its note is not appended a second time if the row already
+                          carries it — a fleet of `qb-reconcile --apply` timers writes
+                          the same receipt on every host (#723)
 POST  /plan/item/depends { item_id, depends_on:[item_id|"#55"] }   (a dependency is a fact)
 POST  /plan/item/update  { item_id, title?, plan?, note?, state? }      ← delegated
                                           (plan/state person-only)
@@ -555,6 +581,64 @@ refused** — a board nobody has configured is one nobody can reorder, rather th
 agent can. `BROWSER_DEV_USER` is a *read* bypass and does not open that door; a local board
 that wants the reorder buttons sets `BROWSER_DEV_HUMAN=true` deliberately. See
 [DEPLOY.md](DEPLOY.md) §0.
+
+### A review round claims the PR it is reviewing (#253)
+
+The claims section above is titled *what you are working on, said before you start*, and until
+#253 the review path said nothing. A lease carries `repo`, `branch` and `title` and **no work
+reference at all** — nothing that names an issue or a PR — so an agent three hours into reviewing
+`#1780` was, on every fleet surface, indistinguishable from one that had just opened the repo.
+Measured on this board while the issue was open: five live agents, three of them reviewing,
+`GET /claims` returning `[]`, and the dashboard's AGENTS rows reading `master`, `test` and
+`Panel review PR rework`.
+
+**The dashboard was never the missing half.** `qbdata._agent_row` has preferred a claim over the
+prompt title since the AGENTS table was three panels, and had nothing to join.
+
+**And the join itself was wrong, which the empty board was hiding.** `POST /claim` records the
+MACHINE as an ordinary claim's holder — `holder: "daedalus"`, session in its own field — and only a
+session-owned claim (the plan's, v2.39) records `daedalus/sable-dune`. `agent_rows` indexed by
+holder, so it matched plan claims and nothing else: every `qb-claim issue` and `qb-claim pr` became
+a claim-only row reading `machine`, one line from the agent holding it. Claims are now indexed by
+**session** where they name one and by holder where they do not, asked in that order — a machine
+runs several agents at once and they all authenticate as that machine, so the holder of an ordinary
+claim cannot say which took it and the session can. `machine` consequently stops meaning two
+things: a machine-held claim that names a session and is not live reads `gone`, and only a claim
+naming neither identity — `create-worktree`'s, taken before its agent exists — is `machine`.
+
+`panel.py` now takes the `pr` claim at the moment it dispatches its seats, and hands it back when
+the round ends. The observation point is #253's own: *"`panel.py` run start — it already POSTs at
+the end, so it knows the PR and round"*, and the rule it follows comes from #229 and #172 — the
+trigger has to be an action that already happens, never a second declaration somebody has to
+remember to make. A round dispatching its seats is that action, which is also why the claim is
+taken **there** rather than in `main()`: everything above that line could still have refused the
+round.
+
+Three properties, each of them a decision:
+
+- **It never gates the round.** Every refusal — a board that cannot be reached, a rotated token, a
+  peer already holding the PR — is a line in `config_notes` and nothing else. A review that would
+  not run because a board was down is a worse failure than a review nobody can see. The HELD case
+  is a note for the same reason and not an exit: two panels on one PR is spend twice, worth telling
+  a reader about, and not the round's call to prevent.
+- **It goes through `qb-claim`**, not a POST from `panel.py`, for the reason `record_run` gives —
+  which board this machine belongs to is site configuration, and re-deriving it in Python is how
+  one island's work lands on another island's board. It also means the key is derived by the board
+  (#172): the kind and the number go up, the key comes back.
+- **The TTL is three hours**, which is *above* the board's one-hour default (`DEFAULT_TTL`) and far
+  below `create-worktree`'s eight (#608's fuse). One hour cannot cover a round — 20-40 minutes
+  ordinarily, longer when CI or a vendor is slow — and a fuse that expires mid-round shows the PR as
+  free while four seats are still reading it. The claim is released when the round ends, so the TTL
+  only governs the paths that cannot release: an exception or an interrupt between the claim and the
+  release leaves it standing for up to that long, which is passive expiry working as designed
+  rather than a leak anything sweeps.
+
+On the dashboard the AGENTS cell now reads `PR#1780 · Panel review PR rework` — the ref in front of
+the words rather than instead of them. It was one or the other before: a claim replaced the title
+outright, so the cell answered "which PR is this?" or "what is this agent up to?" and never both.
+A prefix rather than a column because the narrow dash is 69 columns and a column costs that width
+on every row, including the ones with nothing to say. The round number is not in the cell because
+it is already in the `stage` column beside it (`R1`, `R1F`, `R2`).
 
 ### Exempting a PR from review is a human write (#335)
 
@@ -1134,6 +1218,53 @@ what a recalibration groups a population by must not cost one fetch per run; the
 detail-only. There is deliberately no release NUMBER among them — `package.nix` ships no
 `pyproject.toml` and no `CHANGELOG.md` into the store, and the number is applied on the base after
 a merge, so a running harness has none to report and a branch's harness never had one.
+
+**And the FIX PASS itself, which is the one actor here nothing recorded (#624).** Everything above
+is about a round: what it read, under which dials, with which seats, produced by which harness,
+ending in which verdict. Reviewers have scorecards, findings have keys and terminal outcomes,
+rounds have a row. The actor *between* two rounds — the fix pass, which writes the code that
+produces the next round's findings — had a paragraph in a markdown brief. On `lexray#1780` its four
+passes ran to +850/−314 across 11 files, +322/−49 across 9, +356/−41 across 12 (seven of them files
+no round had read) and +142/−31 across 7, and every one of those numbers was reconstructed from
+`git` by hand, afterwards, in order to file the issue.
+
+`fix_pass` is that record, and it is an **assembly** rather than a new measurement: the churn split
+(#554), the surface (#619), the range and the brief's fate (#506), the pricing (#622) and the
+attribution (#489) were each already derived once a round and then filed under the round's *stop
+decision* as five unrelated rungs. #624's own words: the interesting field "already exists per-round
+as `introduced` — it simply is not attached to the pass that caused it".
+
+| field | what it is | authority |
+|---|---|---|
+| `range` | both ends of the commit range, which of three readers supplied the diff, how many commits and merges it holds, and `spans` — how many fix phases it actually covers | derived |
+| `brief` | which round's **To fix** list briefed it, how many findings that list held, and how many of them this round could key | derived |
+| `churn` | production / test / prose / total, over insertions plus deletions | derived |
+| `surface` | the files it touched, and which of them no earlier round of the cycle had read | derived |
+| `cleared` / `still_open` | brief entries this round no longer raises, and those it still does — keys and severities | derived |
+| `introduced` | how many of **this** round's findings were attributed to that pass | derived |
+| `declared` | the `narrowed` / `declined` / `escalated` keys the pass reported, dated to this round | **declared** |
+| `counts` | the eleven-key integer summary, which is what rides `GET /reviews` | derived |
+| `gaps` | the record's own account of what it cannot say | — |
+
+Every measurement comes from the diff, the commits and the payload the pass was given — never from
+the pass's account of itself, which is what #622 and #621 exist to remove — and the two things that
+*are* declarations sit under a key that says so and feed no count. The record is opaque JSONB on
+`GET /review/{id}`; `fix_pass_counts` is its own `counts` block, lifted rather than recomputed, and
+rides `GET /reviews` on the rule the three tallies already state.
+
+**And it is deliberately not a leaderboard**, which is the other half of #624's title. Its second
+opinion, adopted in full: every obvious ratio here is gameable in a direction worse than the
+disease — *lines per finding cleared* rewards compressed and superficial fixes, *findings introduced
+per pass* rewards weakening tests and avoiding the files most likely to be read, *new files opened*
+rewards refusing a cross-file repair that is genuinely required (a P1 left unfixed to protect a
+metric), and *share still standing a round later* is invalid under increment scope because the later
+round may never have re-read the repair. So the record carries **no actor key at all** — it names
+the pass by its range and the round that briefed it, never the agent, model or session that
+performed it, which is a stronger guarantee than a policy of not writing the query. No ratio is
+stored, nothing is indexed to invite an aggregation, `round_stop` is not passed it and does not read
+it, no dial governs it, and `GET /review/stats` — the leaderboard this table already feeds — does
+not touch it. The fixer's brief says the record is made and says it is not scored, because a
+measurement the measured party is not told about is a trap rather than a brake.
 
 **And a value Postgres will not store, anywhere in the payload, no longer costs the round (#646).**
 A NUL cannot live in a `text` column or a `JSONB` string and neither can `NaN`/`Infinity`;

@@ -540,6 +540,45 @@ def pr_claim_wanted(panel: dict, no_pr_claim: bool, notes: list[str]) -> bool:
     return False
 
 
+def history_wanted(panel: dict, no_history: bool, notes: list[str]) -> bool:
+    """Whether this round shows its seats the changed files' git history (#716).
+
+    On by default, because the block exists to close a gap that was MEASURED: three
+    of eight declared coverage gaps on the instrumented cycle were questions a single
+    `git log` answers, and every one of them cost the round its confident stop.
+
+    An off switch all the same, and for two reasons that are not symmetry with
+    :func:`pr_claim_wanted`. The first is cost: this block is charged to the seat's
+    diff budget, and a repo that would rather spend every character on the diff is
+    making a defensible call rather than a mistake. The second is #550's, arriving
+    one section over — the honest limit on #716 is `n=1`, a single history-heavy
+    migration PR, and the way that stops being `n=1` is by running the same PRs with
+    the block and without it and counting the declared gaps. `history_brief: false`
+    in the repo's rules and `panel.py --no-history-brief` for one run are what make
+    that comparison producible at all; the flag is the instrument, because the dial
+    lives in the repo under review and flipping it there would change the diff whose
+    gaps are being counted.
+
+    **A value this cannot read as a boolean falls CLOSED**, on
+    :func:`code_access_wanted`'s reasoning rather than a new one: `bool("false")` is
+    True, so the intuitive read turns a hand-written `"history_brief": "false"` into
+    the setting's opposite. The closed posture here is also the cheap one and the one
+    that ran for the whole life of the panel before this."""
+    if no_history:
+        return False
+    raw = panel.get("history_brief", True)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None or raw == "":
+        # Unset means unset, the reading `code_access_wanted` gives an absent
+        # setting: silent, and the default applies.
+        return True
+    notes.append(f"`history_brief`={raw!r} is not true or false — the seats were NOT "
+                 "shown the changed files' git history this round (#716). A setting "
+                 "that decides what evidence a seat is given is not guessed at")
+    return False
+
+
 def strip_convention_files(root: Path) -> list[str]:
     """Remove every vendor instruction file and config directory under `root`,
     returning what was removed, repo-relative and sorted.
@@ -789,7 +828,13 @@ def seat_checkout(tree: Path, where: Path) -> tuple[str, bool]:
 
     `git init` runs either way, because :func:`member_sandbox` is non-destructive —
     `mkdir(exist_ok=True)` then `git init` — so initialising a populated directory is
-    intended here rather than tolerated."""
+    intended here rather than tolerated.
+
+    That `git init` also has no origin, so this tree is as nameless to the fleet as
+    an empty sandbox: it is a copy of a PR's files at a temp path, not a checkout of
+    the repository. It reports no repo for the same reason and by the same route —
+    :data:`SANDBOX_ENV`, exported by :func:`run_cli` — rather than needing its own
+    rule."""
     try:
         shutil.copytree(tree, where, symlinks=True, dirs_exist_ok=True)
     except OSError as e:
@@ -880,6 +925,24 @@ def member_sandbox(where: Path) -> str:
     stop (:attr:`ReviewerRun.code_blind`), which is the mitigation available to a repo
     that keeps this function.
 
+    **This repo must not reach the board, and saying so is now this module's job**
+    (#714, #721). A seat's cwd is a throwaway `git init`, so `qb-hook` — which runs
+    in it, because a hooked `claude -p` is how a seat is invoked — reports the
+    session's repo from a checkout that exists for one process and one run. It read
+    the directory basename, which is how the board came to hold live agents in a
+    repository called `cwd` on a branch called `master`, indistinguishable from an
+    unexpanded variable. The directory is named `seat` for the same reason, and
+    neither the old name nor an origin remote should come back here.
+
+    What changed in #721 is WHERE that is enforced. The hook used to infer it —
+    no origin, therefore no repo — and that sentence is true of this directory and
+    false of an ordinary local-only repository, which went silent with it and took
+    two agents in it off the collision index. The hook cannot tell those apart:
+    a fresh `git init` and a never-pushed repo of ten years' commits differ in
+    nothing it can see. This module can, because it made the directory. So
+    :data:`SANDBOX_ENV` declares it and :func:`run_cli` exports it to every seat
+    CLI, whose hook is a child process and inherits it.
+
     A `git init` that fails is reported and then degraded past, never raised. **Every
     way it can fail, not just a non-zero exit** — `git` absent from PATH raises
     `FileNotFoundError`, a bad temp root raises `PermissionError`, a stalled mount or
@@ -915,6 +978,39 @@ def member_sandbox(where: Path) -> str:
         print(f"! sandbox: git init failed in {where} ({why}) — a seat that requires "
               f"a git repo will refuse to start and say so", file=sys.stderr)
     return str(where)
+
+
+#: What a seat's environment says about the directory it was given (#721).
+#:
+#: `qb-hook` runs inside every seat — a seat is a hooked `claude -p`, and the
+#: lifecycle hooks are configured per USER, not per repo, so they fire wherever the
+#: CLI is started. Left to itself the hook reports the checkout it is standing in,
+#: and for a seat that checkout is :func:`member_sandbox`'s `git init` (or
+#: :func:`seat_checkout`'s copy of the PR tree, which is `git init`ed by the same
+#: function): a repository that exists for one process, one run and one temp dir.
+#: This flag is how the thing that CREATED it says so.
+#:
+#: The alternative — and what #714 actually shipped — was for the hook to infer it
+#: from the absence of an origin remote. That is a property of this directory and
+#: also of an ordinary local-only repository, so it took every never-pushed
+#: checkout off the collision index alongside the sandboxes. The knowledge lives
+#: here; the declaration should too.
+SANDBOX_ENV = {"QB_SANDBOX": "1"}
+
+
+def sandbox_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment a seat CLI runs in: the caller's, plus :data:`SANDBOX_ENV`.
+
+    An OVERLAY, and that is the whole reason this is a function. `subprocess.run`'s
+    `env=` REPLACES the environment rather than adding to it, so handing it the flag
+    alone would start every seat with no PATH (the CLI is not found), no HOME (no
+    vendor config, no credentials) and none of the API keys the seats authenticate
+    with — a total panel outage in exchange for one field on a lease.
+
+    `base` defaults to the live `os.environ` and is a parameter only so a test can
+    hand in a known one; nothing in the harness passes it.
+    """
+    return {**(os.environ if base is None else base), **SANDBOX_ENV}
 
 
 class CliFailure(str):
@@ -968,8 +1064,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     NOT retried (it already burned the whole budget; retrying just doubles the
     wall-clock).
 
-    **`cwd` is the member's own empty sandbox repo (see `member_sandbox`), and
-    passing it is what makes a seat reproducible.** Without it every reviewer
+    **`cwd` is the member's own sandbox repo (see `member_sandbox`), and passing it
+    is what makes a seat reproducible.** Without it every reviewer
     inherited whatever directory the panel process happened to be started from,
     so a run's membership was decided by ambient state that nothing configured,
     nothing recorded, and nothing could reproduce. That is not hypothetical: on
@@ -980,6 +1076,22 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     scratch directory under /tmp, and codex refuses to start outside a repo. The
     panel lost a whole vendor's eyes to the caller's shell, and #68 is the report
     that reads the same either way.
+
+    **`cwd` is also what marks the run as a seat's** (#721). A sandbox is a
+    throwaway repo, `qb-hook` fires inside every seat because the lifecycle hooks
+    are configured per user rather than per repo, and a hook that reported this
+    directory would put a repository nobody outside this process can name on the
+    fleet's collision index. So a call that passes a `cwd` gets
+    :func:`sandbox_env`, and one that does not runs in the panel process's own
+    directory — a real checkout, where the hook should report normally.
+
+    Derived from `cwd` rather than taken as a parameter beside it, because the two
+    are the same fact: the docstring above already promises that this parameter is a
+    member sandbox, all five call sites in the harness pass one, and an `env=`
+    argument would be five more places to forget the flag and five ways for the two
+    to disagree — two of them in `panel_rounds`, which is a different module and
+    would have to be told. The defect this closes is exactly a fact about the
+    sandbox being enforced somewhere other than where the sandbox is made.
 
     A sandbox satisfies codex's check by construction, which is why no
     `--skip-git-repo-check` appears anywhere here — verified against an untrusted
@@ -1048,12 +1160,16 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     (codex) would otherwise under-report exactly the seat that is flaking."""
     last = f"{label}: no attempt made"
     feed = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
+    # Resolved once for the whole retry loop rather than per attempt: nothing
+    # between attempts changes it, and building it three times would be three
+    # copies of `os.environ` for one dict entry.
+    env = sandbox_env() if cwd is not None else None
     for _ in range(max(1, attempts)):
         argv = args() if callable(args) else args
         started = time.monotonic()
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout, cwd=cwd, **feed)
+                                  timeout=timeout, cwd=cwd, env=env, **feed)
         except subprocess.TimeoutExpired as e:
             # A timeout is the most expensive outcome the panel has: the model
             # read the whole diff and thought about it for the full budget before
@@ -1242,6 +1358,309 @@ def record_run(payload: dict) -> str:
     # sees the record land.
     print(f"panel: {proc.stdout.strip().splitlines()[-1]}", file=sys.stderr)
     return ""
+
+
+#: How long a round's claim on its PR is good for. The claim is RELEASED when the
+#: round ends (see :func:`release_pr`), so this is not a duration — it is the fuse
+#: for the case where the release never runs, and the only thing it has to outlast
+#: is the slowest round anybody has measured. A round takes 20-40 minutes on this
+#: fleet, which is the figure the CI-settle comment in `panel.py` cites.
+#:
+#: Three hours is a deliberate figure between the two the fleet already uses, and
+#: it is longer than the board's default rather than shorter — the first version of
+#: this comment had that backwards (PR #715 review). The board's own default is
+#: **one hour** (`app/claims`' `DEFAULT_TTL = 3600`, which is what `qb-claim` gets
+#: when nothing passes `--ttl`), and one hour cannot cover a round: 20-40 minutes
+#: is the ordinary case, and a round that waits on CI or a slow vendor exceeds an
+#: hour without anything being wrong. A fuse that expires mid-round would make the
+#: PR read as free while four seats are still reading it, which is worse than no
+#: claim at all.
+#:
+#: It is deliberately far short of `create-worktree`'s eight hours (`CLAIM_TTL`),
+#: which is #608's complaint — a fuse the agent burning it cannot renew — and that
+#: claim covers a whole worktree's work where this covers one round.
+#:
+#: Passive expiry is the intended failure mode and the board has no reaper by
+#: design (`app/models/lease.py`), so this number IS the recovery time for the
+#: paths that cannot release: an exception or an interrupt between the claim and
+#: the release (`panel.py` has no `try/finally` around the round, and the span is
+#: some 2,600 lines) leaves the claim standing for up to this long.
+PR_HOLD_TTL = 10800
+
+#: `qb-claim`'s exit codes, named for the two this cares about. 1 is a definite
+#: holder and 2 is everything else — a board outage, a rotated token, a ref this
+#: board will not key — and the split matters here for the reason it matters to
+#: `create-worktree`: a peer already reviewing this PR is worth a line in the
+#: round's own notes, and a board that could not be reached is not that peer.
+CLAIM_TAKEN, CLAIM_HELD = 0, 1
+
+
+def hold_pr(repo_path: str, pr_number: int, round_no: int) -> str:
+    """Take the board's claim on this PR for the length of a round. Best-effort.
+
+    **NOT :func:`panel.pr_claim`**, which is #550's block carrying what the PR's
+    author says the change does. This is quarterback's claim — the exclusivity
+    record naming which agent is on a piece of work — and one file uses the word
+    both ways, so these two are spelled apart.
+
+    #253 asks for the six work-lifecycle events to be OBSERVED rather than
+    volunteered, and names this one: *"start reviewing a PR — `panel.py` run
+    start, it already POSTs at the end, so it knows the PR and round"*. The rule
+    it applies (#229, #172) is that the trigger must be an action that already
+    happens, never a second declaration somebody has to remember to make. A round
+    starting is that action, and this is the line that observes it.
+
+    What it buys: `GET /active` carries no work reference at all — a lease has
+    `repo`, `branch` and `title` and nothing that names an issue or a PR — so an
+    agent three hours into reviewing #1780 read, on every fleet surface, exactly
+    like one that had just opened the repo. The dashboard's AGENTS row already
+    joins a claim onto its holder (`qbdata._agent_row` prefers the claim over the
+    prompt title) and had nothing to join, because nothing on the review path
+    claimed anything. Measured on this board while #253 was open: five live
+    agents, three of them reviewing, and `/claims` empty.
+
+    Through `qb-claim` rather than a POST from here, for :func:`record_run`'s
+    reason exactly — which board this machine belongs to is site configuration,
+    and re-deriving it in Python is how one island's work lands on another
+    island's board. It also means the key is derived by the board and not composed
+    here (#172): the kind and the number go up, the key comes back, and this
+    cannot invent a third spelling of a PR's key.
+
+    **It never gates the round.** Every refusal is a line in `config_notes` and
+    nothing else. The claim exists to make the round discoverable, and a review
+    that would not run because a board was unreachable is a worse failure than a
+    review nobody can see. The HELD case is a note for the same reason and not an
+    exit: two panels on one PR is duplicated spend and worth telling a reader
+    about, and it is not this function's call to stop one.
+
+    The argument against that, which is real (PR #715 review): a claim that never
+    refuses is not an exclusivity record, and if the point were to stop duplicate
+    spend then the HELD case is precisely where it should stop. Two things decide
+    it the other way here. First, this claim can be LEFT STANDING by a round that
+    died — see :data:`PR_HOLD_TTL` — so gating would let a dead round refuse a live
+    one for up to three hours, and a refusal caused by the mechanism's own failure
+    mode is worse than the duplicate it prevents. Second, refusing a review is a
+    policy change and this is not the layer that makes them: `panel.py` already has
+    a gate parameter carrying the preconditions that DO stop a round (#271, #55,
+    #617), each with a dial and a `--force`, and a fourth precondition belongs
+    there with the same furniture rather than inside a telemetry call. Until then
+    the honest description is a record, which is what this says.
+
+    **It takes the claim with `--no-plan-item`, and that is #722.** Every issue/PR
+    claim writes a top-ranked plan item, because picking work up is the one act
+    that should put work on the board (#427) — and a review round is not picking
+    the PR up. The round wrote PR #n in at rank 1, released the claim at the end,
+    and left the row open, unclaimed and unblocked at the top of the plan, so
+    `plan_read`'s `next` handed the following agent a review that had already
+    happened, above whatever a human had ordered. Read off this board while #722
+    was open: `next` for this repo was the item for **PR #715** — the PR that added
+    this claim — open at rank 8, `rank_source: picked-up`, its claim released, and
+    ahead of every ordered item below it.
+
+    The flag is the whole fix and it does nothing else — it does not retire an item
+    that is already there, so a PR somebody genuinely picked up keeps its row and
+    its position while a round reviews it.
+
+    So this passes no title either: `--title` and `--no-gh-title` both exist to
+    name the plan item, and there is no longer one to name. `qb-claim` reads
+    `--no-plan-item` as implying `--no-gh-title`, which is where the saved `gh`
+    call went.
+
+    **Mixed versions are the ordinary state here, and both directions are handled.**
+    This harness and the board deploy separately, so during any rollout one of them
+    is older than the other and neither can be assumed. Each direction fails in its
+    own way and neither may fail silently:
+
+    * *New harness, old board.* `ClaimIn` takes pydantic's default `extra="ignore"`,
+      so an old board discards `plan_item` and writes the rank-1 row anyway. The
+      answer says so — a non-null `plan_item` on a request that asked for none — and
+      `--json` is what lets this read it rather than grep prose. Noted, never
+      failed: the claim is real and it is the half that prevents duplicated work.
+    * *New harness, old `qb-claim`.* argparse refuses the unknown flag and exits 2,
+      which this used to file as "the board did not take it" — so a host part-way
+      through an upgrade would run every round UNCLAIMED, silently undoing #715 a
+      few hours after it shipped. That refusal is now told apart from a board's
+      (argparse's own wording, plus the flag's name) and the claim is retried once
+      without the flag. The round then holds the PR *and* writes a plan item, which
+      is the #722 defect — and it is the better of the two, because an imperfect
+      record somebody can see beats no record at all.
+
+    Returns ``(note, holding)``. **Two facts, not one**, and they used to be one
+    string: "" meant both "nothing to report" and "the claim is ours", because every
+    note this raised also meant the claim was not. The two combinations above break
+    that — a note beside a claim we do hold — and a caller that inferred one from the
+    other would skip the release and leave the PR held for :data:`PR_HOLD_TTL`.
+    """
+    if not shutil.which("qb-claim"):
+        return _unclaimed(pr_number, "there is no `qb-claim` on this host"), False
+    # `--json` puts the board's whole answer on stdout, which is how the old-board
+    # case below is detected: the evidence is structured, and reading it out of
+    # `qb-claim`'s prose would be the coupling `create-worktree` warns about.
+    base = ["qb-claim", "pr", str(pr_number), "--repo-path", repo_path,
+            "--ttl", str(PR_HOLD_TTL),
+            "--note", f"panel review round {round_no}", "--json"]
+    # Exclusivity, not a pickup — see the docstring. The note is what a reader gets
+    # instead of a plan row, and it says which round.
+    proc = _qb_claim(base + ["--no-plan-item"])
+    if isinstance(proc, Exception):
+        return _unclaimed(pr_number, f"`qb-claim` failed ({proc.__class__.__name__})"), False
+    stale_tool = _rejected_the_flag(proc)
+    if stale_tool:
+        proc = _qb_claim(base)
+        if isinstance(proc, Exception):
+            return _unclaimed(
+                pr_number, f"`qb-claim` failed ({proc.__class__.__name__})"), False
+
+    if proc.returncode == CLAIM_TAKEN:
+        if stale_tool:
+            return _note(
+                f"the claim on PR #{pr_number} was taken WITH a plan item: this "
+                f"host's `qb-claim` predates `--no-plan-item`, so the round is on "
+                f"the board and the PR is now on the plan at rank 1 too (#722). "
+                f"Upgrade the harness on this host; until then the row has to be "
+                f"retired by hand once this round releases the claim"), True
+        if _wrote_a_plan_item(proc.stdout):
+            return _note(
+                f"the claim on PR #{pr_number} is ours, but this BOARD is older "
+                f"than `--no-plan-item` and ignored it, so the PR is on the plan at "
+                f"rank 1 (#722). The review is unaffected; the plan row will sit "
+                f"open at that rank once this round releases the claim, and only a "
+                f"board upgrade or a hand edit removes it"), True
+        return "", True
+    # stderr first: with `--json`, stdout is the board's answer on the paths that
+    # have one, and quoting a line of JSON at a human tells them nothing. Every
+    # message worth quoting here has always been on stderr.
+    said = (proc.stderr or proc.stdout or "").strip().splitlines()
+    quoted = f" — `qb-claim` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    if proc.returncode == CLAIM_HELD:
+        # Through `_note` like the other two, because this is the one of the three
+        # a human watching the round most wants on their terminal: it names a peer
+        # spending money on the same PR right now.
+        return _note(f"PR #{pr_number} is claimed by somebody else{quoted}. This "
+                     "round ran anyway — the claim is a record and not a gate — but "
+                     "two panels on one PR is spend twice, so it is worth knowing "
+                     "which"), False
+    return _unclaimed(pr_number, f"the board did not take it{quoted}"), False
+
+
+def _qb_claim(argv: list[str]):
+    """One `qb-claim` run, or the exception that stopped it. Never raises.
+
+    Returning the exception rather than None because the caller says its class name
+    out loud, and because there are two call sites now — the flagged attempt and the
+    retry — and a helper that reported the failure itself would say it twice.
+    """
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return e
+
+
+def _rejected_the_flag(proc) -> bool:
+    """Did THIS `qb-claim` refuse `--no-plan-item` as an unknown argument?
+
+    Told apart from every other exit 2 — an outage, a rotated token, a ref the board
+    will not key — because the remedy is different and only this one has one: drop
+    the flag and ask again. Retrying any of the others is a second wrong answer at
+    twice the latency, which is the rule `qb-claim` itself states about its retry.
+
+    Matched on argparse's own wording rather than on `qb-claim`'s: the string
+    belongs to the standard library, has been that sentence for the life of the
+    module, and is what the tool prints without choosing to. The flag's own name is
+    required beside it so that a DIFFERENT unknown argument — a future flag this
+    file grows, sent to a host older still — is not answered by dropping this one
+    and retrying into the identical refusal.
+    """
+    return (proc.returncode not in (CLAIM_TAKEN, CLAIM_HELD)
+            and "unrecognized arguments" in (proc.stderr or "")
+            and "--no-plan-item" in (proc.stderr or ""))
+
+
+def _wrote_a_plan_item(stdout: str) -> bool:
+    """Did the board write a plan item for a claim that asked for none? Never raises.
+
+    Reads `--json`'s own payload. A board that cannot be parsed, or one whose answer
+    carries no `plan_item` at all, is a "no": the note this feeds is an alarm, and an
+    alarm that fires on an unreadable answer is one people learn to ignore. The cost
+    of a miss is the pre-#722 behaviour, which is what the fleet had yesterday.
+    """
+    try:
+        return bool(json.loads(stdout or "{}").get("plan_item"))
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
+def _unclaimed(pr_number: int, why: str) -> str:
+    """The one line a round that could not claim its PR says about itself.
+
+    Printed on stderr AND returned, for :func:`_unrecorded`'s reason: those are
+    two different readers, and a line that exists only in a subprocess's stderr
+    is #284's failure.
+
+    It says the review is unaffected because it is — nothing downstream of the
+    claim reads it — and it names what is actually lost, which is not the review
+    but the fleet's ability to say what this agent is doing.
+    """
+    return _note(
+        f"the board has no claim on PR #{pr_number} for this round — {why}. The "
+        "review itself is complete and unaffected; what is missing is the record, "
+        "so no fleet surface will say which PR this agent is on")
+
+
+def _note(line: str) -> str:
+    """Printed on stderr AND returned — the two readers :func:`_unrecorded` names.
+
+    One printer rather than the `print` copied into each branch that has something
+    to say. The copies were how the HELD case became the only note of the three
+    that never reached a terminal, which is the one a human watching a round most
+    needs: it names a peer spending money on the same PR at the same time.
+    """
+    print(f"panel: {line}", file=sys.stderr)
+    return line
+
+
+def release_pr(repo_path: str, pr_number: int) -> str:
+    """Hand back what :func:`hold_pr` took. Best-effort, and nothing to release is
+    not a failure.
+
+    Released at the end of the round rather than left to lapse, for `qb-release`'s
+    own reason: a claim that outlives its work is #135, and it was measured here —
+    four plan items still holding live claims after their PRs had merged, one of
+    them shipped hours earlier. A cycle is several rounds with a fix pass between
+    them, so a claim held to its TTL would also make the FIXER read as an agent
+    queueing behind a reviewer that had already finished.
+
+    The release is idempotent on the board (`released_at` is set once and the row
+    stays as history), so this racing a TTL that has already expired, or a second
+    caller, does nothing rather than damage.
+    """
+    if not shutil.which("qb-release"):
+        return ""
+    try:
+        proc = subprocess.run(["qb-release", "pr", str(pr_number),
+                               "--repo-path", repo_path],
+                              capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return _unreleased(pr_number, f"`qb-release` failed ({e.__class__.__name__})")
+    if not proc.returncode:
+        return ""
+    said = (proc.stdout or proc.stderr or "").strip().splitlines()
+    quoted = f" — `qb-release` said: {said[-1][:QB_SAID_MAX]}" if said else ""
+    return _unreleased(pr_number, f"the board would not release it{quoted}")
+
+
+def _unreleased(pr_number: int, why: str) -> str:
+    """Why a round's claim is still standing after the round finished.
+
+    Worth a note rather than a silence, because the consequence is visible on a
+    surface somebody reads: the dashboard will show this agent holding PR #n for
+    up to :data:`PR_HOLD_TTL` after it stopped working on it, and a reader with no
+    note has to guess whether that is a stuck round or a stale claim.
+    """
+    return _note(
+        f"this round's claim on PR #{pr_number} was not handed back — {why}. It "
+        f"lapses on its own within {PR_HOLD_TTL // 3600}h; until then the fleet "
+        "shows this agent as still holding the PR")
 
 
 #: `qb`'s exit code for a subcommand it does not have — and for several other
@@ -4038,7 +4457,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # and through it the coverage veto and the payload — has to follow it
             # down. Believing the intent here is how a blind seat gets recorded as
             # a sighted one and has its declarations counted against the round.
-            sandbox, reads_code = seat_checkout(code_tree, tmpdir / "cwd")
+            sandbox, reads_code = seat_checkout(code_tree, tmpdir / "seat")
             if not reads_code:
                 # The prompt was composed BEFORE this staging could be attempted —
                 # `run` decides the brief when it builds the text, and only this
@@ -4053,7 +4472,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # will otherwise go looking for a checkout it was promised.
                 prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF)
         else:
-            sandbox = member_sandbox(tmpdir / "cwd")
+            sandbox = member_sandbox(tmpdir / "seat")
         #: What that sandbox COSTS the seat, recorded at the line that causes it.
         #: An empty repo and no file tools means the diff in the prompt is the
         #: seat's entire evidence, so anything it declares about code outside the
@@ -5174,10 +5593,13 @@ __all__ = [
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
-    "is_deterministic_failure", "member_sandbox", "run_cli", "record_run",
+    "is_deterministic_failure", "member_sandbox", "SANDBOX_ENV", "sandbox_env",
+    "run_cli", "record_run",
+    # The round-start claim (#253) and the release that ends it.
+    "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
-    "code_access_wanted", "pr_claim_wanted",
+    "code_access_wanted", "pr_claim_wanted", "history_wanted",
     "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
     "READ_ONLY_TOOLS", "claude_args",
     "QB_NO_SUBCOMMAND", "record_ask", "diff_budget", "resolve_round_scope",

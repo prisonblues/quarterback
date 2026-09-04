@@ -46,6 +46,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import harness_rules  # noqa: E402
 import panel  # noqa: E402
+import panel_caps  # noqa: E402
 import panel_core  # noqa: E402  — `sh`, the seam every stub here replaces
 import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
@@ -485,12 +486,22 @@ def test_there_is_no_FLAG_to_arm_one_either():
     # Every dial whose name mentions a budget, so a key added for this would show up
     # here rather than in whatever this list happens to contain. The `budget.*` block
     # is #191's spend ceiling and `budget_window_hours` is its window — neither is
-    # `low_severity_fix_lines` and none of them is new.
+    # `low_severity_fix_lines`, and the one addition since is `tokens_per_round`
+    # (#483), which is that same spend ceiling denominated in the unit its work is
+    # dispatched in. This list is a canary and not a ledger: a member added here has
+    # to be a TOKEN-and-RUN ceiling measured against `GET /review/spend`, which is
+    # what makes it not a dial for the churned-line budget above.
     assert {k for k in harness_rules.BOARD_DIALS if "budget" in k} == {
         "review_panel.budget.tokens_per_day", "review_panel.budget.runs_per_day",
+        "review_panel.budget.tokens_per_round",
         "review_panel.budget.tokens_per_pr", "review_panel.budget.runs_per_pr",
         "review_panel.budget.fleet_tokens_per_day",
         "review_panel.budget_window_hours"}
+    # And the canary's real claim, stated so it cannot be satisfied by editing a
+    # literal: every one of them is a ceiling `panel_caps` measures, so none of them
+    # is a dial for the fix budget whatever it is called.
+    assert {k.rsplit(".", 1)[-1] for k in harness_rules.BOARD_DIALS
+            if k.startswith("review_panel.budget.")} == set(panel_caps.CEILINGS)
 
 
 def test_a_PROVEN_breach_ends_the_round_and_names_the_premise():
