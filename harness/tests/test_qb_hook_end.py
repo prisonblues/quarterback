@@ -257,9 +257,13 @@ def test_the_same_session_starting_again_ends_nothing(hook):
 
 def test_a_session_with_no_instance_never_supersedes_anything(hook):
     """Without QUARTERBACK_INSTANCE the instance IS the session-id prefix, so the
-    record is per-session and can never hold a different one. A plain `claude` in
-    a window has no pane identity to inherit, and inventing one would let two
-    unrelated sessions end each other."""
+    record is per-session and can never hold a different one. Nothing on this
+    fleet sets the variable — `qb-seats` unsets it (#540) — so this is the case
+    every session is in, and it is why #263's release still only reaches a pane
+    somebody pinned by hand. Inventing a pane identity where the environment
+    offers none would let two unrelated sessions end each other, which is worse
+    than the bug: see the INSTANCE block in `qb-hook` for the two environment
+    values that look like a pane and are not."""
     hook.fire("SessionStart", session_id="aaaaaaaa-1")
     hook.fire("SessionStart", session_id="bbbbbbbb-2")
     assert hook.to("/session/end") == []
@@ -385,3 +389,68 @@ def test_no_qb_catchup_on_path_is_not_an_error(tmp_path):
     got = merged(h)                      # no stub installed
     assert got.returncode == 0
     assert got.stdout.strip() == "", got.stdout
+
+
+# --------------------------------------------- SessionStart's `source` (#263)
+#
+# The hook never read it. `grep -n source` over the script found only comments,
+# which is #263's item 1 — so every start looked alike, including the two that
+# are opposites: a `clear` is a conversation that remembers nothing of the one
+# before it, and a `resume` is the same conversation continuing.
+
+
+def test_a_clearing_start_reports_the_ending_as_a_context_reset(hook):
+    """`superseded` says only that something else is here now. When Claude Code
+    has told us it was a `/clear` we can say the truer thing, and the board keeps
+    the two apart on the lease it stamps."""
+    env = hook.env(QUARTERBACK_INSTANCE="seat-6")
+    hook.fire("SessionStart", env=env, session_id="sid-old", source="startup")
+    hook.fire("SessionStart", env=env, session_id="sid-new", source="clear")
+
+    ended = hook.to("/session/end")
+    assert len(ended) == 1, hook.sent()
+    assert '"session":"sid-old"' in ended[0]
+    assert '"reason":"context_reset"' in ended[0]
+
+
+def test_a_source_the_hook_does_not_know_still_supersedes(hook):
+    """`compact` and `fork` both carry memory forward, and an older Claude Code
+    sends no source at all. None of them is a context reset, and every one of
+    them still means a different conversation is in this pane — which is exactly
+    what `superseded` claims and all it claims."""
+    for source in ("compact", "fork", None):
+        root = hook.root / f"case-{source}"
+        root.mkdir()
+        h = Hooked(root)
+        env = h.env(QUARTERBACK_INSTANCE="seat-7")
+        h.fire("SessionStart", env=env, session_id="sid-old", source="startup")
+        payload = {} if source is None else {"source": source}
+        h.fire("SessionStart", env=env, session_id="sid-new", **payload)
+        ended = h.to("/session/end")
+        assert len(ended) == 1, (source, h.sent())
+        assert '"reason":"superseded"' in ended[0], source
+
+
+def test_a_resume_hands_nothing_back(hook):
+    """The cure that would be worse than the disease. Releasing a resumed
+    session's claims is #263 with the sign flipped, and it is refused twice
+    over: the source says `resume`, and a resume reuses the session id."""
+    env = hook.env(QUARTERBACK_INSTANCE="seat-8")
+    hook.fire("SessionStart", env=env, session_id="sid-same", source="startup")
+    hook.fire("SessionStart", env=env, session_id="sid-same", source="resume")
+    assert hook.to("/session/end") == []
+
+
+def test_a_child_session_never_ends_its_parents_session(hook):
+    """Insurance rather than a fix for anything observed, and cheap. A Task
+    sub-agent inherits whatever QUARTERBACK_INSTANCE its parent had, so on a box
+    where one is set by hand it would share the supersede record with its parent
+    and hand back claims a live agent is still working. Nothing on this fleet
+    sets the variable and a sub-agent's payload carries the parent's session id
+    anyway — but this is the one thing this path must never do by accident."""
+    env = hook.env(QUARTERBACK_INSTANCE="seat-9")
+    hook.fire("SessionStart", env=env, session_id="sid-parent", source="startup")
+    child = hook.env(QUARTERBACK_INSTANCE="seat-9", CLAUDE_CODE_CHILD_SESSION="1")
+    hook.fire("SessionStart", env=child, session_id="sid-child", source="startup")
+
+    assert hook.to("/session/end") == [], hook.sent()

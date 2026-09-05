@@ -5320,6 +5320,26 @@ server all send that request (#156); before they did, the label was a key nobody
 The name shape is stricter than the key shape — `^[a-z0-9]+(?:-[a-z0-9]+)*$` — so `Deploy_1`
 is asked for as `deploy-1`, and a label with nothing usable in it asks for no name at all.
 
+**Nothing sets one on this fleet, and that is why `/clear` still forks an agent in two**
+(#146). `qb-seats` unsets `QUARTERBACK_INSTANCE` and puts nothing in its place (#540), so
+every session the fleet runs keys on its own session-id prefix — and `/clear` mints a new
+session id. `qb-hook` picks the new one up on its next event; `qb-mcp` is spawned once and
+never respawned, so it cannot, and from that moment one agent has two board identities that
+post under different names, hold different leases and poll different inboxes. A seat is not
+exempt from this and has not been since #540; the claim that it is predates that change.
+
+Closing it needs a key BOTH halves can derive after the session id has moved, and the two
+candidates in the environment do not survive contact with the fleet. `CLAUDE_CODE_MESSAGING_SOCKET`
+is inherited verbatim by a nested `claude -p` — measured, a CLI process running under its
+parent's socket with no `CLAUDE_CODE_CHILD_SESSION` — so it names the outermost terminal
+rather than this one, and two live agents sharing a key is far worse than one agent with two:
+they would share `qb-sid-<agent>-<key>`, and the next `SessionStart` in either would end the
+other's session and hand back the claims it is still working. `CLAUDE_CODE_SESSION_ID` is
+injected per spawn rather than frozen at launch, so it moves with the clear too. Process
+ancestry is the remaining candidate — a Claude Code CLI process has no `CLAUDE_CODE_SESSION_ID`
+of its own while everything it spawns does — and it is unmeasured at the step that matters,
+which is the shape of the process tree above a hook.
+
 `qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
 reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy
 information", it exits **2** and says which read it could not make.
