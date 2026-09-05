@@ -2615,27 +2615,56 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "same PR, not a continuation of that one. Its round counter, "
                      "its baseline and every cycle guard start from scratch")
 
-    # ---- WHERE THIS BRANCH ACTUALLY FORKED (#241). Past the skip branch, which
-    # returns above and must stay free of API calls, and before the diff so that
-    # everything downstream — the payload, the mid-round re-read, the next round's
-    # anchor — agrees about which commit it means.
+    # ---- WHERE THIS BRANCH ACTUALLY FORKED (#241), AND WHAT THE DIFF WAS BUILT
+    # FROM (#747). Past the skip branch, which returns above and must stay free of
+    # API calls, and before the diff so that everything downstream — the payload,
+    # the mid-round re-read, the next round's anchor — agrees about which commit it
+    # means.
     #
-    # `baseRefOid` is not this. GitHub maintains it for its own purposes and it has
-    # been measured wrong in both directions on this repo: OLDER than the fork
-    # point on PR #187, where a commit shared with another PR landed on `main` and
-    # nothing recomputed the stored base, so `gh pr diff` returned already-landed
-    # code and a full round confirmed 15 findings about it; and NEWER on PR #270,
-    # where the stored base was the tip of `main` and named a commit the branch had
-    # never contained. Recording the stored value as `merge_base` is what let both
-    # rounds report a range nobody had reviewed.
+    # `baseRefOid` is not the fork point. It is the base branch's TIP as of the PR
+    # being opened, or of the last push to the head branch — measured directly:
+    # a branch cut from an older commit gets a `baseRefOid` its own history has
+    # never contained, and a `baseRefOid` recorded before the base branch moved
+    # stays put while the base runs on. So it sits wrong in both directions, which
+    # is what #241 found: NEWER than the fork point on PR #270, where it was the
+    # tip of `main`; OLDER on PR #187, where a commit shared with another PR landed
+    # on `main` and no push to the head branch recomputed it. Recording it as
+    # `merge_base` is what let both rounds report a range nobody had reviewed, and
+    # `merge_base` is a merge base now.
     #
-    # The diff is still `gh pr diff`, and that is deliberate rather than
-    # unfinished: silently re-deriving the target from a locally-computed range
-    # would swap one unannounced scope for another, and the load-bearing part of
-    # #241 is that a mis-scoped round must not be SILENT. So the fork point is
-    # recorded, the stored base is compared against it, and any disagreement is
-    # said out loud in `config_notes` — where a reader can discount findings that
-    # fall outside the true range.
+    # #747 corrects the second half of that fix, which drew the wrong conclusion
+    # from the first. The old note assumed `gh pr diff` diffs FROM `baseRefOid`. It
+    # does not, and the premise this check now rests on instead is:
+    #
+    #     `gh pr diff` serves the three-dot diff from `merge-base(baseRefOid, head)`
+    #
+    # **That is a measured inference, not a documented contract, and the difference
+    # is load-bearing.** GitHub documents neither, and `gh pr diff` does not compute
+    # it: it GETs the pull endpoint under a diff media type and prints the response,
+    # so nothing binds what comes back to the metadata snapshot compared against
+    # here. What supports it is three pull requests built on 2026-09-05 to hold one
+    # shape each — a base that moved under an untouched PR, a branch cut behind the
+    # base tip, and a base fast-forwarded onto a commit the head also carried — plus
+    # 21 open PRs on `prisonblues/lexray` for the field's behaviour. In all three the
+    # diff matched `merge-base(base.sha, head)...head` file for file, and in none did
+    # it match a diff from `base.sha` itself.
+    #
+    # What breaks if the premise is wrong, so the next reader knows what to look
+    # for: were GitHub in fact serving a TWO-dot diff from the stored base, #270's
+    # shape would become a silent false NEGATIVE — the two merge bases agree there,
+    # so this stays quiet while the patch is wrong. Neither that nor a changed
+    # serving rule returns None, so the "unverified" arm below does not catch it,
+    # and the tests inject the diff base rather than deriving it, so they cannot
+    # either. What WOULD notice it is a content check: the file set of the diff in
+    # hand against `.files` of the compare response for the predicted range. That is
+    # not run inline because the compare body caps files at 300 with no truncation
+    # flag, and a check whose own limits are unmeasured would manufacture exactly
+    # the false positive this issue is about. Measure the cap first.
+    #
+    # The diff is still `gh pr diff`, deliberately: silently re-deriving the target
+    # from a locally-computed range would swap one unannounced scope for another,
+    # and the load-bearing part of #241 is that a mis-scoped round must not be
+    # SILENT.
     forked_at = _merge_base_now(gh_repo, base, head_sha)
     if forked_at is None and stored_base:
         notes.append(
@@ -2650,16 +2679,56 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "staleness check has nothing to anchor against")
     else:
         merge_base = forked_at
-        if stored_base and stored_base != forked_at:
+        if not stored_base:
+            # Separate from "the two agree" and not folded into it (#747 review).
+            # With no stored base there is no `merge-base(stored, head)` to ask
+            # for, so the premise above cannot be evaluated at all — which is not
+            # the same as evaluating it and finding nothing wrong. `gh pr diff`
+            # still returned something; what it was built from is unknown here.
             notes.append(
-                f"the target may be MIS-SCOPED: this round's diff came from `gh pr "
-                f"diff`, which GitHub builds against its stored base for the PR "
-                f"({stored_base[:8]}), and that is not where the branch forked from "
-                f"({forked_at[:8]} — `{base}...{head_sha[:8]}`). Findings may fall "
-                f"outside the range this PR actually contributes; check any finding "
-                f"against `git diff {forked_at[:8]}...{head_sha[:8]}` before acting "
-                "on it. `merge_base` below records the fork point, not the stored "
-                "base")
+                "GitHub returned no stored base for this PR, so what `gh pr diff` "
+                "built this round's diff from could not be established. The fork "
+                f"point ({forked_at[:8]}) is recorded as `merge_base` and is the "
+                "range this PR should contribute; treat the target as unverified "
+                "against it rather than as agreeing with it")
+        elif stored_base == forked_at:
+            # No call, and the skip is an identity rather than a saving: the stored
+            # base here IS a merge base of the head, so it is an ancestor of the
+            # head, and `merge-base(x, head)` for an ancestor x can only answer x.
+            # A force-push to either branch does not disturb that — it is a fact
+            # about the two commits, not about what points at them.
+            pass
+        else:
+            diff_base = _merge_base_now(gh_repo, stored_base, head_sha)
+            if diff_base is None:
+                # The disagreement is there but the confirming call failed, so this
+                # round cannot say which shape it is in. It says THAT rather than
+                # picking one: #241's failure mode is silence, and #747's is a
+                # warning worded as a finding when it is a missing measurement.
+                notes.append(
+                    f"GitHub's stored base for this PR ({stored_base[:8]}) is not "
+                    f"the fork point ({forked_at[:8]}), and the compare that would "
+                    "say whether `gh pr diff` was therefore built from a different "
+                    "commit could not be read. Usually this disagreement is "
+                    "harmless — the stored base is just an older tip of the base "
+                    "branch — so treat the target as unverified rather than wrong")
+            elif diff_base != forked_at:
+                # Deliberately direction-NEUTRAL about what the extra range holds
+                # (#747 review). The common cause is the base branch having absorbed
+                # commits the head also carries, which makes the diff too WIDE. But
+                # a base branch reset backwards puts the predicted base ahead of the
+                # fork point instead, and then the diff is too NARROW — same
+                # predicate, opposite defect. Naming only the first would tell a
+                # reader to look for surplus code in a diff that is missing some.
+                notes.append(
+                    f"the target may be MIS-SCOPED: `gh pr diff` built this round's "
+                    f"diff from {diff_base[:8]}, but the branch forked from "
+                    f"{forked_at[:8]}. The diff may omit or include changes outside "
+                    f"the range this PR contributes; check any finding against "
+                    f"`git diff {forked_at[:8]}...{head_sha[:8]}` before acting on "
+                    "it, and check that range for anything the round did not see. "
+                    "`merge_base` below records the fork point, not the commit the "
+                    "diff was built from")
 
     # The head is read BEFORE the diff, and the order is load-bearing. The two are
     # separate requests, so a push that lands between them makes them disagree —
