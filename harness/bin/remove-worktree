@@ -17,6 +17,9 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        disk, an unarchivable file) — without it, a failing
 #                        backup makes the worktree permanently un-removable,
 #                        because the failure aborts the teardown (#743)
+#   --require-lock       Refuse unless the occupancy check gives a DEFINITE
+#                        answer. For unattended callers — see the header on
+#                        holder_check (#743)
 
 # ============================================
 # COLORS & HELPERS
@@ -125,19 +128,42 @@ drop_db_forcefully() {
 # agent" answer (exit 3) counts as a reason to stop. Anything else (missing,
 # board down, nobody there) returns success and the teardown proceeds, because a
 # coordination tool that cannot be reached must never make a worktree unusable.
+#
+# THAT REASONING IS RIGHT FOR A HUMAN AT A TERMINAL AND WRONG FOR A TIMER, and
+# on 2026-09-04 this script acquired its first unattended caller: zeus runs
+# `stack-reaper` hourly, after two graphical sessions were lost to leaked
+# per-worktree docker stacks. Interactively, "board down, proceeding" is fine —
+# somebody typed the command, knows which tree it names, and is watching it go.
+# Nobody is watching the reaper, and what it deletes is a worktree, its stack,
+# its database and its local branch. So the permissive reading of "could not
+# tell" is kept as the DEFAULT and made opt-out: --require-lock (or
+# QB_UNATTENDED=1) says the caller cannot supply the judgement that made
+# fail-open safe, and turns "could not tell" into a refusal.
+#
+# Three answers, so the caller can tell the two failure modes apart:
+#   0  clear — nobody else is here
+#   1  held by a named live agent (holder exit 3)
+#   2  could not tell (holder missing, or holder exit 4: no board, no curl/jq —
+#      and any other code, because an answer this script does not recognise is
+#      not evidence that the tree is free)
+#
+# Still not a lock. Between this answering and the `rm -rf` landing, an agent can
+# still be handed the tree; closing that needs a real claim on both sides, which
+# is the other half of #743 and is not this.
 holder_check() {
     local dir="$1" hb="" rc
     hb=$(command -v worktree-holder 2>/dev/null || true)
     # The `*/*` guard matters: invoked by bare name with no worktree-holder on
     # PATH, `${0%/*}` leaves $0 untouched and would build a nonsense path.
     if [[ -z "$hb" && "$0" == */* ]]; then hb="${0%/*}/worktree-holder"; fi
-    [[ -n "$hb" && -x "$hb" ]] || return 0
+    [[ -n "$hb" && -x "$hb" ]] || return 2
     # Stdout dropped, stderr kept: the all-clear would be noise on every single
     # teardown, while the "held by" report is the whole point of asking.
     "$hb" "$dir" >/dev/null
     rc=$?
+    [[ $rc -eq 0 ]] && return 0
     [[ $rc -eq 3 ]] && return 1
-    return 0
+    return 2
 }
 
 # >>> release (extracted verbatim by harness/tests/test_remove_worktree_claim.py)
@@ -266,6 +292,11 @@ KEEP_DB=false
 KEEP_CLAIM=false
 FORCE=false
 NO_BACKUP=false
+# QB_UNATTENDED=1 is the environment spelling of --require-lock, for a caller
+# that is a systemd timer rather than a command line — the reaper's own units
+# already set it, and a wrapper script would be one more thing to keep in step.
+REQUIRE_LOCK=false
+[[ "${QB_UNATTENDED:-}" = "1" ]] && REQUIRE_LOCK=true
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -282,6 +313,8 @@ while [[ $# -gt 0 ]]; do
             FORCE=true; shift ;;
         --no-backup)
             NO_BACKUP=true; shift ;;
+        --require-lock)
+            REQUIRE_LOCK=true; shift ;;
         --*)
             die "Unknown option: $1" ;;
         *)
@@ -382,13 +415,25 @@ fi
 # the tooling that rewrites a worktree never had to ask who was in it, so the
 # only signal was the other agent noticing its own branch had moved. This is
 # that question, asked once, and it is advisory — --force always wins.
+#
+# --require-lock (or QB_UNATTENDED=1) is what an unattended caller passes, and it
+# only changes the "could not tell" answer: held is still a refusal and clear is
+# still a go. See holder_check's header for why the default stays permissive.
 if [[ -d "$WORKTREE_DIR" && "$FORCE" != true ]]; then
-    if ! holder_check "$WORKTREE_DIR"; then
+    holder_check "$WORKTREE_DIR"
+    HOLDER_RC=$?
+    if [[ $HOLDER_RC -eq 1 ]]; then
         echo "" >&2
         die "Another live agent is working in $WORKTREE_DIR (see above).
   Talk to it, or re-run with --force if you are certain it has finished.
   This is advisory only: a lapsed lease never blocks, and neither does an
   unreachable board."
+    elif [[ $HOLDER_RC -eq 2 && "$REQUIRE_LOCK" = true ]]; then
+        echo "" >&2
+        die "Could not confirm nobody is working in $WORKTREE_DIR (see above),
+  and --require-lock says an unattended teardown must not guess.
+  Either worktree-holder is not installed here or the board did not answer.
+  Fix the board, or re-run with --force if you have looked at the tree yourself."
     fi
 fi
 
