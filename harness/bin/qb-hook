@@ -1164,6 +1164,19 @@ What to do instead, cheapest first:
 
 If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of the command and it will run."
   fi
+  # THE WAY OUT IS PART OF THE GUARD, not decoration on it. 2026-09-04 is the
+  # proof: a sub-agent doing a red/green step was refused the ref-restore form,
+  # reached for `checkout-index -a -f` because nothing had told it what else to
+  # do, and rewrote every tracked file in its worktree from the index. A refusal
+  # that names no working alternative does not stop the caller — it moves it one
+  # rung down, and the rungs get worse. So the red/green case, which is the one
+  # that keeps arriving here, is spelled out rather than alluded to: capture a
+  # patch over the paths you name, replay it in both directions, and use
+  # `git show <ref>:<path>` when you want exactly one file back.
+  #
+  # Verified end to end on git 2.54.0, 2026-09-05, over a change that spanned a
+  # tracked edit (part staged, part not) and a brand-new file: `-R` removed both
+  # and the replay restored both.
   _deny "quarterback: refusing this in a SHARED working tree.
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names
@@ -1173,7 +1186,14 @@ This command destroys uncommitted work, and in a shared checkout some of that wo
 What to do instead, cheapest first:
   1. Work somewhere else: $(_take_a_worktree "$root")
   2. Ask first: board_post(type='ask', to='<peer>', summary='about to reset $root — anything of yours in it?')
-  3. Save theirs and yours before you swing: qb-stash push   (or git diff > /tmp/tree.patch)
+  3. Save theirs and yours before you swing: qb-stash push   — per-worktree and invisible to siblings, unlike the one refs/stash every worktree of this repo shares
+  4. Only undoing your own change to watch a test go red, then putting it back? Do NOT reach for a wider command to do it — a whole worktree went that way on 2026-09-04. Capture the change and replay it, which touches only the paths you name:
+       git add -N <the files you touched, new ones included>
+       git diff HEAD -- <those same files> > redgreen.patch    # relative: an absolute path under \$HOME is refused
+       test -s redgreen.patch || echo 'STOP: captured nothing'
+       git apply -R redgreen.patch      # your change is gone — run the test
+       git apply redgreen.patch         # and back
+     One file back to a ref and nothing else: git show <ref>:<path> | tee <path> >/dev/null
 
 If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of the command and it will run."
 }

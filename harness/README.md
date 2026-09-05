@@ -940,7 +940,8 @@ fixes while they were still writing them.
   `takes`, is below and is gated differently):
   - it **destroys** it — `reset --hard|--merge`, `checkout` of a path or with `-f`,
     `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
-    `rm -f`, `worktree remove --force`, the `--abort` of an in-progress merge/rebase/cherry-pick;
+    `rm -f`, `worktree remove --force`, `checkout-index -f|-a`, `read-tree --reset -u`, the
+    `--abort` of an in-progress merge/rebase/cherry-pick;
   - or it **absorbs** it — `commit -a`, `add .`/`-A`/`-u`. In a shared tree you cannot tell your
     uncommitted files from theirs, so staging "everything" stages theirs;
 - **the tree that command will actually touch** holds some, **untracked files included** —
@@ -951,6 +952,17 @@ fixes while they were still writing them.
 Take any one away and nothing happens. A clean tree is never refused. Alone in a tree, your own
 uncommitted work stays yours to throw away. `--help` is never refused, and neither is a dry run:
 `git clean -n`, `-fdn` and `--dry-run` print what they would remove and remove nothing.
+
+**The last two of those verbs arrived by being reached for.** `checkout-index` and `read-tree`
+were both considered when the list was written and both left out, on the grounds that they were
+real forms nobody had ever actually run. On 2026-09-04 a sub-agent in the lexray repo, refused
+the ref-restore form during a red/green step, ran `git checkout-index -a -f` instead and rewrote
+every tracked file in its worktree from the index — reverting finished edits and truncating a new
+module, silently, since that command says nothing when it works. It recovered because it happened
+to look. "Nobody reaches for it" was never a claim about the command; it was a claim about the
+caller, and the caller is somebody who has just been refused, so the rung below a guarded command
+is precisely where a refusal sends them. `read-tree --reset -u` is the next rung down again and
+is guarded for that reason rather than for an incident of its own.
 
 **There is a third harm, and it deliberately does not use those three facts.** `git stash pop`
 and `git stash apply` **take** a peer's work rather than destroying or absorbing it (#739), and

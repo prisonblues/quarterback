@@ -415,3 +415,69 @@ def test_an_explicit_object_off_the_shared_stack_is_not_this_harm(cmd):
 ])
 def test_the_shared_stack_is_still_named_however_it_is_spelled(cmd):
     assert classify(cmd)["harm"] == "takes", cmd
+
+
+# ------------------------------------------------- the rung below a refusal (#745)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout-index -a -f",
+    "git checkout-index -f -a",
+    "git checkout-index -af",
+    "git checkout-index --all --force",
+    "git checkout-index -a",                          # before anyone reaches for -f
+    "git checkout-index -f -- app.py",                # one file, the same overwrite
+    "git checkout-index --force --prefix=/tmp/s/ -a",
+    "git -c core.filemode=false checkout-index -a -f",
+    "sh -c 'git checkout-index -a -f'",
+    "git status && git checkout-index -a -f",
+])
+def test_restoring_the_tree_from_the_index_is_destructive(cmd):
+    """2026-09-04, lexray. A sub-agent doing the red/green step of `/fix-issue`
+    found the ref-restore form refused, ran this instead, and rewrote every
+    tracked file in its worktree from the index — finished edits reverted, a new
+    module truncated, nothing said. It is the worst of that family: `-a` names no
+    path, there is no ref to make it read as a discard, and it is silent when it
+    works."""
+    assert classify(cmd)["harm"] == "destroys", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout-index app.py",     # no -f: git will not write over a file that exists
+    "git checkout-index",
+    "git checkout-index --help",
+    "git checkout-index --stdin",
+])
+def test_a_checkout_index_that_cannot_overwrite_is_left_alone(cmd):
+    assert not destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd,want", [
+    ("git read-tree --reset -u HEAD", True),
+    ("git read-tree -u --reset HEAD", True),
+    ("git read-tree --reset --update HEAD", True),
+    ("git read-tree -m -u --reset HEAD", True),
+    ("git read-tree -um --reset HEAD", True),
+    # `--reset` alone rewrites the INDEX and stops there, and index-only damage
+    # is consistently not this harm — `reset HEAD~1` and `restore --staged` are
+    # both false for the same reason. `-u` alone is not a command git accepts
+    # (`fatal: -u is meaningless without -m, --reset, or --prefix`), and `-m -u`,
+    # which it does, is a merge that carries the local change forward rather than
+    # writing over it. All three measured on git 2.54.0.
+    ("git read-tree --reset HEAD", False),
+    ("git read-tree -u HEAD", False),
+    ("git read-tree -m -u HEAD", False),
+    ("git read-tree HEAD", False),
+    ("git read-tree --help", False),
+])
+def test_the_next_rung_down_needs_both_halves(cmd, want):
+    assert destructive(cmd) is want, cmd
+
+
+def test_the_new_verbs_answer_to_the_tree_hatch_like_the_rest():
+    """They are the `destroys` harm, so they are escaped by the hazard's own
+    hatch and by no other — a caller who has settled it with the peer standing
+    in the tree gets through, and `QB_ALLOW_SHARED_STASH` is not that caller."""
+    assert classify("QB_ALLOW_SHARED_TREE=1 git checkout-index -a -f")["allowed_by"]
+    assert classify("QB_ALLOW_SHARED_TREE=1 git read-tree --reset -u HEAD")["allowed_by"]
+    assert not classify("QB_ALLOW_SHARED_STASH=1 git checkout-index -a -f")["allowed_by"]

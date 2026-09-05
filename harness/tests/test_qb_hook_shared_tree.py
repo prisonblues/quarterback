@@ -338,6 +338,23 @@ def test_the_refusal_says_what_to_do_instead(shared):
     assert "git stash" not in reason
 
 
+def test_the_refusal_spells_out_the_red_green_undo(shared):
+    """The case that keeps arriving here is "take my fix out, run the test, put
+    it back", and on 2026-09-04 an agent that was refused it reached for
+    `checkout-index -a -f` and emptied its worktree from the index. A hint that
+    stops at "save your work first" leaves that caller to invent the rest, which
+    is exactly what it did — so the patch-and-replay recipe is in the message,
+    not implied by it."""
+    reason = shared.decision(shared.bash("git reset --hard"))["permissionDecisionReason"]
+    assert "git apply -R" in reason          # take it out
+    assert "git apply redgreen.patch" in reason   # and put it back
+    assert "git show <ref>:<path>" in reason      # one file, without touching the others
+    # The redirect is spelled relative and the note saying why must survive the
+    # shell that builds this message — an unescaped `$HOME` there expands into
+    # whatever this process's home is and the reader loses the reason entirely.
+    assert "$HOME" in reason
+
+
 def test_a_peers_subagent_counts_as_a_peer(shared):
     """A peer's fan-out edits the peer's tree with the peer's hands. Losing its
     work loses the peer's work, so `subagents` is not a separate, softer case."""
