@@ -611,6 +611,27 @@ trap claim_rollback EXIT
 # extend it past the TTL nor hand it back. A claim that names no session falls
 # back to the machine, which is exactly what a checkout claim is — it belongs to
 # the tree until an agent picks it up.
+#
+# **And nothing ever picked it up, which is #681.** A machine claim is outside
+# every automatic release the fleet has: `POST /session/end` frees the claims a
+# SESSION took and a null session matches none of them, and `qb-reconcile` looks
+# the holder up in `/active`, which lists leases, so a bare machine name can never
+# appear there and the check is structurally incapable of settling. Nine such
+# claims were standing on zeus the day #681 was written, three of them naming
+# issues that had closed seven hours earlier. Only `qb-release` — by hand, or
+# through `remove-worktree` — and the TTL could ever end one.
+#
+# So the claim is HANDED OVER rather than re-attributed. It stays machine-owned
+# here, for every reason above, and the first agent to work in the tree adopts it
+# by re-claiming the same issue from inside its own session: `acquire` reads that
+# as a renew by the same machine and `_renew_onto` stamps the session onto the row
+# that is already there, so the claim keeps its identity, its history and its
+# place on the plan, and gains an owner `/session/end` can find. The instruction
+# to do it is written into the worktree's own `CLAUDE.local.md` — the `adopt`
+# block in the context-note step below, spelled without its marker so that the
+# marker stays unique to the block itself — because that file is read by whatever
+# agent opens the tree, whichever route brought it there, and a line in six command
+# briefs would be read by none of them.
 claim_the_branch() {
     local branch="$1" issue qc rc bindir
     [[ "$CLAIM" = true ]] || return 0
@@ -1674,6 +1695,46 @@ step "Writing worktree context (CLAUDE.local.md)..."
     if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
         echo "- **Via nginx:** \`/$BRANCH_NAME/\`"
     fi
+    # >>> adopt (extracted verbatim by harness/tests/test_create_worktree_adopt.py)
+    # The one act that gives the checkout's claim an owner (#681).
+    #
+    # `claim_the_branch` took it for the MACHINE — see the claim block above for
+    # why it cannot take it for a session — and a machine claim is reachable by no
+    # automatic release the fleet has. Left alone it stands for CLAIM_TTL whatever
+    # happens to the work, which is what #681 measured: three claims still held
+    # seven hours after the issues they named had closed.
+    #
+    # Re-claiming the same issue from inside a session is a RENEW by the same
+    # machine, and a renew stamps the session onto the row that is already there.
+    # So this hands the claim over without moving it: same key, same history, same
+    # plan item, and an owner that `POST /session/end` can find.
+    #
+    # Written HERE rather than into the command briefs because this file is what an
+    # agent opening the tree actually reads, whichever route brought it there —
+    # `/fix-issue`, the epic driver, `qb-start`, or a human who ran the checkout by
+    # hand. A brief covers one route; six briefs cover six, and the routes nobody
+    # remembered stay where they were.
+    #
+    # Only when a claim is actually standing for this tree. `CLAIM_ANSWER` is the
+    # board's own answer and is emptied on every path that took nothing — no
+    # issue in the branch name, no `qb-claim`, an unreachable board — and telling
+    # an agent to hand back a claim that was never taken is worse than silence: it
+    # reads as a record that exists.
+    if [[ -n "$CLAIM_ANSWER" && -n "$CLAIM_ISSUE" ]]; then
+        echo "- **Board claim — adopt it before you start (#681).** \`create-worktree\` claimed"
+        echo "  issue #$CLAIM_ISSUE for this tree. It is held by the MACHINE and names no session,"
+        echo "  so no session ending can hand it back and it stands for $((CLAIM_TTL / 3600))h whatever"
+        echo "  happens to the work. Re-claim it from your own session as your first act here —"
+        echo "  that renews the row that already exists onto your session, so \`/session/end\`"
+        echo "  releases it when you stop:"
+        echo ""
+        echo "      qb-claim issue $CLAIM_ISSUE --repo-path $(sh_quote "$WORKTREE_DIR") --ttl $CLAIM_TTL --note $(sh_quote "working $BRANCH_NAME")"
+        echo ""
+        echo "  Exit 0 is the expected answer and there is nothing further to do. Exit 1 names a"
+        echo "  holder that is not this machine — stop and go and talk to them. Exit 2 is a board"
+        echo "  that could not be reached: say so and carry on, exactly as the checkout did."
+    fi
+    # <<< adopt
     echo "- **Remove this worktree:** \`remove-worktree $(sh_quote "$BRANCH_NAME")\`"
 } > "$WORKTREE_DIR/CLAUDE.local.md"
 
