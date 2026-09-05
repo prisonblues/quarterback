@@ -236,6 +236,59 @@ _once() {   # _once <key>: true the first time only (no expiry) — dedupe by id
   : > "$mark"; return 0
 }
 
+# ---- is this turn somebody declaring work? (#157) ---------------------------
+# A prompt is not a claim. The UserPromptSubmit block below publishes the turn
+# twice — as the lease's `recap`, which is the field peer discovery ranks on, and
+# as a `status` post — and both used to fire on ANY prompt, because the only
+# thing they asked was whether `.prompt` was non-empty.
+#
+# It is often not a person taking something on. A 240-minute board sample of 34
+# auto-claims had 9 that were not work (26.5%): peer messages, task
+# notifications, and scripted sessions whose prompt is a system prompt. The
+# status post is the visible half and the smaller one; the lease write is the
+# damage. It has no throttle at all, so an agent messaged five times in ten
+# minutes had its declared subject overwritten five times with the sender's
+# socket-path wrapper — undiscoverable, for that window, on what it is actually
+# doing. That is precisely the failure the claim exists to prevent, and a peer
+# who checks and is told the coast is clear acts on the answer.
+#
+# THIS IS A HEURISTIC AND IT IS ONE-SIDED ON PURPOSE. Claude Code hands the hook
+# no provenance field — the payload carries the text and nothing about where it
+# came from — so all this can read is the shape of the text. A missing claim is
+# the failure the whole subsystem exists to prevent, so the rule refuses only
+# turns whose OPENING is a wrapper the client itself wrote. A prompt that merely
+# mentions one still claims.
+_declares_work() {   # _declares_work <prompt> — true if this reads as a person's own turn
+  local p="$1" first
+  # Short follow-ups ("yes", "carry on") claim nothing new. This gate already
+  # guarded the post; it guards the lease's subject now too, because "yes"
+  # overwrites a good subject exactly as thoroughly as a wrapper does.
+  [ "${#p}" -gt 25 ] || return 1
+  p="${p#"${p%%[![:space:]]*}"}"
+  first="${p%%$'\n'*}"
+  # One short lead-in line the client may prepend — "Another Claude session sent
+  # a message:" is the observed one — is stepped over, and nothing else is.
+  case "$first" in
+    *"<"*) : ;;
+    *:) if [ "${#first}" -le 120 ]; then
+          p="${p#*$'\n'}"; p="${p#"${p%%[![:space:]]*}"}"; first="${p%%$'\n'*}"
+        fi ;;
+  esac
+  case "$first" in
+    # A peer's message and a subagent finishing are turns nobody typed. Both are
+    # worth a board post — but attributed to the sender, not published under the
+    # recipient's name as the recipient's declared work (#155).
+    "<cross-session-message"*|"<task-notification"*) return 1 ;;
+    # Client plumbing: reminders it injects, a slash command's captured stdout,
+    # a `!` bash line and its output.
+    "<system-reminder"*|"<local-command-"*|"<bash-"*) return 1 ;;
+  esac
+  # NOT excluded: `<command-message>`/`<command-name>` — a slash command is a
+  # person declaring work (`/fix-issue 157`), and the wrapper is how they typed
+  # it. The recap it produces is ugly; it is still true.
+  return 0
+}
+
 # ---- the state beacon -------------------------------------------------------
 # What this session is DOING, for a human looking at a row of panes: working,
 # waiting (on you), input (a prompt is up), or gone. One word, one file, rewritten
@@ -1444,14 +1497,29 @@ case "$EVENT" in
     # query below reads everyone else's. Two agents starting together now both
     # see each other rather than neither. Untitled/unrecapped fields stay as they
     # are — the server only overwrites what we actually send.
+    #
+    # ...but only when the prompt is a person declaring work (#157, `_declares_work`
+    # above). One gate, both writes: patching only the post would leave the
+    # unthrottled subject overwrite in place and make it HARDER to see rather than
+    # smaller. `recap` is empty on this event unless set here, and an empty field
+    # is one the server does not overwrite — so a turn nobody typed leaves the
+    # last real subject standing rather than replacing it with a socket path.
+    #
+    # `_lease` itself still runs on every prompt: it is the presence heartbeat and
+    # the `working` state, and presence is not a claim.
+    declared=""
     if [ -n "$prompt" ]; then
-      recap=$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-300)
+      if _declares_work "$prompt"; then
+        declared=1
+        recap=$(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-300)
+      fi
       _lease
       # ...and say it in the stream too, not just the lease table, so a human and
-      # a plain board_read can both see who took what. Throttled per session, and
-      # skipped for short follow-ups ("yes", "carry on") that claim nothing new.
-      if [ "${#prompt}" -gt 25 ] && _throttle "claim-$sid" 600; then
-        _post status "working on: $(printf '%s' "$prompt" | tr '\n' ' ' | cut -c1-140)"
+      # a plain board_read can both see who took what. Throttled per session —
+      # and the throttle is now spent only by a real claim, where an injected turn
+      # used to burn the slot and silence the genuine prompt behind it.
+      if [ -n "$declared" ] && _throttle "claim-$sid" 600; then
+        _post status "working on: $(printf '%s' "$recap" | cut -c1-140)"
       fi
     fi
 
@@ -1468,7 +1536,11 @@ case "$EVENT" in
     # (b) Same-problem discovery on the current task: match the PROMPT (the
     # strongest subject signal) against live peers in this repo and seed a DIRECT
     # ask, so a silent overlap becomes a conversation. Throttled per session.
-    if [ -n "$repo" ] && [ -n "$prompt" ] && _throttle "discover-$sid" 600; then
+    # `declared` rather than `prompt` for the same reason the claim above uses it
+    # (#157): a socket-path wrapper is not a subject, so matching peers against it
+    # can only produce a false "another agent is also on this" — and it would spend
+    # the 10-minute discovery slot the genuine next prompt needs.
+    if [ -n "$repo" ] && [ -n "$declared" ] && _throttle "discover-$sid" 600; then
       peers=$(curl -sS --max-time 3 "${_auth[@]}" -G "$BASE/overlap" \
         --data-urlencode "mine=$sid" --data-urlencode "repo=$repo" \
         --data-urlencode "subject=$prompt" 2>/dev/null)
