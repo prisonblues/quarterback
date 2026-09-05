@@ -239,6 +239,21 @@ release_the_claim() {
 # then cannot stat a file under that name, so the one path most likely to be
 # somebody's real work is the one silently missing from the archive. -z emits
 # each record raw and NUL-terminated, so there is nothing to unquote.
+
+# Ignored does not mean precious. `--ignored` sweeps in every build cache and
+# vendored dependency tree the project has, and the first unattended run of the
+# equivalent sweep in `stack-reaper` put 11 MB of `.pyc` into an archive meant to
+# hold a few KB of config — on a project whose `.venv` or `node_modules` is a
+# real directory rather than a symlink it is hundreds of megabytes, written and
+# gzipped on every single teardown. Each of these is reconstructed by one
+# command, so losing them costs nothing and archiving them costs the backup the
+# thing that makes it usable.
+#
+# `(^|/)` rather than `^`, because caches nest: anchored at the start only,
+# `apps/__pycache__/` does not match. Whole segments on both ends, so a
+# directory genuinely called `venv-notes` is not swept up with them.
+DISPOSABLE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache|\.tox|\.next|\.nuxt|\.parcel-cache|\.gradle|\.terraform|htmlcov)(/|$)'
+
 collect_dirty_files() {
     local root="$1" rec status path
     while IFS= read -r -d '' rec; do
@@ -251,6 +266,13 @@ collect_dirty_files() {
         # was git's *human* rendering, which -z does not produce at all.)
         if [[ "$status" == R* || "$status" == C* ]]; then
             IFS= read -r -d '' _ || true
+        fi
+        # The disposable filter applies to IGNORED entries only. A tracked file
+        # that happens to sit under one of those names is somebody's edit and is
+        # archived like any other — `!!` is the status git gives the things
+        # .gitignore covers, and it is the only status this drops.
+        if [[ "$status" = "!!" && "$path" =~ $DISPOSABLE ]]; then
+            continue
         fi
         # A deletion has no bytes to archive, and `tar -T` fails the WHOLE run on
         # one entry it cannot stat. Now that a failed backup aborts the teardown,

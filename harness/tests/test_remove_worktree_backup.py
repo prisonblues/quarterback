@@ -231,6 +231,54 @@ def test_no_backup_is_the_escape_hatch_for_a_backup_that_cannot_succeed(
     assert backups(repo) == []
 
 
+def test_a_build_cache_is_not_dragged_into_the_backup(repo, worktree, tmp_path):
+    """`--ignored` sweeps in every cache the project has, and that is a problem.
+
+    The equivalent sweep in `stack-reaper` put 11 MB of `.pyc` into an archive
+    meant to hold a few KB of config; where `.venv` or `node_modules` is a real
+    directory it is hundreds of megabytes, gzipped on every teardown. Each of
+    these is remade by one command, so archiving them costs the backup the thing
+    that makes it usable and saves nothing.
+    """
+    # The worktree's own .gitignore, not the main checkout's: the fixture's
+    # commit is on a branch this worktree does not have, so editing it there
+    # would leave the caches tracked-and-absent rather than ignored, and the
+    # test would pass for the wrong reason.
+    (worktree / ".gitignore").write_text(
+        ".env\ndata/\n__pycache__/\nnode_modules/\n")
+    (worktree / ".env").write_text("SECRET=1\n")
+    (worktree / "__pycache__").mkdir()
+    (worktree / "__pycache__" / "m.pyc").write_bytes(b"\x00" * 64)
+    (worktree / "node_modules").mkdir()
+    (worktree / "node_modules" / "left-pad.js").write_text("//\n")
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    names = archived(repo)
+    assert ".env" in names, names
+    assert not [n for n in names if "__pycache__" in n or "node_modules" in n], names
+
+
+def test_a_tracked_file_under_a_cache_name_is_still_archived(repo, worktree,
+                                                             tmp_path):
+    """The filter drops `!!` entries only.
+
+    A repo that commits something under a directory sharing one of those names
+    has an edit there like any other, and a filter that reached past "ignored"
+    would be silently discarding tracked work — the failure this whole file is
+    about, wearing a different hat.
+    """
+    (worktree / "htmlcov").mkdir()
+    (worktree / "htmlcov" / "notes.md").write_text("kept\n")
+    assert git(worktree, "add", "htmlcov/notes.md").returncode == 0
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert "htmlcov/notes.md" in archived(repo)
+
+
 def test_a_clean_worktree_writes_no_backup_at_all(repo, worktree, tmp_path):
     """`--ignored` must not turn every teardown into a tarball.
 
