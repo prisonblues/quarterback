@@ -941,6 +941,14 @@ class Proposal:
     #: plus one moved input, so a consumer who commits afterwards has a system
     #: nothing here has built, and `--apply` refuses rather than switch onto it.
     base_head: str = ""
+    #: git's own identity (the blob id) for the COMMITTED `flake.lock` when this was
+    #: prepared. Recorded rather than derived from `base_head` on demand, because the
+    #: question it answers — "has the committed baseline moved under me?" — must stay
+    #: answerable after that commit is rewritten, pruned or garbage-collected. Derived
+    #: on demand it silently became "cannot tell", and "cannot tell" is one bad
+    #: default away from discarding an operator's lock (#744). `"none"` when HEAD
+    #: carried no `flake.lock`, which is a different answer from "not recorded".
+    base_head_lock: str = ""
     #: True when `--host` named the attribute rather than it being matched against
     #: this machine's hostname. It is the wrapper question: a `rebuild` wrapper picks
     #: its attribute from the live hostname, so it agrees with a MATCHED attr by
@@ -998,6 +1006,46 @@ def dirty_tracked(flake: Path) -> list[str]:
     return [n for n in (line.strip() for line in out.splitlines()) if n and n != "flake.lock"]
 
 
+def head_lock_blob(flake: Path) -> str:
+    """git's identity for `flake`'s COMMITTED `flake.lock`, or ``"none"`` if HEAD has none.
+
+    A blob id rather than a hash of the bytes: it is what git already computed, it is
+    stable across checkouts, and it costs one `rev-parse` against the object store
+    rather than a read of the working tree — which is the wrong file to read here
+    anyway, since the whole question is what is COMMITTED.
+    """
+    rc, blob, _ = run(["git", "-C", str(flake), "rev-parse", "HEAD:flake.lock"])
+    return blob if rc == 0 else "none"
+
+
+def committed_lock_stayed(flake: Path, recorded: str) -> bool:
+    """True only when `flake`'s committed `flake.lock` is PROVABLY the blob `recorded`.
+
+    This is the guard that makes :func:`lock_is_committed`'s base-hash recognition
+    sound, and it is deliberately phrased so that no answer means no.
+
+    The sequence it exists for: a proposal is prepared while the tree holds lock A; the
+    consumer then commits a DIFFERENT lock D; the operator restores A in the working
+    tree on purpose. The tree now hashes to `base_lock_sha` while holding a change of
+    theirs that a prepare-against-HEAD would discard. Byte-identity with a file this
+    tool once read does not establish that the committed baseline stayed put — only
+    this does.
+
+    An earlier version of this asked the question as "has the lock at `base_head`
+    changed?", and answered "no" whenever `base_head` could not be resolved. That put a
+    garbage-collected or rewritten commit — a rebase away in any consumer — between the
+    operator and their lock: the check went quiet exactly when it had least evidence,
+    which is the one direction a guard must never fail in. So the answer is recorded at
+    prepare time (`Proposal.base_head_lock`) and compared against HEAD's now, and a
+    cache too old to carry it (`""`) is not treated as agreement. That declines the
+    base-only match for one cache written before the field existed — the narrowest
+    possible cost, paid once, by a run that then says exactly what it wants.
+    """
+    if not recorded:
+        return False
+    return head_lock_blob(flake) == recorded
+
+
 def lock_is_committed(flake: Path) -> str:
     """``""`` if the consumer's `flake.lock` is safe to prepare over, else why it is not.
 
@@ -1025,6 +1073,47 @@ def lock_is_committed(flake: Path) -> str:
     it replaces this tool's own lock with a newer version of it and discards nothing.
     A lock that has been edited since, one from a cleared cache, one from another
     machine — none of those match, and all of them still refuse.
+
+    **But what it wrote is only half its handwriting (#744).** A proposal records two
+    hashes: `new_lock_sha`, the lock it WROTE, and `base_lock_sha`, the working-tree lock
+    it READ when it prepared. The second is NOT the lock the build was made from —
+    :func:`prepare` archives HEAD and updates the lock in that copy — it is the file this
+    tool looked at, and `--apply` uses it as a precondition: the tree must still be that
+    lock or the new one, or the build is not a build of this tree. Recognising only the
+    first meant a prepare that was never applied disarmed the recognition for the lock
+    that WAS applied, and that is the ordinary sequence rather than a corner: apply
+    A→B (tree is now `lock(B)`), main moves, prepare B→C to see what the next bump would
+    do, get pulled onto something else. The cache now says `base_lock_sha = lock(B)`,
+    `new_lock_sha = lock(C)`, and the tree — this tool's own applied lock, untouched —
+    matches only the base. Preparing is the cheap, safe half people run without applying,
+    so any such run re-created exactly the state #537 closed, and refused it in a
+    sentence the cache disproved.
+
+    So the base hash is accepted as this tool's handwriting too — but only together with
+    :func:`committed_lock_stayed`, because byte-identity on its own does not prove
+    authorship. It takes both facts:
+
+    1. the tree is byte-identical to what this tool read when it prepared, and
+    2. the COMMITTED lock is provably the same blob it was at that moment.
+
+    Given (2), a tree that was clean when this read it cannot be dirty now with the same
+    bytes — same content, same committed blob, no diff — so the file this read was not
+    HEAD's, and the only other thing it can have been is this tool's own output: the
+    gate below had already passed it, and those are the only two ways past. Which makes
+    the lock in front of us this tool's, still uncommitted, and preparing over it
+    discards nothing. Drop (2) and the argument collapses into a guess — the consumer
+    could have committed a different lock and the operator deliberately restored the old
+    one, which is a change of theirs wearing bytes this tool recognises.
+
+    The `new_lock_sha` branch above is #537's, unchanged and not given the same second
+    fact: reaching it at all means HEAD's committed lock is not what `--apply` wrote, and
+    getting there with a lock the operator meant to keep takes committing a lock that is
+    not the one in the working tree — index surgery, not a `git commit`.
+
+    One proposal with both hashes, rather than a ring of recent ones: consecutive
+    prepares without an apply all read the same unchanged working tree, so they record
+    the same base and shadow nothing. Only an apply moves that tree, and an apply is
+    recorded as the new hash.
     """
     rc, _, _ = run(["git", "-C", str(flake), "diff", "--quiet", "HEAD", "--", "flake.lock"])
     if rc == 0:
@@ -1035,15 +1124,43 @@ def lock_is_committed(flake: Path) -> str:
             current = (flake / "flake.lock").read_text(encoding="utf-8")
         except OSError:
             current = ""
-        if current and sha(current) == mine.new_lock_sha:
+        here = sha(current) if current else ""
+        if here and here == mine.new_lock_sha:
             say(f"{flake}/flake.lock is uncommitted, and is the one this installed "
                 f"({mine.input} -> {mine.new_rev[:12]}) — preparing over it, not "
                 "over anything of yours")
             say("committing it is still yours to do", indent=True)
             return ""
-    return (f"{flake}/flake.lock has uncommitted changes that this did not write. It "
-            "prepares against HEAD, so applying the result would discard them — commit "
-            "or revert that file first")
+        if here and here == mine.base_lock_sha:
+            # Said rather than refused, and said either way: the tool knows the file is
+            # one it has held, so no outcome here may be worded as if it did not.
+            if committed_lock_stayed(flake, mine.base_head_lock):
+                say(f"{flake}/flake.lock is uncommitted, and is byte-for-byte the lock "
+                    f"this read when it prepared {mine.input} "
+                    f"{mine.old_rev[:12]} -> {mine.new_rev[:12]}, over a committed lock "
+                    "that has not moved since — so preparing over it discards nothing")
+                say("committing it is still yours to do", indent=True)
+                return ""
+            if not mine.base_head_lock:
+                return (f"{flake}/flake.lock is the lock this last prepared from, but "
+                        "that proposal predates the record of which committed lock it "
+                        "was prepared over, so this cannot tell whether the file is "
+                        "still its own or a change of yours that looks like it. Re-run "
+                        "`qb-bump` to prepare a proposal that can answer, or commit or "
+                        "revert that file first")
+            return (f"{flake}/flake.lock is the lock this last prepared from, but "
+                    f"{flake} has committed a different lock since — so relative to "
+                    "HEAD it is now a change of yours, and preparing against HEAD would "
+                    "discard it. Commit or revert that file first")
+    # "does not recognise", never "did not write". The tool compares against what it
+    # last wrote AND what it last read, so the honest claim is about recognition; the
+    # authorship claim is one its own cache was able to disprove (#744).
+    detail = ("they are neither the lock it last wrote nor the one it last prepared from"
+              if mine is not None and Path(mine.flake) == flake
+              else "there is no prepared bump of this flake to account for them")
+    return (f"{flake}/flake.lock has uncommitted changes this does not recognise: "
+            f"{detail}. It prepares against HEAD, so applying the result would discard "
+            "them — commit or revert that file first")
 
 
 def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,
@@ -1069,6 +1186,11 @@ def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,
         # afterwards it recorded whatever the consumer had become during an hour-long
         # build, blessing a commit that was never archived and never built.
         base_head = head_of(consumer.flake)
+        # Taken here, beside `base_head`, and for the same reason: what the committed
+        # lock IS at this moment is a fact only this moment can record. Asked later it
+        # becomes "what does the commit I remember say", which a rebase or a `gc` turns
+        # into no answer at all (#744).
+        base_head_lock = head_lock_blob(consumer.flake)
         base_dirty = dirty_tracked(consumer.flake)
         base_lock = (consumer.flake / "flake.lock").read_text(encoding="utf-8")
         why = export_head(consumer.flake, tmp)
@@ -1108,7 +1230,8 @@ def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,
                                f"{moved_under_us[:12]} while this was building, so what "
                                "was built is not what a switch would build. Re-run it.")
         proposal = Proposal(
-            base_head=base_head, dirty=base_dirty, attr_named=attr_named,
+            base_head=base_head, base_head_lock=base_head_lock,
+            dirty=base_dirty, attr_named=attr_named,
             flake=str(consumer.flake), attr=attr, input=consumer.input,
             old_rev=consumer.rev, new_rev=new_rev, out_path=out.splitlines()[-1] if out else "",
             base_lock_sha=sha(base_lock), new_lock_sha=sha(new_lock),

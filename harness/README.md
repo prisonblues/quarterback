@@ -4652,6 +4652,33 @@ distinguishable rather than both being "not HEAD". A working-tree lock that hash
 cached proposal's, for that same flake, is this tool's own output and is prepared over. A
 lock edited since, a proposal for another flake, a cleared cache — all still refuse.
 
+**Both halves of the handwriting, not just the last line of it (#744).** A proposal records
+two hashes: `new_lock_sha`, the lock it wrote, and `base_lock_sha`, the working-tree lock it
+read when it prepared. The second is not the lock the build was made from — preparation
+archives HEAD and updates the lock in *that* copy — it is the file the tool looked at, and
+`--apply` uses it as a precondition. Recognising only the first meant a prepare that was
+never applied disarmed the recognition for the lock that *was* applied — apply A→B, main
+moves, prepare B→C to see what the next bump would do, get pulled onto something else, and
+the tree now matches the base rather than the new. Preparing is the cheap half people run
+without applying, so that sequence is ordinary, and it put the tool back in the state #537
+closed while asserting an authorship its own cache disproved.
+
+A tree matching *either* hash is now prepared over — but the base half needs a second fact,
+because byte-identity with a file this tool once read does not prove the file is still its
+own. The consumer can commit a *different* lock and the operator can then restore the old
+content deliberately, and that tree is a change of theirs wearing bytes the tool recognises.
+So preparation records git's blob id for the **committed** lock, and the base match is
+accepted only when HEAD's committed lock is provably still that blob. Given that, a lock this
+tool read while it was clean cannot be dirty now with the same bytes, so the file it read was
+its own output — which is what makes preparing over it discard nothing.
+
+The blob is *recorded*, not looked up through the commit it came from: asked later, "what
+does the commit I remember say" becomes no answer at all after a rebase or a `gc`, and a
+guard that goes quiet where it has least evidence is the failure it was written to prevent.
+A proposal too old to carry the field declines the base match and says so, which costs one
+refusal for one legacy cache. A lock matching neither hash refuses as before, and says "does
+not recognise" rather than "did not write".
+
 #### Finding the quarterback checkout it compares against
 
 The drift is a comparison between two directories, and one of them is a checkout of this
