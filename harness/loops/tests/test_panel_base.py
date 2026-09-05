@@ -272,8 +272,12 @@ def test_a_skipped_round_keeps_the_free_end_and_buys_nothing(monkeypatch, tmp_pa
 # mis-scoped round must not be SILENT.
 #
 # #747 CORRECTS WHAT THE NOTE TESTS FOR, and the correction is the second half of
-# this section. `gh pr diff` does not build from `baseRefOid`; it builds the
-# three-dot diff from `merge-base(baseRefOid, head)`. So `baseRefOid != fork
+# this section. `gh pr diff` does not build from `baseRefOid`; measured on three
+# constructed PRs, it builds the three-dot diff from `merge-base(baseRefOid,
+# head)`. Every test below INJECTS that commit as `diff_base`, so what they pin
+# is the panel's behaviour given the diff base — not the inference that GitHub
+# computes it that way, which no stubbed test can check and which `panel.run`
+# carries the caveat for. So `baseRefOid != fork
 # point` is NOT the mis-scoping condition — it is the ordinary state of any
 # branch cut from an older commit than the base tip (#270's shape), where that
 # merge base IS the fork point and the diff is exactly right. Measured on
@@ -317,6 +321,45 @@ def test_a_diff_built_behind_the_fork_point_is_named_in_config_notes(
     assert len(said) == 1, payload["config_notes"]
     assert "e08372ae" in said[0] and "e38c1020" in said[0]
     assert "gh pr diff" in said[0], "a reader has to be told which base was used"
+
+
+def test_a_diff_built_AHEAD_of_the_fork_point_warns_the_same_way(
+        monkeypatch, tmp_path):
+    """The reversed ancestry, and the reason the note says "omit or include"
+    rather than naming already-landed code.
+
+    Take `A—B—H` with the stored base at `B`, then reset the BASE branch back to
+    `A` with the head untouched. The predicted diff base is `merge-base(B, H) =
+    B`; the fork point is now `merge-base(A, H) = A`. The predicate fires — and
+    the defect is the opposite one: the diff OMITS `A..B` rather than carrying
+    anything that has landed. A note that told this reader to go looking for
+    surplus code would be describing a diff that is missing some, so the wording
+    commits to neither direction."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="bbbb2222",
+                      fork_point="aaaa1111", diff_base="bbbb2222")
+    said = [n for n in payload["config_notes"] if "MIS-SCOPED" in n]
+    assert len(said) == 1, payload["config_notes"]
+    assert "omit or include" in said[0], said[0]
+    assert "already landed" not in said[0], \
+        "the reversed shape drops code from the range rather than adding it"
+
+
+def test_no_stored_base_at_all_says_the_diff_base_is_unknown(
+        monkeypatch, tmp_path):
+    """A `gh` that answered no `baseRefOid` but a compare that read fine.
+
+    Distinct from "the stored base agrees with the fork point", and the two were
+    one branch until #747's review split them. With nothing stored there is no
+    `merge-base(stored, head)` to ask for, so the premise the check rests on
+    cannot be evaluated at all — which is not the same as evaluating it and
+    finding nothing wrong. Staying silent here would report an unexamined target
+    as an examined one."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base=None,
+                      fork_point="0ddba5e0")
+    assert payload["merge_base"] == "0ddba5e0"
+    said = " ".join(payload["config_notes"])
+    assert "no stored base" in said and "unverified" in said, payload["config_notes"]
+    assert not any("MIS-SCOPED" in n for n in payload["config_notes"])
 
 
 def test_a_base_branch_that_merely_moved_raises_no_note(monkeypatch, tmp_path):
@@ -364,9 +407,42 @@ def test_an_unreadable_diff_base_says_unverified_not_mis_scoped(
     payload, _ = _run(monkeypatch, tmp_path, merge_base="46219a54",
                       fork_point="d282366d", diff_base=None)
     said = " ".join(payload["config_notes"])
-    assert "unverified rather than as wrong" in said
+    assert "unverified rather than wrong" in said
     assert "46219a54" in said and "d282366d" in said
     assert not any("MIS-SCOPED" in n for n in payload["config_notes"])
+
+
+def test_the_stub_refuses_a_compare_from_anything_it_was_not_taught(monkeypatch):
+    """#747's review, and a test about the STUB rather than the panel.
+
+    The diff-base read is told from the fork-point read by what it compares FROM,
+    and an earlier cut of that classified "anything that is not the base branch"
+    as the diff-base read. That hands the expected answer to a regression that
+    compares from the head, from an unrelated sha, or from a misspelled branch —
+    green tests over a call nobody meant to make, which is the exact hole
+    `strict` exists to close. Both operands are matched now, so the wrong ones
+    raise like any untaught call."""
+    sh = gh_stub(meta=pr_meta(head="aaa111", merge_base="0ddba5e0"),
+                 merge_base="0ddba5e0", fork_point="d282366d",
+                 diff_base="d282366d")
+    jq = ["--jq", panel._MERGE_BASE_JQ]
+
+    def ask(rng):
+        return sh(["gh", "api", f"repos/acme/board/compare/{rng}?per_page=1"] + jq)
+
+    # The two calls panel.py really makes.
+    assert ask("main...aaa111").strip() == "d282366d"
+    assert ask("0ddba5e0...aaa111").strip() == "d282366d"
+
+    for bad, why in [("aaa111...aaa111", "compared from the HEAD"),
+                     ("deadbeef...aaa111", "compared from an unrelated sha"),
+                     ("mian...aaa111", "compared from a misspelled branch"),
+                     ("main...bbb222", "asked about the wrong head")]:
+        try:
+            ask(bad)
+        except AssertionError:
+            continue
+        raise AssertionError(f"stub answered a call it should not know: {why} ({bad})")
 
 
 def test_an_unreadable_fork_point_falls_back_and_says_which_base_it_used(

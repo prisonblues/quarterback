@@ -40,7 +40,8 @@ them apart: by their ``--jq`` (a merge base, versus a range of file patches for
 ``_fix_range_diff``) and then, between the two merge-base reads, by what they
 compare FROM. Asking from the base BRANCH gives the fork point
 (:func:`panel_scope._merge_base_now`, #241); asking from the stored base's SHA
-gives the commit ``gh pr diff`` actually built its diff from (#747). There used
+gives the commit ``gh pr diff`` is inferred to have built its diff from (#747).
+There used
 to be a ``gh pr view --json baseRefOid`` here instead of the first — that read is
 the defect #241 is about, because ``baseRefOid`` is the base branch's tip as of
 the last head push and not a merge base.
@@ -285,7 +286,8 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
       merge_base_after: what the fork-point read answers once the head has
         moved. Defaults to the unchanged `fork_point` (the no-op path).
       diff_base: what the compare API answers for `merge-base(stored base, head)`
-        — the commit `gh pr diff` actually built its diff from (#747). Only asked
+        — the commit `gh pr diff` is inferred to build its diff from (#747, an
+        undocumented behaviour measured rather than promised). Only asked
         when `merge_base` and `fork_point` disagree. Defaults to `fork_point`,
         i.e. the stored base is merely an older tip of the base branch and the
         diff is correct, which is #270's shape and most PRs. Give it a value
@@ -391,10 +393,32 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
                     # #747's diff-base check asks from the stored base's SHA. On
                     # the path panel.py actually sends, for the same reason the
                     # `--jq` discrimination above is.
-                    lhs = path.split("/compare/", 1)[1].split("...", 1)[0]
-                    if lhs != base.get("baseRefName"):
+                    #
+                    # BOTH operands are matched, and neither is a wildcard. An
+                    # earlier cut of this took "left side is not the base branch"
+                    # to mean the diff-base read, which is the shape of stub bug
+                    # this file's `strict` exists to prevent: a regression that
+                    # compared from the HEAD, from an unrelated sha, or from a
+                    # misspelled branch would have been handed the answer the
+                    # test wanted and passed. Anything not recognised raises
+                    # below, like any other untaught call.
+                    lhs, _, rhs = path.split("/compare/", 1)[1].partition("...")
+                    rhs = rhs.split("?", 1)[0]
+                    # The head moves mid-round on the `head_moves_to` path, and
+                    # the re-read legitimately asks about the NEW head.
+                    heads = {h for h in (the_head, head_moves_to) if h}
+                    if rhs not in heads:
+                        raise AssertionError(
+                            f"compare asked about {rhs!r}, not the PR's head "
+                            f"({', '.join(sorted(map(repr, heads)))}): {args!r}")
+                    if lhs == the_merge_base and lhs != base.get("baseRefName"):
                         got = the_fork if diff_base is UNSET else diff_base
                         return "" if got is None else f"{answer(got)}\n"
+                    if lhs != base.get("baseRefName"):
+                        raise AssertionError(
+                            f"compare asked from {lhs!r}, which is neither the "
+                            f"base branch ({base.get('baseRefName')!r}) nor the "
+                            f"stored base ({the_merge_base!r}): {args!r}")
                     # The first read is the round's own; any later one is the
                     # re-read after the head moved, exactly as `head_moves_to`
                     # applies from the first single-field head read.

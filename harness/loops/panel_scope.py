@@ -970,18 +970,27 @@ def _merge_base_now(gh_repo: str, base_ref: str, head_sha: str) -> str | None:
     the weak one — `baseRefOid` is not a merge base — and only asking for a merge
     base satisfies it.
 
-    **What `gh pr diff` builds from is `merge-base(baseRefOid, head)`**, not
-    `baseRefOid` itself (#747, measured on three constructed PRs). So the two
-    directions above do not cost the same: in #270's shape the stored tip is off to
-    the side of the head branch and that merge base IS the fork point, so the diff
-    is exactly right; in #187's shape the stored tip is an ancestor of the head and
-    the diff is built from it, which is how a round came to spend 15 confirmed
-    findings on already-landed code. A caller wanting to know which shape it is in
-    asks this function a second time with the STORED BASE in `base_ref` — see the
-    `config_notes` block in `panel.run`.
+    **A caller can also ask this for the commit `gh pr diff` appears to build
+    from**, by passing the STORED BASE in `base_ref` — `merge-base(baseRefOid,
+    head)`. That is what the `config_notes` block in `panel.run` does, and the
+    reading rests on an INFERENCE rather than on a contract: `gh pr diff` GETs the
+    pull endpoint under a diff media type and prints what comes back, so nothing
+    documented ties its response to this computation. Measured on 2026-09-05 across
+    three pull requests built to hold one shape each; in all three the diff matched
+    `merge-base(base.sha, head)...head` file for file, and in none did it match a
+    diff from `base.sha` itself. It explains both of #241's directions: in #270's
+    shape the stored tip is off to the side of the head branch, so that merge base
+    IS the fork point and the diff is right; in #187's shape the stored tip is an
+    ancestor of the head and the diff is built from it, which is how a round came to
+    spend 15 confirmed findings on already-landed code. Treat it as the best current
+    reading of an undocumented behaviour — `panel.run` carries what breaks if it
+    stops holding.
 
-    The compare endpoint's `merge_base_commit` IS `git merge-base <base> <head>`,
-    computed by GitHub against the base branch as it stands now. Read from the API
+    The compare endpoint's `merge_base_commit` IS `git merge-base <a> <b>` for the
+    two commit-ishes given. For the fork-point caller that means the base branch as
+    it stands NOW, since it passes a branch name and the branch is re-resolved on
+    every call; for the diff-base caller it means a fixed pair, since the stored
+    base is an immutable sha. Read from the API
     rather than from a local `git merge-base` because nothing else in this panel
     needs a checkout: the whole tool reads GitHub, runs anywhere `gh` is
     authenticated, and a local computation would be right only when the PR's head
@@ -1024,9 +1033,11 @@ def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
     So a staleness check built on `baseRefOid` alone reads "unmoved, the review
     still stands" in exactly the case it exists to catch. Both ends are recorded
     because they answer different questions: `merge_base` is the PR's own base
-    commit — what a whole-PR diff is built from, and what #41's tier-2 context is
+    commit — the range the PR OUGHT to contribute, and what #41's tier-2 context is
     measured from under increment scope — while this is what the branch would be
-    merged INTO.
+    merged INTO. Not, note, a promise about what `gh pr diff` was actually built
+    from: #747 keeps a `config_notes` warning for the case where the two come
+    apart, and #187 is the case.
 
     `git/ref/heads/…` rather than `commits/…`: it returns one object of a few
     hundred bytes where the commits endpoint ships the whole commit including its
