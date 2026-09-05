@@ -338,6 +338,89 @@ def test_the_refusal_says_what_to_do_instead(shared):
     assert "git stash" not in reason
 
 
+def test_the_refusal_spells_out_the_red_green_undo(shared):
+    """The case that keeps arriving here is "take my fix out, run the test, put
+    it back", and on 2026-09-04 an agent that was refused it reached for
+    `checkout-index -a -f` and emptied its worktree from the index. A hint that
+    stops at "save your work first" leaves that caller to invent the rest, which
+    is exactly what it did — so the patch-and-replay recipe is in the message,
+    not implied by it."""
+    reason = shared.decision(shared.bash("git reset --hard"))["permissionDecisionReason"]
+    assert "git apply -R" in reason               # take it out
+    assert 'git apply "$p"' in reason             # and put it back
+    assert "git show <ref>:<path>" in reason      # one file, without touching the others
+
+
+def test_the_recipe_is_gated_on_being_alone_in_the_tree(shared):
+    """The first draft of that hint was itself destructive, and a second-opinion
+    review caught it. `git diff HEAD -- <paths>` selects by PATH, and a path is
+    not an owner: in the shared tree this message is printed in, those paths hold
+    a peer's uncommitted edits too, so replaying the patch in reverse deletes
+    their work with ours. Handing that back under this guard's authority is worse
+    than saying nothing, so the recipe is now what to do once step 1 has been
+    taken, and the message says why in as many words."""
+    reason = shared.decision(shared.bash("git reset --hard"))["permissionDecisionReason"]
+    assert "NOT IN THIS TREE" in reason
+    assert "A PATH IS NOT AN OWNER" in reason
+    # `| tee <path>` truncates the destination before `git show` can fail, and
+    # without `pipefail` the pipeline still reports success — so the file is
+    # emptied by the command offered to restore it. Gone, and it must stay gone.
+    assert "| tee" not in reason
+    # A fixed patch name collides between concurrent agents in one tree, which is
+    # the population this guard exists for; a plain diff cannot replay a binary
+    # hunk, and the replay is the half that puts the work back; and `|| echo`
+    # prints a warning and then runs the next command anyway.
+    assert "mktemp" in reason
+    assert "git diff --binary HEAD" in reason
+    assert "|| exit 1" in reason
+    assert "redgreen.patch" not in reason
+
+
+def test_a_path_scoped_undo_here_would_take_the_peers_edit(tmp_path):
+    """The behaviour behind the sentence above, in the shape it actually arrives:
+    ONE FILE, TWO AGENTS. Asserting that the message contains some words proves
+    nothing about whether the words are true, so this runs the two routes against
+    a file holding both agents' uncommitted work.
+
+    The path-scoped route is the one the hint used to give and no longer does.
+    The isolated route is the one it gives now, and the peer's line survives it."""
+    def git(*a, cwd=tmp_path):
+        return subprocess.run(("git", *a), cwd=cwd, capture_output=True, text=True, timeout=30)
+
+    git("init", "-q", ".")
+    git("config", "user.email", "a@b")
+    git("config", "user.name", "a")
+    app = tmp_path / "app.py"
+    app.write_text("base\n")
+    git("add", "app.py")
+    git("commit", "-qm", "base")
+
+    # A shared checkout: their uncommitted line and ours, in one file.
+    app.write_text("base\npeer-edit\nmy-edit\n")
+
+    # Route one — select by path, reverse the patch. Both lines go.
+    patch = tmp_path / "p.patch"
+    git("add", "-N", "app.py")
+    patch.write_text(git("diff", "--binary", "HEAD", "--", "app.py").stdout)
+    assert git("apply", "-R", str(patch)).returncode == 0
+    assert "peer-edit" not in app.read_text(), "the peer's line survived — scenario is wrong"
+
+    # Route two — step 1 first, then red/green somewhere nobody else is standing.
+    app.write_text("base\npeer-edit\nmy-edit\n")
+    wt = tmp_path / "mine"
+    git("worktree", "add", "-q", "--detach", str(wt))
+    mine = wt / "app.py"
+    mine.write_text("base\nmy-edit\n")
+    p2 = tmp_path / "p2.patch"
+    git("add", "-N", "app.py", cwd=wt)
+    p2.write_text(git("diff", "--binary", "HEAD", "--", "app.py", cwd=wt).stdout)
+    assert git("apply", "-R", str(p2), cwd=wt).returncode == 0      # red
+    assert git("apply", str(p2), cwd=wt).returncode == 0            # and back
+    assert mine.read_text() == "base\nmy-edit\n"
+    # The whole point: the tree the peer is standing in was never touched.
+    assert app.read_text() == "base\npeer-edit\nmy-edit\n"
+
+
 def test_a_peers_subagent_counts_as_a_peer(shared):
     """A peer's fan-out edits the peer's tree with the peer's hands. Losing its
     work loses the peer's work, so `subagents` is not a separate, softer case."""

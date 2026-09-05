@@ -317,9 +317,101 @@ def _destroys(verb: str, args: list[str], tree: str | None) -> bool:
         # An abort restores the pre-operation state, discarding whatever was
         # written into the tree while the conflict was being resolved.
         return _has(args, "--abort")
-    # `checkout-index -f` and `read-tree --reset -u` were here and are gone. Both
-    # are real, and neither has ever happened: they were reach, and reach is what
-    # the second round's thirteen P1s were made of.
+    if verb == "checkout-index":
+        # THE THIRD RUNG, and the one that was reasoned away. What stood here
+        # said `checkout-index -f` and `read-tree --reset -u` were reach — real
+        # forms that had never happened — and on 2026-09-04 one of them
+        # happened. A sub-agent doing the red/green step of `/fix-issue` in the
+        # lexray repo found the ref-restore form refused, reached for this one
+        # instead, and rewrote every tracked file in its worktree from the
+        # index: finished documentation edits reverted, a new module truncated.
+        # It recovered because it happened to notice, and nothing else said a
+        # word — this command is silent on success.
+        #
+        # The reasoning is not what was wrong; its premise was. "Reach" was
+        # never a claim about the command, it was a claim about the CALLER, and
+        # the caller here is an agent that has just been refused and is looking
+        # for the next thing that does the same job. Refusing the rung above
+        # this one does not remove the reach. It aims it.
+        #
+        # And this is the worst of the three: `-a` names no path, so the blast
+        # radius is the whole worktree rather than one file; there is no ref, so
+        # it does not read as "discard against a ref" to anyone reviewing it;
+        # and it says nothing when it works.
+        #
+        # `-f` and `-a` are each enough, and they destroy DIFFERENT things.
+        # `-f` authorises the overwrite: without it git writes nothing over a
+        # file that exists, it prints `already exists, no checkout` and returns
+        # 1. `-a` cannot overwrite — and it can still take a peer's work, by
+        # RECREATING A FILE THEY DELETED. An uncommitted `rm` is uncommitted
+        # work like any other, the path is absent so no force is needed to write
+        # it, and the deletion is silently undone. Measured, 2026-09-05: `rm
+        # f.txt` then `checkout-index -a` put `f.txt` back.
+        #
+        # That is the argument for taking `-a`, and it replaces the one that was
+        # here. This guard does not predict what a caller will type next.
+        #
+        # Forms that DEMONSTRABLY do not write a tracked destination are out,
+        # all measured on git 2.54.0, 2026-09-05:
+        #   * `--temp` and `--stage=all` write `.merge_file_*` and print the
+        #     mapping; the tracked paths are untouched.
+        #   * an ABSOLUTE `--prefix=` is the export idiom and lands outside the
+        #     tree. The relative spelling is not the same command: `--prefix=./`
+        #     overwrote the tracked file outright, and `--prefix=sub/` wrote
+        #     into `sub/`, which holds tracked files of its own. So only the
+        #     absolute form is exempt, and only where it is outside the tree.
+        #
+        # `-n` is NOT on that list, and it is the trap. It is `--no-create`, not
+        # a dry run: `-a -f -n` overwrote the tracked file in the same
+        # measurement. The `clean -n` exemption above must not be copied down
+        # here on the strength of the letter.
+        if _has(args, "--temp", "--stage=all"):
+            return False
+        prefix = next((a.split("=", 1)[1] for a in args if a.startswith("--prefix=")), None)
+        if prefix is not None and prefix.startswith("/"):
+            try:
+                outside = tree is None or not Path(prefix).resolve().is_relative_to(
+                    Path(tree).resolve())
+            except (OSError, ValueError):
+                outside = False
+            if outside:
+                return False
+        return _has(args, "-f", "--force", "-a", "--all") or bool(flags & set("fa"))
+    if verb == "read-tree":
+        # The sibling named in that same removed sentence, and the next rung
+        # down from `checkout-index`. `--reset -u` discards local changes and
+        # writes the tree out over them, naming no paths: the same shape, the
+        # same blast radius, and plumbing, so it reads as machinery rather than
+        # as a discard.
+        #
+        # It has NOT happened, and it is here anyway because the one above it
+        # has. What 2026-09-04 measured is not that this particular verb is
+        # popular — it is that a refusal moves the caller one rung down rather
+        # than stopping it, and the bottom rung is where the refusals above it
+        # send them. Guarding the family one incident at a time is how the
+        # family gets walked one incident at a time.
+        #
+        # BOTH halves are the condition, and each one is load-bearing.
+        # `--reset` without `-u` rewrites the index and stops there, and
+        # index-only damage is consistently not this harm — `reset HEAD~1` and
+        # `restore --staged` are both false above for the same reason. And `-u`
+        # is not enough on its own: bare `-u` is refused outright (`fatal: -u is
+        # meaningless without -m, --reset, or --prefix`), and of the three
+        # partners that sentence names, the common one is `-m` — a MERGE, which
+        # carries a local change forward rather than writing over it, and which
+        # therefore stays unguarded. Measured on git 2.54.0, 2026-09-05.
+        #
+        # And a dry run is exempt, as it is for `clean` above. `--reset -u -n`
+        # and `--reset -u --dry-run` satisfy every other condition here and
+        # update neither the index nor the worktree — measured in the same
+        # session. Refusing one would break the promise the module header makes
+        # in its own words, citing `clean -n` as the precedent, and a guard that
+        # fires on a command which changes nothing is a guard that gets read as
+        # noise. Unlike `checkout-index`, where `-n` means `--no-create` and
+        # overwrites, `-n` here is genuinely `--dry-run`.
+        if _has(args, "-n", "--dry-run") or "n" in flags:
+            return False
+        return _has(args, "--reset") and (_has(args, "-u", "--update") or "u" in flags)
     return False
 
 

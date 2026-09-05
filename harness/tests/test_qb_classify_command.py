@@ -415,3 +415,123 @@ def test_an_explicit_object_off_the_shared_stack_is_not_this_harm(cmd):
 ])
 def test_the_shared_stack_is_still_named_however_it_is_spelled(cmd):
     assert classify(cmd)["harm"] == "takes", cmd
+
+
+# ------------------------------------------------- the rung below a refusal (#745)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout-index -a -f",
+    "git checkout-index -f -a",
+    "git checkout-index -af",
+    "git checkout-index --all --force",
+    "git checkout-index -a",                          # before anyone reaches for -f
+    "git checkout-index -f -- app.py",                # one file, the same overwrite
+    "git -c core.filemode=false checkout-index -a -f",
+    "sh -c 'git checkout-index -a -f'",
+    "git status && git checkout-index -a -f",
+])
+def test_restoring_the_tree_from_the_index_is_destructive(cmd):
+    """2026-09-04, lexray. A sub-agent doing the red/green step of `/fix-issue`
+    found the ref-restore form refused, ran this instead, and rewrote every
+    tracked file in its worktree from the index — finished edits reverted, a new
+    module truncated, nothing said. It is the worst of that family: `-a` names no
+    path, there is no ref to make it read as a discard, and it is silent when it
+    works."""
+    assert classify(cmd)["harm"] == "destroys", cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout-index app.py",     # no -f: git will not write over a file that exists
+    "git checkout-index",
+    "git checkout-index --help",
+    "git checkout-index --stdin",
+])
+def test_a_checkout_index_that_cannot_overwrite_is_left_alone(cmd):
+    assert not destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout-index -a -f --temp",
+    "git checkout-index -a --temp",
+    "git checkout-index -a -f --stage=all",
+    "git checkout-index -a -f --prefix=/tmp/export/",
+    "git -C /srv/repo checkout-index -a -f --prefix=/tmp/export/",
+])
+def test_a_form_that_writes_no_tracked_destination_is_not_refused(cmd):
+    """A guard that fires on a temp-file export is one that gets ignored when it
+    fires for real, and these demonstrably do not touch a tracked path — measured
+    on git 2.54.0: `--temp` and `--stage=all` write `.merge_file_*` and print the
+    mapping, and an absolute `--prefix=` lands outside the tree entirely."""
+    assert not destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    # `--prefix=./` overwrote the tracked file outright, and `--prefix=sub/`
+    # writes into a directory that holds tracked files of its own. Relative is
+    # not the export idiom; only the absolute spelling is exempt.
+    "git checkout-index -a -f --prefix=./",
+    "git checkout-index -a -f --prefix=sub/",
+    # `-n` is `--no-create`, NOT a dry run. `-a -f -n` overwrote the tracked file
+    # in the same measurement, so the `clean -n` exemption must not be copied
+    # down here on the strength of the letter.
+    "git checkout-index -a -f -n",
+    "git checkout-index -a -fn",
+])
+def test_the_forms_that_look_exempt_and_are_not(cmd):
+    assert destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git read-tree --reset -u -n HEAD",
+    "git read-tree --reset -u --dry-run HEAD",
+    "git read-tree --reset -un HEAD",
+])
+def test_a_read_tree_dry_run_is_exempt_like_every_other_dry_run(cmd):
+    """`clean -n` is exempt and the module header cites it as the precedent, so a
+    guard that refused this one would be breaking its own stated promise. These
+    satisfy every other condition of the rule and update neither the index nor
+    the worktree — measured on git 2.54.0."""
+    assert not destructive(cmd), cmd
+
+
+def test_recreating_a_peers_deletion_is_why_all_is_taken_without_force():
+    """`-a` cannot overwrite an existing file, and it is refused anyway for a
+    reason that does not rest on guessing what the caller types next: it
+    RECREATES a file the peer deleted. An uncommitted `rm` is uncommitted work,
+    the path is absent so no force is needed to write it, and the deletion goes
+    away silently. Measured 2026-09-05: `rm f.txt` then `checkout-index -a` put
+    `f.txt` back."""
+    assert destructive("git checkout-index -a")
+    assert classify("git checkout-index -a")["harm"] == "destroys"
+
+
+@pytest.mark.parametrize("cmd,want", [
+    ("git read-tree --reset -u HEAD", True),
+    ("git read-tree -u --reset HEAD", True),
+    ("git read-tree --reset --update HEAD", True),
+    ("git read-tree -m -u --reset HEAD", True),
+    ("git read-tree -um --reset HEAD", True),
+    # `--reset` alone rewrites the INDEX and stops there, and index-only damage
+    # is consistently not this harm — `reset HEAD~1` and `restore --staged` are
+    # both false for the same reason. `-u` alone is not a command git accepts
+    # (`fatal: -u is meaningless without -m, --reset, or --prefix`), and `-m -u`,
+    # which it does, is a merge that carries the local change forward rather than
+    # writing over it. All three measured on git 2.54.0.
+    ("git read-tree --reset HEAD", False),
+    ("git read-tree -u HEAD", False),
+    ("git read-tree -m -u HEAD", False),
+    ("git read-tree HEAD", False),
+    ("git read-tree --help", False),
+])
+def test_the_next_rung_down_needs_both_halves(cmd, want):
+    assert destructive(cmd) is want, cmd
+
+
+def test_the_new_verbs_answer_to_the_tree_hatch_like_the_rest():
+    """They are the `destroys` harm, so they are escaped by the hazard's own
+    hatch and by no other — a caller who has settled it with the peer standing
+    in the tree gets through, and `QB_ALLOW_SHARED_STASH` is not that caller."""
+    assert classify("QB_ALLOW_SHARED_TREE=1 git checkout-index -a -f")["allowed_by"]
+    assert classify("QB_ALLOW_SHARED_TREE=1 git read-tree --reset -u HEAD")["allowed_by"]
+    assert not classify("QB_ALLOW_SHARED_STASH=1 git checkout-index -a -f")["allowed_by"]

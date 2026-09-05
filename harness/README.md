@@ -940,7 +940,10 @@ fixes while they were still writing them.
   `takes`, is below and is gated differently):
   - it **destroys** it — `reset --hard|--merge`, `checkout` of a path or with `-f`,
     `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
-    `rm -f`, `worktree remove --force`, the `--abort` of an in-progress merge/rebase/cherry-pick;
+    `rm -f`, `worktree remove --force`, `checkout-index -f|-a`, `read-tree --reset -u`, the
+    `--abort` of an in-progress merge/rebase/cherry-pick. Not `checkout-index --temp`,
+    `--stage=all` or an absolute `--prefix=`, which write no tracked destination, and not
+    `read-tree`'s `-n`/`--dry-run`;
   - or it **absorbs** it — `commit -a`, `add .`/`-A`/`-u`. In a shared tree you cannot tell your
     uncommitted files from theirs, so staging "everything" stages theirs;
 - **the tree that command will actually touch** holds some, **untracked files included** —
@@ -951,6 +954,25 @@ fixes while they were still writing them.
 Take any one away and nothing happens. A clean tree is never refused. Alone in a tree, your own
 uncommitted work stays yours to throw away. `--help` is never refused, and neither is a dry run:
 `git clean -n`, `-fdn` and `--dry-run` print what they would remove and remove nothing.
+
+**The last two of those verbs arrived by being reached for.** `checkout-index` and `read-tree`
+were both considered when the list was written and both left out, on the grounds that they were
+real forms nobody had ever actually run. On 2026-09-04 a sub-agent in the lexray repo, refused
+the ref-restore form during a red/green step, ran `git checkout-index -a -f` instead and rewrote
+every tracked file in its worktree from the index — reverting finished edits and truncating a new
+module, silently, since that command says nothing when it works. It recovered because it happened
+to look. "Nobody reaches for it" was never a claim about the command; it was a claim about the
+caller, and the caller is somebody who has just been refused, so the rung below a guarded command
+is precisely where a refusal sends them. `read-tree --reset -u` is the next rung down again and
+is guarded for that reason rather than for an incident of its own.
+
+`-a` is taken without `-f` even though it cannot overwrite an existing file, because it can still
+**recreate one the peer deleted** — an uncommitted `rm` is uncommitted work, and no force is
+needed to write a path that is absent. What is *not* taken is anything that demonstrably writes
+no tracked destination: `--temp` and `--stage=all` write `.merge_file_*`, and an absolute
+`--prefix=` exports outside the tree. The relative spellings are a different command — measured,
+`--prefix=./` overwrote the tracked file — and `-n` here is `--no-create`, not a dry run, so the
+`clean -n` exemption does not reach it. `read-tree`'s `-n` genuinely is one, and is exempt.
 
 **There is a third harm, and it deliberately does not use those three facts.** `git stash pop`
 and `git stash apply` **take** a peer's work rather than destroying or absorbing it (#739), and
