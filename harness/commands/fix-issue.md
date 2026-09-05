@@ -156,6 +156,38 @@ refused by the `dcg` pre-tool guard (`core.filesystem:redirect-truncate-root-hom
 so the obvious `printf … > "$marker"` never runs and the bar spends the whole
 session showing the main checkout. `tee` is not a redirect and is allowed.
 
+**Adopt the checkout's claim onto this session — one command, and it is not
+bookkeeping.** `create-worktree` claimed `$ISSUE_NUMBER` for the tree, held by the
+machine and naming no session. That is right at checkout time (the agent that will
+work here does not exist yet) and it leaves the claim unreleasable afterwards:
+`POST /session/end` frees what a *session* took, and `qb-reconcile` looks a holder
+up in `/active`, where a bare machine name can never appear. Re-claim it from
+here — the board reads that as a renew by the same machine and stamps your session
+onto the row that already exists, so the claim keeps its key, its history and its
+plan item and gains an owner:
+
+```bash
+qb-claim issue $ISSUE_NUMBER --repo-path "$WT_DIR" --ttl 28800 \
+  --note "working $ISSUE_NUMBER in $WT_DIR"
+```
+
+- **Exit 0** — it is yours, and ending this session now hands it back.
+- **Exit 1** — a holder that is not this machine. STOP and go and talk to them
+  before you write anything; you are about to work an issue somebody else has.
+- **Exit 2** — the board could not be reached, or there is no `qb-claim` here. Say
+  so in your final report and carry on: a coordination tool that cannot be reached
+  must not stop the work, which is the rule the checkout itself follows.
+
+**Every route through this step wants it, including the two that skipped
+`create-worktree`.** On the epic and reuse routes there may be no claim standing at
+all, and then this takes a fresh one — with a session on it from the start. The
+worktree's own `CLAUDE.local.md` carries the same line for an agent that arrives
+here by some other route entirely.
+
+Without it the issue reads as held by this machine for eight hours after you stop,
+whether or not the work landed. That is the state #681 measured: nine standing
+claims on one box, three of them naming issues that had closed seven hours before.
+
 **Work via explicit paths, not a persistent `cd`.** Because the cwd resets every
 call, do NOT assume you're "in" the worktree. For the rest of this skill:
 - git commands: `git -C "$WT_DIR" …`

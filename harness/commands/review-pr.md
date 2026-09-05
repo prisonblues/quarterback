@@ -34,6 +34,44 @@ Capture: repo (`gh repo view --json nameWithOwner`), remote, base branch, the
 PR number (if any), the branch name, and the absolute repo path. Pass all of
 these to the sub-agent.
 
+## 1b. Claim what you are about to review
+
+Nothing on the review path has ever claimed anything, so an agent three hours into
+a review read — on every fleet surface — exactly like one that had just opened the
+repo, and the plan went on offering the work (#713). `/panel-review-pr` had the
+same hole until #715 gave `panel.py` a claim of its own; this command still had
+none, and this one *fixes and pushes*, so a duplicate here is not merely wasteful.
+
+Take it **in this conversation, before you launch the sub-agent**. The claim then
+names this session, so ending the session releases it (#681) — a sub-agent's
+session is not this one, and a claim taken inside the fixer would go back to being
+something only a TTL could end.
+
+- **A PR number was given:**
+  ```bash
+  qb-claim pr <n> --no-plan-item --ttl 10800 --note "review-pr: reviewing and fixing PR #<n>"
+  ```
+  `--no-plan-item` is #722. A claim on an issue or a PR normally writes that repo's
+  plan item at rank 1, because picking work up is the one act that should put work
+  on the board (#427) — but reviewing a PR is not picking it up, and the row it
+  wrote sat open at rank 1 after the claim was released, offering the next agent a
+  review that had already happened.
+- **No argument (the current branch), and the branch names an issue** — `fix/issue-N`
+  and friends: `create-worktree` already claimed `N` for this tree, held by the
+  machine. Adopt that claim instead of taking a second one; re-claiming from here is
+  a renew by the same machine and stamps this session onto the existing row, which
+  is what lets `/session/end` end it (#681):
+  ```bash
+  qb-claim issue <the number in the branch> --ttl 28800 --note "reviewing $(git branch --show-current)"
+  ```
+- **No argument and the branch names no issue** — there is nothing repo-global to
+  key on. Say so in the relay and carry on; do not invent a resource to claim.
+
+Whichever line ran: **exit 0** is expected; **exit 1** names a holder — say so to
+the user before the sub-agent starts, because a second reviewer-fixer on one PR is
+two agents pushing to one branch; **exit 2** is a board that could not be reached,
+which is worth a line in the relay and stops nothing.
+
 ## 2. Launch the fixer sub-agent
 
 Stamp the stage so the statusline says what this session is doing:
@@ -1217,6 +1255,20 @@ Findings you discovered yourself, with no board record behind them, have no key
 and nothing to record: this is for panel findings only.
 
 ## 3. Relay the result
+
+**Hand back what §1b claimed, first.** The pass is over, so the record should stop
+saying this agent is on it — a claim that outlives its work is #135, and it is what
+makes the fleet's claim count highest right after it has been most productive.
+
+```bash
+qb-release pr <n>                 # or: qb-release issue <n>, on the current-branch route
+```
+
+Nothing to release is exit 0, so run it even on the paths where §1b took nothing —
+the board was unreachable, or the branch named no issue. If §1b adopted the
+checkout's claim on an *issue* and the work is not finished, leave it: that claim
+covers the branch, not this pass, and §4 and the worktree teardown are where it goes
+back.
 
 Show the user the sub-agent's summary table verbatim, then state plainly: the
 branch it pushed to, whether all checks passed, and anything it flagged as

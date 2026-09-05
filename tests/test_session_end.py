@@ -205,6 +205,56 @@ async def test_a_claim_that_named_no_session_belongs_to_the_machine(client):
     assert len(await held(client, f"{REPO}:checkout")) == 1
 
 
+async def test_a_machine_claim_a_session_adopts_is_released_when_that_session_ends(client):
+    """The other end of the test above, and the whole of #681's harness half.
+
+    A checkout claim belongs to the box on purpose — and until something takes it
+    over, nothing can ever hand it back: this endpoint releases what a SESSION
+    took, so a null session matches no row here, and `qb-reconcile` looks the
+    holder up in `/active`, which lists leases and can therefore never name a
+    machine. Nine such claims were standing on zeus the day #681 was written, three
+    of them naming issues that had closed seven hours earlier.
+
+    So the agent that opens the worktree adopts the claim by re-claiming the same
+    key from inside its own session. That is a renew by the same machine, not a
+    second claim: the row keeps its id — its history, and the plan item that came
+    with it — and gains an owner. This is the property the harness change relies
+    on, asserted here rather than assumed by a bash stanza.
+    """
+    await lease(client, "s-end-adopt", cwd="/src/q")
+    taken = await claim(client, f"{REPO}:adopted", None, note="worktree fix/issue-663")
+    assert taken["session"] is None
+
+    adopted = await claim(client, f"{REPO}:adopted", "s-end-adopt",
+                          note="working fix/issue-663")
+    assert adopted["renewed"] is True, (
+        "adopting the checkout's claim took a second claim rather than renewing the "
+        "one that is there, so the row an agent adopted is not the row the plan "
+        "joined against")
+    assert adopted["claim_id"] == taken["claim_id"]
+    assert adopted["session"] == "s-end-adopt"
+
+    body = (await end(client, "s-end-adopt", "finished")).json()
+    assert [c["key"] for c in body["released_claims"]] == [f"{REPO}:adopted"]
+    assert await held(client, f"{REPO}:adopted") == []
+
+
+async def test_adopting_leaves_a_co_tenants_checkout_claim_where_it_was(client):
+    """Adoption is by key and by session, so it cannot reach sideways: ending the
+    adopting session releases the row it adopted and no other machine claim on the
+    same box. Without this the fix for #681 would trade nine standing claims for
+    a session ending that frees every checkout on the machine — which is the
+    failure `test_a_claim_that_named_no_session_belongs_to_the_machine` names."""
+    await lease(client, "s-end-adopt-one", cwd="/src/q")
+    await claim(client, f"{REPO}:adopted-one", None)
+    await claim(client, f"{REPO}:untouched", None)
+    await claim(client, f"{REPO}:adopted-one", "s-end-adopt-one")
+
+    body = (await end(client, "s-end-adopt-one", "finished")).json()
+    assert [c["key"] for c in body["released_claims"]] == [f"{REPO}:adopted-one"]
+    assert len(await held(client, f"{REPO}:untouched")) == 1
+
+
 async def test_another_machines_claim_on_this_session_key_is_reported_not_taken(client):
     """A session key is opaque to the board and two machines may spell one the
     same way. Releasing across that boundary would be this endpoint reaching onto
