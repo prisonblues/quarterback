@@ -888,18 +888,37 @@ def test_a_BELOW_FIX_FLOOR_finding_still_counts_against_the_premise(tmp_path):
     brief budgeted", where dropping an entry is the one thing that must never happen —
     so the two fields diverge here exactly as they already do on an unplaceable record.
 
-    The direction is what makes it safe either way: a below-floor severity is not in the
-    budgeted band, so an extra entry can only ever make `all_budgeted` FALSE, and
-    declining is what `budgeted_brief` is documented to prefer."""
+    **The dials are a shape the producer can actually emit**, which is what makes this a
+    regression test rather than an assertion about contradictory input. `below_floor` is
+    `not severity_at_least(severity, dials.fix_floor)`, so a P1 flagged below the floor
+    is impossible from any dials at all and a test written on one would prove only that
+    junk is handled. At `fix_severity_floor: P3` under the `P2` trigger floor the P3 is
+    in the fixer's list and the P4 is below the floor, which is the real thing.
+
+    The sentence is asserted as well as the verdict, because the sentence is where the
+    cost of keeping this list wide shows up: the P4 is reported as "mandatory work,
+    which this spend may have gone on", about a finding the fixer was forbidden to
+    touch. That is wrong in the DECLINING direction — `all_budgeted` false is the answer
+    that refuses to price a breach — it is what this consumer did before #746, and it is
+    recorded on `fixed_findings` rather than changed on this issue's evidence."""
     got = _loaded(tmp_path, _payload([
         {"severity": "P3", "file": "a.py", "key": "k1", "below_fix_floor": False},
-        {"severity": "P1", "file": "b.py", "key": "k2", "below_fix_floor": True},
-    ]))
-    assert got.fixed_severities == ["P3", "P1"]
+        {"severity": "P4", "file": "b.py", "key": "k2", "below_fix_floor": True},
+    ], dials=_dials(floor="P3")))
+    assert got.fixed_severities == ["P3", "P4"]
     assert [k for k, *_ in got.fixed_findings] == ["k1"]
     assert list(got.fixed_here) == ["a.py"]
+    # The flag on that payload is the one the producer would have written: at these
+    # dials the applied floor is P3, so the P3 is briefed and the P4 is not.
+    was = panel_seats.Dials(fix_severity_floor="P3", round_trigger_floor="P2",
+                            low_severity_fix_lines=40)
+    assert was.fix_floor == "P3" and was.budgeted("P3") and not was.budgeted("P4")
     brief = panel_rounds.budgeted_brief(got, 2, 40, 2)
-    assert brief["findings"] == 2 and brief["all_budgeted"] is False
+    assert brief["findings"] == 2 and brief["budgeted"] == 1
+    assert brief["all_budgeted"] is False
+    assert brief["why"] == ("1 of round 1's 2 finding(s) were mandatory work, which "
+                            "this spend may have gone on and a diff cannot say it did "
+                            "not")
 
 
 def test_a_MALFORMED_entry_DECLINES_the_brief_rather_than_vanishing_from_it(tmp_path):

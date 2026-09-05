@@ -39,6 +39,7 @@ import panel_core  # noqa: E402
 import panel_preflight  # noqa: E402  — the seat predicate the e2e rounds pin
 import panel_rounds  # noqa: E402
 import panel_scope  # noqa: E402
+import panel_seats  # noqa: E402  — `Dials.fix_floor`, the floor the flag is computed against
 from conftest import gh_stub  # noqa: E402
 
 #: A fix pass that wrote lines 100-102 of `app/thing.py` and nothing else.
@@ -358,8 +359,8 @@ def test_a_BELOW_FIX_FLOOR_finding_is_nobody_s_premise_either(tmp_path):
     `load_baseline`). Counting it makes every file the panel merely MENTIONED look like
     a place the fix pass was answering a complaint.
 
-    Invisible at the shipped `fix_severity_floor: P4`, where nothing is ever below the
-    fix floor, which is why this round has to raise it."""
+    This round raises `fix_severity_floor`, which is how the defect was measured — but
+    that is not the only door in, and the sibling test below walks the other one."""
     b = panel.load_baseline(
         [_round(tmp_path, "r2.json", 2, head_sha="b" * 40,
                 review_panel={"fix_severity_floor": "P2",
@@ -373,9 +374,36 @@ def test_a_BELOW_FIX_FLOOR_finding_is_nobody_s_premise_either(tmp_path):
     assert b.fixed_here == {"briefed.py": {"aaaa000000000001"}}
     assert [k for k, *_ in b.fixed_findings] == ["aaaa000000000001"]
     # …and counted where counting can only DECLINE the strict premise, which is the
-    # standing asymmetry between these two fields and the reason `fix_budget` loses
-    # nothing to the filter above.
+    # standing asymmetry between these two fields and the reason the filter above could
+    # move without moving `budgeted_brief` with it.
     assert b.fixed_severities == ["P2", "P3"]
+
+
+def test_a_ZERO_low_severity_budget_puts_rows_below_the_SHIPPED_floor(tmp_path):
+    """The flag is computed against `Dials.fix_floor`, which is the written
+    `fix_severity_floor` EXCEPT at `low_severity_fix_lines: 0` — there the applied floor
+    rises to the trigger floor, because a band that can buy nothing is not this round's
+    work in any sense. So a repo that touched neither floor and set the budget to zero
+    gets below-floor rows at the shipped `P4`, and "raise the fix floor" is how #746 was
+    measured rather than the boundary of what it reaches."""
+    b = panel.load_baseline(
+        [_round(tmp_path, "r2.json", 2, head_sha="b" * 40,
+                review_panel={"fix_severity_floor": "P4",
+                              "round_trigger_floor": "P2",
+                              "low_severity_fix_lines": 0},
+                to_fix=[{**_finding("aaaa000000000001", file="briefed.py"),
+                         "below_fix_floor": False},
+                        {**_finding("dddd000000000004", file="mentioned.py",
+                                    sev="P4"),
+                         "below_fix_floor": True}])],
+        THIS_RUN)
+    assert b.fixed_here == {"briefed.py": {"aaaa000000000001"}}
+    assert [k for k, *_ in b.fixed_findings] == ["aaaa000000000001"]
+    # And the producer really does write that row, rather than this test asserting a
+    # payload only a hand could make: the floor the flag is computed against is the
+    # APPLIED one, and at a zero budget it is the trigger floor.
+    assert panel_seats.Dials(fix_severity_floor="P4", round_trigger_floor="P2",
+                             low_severity_fix_lines=0).fix_floor == "P2"
 
 
 def test_a_SONAR_issue_below_the_fix_floor_is_still_work_the_fixer_was_SENT_TO(

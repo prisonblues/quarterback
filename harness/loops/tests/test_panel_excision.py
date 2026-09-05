@@ -283,12 +283,15 @@ def test_a_BELOW_FIX_FLOOR_finding_is_not_the_next_rounds_BRIEF(tmp_path):
     assert [c["key"] for c in cleared] == [BLOCKER[0]] and still_open == []
 
 
-def test_the_same_finding_IS_the_brief_at_the_shipped_fix_floor(tmp_path):
-    """The bug is invisible at the shipped defaults, which is why it survived: with
-    `fix_severity_floor: P4` nothing is ever below the fix floor, `to_fix` and the brief
-    are one list, and the premise `sub_floor_brief` rested on holds. The same payload at
-    the default floor must therefore behave exactly as it did before #746 — the P3 is in
-    the brief, it is sub-floor, and its fix is excisable."""
+def test_the_same_finding_IS_the_brief_at_the_shipped_DIALS(tmp_path):
+    """Why it survived: at the shipped `fix_severity_floor: P4` with the shipped 40-line
+    budget, `Dials.fix_floor` is `P4`, no finding is ever below it, `to_fix` and the
+    brief are one list, and the premise `sub_floor_brief` rested on holds. The shipped
+    DIALS and not the shipped FLOOR alone — the floor moves with the budget, and the
+    zero-budget door in is pinned in `test_panel_recurrence`.
+
+    The same payload under those dials must behave exactly as it did before #746: the P3
+    is in the brief, it is sub-floor, and its fix is excisable."""
     path = tmp_path / "r2.json"
     path.write_text(json.dumps({
         "round": 2, "cycle": "abc123", "reviewed": True, "repo": "e2e",

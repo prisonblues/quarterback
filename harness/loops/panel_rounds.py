@@ -1844,13 +1844,16 @@ class Baseline:
     #: where the fix pass was working is only *circling* if that pass was working
     #: there in answer to a complaint, and this is the complaint.
     #:
-    #: **The BRIEF, not the payload bucket it is read out of** — the two guards in
-    #: :func:`load_baseline` drop the rows the report takes out of **To fix**, and
-    #: state there why the bucket is wider than the brief (#627, #746). Every sentence
-    #: in this file that says "the fixer was sent to it" rests on those, this one
-    #: included: a file the panel merely MENTIONED is not a place the pass was
-    #: answering a complaint, and reading it as one is how a fresh defect there comes
-    #: to look like a circle.
+    #: **Closer to the BRIEF than to the payload bucket it is read out of** — the two
+    #: guards in :func:`load_baseline` drop the `excised` and `below_fix_floor` rows,
+    #: and state there why the bucket is wider than the brief (#627, #746). Not yet the
+    #: below-THRESHOLD rows, which the report takes out on the same argument and which
+    #: are still counted here (#753), so on a repo with `threshold_by_severity` set this
+    #: is still slightly wider than what the fixer was handed. Every sentence in this
+    #: file that says "the fixer was sent to it" rests on those guards, this one
+    #: included: a file the panel merely MENTIONED is not a place the pass was answering
+    #: a complaint, and reading it as one is how a fresh defect there comes to look like
+    #: a circle.
     #:
     #: **From the anchor round alone**, not a union over every earlier round, and
     #: the reason is the same one ``head_sha`` gives for taking the latest rather
@@ -1869,14 +1872,24 @@ class Baseline:
     #: different consumers at different grains: the mechanical test wants a file
     #: index, and the judge wants sentences it can recognise the fix in.
     #:
-    #: Filtered to the BRIEF by the same two rules ``fixed_here`` is, and every one of
-    #: its readers wants that rather than the whole confirmed list:
+    #: Filtered towards the BRIEF by the same two rules ``fixed_here`` is — and towards
+    #: rather than onto it, for the #753 reason stated up there. Every one of its
+    #: readers wants the brief rather than the whole confirmed list:
     #: :func:`recurrence_brief` prints it to the judge under the heading "findings the
     #: previous round asked the fixer to fix", :func:`fix_pass_outcome` prices a revert
     #: by what the pass was asked for, and :func:`sub_floor_brief` and the excision
-    #: built on it ask whether the pass answered anything it could give back. A reader
-    #: that genuinely wants the WHOLE list has one: ``fixed_severities`` below, which
-    #: is why moving this filter costs :func:`budgeted_brief` nothing.
+    #: built on it ask whether the pass answered anything it could give back.
+    #:
+    #: A reader that wants the WHOLE list has one — ``fixed_severities`` below — which
+    #: is why the filter could move here without moving :func:`budgeted_brief` with it.
+    #: That is not the same as costing it nothing. It keeps the behaviour it had, and
+    #: that behaviour has a rough edge: at a fix floor of `P3` under a `P2` trigger
+    #: floor, a briefed P3 beside an excluded P4 makes ``all_budgeted`` false and the
+    #: sentence then calls the P4 "mandatory work, which this spend may have gone on" —
+    #: about a finding the fixer was forbidden to touch. Wrong in the declining
+    #: direction, which is the one :func:`budgeted_brief` is documented to prefer, and
+    #: pre-existing rather than #746's doing; recorded here rather than fixed on this
+    #: issue's evidence.
     fixed_findings: list[tuple[str, str, str, int | None, str]] = field(default_factory=list)
     #: The anchor round's ``{round-local id: key}`` map — #627's other spelling for a
     #: finding, and the only one a fixer is actually shown.
@@ -2975,6 +2988,16 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                     # brief of 3 was reported as 19, with 16 of them named as sub-floor
                     # work the pass had been sent to.
                     #
+                    # **A RAISED `fix_severity_floor` IS NOT THE ONLY WAY IN.** The flag
+                    # is computed against `Dials.fix_floor`, which is the written
+                    # `fix_severity_floor` EXCEPT at `low_severity_fix_lines: 0`, where
+                    # the applied floor rises to the trigger floor — a band that can buy
+                    # nothing is not this round's work in any sense. So a repo that
+                    # touched neither floor and set the budget to zero produces
+                    # below-floor rows at the shipped `P4`, and this guard has to hold
+                    # there too. The lexray case is what MEASURED the defect, not the
+                    # boundary of it.
+                    #
                     # **`to_fix` only.** The flag is computed on the `sonar_findings`
                     # rows too, and there it means nothing: a hard-gate issue is exempt
                     # from both severity floors at every rule in :func:`round_stop`, it
@@ -2989,9 +3012,17 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                     # ever DECLINE on an extra entry, and declining is the direction
                     # :func:`budgeted_brief` is documented to prefer.
                     #
-                    # `is True` and not truthiness, for the reason one comment up: a
-                    # payload written before the key existed carries none, and it must
-                    # read as the old behaviour rather than silently emptying a brief.
+                    # `is True` and not truthiness, and the reason is NOT the one that
+                    # first suggests itself. A payload written before the key existed
+                    # returns `None` here, and `None is True` and `bool(None)` are both
+                    # false — so an old payload behaves identically under either test
+                    # and the compatibility argument decides nothing. What the strict
+                    # test decides is the MALFORMED truthy value: a hand-edited `"yes"`
+                    # or `1` reads as "not flagged" and the row stays in the brief,
+                    # rather than a junk string silently removing a finding the fixer
+                    # really was sent to. That is the direction the whole loop leans —
+                    # every other guard here declines rather than empties — and it is
+                    # what makes this safe to apply to a field a human can write.
                     #
                     # NOT YET the below-THRESHOLD rows (#78), which the report takes out
                     # of **To fix** on exactly this argument and which are still counted
@@ -5800,8 +5831,11 @@ def sub_floor_brief(brief: Iterable[tuple], dials: dict | None,
     `fix_severity_floor` is still not applied here — but not for the reason this
     paragraph used to give. It said a finding below the fix floor "was never in the
     brief to begin with": the right argument resting on a false fact about ``brief``,
-    which :func:`load_baseline`'s second guard states and now makes true by dropping
-    those rows on the way in (#746).
+    which :func:`load_baseline`'s second guard states and now makes true FOR THIS
+    FLOOR, dropping those rows on the way in (#746). Only for this one — the
+    below-THRESHOLD rows the report also takes out of **To fix** are still counted
+    (#753) — so what holds today is "nothing here below the fix floor", not "everything
+    here was in the brief".
 
     What it cost while it was false is this function's own. On a repo that had raised
     `fix_severity_floor` above `P4` it named findings no fixer was sent to as sub-floor
