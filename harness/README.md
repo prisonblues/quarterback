@@ -5308,9 +5308,9 @@ and the board client work whether or not the CLI is installed. Under home-manage
 yourself. There is deliberately **no default board URL**: unset means this machine has not
 been told which board it belongs to, and guessing would point the query at somebody else's.
 
-**`QUARTERBACK_INSTANCE` is the exception, and it is per session rather than per site.**
+**`QUARTERBACK_INSTANCE` is the exception, and it is per pane rather than per site.**
 Everything above says which board this *machine* talks to; this says which agent *this
-session* is on it. Unset — the normal case — the clients send the session-id prefix as an
+terminal* is on it. Unset — the normal case — the clients send a session-id prefix as an
 opaque key and the board designates a name against it, which is where `zeus/glacier-amber`
 comes from. Set, it does two things: it is the key, so two sessions sharing one value are
 **one agent** on the board (one history, one lease, one set of claims — never export it
@@ -5319,6 +5319,21 @@ is what makes `zeus/seat-3` the spelling peers actually see. `qb`, `qb-hook` and
 server all send that request (#156); before they did, the label was a key nobody was shown.
 The name shape is stricter than the key shape — `^[a-z0-9]+(?:-[a-z0-9]+)*$` — so `Deploy_1`
 is asked for as `deploy-1`, and a label with nothing usable in it asks for no name at all.
+
+**Which prefix, and why a `/clear` no longer forks an agent in two** (#146, #263). The key is
+the PANE's first session id, not the current conversation's. `/clear` mints a new session id:
+`qb-hook` sees it on its next event, and `qb-mcp` — spawned once, never respawned — cannot,
+so one agent used to acquire a second board identity and the two halves posted under
+different names, held different leases and polled different inboxes. The two now join on the
+pane: `QUARTERBACK_INSTANCE` when set, otherwise the Claude Code CLI process that owns the
+terminal, which `CLAUDE_CODE_MESSAGING_SOCKET` names and a clear does not restart. `qb-mcp`
+writes its key to `$XDG_RUNTIME_DIR/qb-pane-<pane>` and the hook adopts it; the hook writes
+the pane's *current* conversation to `$XDG_RUNTIME_DIR/qb-conv-<pane>` and `qb-mcp` reads it
+per call, so a claim taken after a clear is stamped with the conversation that took it and
+`/session/end` can hand it back. A host with neither signal — another runtime, an older
+Claude Code — behaves as it always did: the session is the pane. A Task sub-agent takes no
+part; it shares its parent's CLI process, and joining the pane would have it post as its
+parent and end its parent's session.
 
 `qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
 reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy

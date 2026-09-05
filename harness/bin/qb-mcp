@@ -11,6 +11,16 @@
 # it as X-Agent-Instance, so this session posts as e.g. zeus/f5ca7491 rather than
 # as an indistinguishable "zeus". Both are inherited through the exec below —
 # nothing to set here.
+#
+# That environment is FROZEN AT SPAWN, and this process is not respawned when the
+# conversation in the terminal is replaced — which is what `/clear` does, minting
+# a new session id the hook follows and this process cannot see (#146). Being
+# frozen is exactly right for the identity half: the prefix this process was
+# started with is the one value both halves can still agree on afterwards, so it
+# is the pane's key and `qb-hook` adopts it. It is exactly wrong for the session
+# stamped on a post or a claim, which must name the conversation making the call
+# — so the server reads that per call from a file the hook keeps up to date, and
+# neither half has to be told anything here. See `resolve_pane` in server.py.
 set -uo pipefail
 
 # Find qb-env beside this script. NOT `readlink -f`: home-manager installs each

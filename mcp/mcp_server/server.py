@@ -116,15 +116,106 @@ def resolve_requested_name() -> str | None:
     return _name(os.environ.get("QUARTERBACK_INSTANCE", ""))
 
 
+def resolve_pane() -> str | None:
+    """The TERMINAL this server is serving, as opposed to the conversation in it.
+
+    The join key between this process and ``qb-hook``, and it exists because the
+    two halves of one agent disagree about time. This server is spawned once and
+    its environment freezes there; the hook re-reads its payload on every event.
+    ``/clear`` mints a new session id, so from that moment the hook knows a fact
+    this process cannot see — and the pane is the thing that did *not* change.
+
+    Derived identically on both sides, from the same environment:
+
+    * ``QUARTERBACK_INSTANCE`` when an operator named the pane (``qb-seats`` sets
+      it on every seat). That pinning is why a seat keeps one name across
+      restarts, and it is deliberately untouched.
+    * otherwise the Claude Code CLI process that owns the pane, which
+      ``CLAUDE_CODE_MESSAGING_SOCKET`` names and which ``/clear`` does not
+      restart.
+
+    ``None`` for a child session — a Task sub-agent is its own conversation
+    sharing its parent's CLI process, so joining the parent's pane would make it
+    post as its parent — and ``None`` on any runtime that offers neither signal,
+    where there is no pane to speak of and the environment is all there is.
+    """
+    named = _slug(os.environ.get("QUARTERBACK_INSTANCE", ""))
+    if named:
+        return named
+    if os.environ.get("CLAUDE_CODE_CHILD_SESSION", "").strip():
+        return None
+    socket = os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET", "").strip()
+    if not socket:
+        return None
+    return _slug("cli-" + os.path.basename(socket).removesuffix(".sock"))
+
+
+def _runtime_dir() -> str:
+    return os.environ.get("XDG_RUNTIME_DIR", "").strip() or "/tmp"
+
+
 def resolve_session() -> str | None:
-    """The Claude Code session these tool calls belong to, for `session` on a post.
+    """The Claude Code conversation these tool calls belong to, for `session`.
 
     Without it every post made through a tool lands with session=null: the board
     can't group it under the agent that wrote it, and `peers` can't offer a peer's
     `last_post_id` to thread a reply onto — the exact affordance that turns a
     detected overlap into a conversation.
+
+    **Read per call, not once at spawn, and that is the fix for #263.** The
+    environment says which conversation this process was STARTED for, which stops
+    being true the moment someone types ``/clear``: the pane gets a conversation
+    that remembers nothing, this process keeps stamping the old session id on
+    every post and every claim it takes, and the claim is then unreachable by any
+    ending — ``/session/end`` releases by session key, and the key on the claim
+    names a context that no longer exists. #263 measured exactly that on a seat,
+    a claim still carrying ``session=24e8ee23`` two conversations later, renewed
+    indefinitely because nothing had died for expiry to notice.
+
+    ``qb-hook`` writes the pane's current conversation to
+    ``$XDG_RUNTIME_DIR/qb-conv-<pane>`` on every SessionStart. Reading the file
+    per call is a stat and a short read against an HTTP round trip; caching it
+    would reintroduce the whole bug in miniature, which is that this process
+    believed something about the session for longer than it was true.
+
+    The environment remains the fallback, so a host with no pane signal, no hook,
+    or no runtime dir behaves exactly as it did before.
     """
+    pane = resolve_pane()
+    if pane:
+        try:
+            with open(os.path.join(_runtime_dir(), f"qb-conv-{pane}")) as handle:
+                current = handle.read().strip()
+        except OSError:
+            current = ""
+        if current:
+            return current
     return os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip() or None
+
+
+def publish_pane_key(key: str) -> None:
+    """Write down the key this process answers to, for ``qb-hook`` to adopt.
+
+    The identity half of the same seam (#146). This process holds the only value
+    both halves can still agree on after a clear — the session id prefix it was
+    spawned with — because it is the one that cannot be superseded here. The hook
+    used to derive its own from whatever session id the payload carried, so a
+    clear gave one agent two names, two leases and two inboxes; now it reads this
+    file instead and the pane keeps a single identity for its whole life.
+
+    Best-effort by contract, like everything else that touches the runtime dir: a
+    read-only or missing directory leaves the hook on its old fallback, which is
+    the behaviour that shipped, rather than taking the server down at startup.
+    """
+    pane = resolve_pane()
+    if not pane or os.environ.get("QUARTERBACK_INSTANCE", "").strip():
+        # A named pane needs no pointer: both halves already read the name.
+        return
+    try:
+        with open(os.path.join(_runtime_dir(), f"qb-pane-{pane}"), "w") as handle:
+            handle.write(key)
+    except OSError:
+        pass
 
 
 @asynccontextmanager
@@ -141,12 +232,21 @@ async def app_lifespan(server: FastMCP):
     # `app.auth.delegated` names (#478). Optional: absent, those two tools refuse
     # with the remedy and every other tool is unaffected. It goes to the same
     # agent host as everything else — see `qb-mcp` for where it is exported.
+    #
+    # The KEY is fixed for the life of this process (see `resolve_key`) and is
+    # published here for `qb-hook` to adopt, so a `/clear` cannot fork one agent
+    # into two (#146). The SESSION is not fixed, so it goes in below as the
+    # function rather than as its answer: this process outlives the conversation
+    # it was started for every time somebody clears the terminal, and a claim
+    # stamped with the conversation that is gone is one no ending can reach
+    # (#263).
+    publish_pane_key(resolve_key())
     client = QuarterbackClient(
         base_url,
         token,
         key=resolve_key(),
         requested_name=resolve_requested_name(),
-        session=resolve_session(),
+        session=resolve_session,
         elevated=os.environ.get("QUARTERBACK_ELEVATED_TOKEN", "").strip() or None,
         elevated_cmd=os.environ.get("QUARTERBACK_ELEVATED_TOKEN_CMD", "").strip() or None,
         elevated_refresh_cmd=os.environ.get(

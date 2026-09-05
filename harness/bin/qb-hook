@@ -335,6 +335,23 @@ cwd=$(printf '%s' "$IN" | jq -r '.cwd // empty' 2>/dev/null)
 tp=$(printf '%s'  "$IN" | jq -r '.transcript_path // empty' 2>/dev/null)
 [ -n "$sid" ] || exit 0
 
+# WHY this session started: `startup | resume | clear | compact | fork`. Claude
+# Code has always put it in the SessionStart payload and this hook has never read
+# it (#263), so every start looked alike — including the two that are opposites.
+# `clear` is a conversation that remembers nothing of the one before it and must
+# not go on holding its work; `resume` is the SAME conversation continuing, and
+# dropping its claims would be a bug of exactly the same shape pointing the other
+# way. (`resume` also reuses the session id, so the release paths below no-op on
+# it by construction as well as by this field — two independent reasons, which is
+# the right number for a decision that hands work back.)
+#
+# Only SessionStart carries it, and this is the hook's hot path: no second jq for
+# the events that have no such field.
+START_SOURCE=""
+if [ "$EVENT" = "SessionStart" ]; then
+  START_SOURCE=$(printf '%s' "$IN" | jq -r '.source // empty' 2>/dev/null)
+fi
+
 repo=""; branch=""
 if [ -n "$cwd" ] && git -C "$cwd" rev-parse --git-dir >/dev/null 2>&1; then
   # Repo identity is the origin remote's, not the directory's: a checkout cloned
@@ -513,15 +530,99 @@ case "$EVENT" in SessionStart|Stop|SessionEnd)
   fi
 ;; esac
 
+# ---- the pane, and the two things that used to hang off one string ----------
+#
+# THE PANE IS THE AGENT; THE CONVERSATION IS THE WORKER. Two facts were keyed on
+# `sid` at once, and they want opposite things of it:
+#
+#   WHO AM I — must be STABLE. A seat keeps one name across restarts, which is
+#   what `QUARTERBACK_INSTANCE` buys and why a seat never saw #146. A session
+#   without one got `sid[0:8]`, and `/clear` MINTS A NEW SESSION ID: this hook
+#   followed it within the second, `qb-mcp` — spawned once and never respawned —
+#   could not, and the two halves of one agent then posted under two names, held
+#   two leases and polled two inboxes.
+#
+#   WHAT AM I HOLDING — must NOT be stable. Claims, the lease's recap, the
+#   `session` stamped on a post: a conversation with no memory of taking a claim
+#   must not go on renewing it (#263), and passive expiry can never reach that
+#   one, because nothing died.
+#
+# PANE names the terminal rather than the conversation in it, and qb-mcp derives
+# it the same way from the same environment, so the two halves join on it:
+#
+#   * `QUARTERBACK_INSTANCE` when an operator named the pane (`qb-seats` sets it
+#     on every seat). Unchanged and deliberate — that pinning is the thing that
+#     makes a seat's name survive a restart, and it must survive this too.
+#   * otherwise the Claude Code CLI process that owns the pane, which
+#     `CLAUDE_CODE_MESSAGING_SOCKET` names and which `/clear` does not restart.
+#
+# NOT for a CHILD SESSION. A Task sub-agent is a conversation of its own with its
+# own session id, and it shares its parent's CLI process — so it would otherwise
+# join the parent's pane, adopt the parent's key, and (via `_supersede_previous`)
+# END ITS PARENT'S SESSION on the board while the parent was still working. It
+# takes no part in any of this and gets the per-session behaviour it has always
+# had.
+#
+# Absent both signals there is no pane to speak of and everything below degrades
+# to exactly what it did before: the session IS the pane, and a clear forks it
+# the way it always did. Nothing here can make a session worse off than it was.
+_key_slug() {   # coerce to the charset the board accepts as a key
+  printf '%s' "$1" | tr -c 'A-Za-z0-9._~-' '-' | sed -E 's/^[._~-]+//' | cut -c1-40
+}
+PANE=""
+if [ -n "${QUARTERBACK_INSTANCE:-}" ]; then
+  PANE=$(_key_slug "$QUARTERBACK_INSTANCE")
+elif [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ] && [ -n "${CLAUDE_CODE_MESSAGING_SOCKET:-}" ]; then
+  # Parameter expansion rather than `basename`: this runs on every event that
+  # gets past the hot-path exit above, and a subprocess there is not free.
+  _sock="${CLAUDE_CODE_MESSAGING_SOCKET##*/}"
+  PANE=$(_key_slug "cli-${_sock%.sock}")
+fi
+
 # Instance = this session among the machine's several. QUARTERBACK_INSTANCE wins
-# (a human label like "deploy"); otherwise the session-id prefix, byte-identical
-# to what qb-mcp computes. IDENT is what the board will call us — used to read our
-# own inbox, and assumes (as this hook always has) that the token's name is the
-# hostname. Sanitized to the charset the board accepts, so a hand-set label can
-# never turn every request into a 400 this fail-open hook would swallow silently.
-INSTANCE=$(printf '%s' "${QUARTERBACK_INSTANCE:-${sid:0:8}}" \
-           | tr -c 'A-Za-z0-9._~-' '-' | sed -E 's/^[._~-]+//' | cut -c1-40)
+# (a human label like "deploy"); otherwise the pane's FIRST session-id prefix,
+# byte-identical to what qb-mcp computes — which is the whole point: qb-mcp's
+# environment is frozen at spawn, so the pane's first session id is the one value
+# both halves can still agree on after a clear. `qb-pane-<pane>` is where that
+# value is written down; qb-mcp writes it at startup (it is the authority — that
+# prefix IS its key) and this hook writes it only when it is missing, so a host
+# with no MCP server still gets one stable key per pane. No pane, no file: the
+# fallback is the current session id, which is what this line always was.
+#
+# IDENT is what the board will call us — used to read our own inbox, and assumes
+# (as this hook always has) that the token's name is the hostname. Sanitized to
+# the charset the board accepts, so a hand-set label can never turn every request
+# into a 400 this fail-open hook would swallow silently.
+_panefile="${XDG_RUNTIME_DIR:-/tmp}/qb-pane-$PANE"
+_pane_key=""
+if [ -n "$PANE" ] && [ -z "${QUARTERBACK_INSTANCE:-}" ]; then
+  # `source=startup` OVERWRITES rather than reads, and that is the answer to the
+  # one hazard in deriving a pane from a pid: the OS reuses pids, and a pane that
+  # was killed rather than closed leaves this file behind for whoever inherits
+  # its number. A startup is by definition the pane's FIRST conversation, so the
+  # key is this session and nothing older can be true. Every other source — the
+  # clear this whole block exists for, a resume, a compact — reads what is there.
+  [ "$START_SOURCE" = startup ] || _pane_key=$(cat "$_panefile" 2>/dev/null)
+  if [ -z "$_pane_key" ]; then
+    _pane_key="${sid:0:8}"
+    printf '%s' "$_pane_key" > "$_panefile" 2>/dev/null
+  fi
+fi
+INSTANCE=$(_key_slug "${QUARTERBACK_INSTANCE:-${_pane_key:-${sid:0:8}}}")
 IDENT="$AGENT${INSTANCE:+/$INSTANCE}"
+
+# The pane's CURRENT conversation, for the half of the agent that cannot see it
+# change. qb-mcp reads this file per call and stamps what it finds as `session`
+# on every post and every claim it takes — so a claim taken after a `/clear` is
+# recorded against the conversation that actually took it, and `/session/end`
+# hands it back when that conversation is replaced. Without it the stamp is
+# whatever session id qb-mcp was spawned with, forever: #263 measured a claim on
+# a seat still carrying `session=24e8ee23` two conversations later, which is
+# precisely the claim no ending could reach.
+#
+# Written on SessionStart only (see the case below) — this is the one event that
+# knows a new conversation has arrived.
+_convfile="${XDG_RUNTIME_DIR:-/tmp}/qb-conv-$PANE"
 
 _auth=(-H "Authorization: Bearer $TOK")
 [ -n "$INSTANCE" ] && _auth+=(-H "X-Agent-Instance: $INSTANCE")
@@ -663,27 +764,41 @@ _end_session() {   # _end_session <session key> <reason>
 }
 
 # The session this pane last ran, so a NEW one can end it if nothing else did.
-# Keyed on the instance rather than the session, which is the whole point: a seat
-# keeps one instance across restarts and resets (that is #263's "the seat is the
-# identity; the conversation is the worker"), so this file is the only local
-# record that the pane held a different conversation five seconds ago. For a
-# session with no QUARTERBACK_INSTANCE the instance IS the session prefix, so the
-# file is per-session, never holds anything else, and this whole path no-ops.
+# Keyed on the instance rather than the session, which is the whole point: an
+# instance is now the PANE (see the pane block above), so this file is the only
+# local record that the pane held a different conversation five seconds ago —
+# that is #263's "the seat is the identity; the conversation is the worker", and
+# since the instance stopped following `/clear` it holds for a plain session as
+# well as for a seat. On a host with no pane signal the instance IS the session
+# prefix, the file is per-session, and this whole path no-ops as it always did.
 _sidfile="${XDG_RUNTIME_DIR:-/tmp}/qb-sid-$AGENT-$INSTANCE"
 
 _supersede_previous() {   # end the conversation this pane held before this one
   local prev
+  # A CHILD SESSION shares its parent's instance whenever the pane is named
+  # (`qb-seats` exports QUARTERBACK_INSTANCE and a Task sub-agent inherits it),
+  # and it has a session id of its own — so without this guard every sub-agent a
+  # seat launched read the seat's own session out of this file and ended it,
+  # handing back the claims the seat was still working. Releasing another
+  # conversation's claims is the one thing this path must never do by accident:
+  # it is #263's failure with the sign flipped, and it is invisible from both
+  # sides in the same way.
+  [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ] || return 0
   prev=$(cat "$_sidfile" 2>/dev/null)
   printf '%s' "$sid" > "$_sidfile" 2>/dev/null
   [ -n "$prev" ] && [ "$prev" != "$sid" ] || return 0
-  # `superseded`, not `context_reset`, and the distinction is the honest one: all
-  # this knows is that a different conversation is now in this pane. SessionEnd
-  # knows WHY — Claude Code tells it — and fires first, so on the ordinary paths
-  # this is a no-op that the board answers "already ended" to and the precise
-  # reason is the one that got recorded. This is the backstop for the endings
-  # nothing observed: a killed pane, a crashed CLI, a hook that could not reach
-  # the board at the time.
-  _end_session "$prev" superseded
+  # WHY it ended, when Claude Code has told us. `source=clear` is a context reset
+  # — `/clear` or `/new`, the pane living on with a conversation that remembers
+  # none of this one — and that is a different fact about the previous session
+  # than "something else is here now", which is all `superseded` claims. On the
+  # ordinary paths SessionEnd fires first with the same verdict and this is a
+  # no-op the board answers "already ended" to; this is the backstop for the
+  # endings nothing observed: a killed pane, a crashed CLI, a hook that could not
+  # reach the board at the time.
+  case "$START_SOURCE" in
+    clear) _end_session "$prev" context_reset ;;
+    *)     _end_session "$prev" superseded ;;
+  esac
 }
 
 # ---- the ask courier (v2.13, #107) ------------------------------------------
@@ -1320,6 +1435,15 @@ case "$EVENT" in
     if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
       ( tmux set-option -p -t "$TMUX_PANE" @qb_session "$sid" ) >/dev/null 2>&1 &
     fi
+    # THE PANE'S CURRENT CONVERSATION, before anything else touches the board.
+    # qb-mcp's environment froze at spawn and no clear reaches it; this file is
+    # the only way it can learn that the conversation it is serving is not the
+    # one it was started for. Written first because the supersede below is what
+    # hands back the PREVIOUS conversation's claims, and those claims are only
+    # findable by the session id qb-mcp stamped on them.
+    if [ -n "$PANE" ] && [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ]; then
+      printf '%s' "$sid" > "$_convfile" 2>/dev/null
+    fi
     _supersede_previous
     # `waiting`, not `working`: the session exists and nothing has been asked of
     # it yet. A seat started by qb-seats submits its brief within the second and
@@ -1532,6 +1656,18 @@ case "$EVENT" in
     # the session id is never reused.
     rm -f "${XDG_RUNTIME_DIR:-/tmp}/qb-state-$sid" \
           "${XDG_RUNTIME_DIR:-/tmp}/qb-title-$sid" 2>/dev/null
+    # The pane's pointers go too — but ONLY when the pane itself is going. A
+    # `clear` is the pane living on, and the SessionStart a moment later is what
+    # repoints these at the conversation replacing this one; clearing them here
+    # would leave qb-mcp reading its own frozen environment again for exactly the
+    # window the reset happens in, which is the window that matters. The pane key
+    # is derived from a CLI pid that the OS may reuse, so a pane that really ends
+    # must not leave its pointers behind for the next process to inherit.
+    if [ -n "$PANE" ] && [ "$why" != context_reset ] \
+       && [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ]; then
+      rm -f "$_convfile" 2>/dev/null
+      [ -z "${QUARTERBACK_INSTANCE:-}" ] && rm -f "$_panefile" 2>/dev/null
+    fi
     # Push the transcript so another device can pull + resume. SNAPSHOT, not
     # handoff, and the swap is a bug fix rather than a tidy-up: handoff is what
     # used to release the lease, and it only ran `[ -n "$sha" ]` — so a session

@@ -256,10 +256,13 @@ def test_the_same_session_starting_again_ends_nothing(hook):
 
 
 def test_a_session_with_no_instance_never_supersedes_anything(hook):
-    """Without QUARTERBACK_INSTANCE the instance IS the session-id prefix, so the
-    record is per-session and can never hold a different one. A plain `claude` in
-    a window has no pane identity to inherit, and inventing one would let two
-    unrelated sessions end each other."""
+    """With no pane signal at all — no operator label and no CLI socket — the
+    instance IS the session-id prefix, so the record is per-session and can never
+    hold a different one. Inventing a pane identity where the environment offers
+    none would let two unrelated sessions end each other. (Where there IS one,
+    `test_qb_hook_pane_identity.py` has the case: a plain `claude` window keeps a
+    single identity across a `/clear` and hands back what the previous
+    conversation held.)"""
     hook.fire("SessionStart", session_id="aaaaaaaa-1")
     hook.fire("SessionStart", session_id="bbbbbbbb-2")
     assert hook.to("/session/end") == []

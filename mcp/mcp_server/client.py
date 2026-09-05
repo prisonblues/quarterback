@@ -14,7 +14,7 @@ import hashlib
 import json
 import subprocess
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 import httpx
 
@@ -82,14 +82,22 @@ class QuarterbackClient:
         api_token: str,
         key: str | None = None,
         requested_name: str | None = None,
-        session: str | None = None,
+        session: str | Callable[[], str | None] | None = None,
         transport: httpx.BaseTransport | None = None,
         elevated: str | None = None,
         elevated_cmd: str | None = None,
         elevated_refresh_cmd: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._session = session
+        #: Which conversation these calls belong to — a string, or a callable
+        #: asked afresh each time (#146/#263). A long-lived client outlives the
+        #: conversation it was constructed for: `/clear` gives the terminal a new
+        #: one and this process is never respawned, so a session captured at
+        #: construction is a value that silently stops being true. Every claim it
+        #: stamped after that point named a context that no longer existed, and
+        #: no ending could reach them. Callers with nothing to re-read pass a
+        #: plain string and nothing changes for them.
+        self._session_source = session
         # No token ⇒ no header at all, rather than a "Bearer " that authenticates
         # nothing. That is the tokenless client the board TUI starts with on a
         # host that has no credential: every authed call 401s, and ``health()``
@@ -147,6 +155,19 @@ class QuarterbackClient:
 
     def close(self) -> None:
         self._http.close()
+
+    @property
+    def _session(self) -> str | None:
+        """The conversation to stamp on this call, asked at the moment of asking.
+
+        Every ``self._session`` below reads this. A callable source is re-read
+        each time on purpose: the answer changes under a running process when the
+        terminal is cleared, and every call site that stamps a session — a post, a
+        claim, a plan verb — wants the conversation that is making the call, never
+        the one the process was started for.
+        """
+        source = self._session_source
+        return source() if callable(source) else source
 
     # -------------------------------------------------------------- delegated
 
