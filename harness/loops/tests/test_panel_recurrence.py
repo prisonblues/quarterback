@@ -352,12 +352,11 @@ def test_a_dismissed_finding_is_nobody_s_premise(tmp_path):
 
 
 def test_a_BELOW_FIX_FLOOR_finding_is_nobody_s_premise_either(tmp_path):
-    """#746, and the same shape as the dismissed case above. The payload's `to_fix`
-    bucket carries every master-confirmed finding; the cut down to the list a fixer is
-    handed happens in the REPORT, which prints the below-floor rows under "Reported, not
-    this round's work". So a row flagged `below_fix_floor` was reported and recorded and
-    no fixer was ever sent to it — and counting it makes every file the panel merely
-    MENTIONED look like a place the fix pass was answering a complaint.
+    """#746, and the same shape as the dismissed case above: a row flagged
+    `below_fix_floor` was reported and recorded and no fixer was ever sent to it (why
+    the bucket is wider than the brief is stated once, at the guard in
+    `load_baseline`). Counting it makes every file the panel merely MENTIONED look like
+    a place the fix pass was answering a complaint.
 
     Invisible at the shipped `fix_severity_floor: P4`, where nothing is ever below the
     fix floor, which is why this round has to raise it."""

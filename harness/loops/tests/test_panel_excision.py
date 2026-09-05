@@ -238,10 +238,9 @@ def test_an_EXCISED_finding_is_not_the_next_rounds_BRIEF(tmp_path):
 
 def test_a_BELOW_FIX_FLOOR_finding_is_not_the_next_rounds_BRIEF(tmp_path):
     """#746, the second row the report takes out of **To fix** and the second one this
-    has to drop on the way in. `sub_floor_brief` filters on the trigger floor alone and
-    its docstring said why — "a finding below the fix floor was never in the brief to
-    begin with". The argument is right and the statement was false: `to_fix` carries
-    every master-confirmed finding and the report is what cuts it to the brief.
+    has to drop on the way in — `sub_floor_brief` filtered on the trigger floor alone
+    because "a finding below the fix floor was never in the brief to begin with", a
+    right argument on a false fact (stated at the guard in `load_baseline`).
 
     Measured on lexray#1656 round 2 at `fix_severity_floor: P2`, and both consequences
     are pinned below. The pass was sent 3 findings and answered 3; the round reported

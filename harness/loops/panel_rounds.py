@@ -1844,12 +1844,13 @@ class Baseline:
     #: where the fix pass was working is only *circling* if that pass was working
     #: there in answer to a complaint, and this is the complaint.
     #:
-    #: **The BRIEF, not the payload bucket it is read out of.** `to_fix` holds every
-    #: master-confirmed finding and the report is what cuts it down to the fixer's
-    #: list, so the two rows the report takes out — `excised` and `below_fix_floor` —
-    #: are dropped here on the way in (#627, #746). Everything in this file that says
-    #: "the fixer was sent to it" depends on that, and until #746 it was not true of a
-    #: repo that had raised `fix_severity_floor`.
+    #: **The BRIEF, not the payload bucket it is read out of** — the two guards in
+    #: :func:`load_baseline` drop the rows the report takes out of **To fix**, and
+    #: state there why the bucket is wider than the brief (#627, #746). Every sentence
+    #: in this file that says "the fixer was sent to it" rests on those, this one
+    #: included: a file the panel merely MENTIONED is not a place the pass was
+    #: answering a complaint, and reading it as one is how a fresh defect there comes
+    #: to look like a circle.
     #:
     #: **From the anchor round alone**, not a union over every earlier round, and
     #: the reason is the same one ``head_sha`` gives for taking the latest rather
@@ -5798,21 +5799,22 @@ def sub_floor_brief(brief: Iterable[tuple], dials: dict | None,
     Severity against the trigger floor is the only test otherwise, and
     `fix_severity_floor` is still not applied here — but not for the reason this
     paragraph used to give. It said a finding below the fix floor "was never in the
-    brief to begin with", which is the right argument and was a false statement about
-    ``brief``: the payload's `to_fix` bucket carries EVERY master-confirmed finding, and
-    the cut down to the list a fixer is handed happens in the report rather than in the
-    payload. So on a repo that had raised `fix_severity_floor` above `P4` this function
-    was handed findings no fixer was ever sent to and classified them as sub-floor work
-    the pass answered — lexray#1656 round 2 named 16 of them against a brief of 3, which
-    accused a fixer of ignoring an instruction it had followed and put 16 findings into
-    the cost column of a revert proposal a human was meant to weigh (#746).
+    brief to begin with": the right argument resting on a false fact about ``brief``,
+    which :func:`load_baseline`'s second guard states and now makes true by dropping
+    those rows on the way in (#746).
 
-    The premise is now made TRUE at the source rather than restated as a second
-    condition here: :class:`Baseline` drops a `below_fix_floor` row on the way in, so
-    every entry in ``brief`` really is one the fixer was sent to. That keeps ONE answer
-    to "what was the fixer sent to" in one place — a second floor test written here
-    would be a second spelling of it, and two spellings are how a report and a payload
-    come to disagree about which findings a round asked for.
+    What it cost while it was false is this function's own. On a repo that had raised
+    `fix_severity_floor` above `P4` it named findings no fixer was sent to as sub-floor
+    work the pass answered, and `seams: 0` beside a non-zero `sub_floor` is exactly what
+    `panel-review-pr.md` asks an orchestrator to relay as the fixer's brief not being
+    followed — lexray#1656 round 2 named 16 against a brief of 3, on a pass that had
+    landed one finding per commit precisely as told. The same list is what
+    :func:`fix_pass_outcome` prices a revert against, so those 16 also went into a cost
+    column documented as a CEILING on what undoing the pass would give back.
+
+    Fixed there rather than by a second floor test here, which would be a second
+    spelling of "what was the fixer sent to" — and two spellings are how a report and a
+    payload come to disagree about which findings a round asked for.
 
     An entry whose severity nothing can parse is not sub-floor. That falls out of
     :func:`severity_at_least`, which reads an unparseable severity as P1, and P1 is at or
