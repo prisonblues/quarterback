@@ -958,17 +958,27 @@ def _merge_base_now(gh_repo: str, base_ref: str, head_sha: str) -> str | None:
     """The TRUE merge base of `base_ref` and `head_sha` — the commit the branch
     actually forked from — or None if it cannot be had.
 
-    **This used to return `baseRefOid` and that is the defect in #241.** GitHub
-    maintains `baseRefOid` for its own purposes and recomputes it on a push to the
-    head branch; it is not the merge base, and it has been measured wrong in both
-    directions on this repo. On PR #187 it was OLDER than the fork point, because a
-    commit shared with another PR landed on `main` and nothing recomputed the
-    stored base — so `gh pr diff` returned code already on `main` and a full round
-    was spent confirming 15 findings about it. On PR #270 it was NEWER: `f34aa89`,
-    the tip of `main`, against a true fork point of `0819625` four commits back, so
-    the recorded base named a commit the branch had never contained. The invariant
-    to hold is the weak one — `baseRefOid` is not a merge base — and only asking
-    for a merge base satisfies it.
+    **This used to return `baseRefOid` and that is the defect in #241.**
+    `baseRefOid` is the base branch's TIP as of the PR being opened, or of the last
+    push to the head branch; it is not a merge base, and it has been measured wrong
+    in both directions on this repo. On PR #270 it was NEWER than the fork point:
+    `f34aa89`, the tip of `main`, against a true fork point of `0819625` four
+    commits back, so the recorded base named a commit the branch had never
+    contained — the ordinary shape for any branch cut from an older commit. On PR
+    #187 it was OLDER, because a commit shared with another PR landed on `main` and
+    no push to the head branch recomputed the stored tip. The invariant to hold is
+    the weak one — `baseRefOid` is not a merge base — and only asking for a merge
+    base satisfies it.
+
+    **What `gh pr diff` builds from is `merge-base(baseRefOid, head)`**, not
+    `baseRefOid` itself (#747, measured on three constructed PRs). So the two
+    directions above do not cost the same: in #270's shape the stored tip is off to
+    the side of the head branch and that merge base IS the fork point, so the diff
+    is exactly right; in #187's shape the stored tip is an ancestor of the head and
+    the diff is built from it, which is how a round came to spend 15 confirmed
+    findings on already-landed code. A caller wanting to know which shape it is in
+    asks this function a second time with the STORED BASE in `base_ref` — see the
+    `config_notes` block in `panel.run`.
 
     The compare endpoint's `merge_base_commit` IS `git merge-base <base> <head>`,
     computed by GitHub against the base branch as it stands now. Read from the API
@@ -1004,12 +1014,12 @@ def _base_tip_now(gh_repo: str, base_ref: str) -> str | None:
 
     The one field in this pair that actually moves, and the reason it needs its
     own call. `gh pr view --json baseRefOid` looks like the answer and is not:
-    it reports the **merge base**, recomputed only when the head branch is
-    pushed, and a merge base cannot move when the base branch advances — a
-    common ancestor is unaffected by commits added to one side of it. Measured
-    rather than assumed: PR #87 sat at `baseRefOid=88643c14` while `main` took
-    ten commits, and `git merge-base` against `main` still answered `88643c14`
-    afterwards.
+    it reports the base tip as of the PR being opened or of the last push to the
+    HEAD branch, and nothing recomputes it when the base branch advances.
+    Measured rather than assumed: PR #87 sat at `baseRefOid=88643c14` while
+    `main` took ten commits, and `git merge-base` against the moved `main` still
+    answered `88643c14` afterwards — a branch cut from the then-tip, so the two
+    coincided and neither had moved.
 
     So a staleness check built on `baseRefOid` alone reads "unmoved, the review
     still stands" in exactly the case it exists to catch. Both ends are recorded

@@ -7,17 +7,17 @@ claim is only true relative to a base.
 
 **Two fields, because the obvious one field cannot do the job, and that is what
 most of this file exists to pin.** #98 proposed stamping GitHub's `baseRefOid`
-and comparing it later against the PR's current `baseRefOid`. That field tracks
-the *fork point*: GitHub recomputes it when the head branch is pushed and never
-when the base branch advances, because a common ancestor is not moved by commits
-added to one side of it. Measured on this repo — PR #87 held `88643c14` across
-ten commits of `main`, and `git merge-base` against the moved `main` agreed with
-it afterwards. So a check resting on it alone answers "unmoved, the review still
-stands" in precisely the case it exists to catch.
+and comparing it later against the PR's current `baseRefOid`. That field is the
+base branch's TIP as of the PR being opened or of the last push to the HEAD
+branch: nothing recomputes it when the base branch advances. Measured on this
+repo — PR #87 held `88643c14` across ten commits of `main`, and `git merge-base`
+against the moved `main` agreed with it afterwards, the branch having been cut
+from the then-tip so that the two coincided. So a check resting on it alone
+answers "unmoved, the review still stands" in precisely the case it exists to
+catch.
 
-**And it does not even track the fork point reliably**, which is #241 and the
-second half of this file: `baseRefOid` is a field GitHub maintains for its own
-purposes, measured both older and newer than the true merge base on this repo.
+**And it is not the fork point either**, which is #241 and the second half of
+this file: measured both older and newer than the true merge base on this repo.
 So the two ends below are now BOTH asked for as what they are.
 
 The two ends therefore mean different things and are never derived from each
@@ -144,14 +144,18 @@ CFG = {"github": "acme/board", "path": "/tmp/repo",
 
 def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
          base_tip=REF_BODY, cfg=None, moves_to=None, merge_base_after=UNSET,
-         fork_point=UNSET):
+         fork_point=UNSET, diff_base=UNSET):
     """One panel run with every subprocess replaced, so what is under test is the
     payload rather than any CLI. `base_tip` is the raw body the ref call returns,
     so a test can make that one call fail without touching the others.
 
     `merge_base` is what GitHub STORES for the PR (`baseRefOid`) and `fork_point`
     is what the compare API answers for the real merge base; they agree unless a
-    test separates them, which is #241's defect.
+    test separates them, which is #241's defect. `diff_base` is the third commit
+    in play (#747): `merge-base(stored base, head)`, which is what `gh pr diff`
+    builds from. It defaults to `fork_point` — the stored base is an older tip of
+    the base branch and the diff is right anyway — so only a test about a genuine
+    mis-scoping has to name it.
 
     `moves_to` makes the head move mid-round — the race the re-read exists for —
     and `merge_base_after` is what the fork-point read then answers, so the
@@ -166,7 +170,7 @@ def _run(monkeypatch, tmp_path, title="feat: a thing", merge_base="0ddba5e0",
     calls = []
     fake_sh = gh_stub(meta=pr_meta(title=title, head="aaa111", merge_base=merge_base),
                       merge_base=merge_base, fork_point=fork_point,
-                      merge_base_after=merge_base_after,
+                      merge_base_after=merge_base_after, diff_base=diff_base,
                       head_moves_to=moves_to, base_tip=base_tip,
                       diff=PR_DIFF, calls=calls)
 
@@ -255,17 +259,35 @@ def test_a_skipped_round_keeps_the_free_end_and_buys_nothing(monkeypatch, tmp_pa
 
 # ----------------------------------- GitHub's stored base is not a merge base
 #
-# #241. `gh pr diff` builds its three-dot diff from `baseRefOid`, the base GitHub
-# has STORED for the PR, and that field is maintained for GitHub's purposes
+# #241. `baseRefOid` is the base branch's TIP as of the PR being opened or of the
+# last push to the head branch, and GitHub maintains it for its own purposes
 # rather than as a merge base. On PR #187 a commit shared with another PR landed
-# on `main` and nothing recomputed it, so the diff carried already-landed code
-# and a full round returned 15 judge-confirmed findings about it — with
+# on `main` and no head push recomputed it, so the diff carried already-landed
+# code and a full round returned 15 judge-confirmed findings about it — with
 # `config_notes: []` and nothing anywhere in the payload saying the target was
 # wrong. It was caught by a peer noticing the diff looked smaller than GitHub
 # advertised.
 #
 # The load-bearing part of the fix is not the recorded field. It is that a
 # mis-scoped round must not be SILENT.
+#
+# #747 CORRECTS WHAT THE NOTE TESTS FOR, and the correction is the second half of
+# this section. `gh pr diff` does not build from `baseRefOid`; it builds the
+# three-dot diff from `merge-base(baseRefOid, head)`. So `baseRefOid != fork
+# point` is NOT the mis-scoping condition — it is the ordinary state of any
+# branch cut from an older commit than the base tip (#270's shape), where that
+# merge base IS the fork point and the diff is exactly right. Measured on
+# lexray#1656: identical file set, identical line counts, identical per-file
+# numstat between `gh pr diff` and the fork-point three-dot range the old note
+# told the reader to go and check by hand.
+#
+# The condition that survives is #187's: the stored base is an ANCESTOR of the
+# head, the base branch has since absorbed the commits between it and the true
+# fork point, and the diff therefore really is built from a commit behind the
+# fork point. That is rare, and a note that fires only there is worth reading —
+# which is the whole point, because `config_notes` is where the load-bearing
+# scoping caveats live and a caveat that is always present and never true trains
+# the reader to skim past them.
 # --------------------------------------------------------------------------
 
 def test_the_recorded_base_is_the_fork_point_not_githubs_stored_one(
@@ -280,26 +302,70 @@ def test_the_recorded_base_is_the_fork_point_not_githubs_stored_one(
     assert payload["merge_base"] == "e38c1020"
 
 
-def test_a_stale_stored_base_is_named_in_config_notes(monkeypatch, tmp_path):
-    """The whole complaint. A round whose target was built against the wrong base
-    has to say so, name both commits, and give the reader the range to check a
-    finding against — because the next step of the cycle briefs a fixer to
-    resolve every confirmed finding without re-deriving it."""
-    payload, _ = _run(monkeypatch, tmp_path,
-                      merge_base="e08372ae", fork_point="e38c1020")
+def test_a_diff_built_behind_the_fork_point_is_named_in_config_notes(
+        monkeypatch, tmp_path):
+    """#187's shape, which is the whole complaint and the one that survives #747.
+    The base branch absorbed commits the head branch also has, so the commit
+    `gh pr diff` built from sits BEHIND the fork point and the diff carries code
+    already landed on the base. A round whose target was built that way has to say
+    so, name both commits, and give the reader the range to check a finding
+    against — because the next step of the cycle briefs a fixer to resolve every
+    confirmed finding without re-deriving it."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="e08372ae",
+                      fork_point="e38c1020", diff_base="e08372ae")
     said = [n for n in payload["config_notes"] if "MIS-SCOPED" in n]
     assert len(said) == 1, payload["config_notes"]
     assert "e08372ae" in said[0] and "e38c1020" in said[0]
     assert "gh pr diff" in said[0], "a reader has to be told which base was used"
 
 
-def test_a_stored_base_that_agrees_raises_no_note(monkeypatch, tmp_path):
+def test_a_base_branch_that_merely_moved_raises_no_note(monkeypatch, tmp_path):
+    """#747, and the reason the old condition had to go. `baseRefOid` is the base
+    TIP, so it disagrees with the fork point on every PR cut from an older commit
+    than that tip — most of them, on an active integration branch. But the diff
+    `gh pr diff` serves is built from `merge-base(baseRefOid, head)`, which in
+    that shape IS the fork point, so nothing is mis-scoped and the old note was a
+    false positive on every such round.
+
+    Asserted through the DIFF BASE rather than by deleting the check, because the
+    check is still real in #187's shape above. The two tests differ only in what
+    the second compare answers."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="46219a54",
+                      fork_point="d282366d", diff_base="d282366d")
+    assert payload["merge_base"] == "d282366d"
+    assert not any("MIS-SCOPED" in n for n in payload["config_notes"]), \
+        payload["config_notes"]
+
+
+def test_a_stored_base_that_agrees_costs_no_second_compare(monkeypatch, tmp_path):
     """The ordinary state of a PR nobody's base moved under. A note that fires on
     every run is a note that gets trained away, and this one has to be legible
-    when it fires."""
-    payload, _ = _run(monkeypatch, tmp_path,
-                      merge_base="0ddba5e0", fork_point="0ddba5e0")
+    when it fires.
+
+    The extra compare is skipped here rather than merely ignored, and the skip is
+    exact rather than a saving: where the stored base already IS the fork point it
+    is an ancestor of the head, so a merge base against it can only answer
+    itself."""
+    payload, calls = _run(monkeypatch, tmp_path,
+                          merge_base="0ddba5e0", fork_point="0ddba5e0")
     assert payload["merge_base"] == "0ddba5e0"
+    assert not any("MIS-SCOPED" in n for n in payload["config_notes"])
+    compares = [a[2] for a in calls
+                if a[:2] == ["gh", "api"] and panel._MERGE_BASE_JQ in a]
+    assert not any("/compare/0ddba5e0..." in p for p in compares), compares
+
+
+def test_an_unreadable_diff_base_says_unverified_not_mis_scoped(
+        monkeypatch, tmp_path):
+    """The stored base disagrees with the fork point and the compare that would
+    say whether that mattered could not be read. #241's failure mode is silence;
+    #747's is a warning worded as a finding when it is a missing measurement. So
+    this path says which one it is and does not claim the target was wrong."""
+    payload, _ = _run(monkeypatch, tmp_path, merge_base="46219a54",
+                      fork_point="d282366d", diff_base=None)
+    said = " ".join(payload["config_notes"])
+    assert "unverified rather than as wrong" in said
+    assert "46219a54" in said and "d282366d" in said
     assert not any("MIS-SCOPED" in n for n in payload["config_notes"])
 
 

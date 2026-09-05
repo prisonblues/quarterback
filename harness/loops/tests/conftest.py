@@ -20,7 +20,7 @@ panel.py means teaching :func:`gh_stub` about it once — and if you forget,
 `strict=True` (the default) raises on the unknown call instead of letting it rot
 into a plausible answer.
 
-**The seven calls panel.py makes**, all through ``panel.sh``:
+**The eight calls panel.py makes**, all through ``panel.sh``:
 
 =============================================  ===========================
 call                                            answered by
@@ -28,18 +28,22 @@ call                                            answered by
 ``gh pr view … --json title,additions,…``      ``meta``
 ``gh pr view … --json headRefOid``             ``head`` / ``head_moves_to``
 ``gh pr view … --json mergeable``              ``mergeable_now``
-``gh api repos/…/compare/… --jq .merge_base…`` ``fork_point`` / ``…_after``
+``gh api repos/…/compare/<branch>… --jq .m…`` ``fork_point`` / ``…_after``
+``gh api repos/…/compare/<sha>… --jq .merg…`` ``diff_base``
 ``gh api repos/…/git/ref/heads/…``             ``base_tip``
 ``gh api repos/…/compare/a...b --jq {status…`` ``compare`` / ``compare_diff``
 ``gh pr diff …``                               ``diff``
 =============================================  ===========================
 
-Two of those are the SAME endpoint told apart by their ``--jq``, which is how
-panel.py itself tells them apart: one asks the compare API for a fork point
-(:func:`panel_scope._merge_base_now`, #241) and the other for a range of file
-patches (``_fix_range_diff``). There used to be a ``gh pr view --json baseRefOid``
-here instead of the first — that read is the defect #241 is about, because
-``baseRefOid`` is GitHub's stored base and not a merge base.
+Three of those are the SAME endpoint, told apart the way panel.py itself tells
+them apart: by their ``--jq`` (a merge base, versus a range of file patches for
+``_fix_range_diff``) and then, between the two merge-base reads, by what they
+compare FROM. Asking from the base BRANCH gives the fork point
+(:func:`panel_scope._merge_base_now`, #241); asking from the stored base's SHA
+gives the commit ``gh pr diff`` actually built its diff from (#747). There used
+to be a ``gh pr view --json baseRefOid`` here instead of the first — that read is
+the defect #241 is about, because ``baseRefOid`` is the base branch's tip as of
+the last head push and not a merge base.
 
 This is deliberately a plain factory rather than a fixture: the modules here set
 ``panel.sh`` inside each test, often several times per test with different
@@ -254,7 +258,7 @@ def pr_meta(title="feat: a thing", *, additions=20, deletions=2,
 
 def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
             head=UNSET, head_moves_to=None, merge_base=UNSET,
-            fork_point=UNSET, merge_base_after=UNSET, compare=UNSET,
+            fork_point=UNSET, merge_base_after=UNSET, diff_base=UNSET, compare=UNSET,
             compare_diff="", mergeable_now=UNSET, tree=UNSET, calls=None,
             strict=True):
     """A `panel.sh` double answering every `gh` call panel.py makes.
@@ -280,6 +284,13 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
         is implicitly about. Give it a different value to reproduce #241.
       merge_base_after: what the fork-point read answers once the head has
         moved. Defaults to the unchanged `fork_point` (the no-op path).
+      diff_base: what the compare API answers for `merge-base(stored base, head)`
+        — the commit `gh pr diff` actually built its diff from (#747). Only asked
+        when `merge_base` and `fork_point` disagree. Defaults to `fork_point`,
+        i.e. the stored base is merely an older tip of the base branch and the
+        diff is correct, which is #270's shape and most PRs. Give it a value
+        older than the fork point to reproduce #187, the shape that really is
+        mis-scoped.
       mergeable_now: what the mergeability RE-READ answers (#271). Only reached
         when the opening read said UNKNOWN, which is what GitHub returns while it
         computes the merge test. Defaults to the metadata's own state.
@@ -375,6 +386,15 @@ def gh_stub(*, meta=UNSET, diff=PR_DIFF, base_tip=DEFAULT_BASE_TIP,
                 if "Accept: application/vnd.github.diff" in args:
                     return answer(compare_diff)
                 if panel._MERGE_BASE_JQ in args:
+                    # TWO merge-base callers, told apart by what they compare
+                    # FROM: the round's fork point asks from the base BRANCH,
+                    # #747's diff-base check asks from the stored base's SHA. On
+                    # the path panel.py actually sends, for the same reason the
+                    # `--jq` discrimination above is.
+                    lhs = path.split("/compare/", 1)[1].split("...", 1)[0]
+                    if lhs != base.get("baseRefName"):
+                        got = the_fork if diff_base is UNSET else diff_base
+                        return "" if got is None else f"{answer(got)}\n"
                     # The first read is the round's own; any later one is the
                     # re-read after the head moved, exactly as `head_moves_to`
                     # applies from the first single-field head read.
