@@ -4652,6 +4652,21 @@ distinguishable rather than both being "not HEAD". A working-tree lock that hash
 cached proposal's, for that same flake, is this tool's own output and is prepared over. A
 lock edited since, a proposal for another flake, a cleared cache — all still refuse.
 
+**Both halves of the handwriting, not just the last line of it (#744).** A proposal records
+two hashes: `new_lock_sha`, the lock it wrote, and `base_lock_sha`, the lock it read and
+built that proposal on top of. Recognising only the first meant a prepare that was never
+applied disarmed the recognition for the lock that *was* applied — apply A→B, main moves,
+prepare B→C to see what the next bump would do, get pulled onto something else, and the tree
+now matches the base rather than the new. Preparing is the cheap half people run without
+applying, so that sequence is ordinary, and it put the tool back in the state #537 closed
+while asserting an authorship its own cache disproved. A tree matching *either* hash is now
+prepared over: matching the base means byte-identical to what this tool read, so nothing has
+changed since it looked. The one staleness that matters is the consumer committing a
+*different* lock afterwards — a working tree left on the old content is then a deliberate
+revert, and that case is detected (`base_head`'s lock versus HEAD's) and still refuses, in
+words that say which of the two it is. A lock matching neither hash refuses as before, and
+says "does not recognise" rather than "did not write".
+
 #### Finding the quarterback checkout it compares against
 
 The drift is a comparison between two directories, and one of them is a checkout of this

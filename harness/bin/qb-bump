@@ -998,6 +998,31 @@ def dirty_tracked(flake: Path) -> list[str]:
     return [n for n in (line.strip() for line in out.splitlines()) if n and n != "flake.lock"]
 
 
+def committed_lock_moved(flake: Path, base_head: str) -> bool:
+    """True only when `flake`'s COMMITTED `flake.lock` provably differs from the one it
+    held at `base_head`.
+
+    This is the one way :func:`lock_is_committed`'s base-hash recognition could be
+    wrong. `base_lock_sha` is the content this tool READ, and at the moment it read it
+    the lock was either identical to HEAD's or this tool's own output — so a tree that
+    still hashes to it holds nothing of anybody's. Unless HEAD's lock has moved
+    underneath since: then a working tree sitting on the old content is a deliberate
+    `git checkout <older> -- flake.lock`, an operator saying "not that lock", and
+    preparing against the new HEAD would write over exactly the thing they were
+    protecting.
+
+    Unresolvable is not moved. A cache from before `base_head` existed, or a commit
+    that has since been garbage-collected, leaves the question unanswered — and the
+    recognition's own justification (byte-identical to what this read) still holds, so
+    an unanswerable staleness check must not become a refusal by itself.
+    """
+    if not base_head:
+        return False
+    rc_then, then, _ = run(["git", "-C", str(flake), "rev-parse", f"{base_head}:flake.lock"])
+    rc_now, now, _ = run(["git", "-C", str(flake), "rev-parse", "HEAD:flake.lock"])
+    return rc_then == 0 and rc_now == 0 and then != now
+
+
 def lock_is_committed(flake: Path) -> str:
     """``""`` if the consumer's `flake.lock` is safe to prepare over, else why it is not.
 
@@ -1025,6 +1050,30 @@ def lock_is_committed(flake: Path) -> str:
     it replaces this tool's own lock with a newer version of it and discards nothing.
     A lock that has been edited since, one from a cleared cache, one from another
     machine — none of those match, and all of them still refuse.
+
+    **But what it wrote is only half its handwriting (#744).** A proposal records two
+    hashes: `new_lock_sha`, the lock it WROTE, and `base_lock_sha`, the lock it READ and
+    built that proposal on top of. Recognising only the first meant a prepare that was
+    never applied disarmed the recognition for the lock that WAS applied, and that is
+    the ordinary sequence rather than a corner: apply A→B (tree is now `lock(B)`), main
+    moves, prepare B→C to see what the next bump would do, get pulled onto something
+    else. The cache now says `base_lock_sha = lock(B)`, `new_lock_sha = lock(C)`, and the
+    tree — this tool's own applied lock, untouched — matches only the base. Preparing is
+    the cheap, safe half people run without applying, so any such run re-created exactly
+    the state #537 closed, and refused it in a sentence the cache disproved.
+
+    So the base hash is accepted as this tool's handwriting too, and it is handwriting in
+    the sense that matters: byte-identical to the content this tool read, which means
+    nothing has changed since it looked and there is nothing of the operator's to
+    discard. `base_lock_sha` is only ever recorded after this very function has passed
+    the lock — clean against HEAD, or this tool's own output — so it is never a hash of
+    somebody's in-flight work. The one way it could go stale is HEAD's lock moving
+    underneath afterwards, which :func:`committed_lock_moved` rules out.
+
+    One proposal with both hashes, rather than a ring of recent ones: consecutive
+    prepares without an apply all read the same unchanged working tree, so they record
+    the same base and shadow nothing. Only an apply moves that tree, and an apply is
+    recorded as the new hash.
     """
     rc, _, _ = run(["git", "-C", str(flake), "diff", "--quiet", "HEAD", "--", "flake.lock"])
     if rc == 0:
@@ -1035,15 +1084,36 @@ def lock_is_committed(flake: Path) -> str:
             current = (flake / "flake.lock").read_text(encoding="utf-8")
         except OSError:
             current = ""
-        if current and sha(current) == mine.new_lock_sha:
+        here = sha(current) if current else ""
+        if here and here == mine.new_lock_sha:
             say(f"{flake}/flake.lock is uncommitted, and is the one this installed "
                 f"({mine.input} -> {mine.new_rev[:12]}) — preparing over it, not "
                 "over anything of yours")
             say("committing it is still yours to do", indent=True)
             return ""
-    return (f"{flake}/flake.lock has uncommitted changes that this did not write. It "
-            "prepares against HEAD, so applying the result would discard them — commit "
-            "or revert that file first")
+        if here and here == mine.base_lock_sha:
+            # Said rather than refused, and said either way: the tool knows the file
+            # is one it has held, so neither outcome may be worded as if it did not.
+            if not committed_lock_moved(flake, mine.base_head):
+                say(f"{flake}/flake.lock is uncommitted, and is byte-for-byte the lock "
+                    f"this read when it prepared {mine.input} "
+                    f"{mine.old_rev[:12]} -> {mine.new_rev[:12]} — nothing has changed "
+                    "since, so preparing over it discards nothing")
+                say("committing it is still yours to do", indent=True)
+                return ""
+            return (f"{flake}/flake.lock is the lock this last prepared from, but "
+                    f"{flake} has committed a different lock since — so relative to "
+                    "HEAD it is now a change of yours, and preparing against HEAD would "
+                    "discard it. Commit or revert that file first")
+    # "does not recognise", never "did not write". The tool compares against what it
+    # last wrote AND what it last read, so the honest claim is about recognition; the
+    # authorship claim is one its own cache was able to disprove (#744).
+    detail = ("they are neither the lock it last wrote nor the one it last prepared from"
+              if mine is not None and Path(mine.flake) == flake
+              else "there is no prepared bump of this flake to account for them")
+    return (f"{flake}/flake.lock has uncommitted changes this does not recognise: "
+            f"{detail}. It prepares against HEAD, so applying the result would discard "
+            "them — commit or revert that file first")
 
 
 def prepare(consumer: Consumer, attr: str, script: str, drift: Drift,

@@ -1808,7 +1808,7 @@ def test_a_lock_somebody_else_touched_still_refuses(prepared, consumer_repo, mon
     assert qb.apply(prepared, dry_run=False) == 0
     (consumer_repo / "flake.lock").write_text(_lock("f" * 40))  # edited since
     why = qb.lock_is_committed(consumer_repo)
-    assert "did not write" in why
+    assert "does not recognise" in why
 
 
 def test_an_uncommitted_lock_with_no_proposal_behind_it_still_refuses(consumer_repo):
@@ -1816,7 +1816,10 @@ def test_an_uncommitted_lock_with_no_proposal_behind_it_still_refuses(consumer_r
     are this tool's handwriting and none of them may be prepared over."""
     (consumer_repo / "flake.lock").write_text(_lock("f" * 40))
     assert qb.load() is None, "the premise: nothing in the cache to compare against"
-    assert "did not write" in qb.lock_is_committed(consumer_repo)
+    why = qb.lock_is_committed(consumer_repo)
+    assert "does not recognise" in why
+    assert "no prepared bump of this flake" in why, \
+        "with an empty cache there are no hashes to have been compared against"
 
 
 def test_a_proposal_for_a_different_consumer_is_not_this_ones_handwriting(prepared,
@@ -1834,7 +1837,107 @@ def test_a_proposal_for_a_different_consumer_is_not_this_ones_handwriting(prepar
     (other / "flake.lock").write_text(_lock("a" * 40))
     _commit(other)
     (other / "flake.lock").write_text((consumer_repo / "flake.lock").read_text())
-    assert "did not write" in qb.lock_is_committed(other)
+    assert "does not recognise" in qb.lock_is_committed(other)
+
+
+# --------------------------------------------------------------------------- #
+# both halves of its own handwriting: what it wrote AND what it read (#744)
+# --------------------------------------------------------------------------- #
+
+def _prepare(consumer_repo: Path, monkeypatch, old_rev: str, new_rev: str) -> qb.Proposal:
+    """One real preparation, with `nix` stubbed to move the pin `old_rev` -> `new_rev`."""
+    monkeypatch.setattr(qb, "have_nix", lambda: True)
+    monkeypatch.setattr(qb, "nix", _fake_nix(new_rev))
+    proposal, _, why = qb.prepare(
+        qb.Consumer(consumer_repo, "quarterback", "quarterback", old_rev, "--flake"),
+        "desktop", str(BIN / "qb-bump"), qb.Drift("fail", "behind"))
+    assert why == "" and proposal is not None
+    return proposal
+
+
+def _apply(proposal: qb.Proposal, monkeypatch) -> None:
+    """A real `--apply`, with the terminal and the `execvp` stubbed out."""
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(qb.os, "execvp", lambda f, argv: None)
+    assert qb.apply(proposal, dry_run=False) == 0
+
+
+def _commit_only(repo: Path, path: str, msg: str) -> None:
+    """Commit one path. `_commit` is `git add -A`, which would sweep in the very
+    uncommitted `flake.lock` these tests are about."""
+    _git(repo, "add", path)
+    _git(repo, "-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false",
+         "commit", "-q", "-m", msg)
+
+
+def test_a_prepare_that_was_never_applied_does_not_disarm_the_lock_that_was(consumer_repo,
+                                                                           monkeypatch,
+                                                                           capsys):
+    """#744, the whole sequence. Prepare A->B, apply it, then prepare B->C and get pulled
+    onto something else — the ordinary reason prepare and apply are separate commands.
+    The working tree still holds the lock that WAS applied, which the second proposal
+    recorded as the one it read; recognising only what it last WROTE put the tool back
+    in the state #537 closed, refusing its own output on the second prepare."""
+    _apply(_prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40), monkeypatch)
+    assert (consumer_repo / "flake.lock").read_text() == _lock("b" * 40)
+    second = _prepare(consumer_repo, monkeypatch, "b" * 40, "c" * 40)
+    assert second.base_lock_sha == qb.sha(_lock("b" * 40)), "the tree it read"
+    assert second.new_lock_sha == qb.sha(_lock("c" * 40)), "the lock it would write"
+    capsys.readouterr()
+    assert qb.lock_is_committed(consumer_repo) == ""
+    assert "discards nothing" in capsys.readouterr().err
+
+
+def test_a_lock_matching_neither_hash_is_still_refused_and_claims_no_authorship(
+        consumer_repo, monkeypatch):
+    """The guard #537 kept, and #744 must not weaken into uselessness: an edited lock
+    matches neither hash and still stops the preparation. The wording is part of the
+    fix — the tool knows the difference between "not mine" and "not the one I was
+    expecting", and it may only assert the former."""
+    _apply(_prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40), monkeypatch)
+    _prepare(consumer_repo, monkeypatch, "b" * 40, "c" * 40)
+    (consumer_repo / "flake.lock").write_text(_lock("9" * 40))
+    why = qb.lock_is_committed(consumer_repo)
+    assert "does not recognise" in why
+    assert "did not write" not in why, "an authorship claim the cache could disprove"
+
+
+def test_a_commit_that_is_not_the_lock_does_not_disarm_the_base_hash(consumer_repo,
+                                                                    monkeypatch):
+    """The staleness guard is about the COMMITTED lock moving, not about HEAD moving.
+    A consumer commits other files all day; refusing on that would re-create #744 in a
+    slightly different shape."""
+    _apply(_prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40), monkeypatch)
+    _prepare(consumer_repo, monkeypatch, "b" * 40, "c" * 40)
+    (consumer_repo / "README").write_text("nothing to do with the lock\n")
+    _commit_only(consumer_repo, "README", "unrelated")
+    assert qb.lock_is_committed(consumer_repo) == ""
+
+
+def test_a_lock_committed_since_turns_the_base_match_back_into_a_refusal(consumer_repo,
+                                                                        monkeypatch):
+    """The one state where a tree matching `base_lock_sha` IS somebody's change: the
+    consumer commits a lock of their own, then puts the older content back in the
+    working tree. That is a deliberate "not that lock", and preparing against the new
+    HEAD would write over exactly what they were protecting."""
+    _apply(_prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40), monkeypatch)
+    _prepare(consumer_repo, monkeypatch, "b" * 40, "c" * 40)
+    (consumer_repo / "flake.lock").write_text(_lock("d" * 40))
+    _commit(consumer_repo, "a lock change of the consumer's own")
+    (consumer_repo / "flake.lock").write_text(_lock("b" * 40))
+    why = qb.lock_is_committed(consumer_repo)
+    assert "committed a different lock since" in why
+    assert "does not recognise" not in why, "it recognises the file; it distrusts the state"
+
+
+def test_a_staleness_check_that_cannot_be_answered_is_not_a_refusal(consumer_repo):
+    """A cache written before `base_head` existed, or one naming a commit that has since
+    been garbage-collected, cannot say whether HEAD's lock has moved. The recognition's
+    justification — byte-identical to what this read — does not depend on the answer, so
+    an unanswerable check must not refuse on its own."""
+    assert qb.committed_lock_moved(consumer_repo, "") is False
+    assert qb.committed_lock_moved(consumer_repo, "0" * 40) is False
+
 
 
 def test_apply_twice_in_a_row_is_the_ordinary_thing_it_looks_like(consumer_repo,
