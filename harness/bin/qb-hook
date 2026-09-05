@@ -244,13 +244,21 @@ _once() {   # _once <key>: true the first time only (no expiry) — dedupe by id
 #
 # It is often not a person taking something on. A 240-minute board sample of 34
 # auto-claims had 9 that were not work (26.5%): peer messages, task
-# notifications, and scripted sessions whose prompt is a system prompt. The
-# status post is the visible half and the smaller one; the lease write is the
-# damage. It has no throttle at all, so an agent messaged five times in ten
-# minutes had its declared subject overwritten five times with the sender's
-# socket-path wrapper — undiscoverable, for that window, on what it is actually
-# doing. That is precisely the failure the claim exists to prevent, and a peer
-# who checks and is told the coast is clear acts on the answer.
+# notifications, and scripted sessions whose prompt is a system prompt (that last
+# source is #764 and is NOT fixed here — no wrapper distinguishes it).
+#
+# Two writes, and the status post is the visible half and the smaller one. The
+# lease's `recap` is the field /overlap ranks peers on, and it had no throttle
+# and no length gate, so it took the wrapper on every injected turn.
+#
+# How long that lasts, stated accurately because this hook is about claims
+# meaning what they say: until the end of the turn. `Stop` leases again with a
+# `recap` read from history.jsonl, which holds what a person TYPED — 0 of 9210
+# entries on this host begin with `<` — so the subject repairs itself one turn
+# later wherever that file has an entry for the session. The damage is one turn
+# wide, not the ten-minute throttle window, and being messaged five times does
+# not stack. It is still the window in which a peer is most likely to be asking,
+# and a peer who checks and is told the coast is clear acts on the answer.
 #
 # THIS IS A HEURISTIC AND IT IS ONE-SIDED ON PURPOSE. Claude Code hands the hook
 # no provenance field — the payload carries the text and nothing about where it
@@ -258,22 +266,35 @@ _once() {   # _once <key>: true the first time only (no expiry) — dedupe by id
 # the failure the whole subsystem exists to prevent, so the rule refuses only
 # turns whose OPENING is a wrapper the client itself wrote. A prompt that merely
 # mentions one still claims.
+
+# The one sentence stepped over in front of a wrapper, matched in FULL. Two
+# pieces of evidence disagree about whether it reaches the hook at all: board
+# post 3434 shows the hook receiving the bare `<cross-session-message`, while
+# every transcript of such a turn stores this line in front of it. Handling both
+# costs one string compare.
+#
+# It is a string compare and not "any short line ending in a colon", which is
+# what the first cut of this did. That arm refused `Look at this:\n<cross-session
+# -message …> what does it mean?` — a person declaring work, in the commonest
+# prompt shape there is, and the exact shape someone debugging THIS FUNCTION
+# would type. One arm added for one observed string was carrying every
+# false-refusal path in the design. Reworded, the lead-in stops being recognised
+# and the turn CLAIMS, which is the direction this whole function errs in.
+_QB_MSG_LEADIN='Another Claude session sent a message:'
+
 _declares_work() {   # _declares_work <prompt> — true if this reads as a person's own turn
   local p="$1" first
-  # Short follow-ups ("yes", "carry on") claim nothing new. This gate already
-  # guarded the post; it guards the lease's subject now too, because "yes"
-  # overwrites a good subject exactly as thoroughly as a wrapper does.
+  # Short follow-ups ("yes", "carry on") claim nothing new, so they write no
+  # subject HERE. They still reach the lease from `Stop`, which sends the last
+  # typed prompt out of history.jsonl — that path is untouched and out of #157's
+  # scope, since what it ships is always something a person actually typed.
   [ "${#p}" -gt 25 ] || return 1
   p="${p#"${p%%[![:space:]]*}"}"
-  first="${p%%$'\n'*}"
-  # One short lead-in line the client may prepend — "Another Claude session sent
-  # a message:" is the observed one — is stepped over, and nothing else is.
-  case "$first" in
-    *"<"*) : ;;
-    *:) if [ "${#first}" -le 120 ]; then
-          p="${p#*$'\n'}"; p="${p#"${p%%[![:space:]]*}"}"; first="${p%%$'\n'*}"
-        fi ;;
-  esac
+  first="${p%%$'\n'*}"; first="${first%"${first##*[![:space:]]}"}"
+  if [ "$first" = "$_QB_MSG_LEADIN" ]; then   # trailing space or CR already trimmed
+    p="${p#*$'\n'}"; p="${p#"${p%%[![:space:]]*}"}"
+    first="${p%%$'\n'*}"; first="${first%"${first##*[![:space:]]}"}"
+  fi
   case "$first" in
     # A peer's message and a subagent finishing are turns nobody typed. Both are
     # worth a board post — but attributed to the sender, not published under the

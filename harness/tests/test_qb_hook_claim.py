@@ -5,13 +5,19 @@ and as a `working on:` status post. Both were gated on nothing but `.prompt`
 being non-empty, and a prompt is not the same thing as a person declaring work.
 
 A 240-minute sample of 34 auto-claims held 9 that were not work — peer messages,
-task notifications, scripted sessions. The status post is the half you can see
-and the smaller one. The lease write is the damage: it had no throttle at all, so
-an agent messaged five times in ten minutes had the field `/overlap` ranks peers
-on overwritten five times with the sender's socket-path wrapper. For that window
-it was undiscoverable on what it was actually doing, which is the exact failure
-the claim was written to prevent — and a peer who checks and is told the coast is
-clear acts on the answer. A corrupted claim is worse than no claim.
+task notifications, scripted sessions (that last source is #764 and is not fixed
+here). The status post is the half you can see and the smaller one; the lease's
+`recap` is the field `/overlap` ranks peers on, and it had no throttle and no
+length gate, so it took the wrapper on every injected turn.
+
+How long that lasts, stated precisely because overstating it would be the same
+kind of error the fix is about: until the end of the turn. `Stop` leases again
+with a `recap` read from `history.jsonl`, which holds what a person typed and
+never a wrapper (0 of 9210 entries on this host open with `<`), so the subject
+repairs itself one turn later wherever that file has an entry for the session.
+One turn wide, not ten minutes, and repeated messages do not stack. Still the
+window in which a peer is most likely to be asking, and a peer who checks and is
+told the coast is clear acts on the answer.
 
 So the two writes share one gate now. The asymmetry the tests below pin is
 deliberate and runs the other way from what a spam filter would do: nothing here
@@ -253,12 +259,71 @@ def test_a_slash_command_is_a_person_declaring_work(hook):
 
 
 def test_a_short_follow_up_claims_nothing_new(hook):
-    """"yes" and "carry on" were already skipped for the post. They now skip the
-    subject too — a two-word acknowledgement overwrites a good subject exactly as
-    thoroughly as a socket path does."""
+    """"yes" and "carry on" were already skipped for the post; they skip this
+    write too. Scope, because an earlier draft of this file claimed more than the
+    change does: it is the per-prompt write that stops, not every write. `Stop`
+    leases again with the last typed prompt out of `history.jsonl` — where 2987 of
+    9210 entries on this host are 25 characters or fewer — so a short follow-up
+    still reaches the lease seconds later, by a path #157 does not touch and
+    should not, since what that path ships is always something a person typed."""
     hook.prompt("yes, carry on")
     assert hook.claims() == []
     assert hook.recaps() == []
+
+
+# ---------------------------------- the one lead-in, and what it must not swallow
+
+
+#: The commonest prompt shape there is: a line of instruction, a colon, and
+#: something pasted underneath. Every one is a person declaring work, and the
+#: third is what somebody debugging this very function would type.
+LEAD_IN_HUMAN = [
+    "Look at this:\n<cross-session-message from=...> what does it mean?",
+    "Do this:\n<task-notification> parsing, is it meant to be dropped?",
+    "Question about the hook:\n<bash-input>ls</bash-input> why is this refused?",
+    "TODO:\n<system-reminder> handling is broken, work out why",
+]
+
+
+@pytest.mark.parametrize("turn", LEAD_IN_HUMAN)
+def test_a_colon_lead_in_over_a_pasted_wrapper_is_still_a_person(hook, turn):
+    """The first cut of `_declares_work` stepped over ANY first line under 120
+    characters that ended in a colon, and judged the second — which refused all
+    four of these. One arm, added to catch one observed string, was carrying every
+    false-refusal path in the design, and false refusal is the direction this gate
+    exists not to fail in. The lead-in is matched in full now."""
+    hook.prompt(turn)
+    assert len(hook.claims()) == 1, f"refused a person declaring work: {turn!r}"
+    assert hook.recaps(), f"refused a person declaring work: {turn!r}"
+
+
+@pytest.mark.parametrize("lead_in", [
+    "Another Claude session sent a message:",
+    "Another Claude session sent a message: ",     # one trailing space
+    "Another Claude session sent a message:\r",    # CRLF delivery
+])
+def test_the_peer_message_lead_in_is_stepped_over_whatever_it_ends_with(hook, lead_in):
+    """The evidence disagrees about whether this line reaches the hook at all —
+    board post 3434 shows the bare wrapper, every transcript shows this sentence
+    in front of it — so both shapes are handled. Trailing whitespace comes off
+    before the compare: an exact match against a line the client formats is one
+    character from silently failing open, and the two characters it is likeliest
+    to gain are a space and a CR."""
+    hook.prompt(f'{lead_in}\n<cross-session-message from="uds:/tmp/x.sock" '
+                'from-name="peer">\nNothing needed from you, just flagging it.')
+    assert hook.claims() == []
+    assert hook.recaps() == []
+
+
+def test_an_unrecognised_lead_in_claims_rather_than_guessing(hook):
+    """The failure direction, pinned deliberately. If the client rewords that
+    sentence the wrapper stops being found and the turn is claimed — a junk claim,
+    which is the outcome this gate prefers to refusing a real one. A test
+    demanding the opposite would be asking for a gate that tightens itself on
+    evidence nobody has."""
+    hook.prompt('Heads up, incoming:\n<cross-session-message from="uds:/tmp/x.sock">'
+                '\nNothing needed from you, just flagging it.')
+    assert len(hook.claims()) == 1
 
 
 # ----------------------------------------------------- the throttle
