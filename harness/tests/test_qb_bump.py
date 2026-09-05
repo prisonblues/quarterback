@@ -1845,7 +1845,16 @@ def test_a_proposal_for_a_different_consumer_is_not_this_ones_handwriting(prepar
 # --------------------------------------------------------------------------- #
 
 def _prepare(consumer_repo: Path, monkeypatch, old_rev: str, new_rev: str) -> qb.Proposal:
-    """One real preparation, with `nix` stubbed to move the pin `old_rev` -> `new_rev`."""
+    """One real preparation, in production's order, with `nix` stubbed to move the pin.
+
+    The gate first, because `prepare` does not call it — `main` does, separately — and
+    the invariant every test below rests on is an ordering one: `base_lock_sha` is only
+    ever recorded for a lock `lock_is_committed` has already passed. A helper that
+    called `prepare` alone would record bases production can never record and prove
+    nothing about production's sequence.
+    """
+    assert qb.lock_is_committed(consumer_repo) == "", \
+        "the gate runs before every prepare, and these fixtures must get past it"
     monkeypatch.setattr(qb, "have_nix", lambda: True)
     monkeypatch.setattr(qb, "nix", _fake_nix(new_rev))
     proposal, _, why = qb.prepare(
@@ -1930,13 +1939,54 @@ def test_a_lock_committed_since_turns_the_base_match_back_into_a_refusal(consume
     assert "does not recognise" not in why, "it recognises the file; it distrusts the state"
 
 
-def test_a_staleness_check_that_cannot_be_answered_is_not_a_refusal(consumer_repo):
-    """A cache written before `base_head` existed, or one naming a commit that has since
-    been garbage-collected, cannot say whether HEAD's lock has moved. The recognition's
-    justification — byte-identical to what this read — does not depend on the answer, so
-    an unanswerable check must not refuse on its own."""
-    assert qb.committed_lock_moved(consumer_repo, "") is False
-    assert qb.committed_lock_moved(consumer_repo, "0" * 40) is False
+def test_the_baseline_is_remembered_rather_than_looked_up_through_a_commit(consumer_repo,
+                                                                            monkeypatch):
+    """The recorded blob is git's identity for the COMMITTED lock, and it survives the
+    commit that carried it. A proposal that had to resolve `base_head` to answer would
+    go quiet the moment a consumer rebased."""
+    proposal = _prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40)
+    assert proposal.base_head_lock == _git(consumer_repo, "rev-parse", "HEAD:flake.lock")
+    assert qb.committed_lock_stayed(consumer_repo, proposal.base_head_lock) is True
+
+
+def test_a_lock_committed_since_is_caught_even_when_the_base_commit_is_gone(consumer_repo,
+                                                                           monkeypatch):
+    """The sequence the recorded blob exists for, with the evidence a lookup would have
+    needed taken away. Prepare over lock A; the consumer commits a different lock D; the
+    operator restores A in the working tree on purpose; the commit this was prepared at
+    is rewritten out of existence. A check that resolved `base_head` would answer "cannot
+    tell" and wave the tree through, and the next prepare-and-apply would replace the
+    lock they deliberately put back."""
+    _apply(_prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40), monkeypatch)
+    proposal = _prepare(consumer_repo, monkeypatch, "b" * 40, "c" * 40)
+    kept = _lock("b" * 40)
+    (consumer_repo / "flake.lock").write_text(_lock("d" * 40))
+    _commit(consumer_repo, "a lock change of the consumer's own")
+    (consumer_repo / "flake.lock").write_text(kept)  # deliberately restored
+    cached = json.loads((qb.CACHE / "proposal.json").read_text())
+    cached["base_head"] = "0" * 40  # the commit it was prepared at, gone
+    (qb.CACHE / "proposal.json").write_text(json.dumps(cached))
+    assert qb.load().base_head_lock == proposal.base_head_lock, "the blob is still there"
+    why = qb.lock_is_committed(consumer_repo)
+    assert "committed a different lock since" in why
+
+
+def test_a_proposal_too_old_to_name_its_baseline_declines_the_base_match(consumer_repo,
+                                                                        monkeypatch):
+    """A cache written before `base_head_lock` existed cannot say whether the committed
+    lock moved, and no answer must mean no — the whole hazard is a check that goes quiet
+    exactly where it has least evidence. The cost is one refusal, for one legacy cache,
+    and the next prepare writes one that can answer."""
+    _apply(_prepare(consumer_repo, monkeypatch, "a" * 40, "b" * 40), monkeypatch)
+    _prepare(consumer_repo, monkeypatch, "b" * 40, "c" * 40)
+    cached = json.loads((qb.CACHE / "proposal.json").read_text())
+    del cached["base_head_lock"]  # the shape a pre-#744 cache has on disk
+    (qb.CACHE / "proposal.json").write_text(json.dumps(cached))
+    assert qb.load() is not None, "an older cache still loads; it just answers less"
+    why = qb.lock_is_committed(consumer_repo)
+    assert "predates the record of which committed lock" in why
+    assert "does not recognise" not in why, "it recognises the bytes; it cannot place them"
+    assert qb.committed_lock_stayed(consumer_repo, "") is False
 
 
 
