@@ -941,7 +941,9 @@ fixes while they were still writing them.
   - it **destroys** it — `reset --hard|--merge`, `checkout` of a path or with `-f`,
     `switch -f|--discard-changes`, `restore` (unless `--staged` alone), `clean -fd|--force`,
     `rm -f`, `worktree remove --force`, `checkout-index -f|-a`, `read-tree --reset -u`, the
-    `--abort` of an in-progress merge/rebase/cherry-pick;
+    `--abort` of an in-progress merge/rebase/cherry-pick. Not `checkout-index --temp`,
+    `--stage=all` or an absolute `--prefix=`, which write no tracked destination, and not
+    `read-tree`'s `-n`/`--dry-run`;
   - or it **absorbs** it — `commit -a`, `add .`/`-A`/`-u`. In a shared tree you cannot tell your
     uncommitted files from theirs, so staging "everything" stages theirs;
 - **the tree that command will actually touch** holds some, **untracked files included** —
@@ -963,6 +965,14 @@ to look. "Nobody reaches for it" was never a claim about the command; it was a c
 caller, and the caller is somebody who has just been refused, so the rung below a guarded command
 is precisely where a refusal sends them. `read-tree --reset -u` is the next rung down again and
 is guarded for that reason rather than for an incident of its own.
+
+`-a` is taken without `-f` even though it cannot overwrite an existing file, because it can still
+**recreate one the peer deleted** — an uncommitted `rm` is uncommitted work, and no force is
+needed to write a path that is absent. What is *not* taken is anything that demonstrably writes
+no tracked destination: `--temp` and `--stage=all` write `.merge_file_*`, and an absolute
+`--prefix=` exports outside the tree. The relative spellings are a different command — measured,
+`--prefix=./` overwrote the tracked file — and `-n` here is `--no-create`, not a dry run, so the
+`clean -n` exemption does not reach it. `read-tree`'s `-n` genuinely is one, and is exempt.
 
 **There is a third harm, and it deliberately does not use those three facts.** `git stash pop`
 and `git stash apply` **take** a peer's work rather than destroying or absorbing it (#739), and

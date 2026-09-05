@@ -427,7 +427,6 @@ def test_the_shared_stack_is_still_named_however_it_is_spelled(cmd):
     "git checkout-index --all --force",
     "git checkout-index -a",                          # before anyone reaches for -f
     "git checkout-index -f -- app.py",                # one file, the same overwrite
-    "git checkout-index --force --prefix=/tmp/s/ -a",
     "git -c core.filemode=false checkout-index -a -f",
     "sh -c 'git checkout-index -a -f'",
     "git status && git checkout-index -a -f",
@@ -450,6 +449,61 @@ def test_restoring_the_tree_from_the_index_is_destructive(cmd):
 ])
 def test_a_checkout_index_that_cannot_overwrite_is_left_alone(cmd):
     assert not destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout-index -a -f --temp",
+    "git checkout-index -a --temp",
+    "git checkout-index -a -f --stage=all",
+    "git checkout-index -a -f --prefix=/tmp/export/",
+    "git -C /srv/repo checkout-index -a -f --prefix=/tmp/export/",
+])
+def test_a_form_that_writes_no_tracked_destination_is_not_refused(cmd):
+    """A guard that fires on a temp-file export is one that gets ignored when it
+    fires for real, and these demonstrably do not touch a tracked path — measured
+    on git 2.54.0: `--temp` and `--stage=all` write `.merge_file_*` and print the
+    mapping, and an absolute `--prefix=` lands outside the tree entirely."""
+    assert not destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    # `--prefix=./` overwrote the tracked file outright, and `--prefix=sub/`
+    # writes into a directory that holds tracked files of its own. Relative is
+    # not the export idiom; only the absolute spelling is exempt.
+    "git checkout-index -a -f --prefix=./",
+    "git checkout-index -a -f --prefix=sub/",
+    # `-n` is `--no-create`, NOT a dry run. `-a -f -n` overwrote the tracked file
+    # in the same measurement, so the `clean -n` exemption must not be copied
+    # down here on the strength of the letter.
+    "git checkout-index -a -f -n",
+    "git checkout-index -a -fn",
+])
+def test_the_forms_that_look_exempt_and_are_not(cmd):
+    assert destructive(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "git read-tree --reset -u -n HEAD",
+    "git read-tree --reset -u --dry-run HEAD",
+    "git read-tree --reset -un HEAD",
+])
+def test_a_read_tree_dry_run_is_exempt_like_every_other_dry_run(cmd):
+    """`clean -n` is exempt and the module header cites it as the precedent, so a
+    guard that refused this one would be breaking its own stated promise. These
+    satisfy every other condition of the rule and update neither the index nor
+    the worktree — measured on git 2.54.0."""
+    assert not destructive(cmd), cmd
+
+
+def test_recreating_a_peers_deletion_is_why_all_is_taken_without_force():
+    """`-a` cannot overwrite an existing file, and it is refused anyway for a
+    reason that does not rest on guessing what the caller types next: it
+    RECREATES a file the peer deleted. An uncommitted `rm` is uncommitted work,
+    the path is absent so no force is needed to write it, and the deletion goes
+    away silently. Measured 2026-09-05: `rm f.txt` then `checkout-index -a` put
+    `f.txt` back."""
+    assert destructive("git checkout-index -a")
+    assert classify("git checkout-index -a")["harm"] == "destroys"
 
 
 @pytest.mark.parametrize("cmd,want", [
