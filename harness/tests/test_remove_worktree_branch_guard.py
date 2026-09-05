@@ -37,9 +37,16 @@ REMOVE = BIN / "remove-worktree"
 #: the guard behaving exactly as #527 designed it. A name MISSING from here is the
 #: worse direction: it reads to the script as "that tool is broken", and the test
 #: would report that as the behaviour of the guard.
+#: `tar`, `gzip` and `mktemp` joined the list with #743: the pre-teardown backup
+#: now collects its file list through `mktemp` and a NUL-delimited `tar --null
+#: -T`, and a backup that cannot be written ABORTS the teardown. So a missing
+#: one of those three no longer reads as "no backup taken" — it reads as "the
+#: worktree was not removed", and this suite would report that as the branch
+#: guard refusing.
 TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
          "wc", "date", "basename", "dirname", "rm", "mkdir", "env", "timeout",
-         "jq", "chmod", "find", "sort", "mv", "ln", "readlink")
+         "jq", "chmod", "find", "sort", "mv", "ln", "readlink", "tar", "gzip",
+         "mktemp")
 
 
 def git(cwd, *args):

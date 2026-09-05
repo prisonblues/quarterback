@@ -12,6 +12,11 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        or the branch carries commits its PR never took
 #   --keep-claim         Don't hand back the board claim on the issue this
 #                        worktree's branch names (#337)
+#   --no-backup          Don't archive the tree's dirty and ignored files first.
+#                        The escape hatch for a backup that cannot succeed (no
+#                        disk, an unarchivable file) — without it, a failing
+#                        backup makes the worktree permanently un-removable,
+#                        because the failure aborts the teardown (#743)
 
 # ============================================
 # COLORS & HELPERS
@@ -196,6 +201,41 @@ release_the_claim() {
 }
 # <<< release
 
+# Turn `git status --porcelain --ignored -z` on stdin into a NUL-delimited list
+# of paths to hand `tar --null -T`. $1 is the worktree root the paths are
+# relative to — porcelain always reports from the repository root, and taking it
+# as an argument rather than as the process's cwd keeps the whole backup honest
+# on the path where the `cd` into the worktree silently failed.
+#
+# -z IS THE POINT. Without it git *quotes* any path holding a quote, a newline,
+# a backslash or a non-ASCII byte — `"caf\303\251.txt"`, with the C escapes
+# literal — and the old `substr($0, 4)` handed tar that spelling verbatim. tar
+# then cannot stat a file under that name, so the one path most likely to be
+# somebody's real work is the one silently missing from the archive. -z emits
+# each record raw and NUL-terminated, so there is nothing to unquote.
+collect_dirty_files() {
+    local root="$1" rec status path
+    while IFS= read -r -d '' rec; do
+        status="${rec:0:2}"
+        path="${rec:3}"
+        # A rename or copy is TWO records under -z: the status line naming the
+        # new path, then a bare record holding the old one. Consumed rather than
+        # parsed — it carries no status field, so reading it as one would take
+        # the first three characters off a real filename. (The old ` -> ` split
+        # was git's *human* rendering, which -z does not produce at all.)
+        if [[ "$status" == R* || "$status" == C* ]]; then
+            IFS= read -r -d '' _ || true
+        fi
+        # A deletion has no bytes to archive, and `tar -T` fails the WHOLE run on
+        # one entry it cannot stat. Now that a failed backup aborts the teardown,
+        # keeping deleted paths in the list would refuse to tear down any
+        # worktree with a `git rm` in it — a guard that fires on the safe case is
+        # a guard somebody disables.
+        [[ -e "$root/$path" || -L "$root/$path" ]] || continue
+        printf '%s\0' "$path"
+    done
+}
+
 detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
@@ -225,6 +265,7 @@ KEEP_BRANCH=false
 KEEP_DB=false
 KEEP_CLAIM=false
 FORCE=false
+NO_BACKUP=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -239,6 +280,8 @@ while [[ $# -gt 0 ]]; do
             KEEP_CLAIM=true; shift ;;
         --force)
             FORCE=true; shift ;;
+        --no-backup)
+            NO_BACKUP=true; shift ;;
         --*)
             die "Unknown option: $1" ;;
         *)
@@ -540,21 +583,57 @@ if [[ -d "$WORKTREE_DIR" ]]; then
     fi
     # <<< qb-stash-rescue
 
-    DIRTY_FILES=$(git status --porcelain 2>/dev/null || true)
-    if [[ -n "$DIRTY_FILES" ]]; then
-        BACKUP="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-        echo -e "${YELLOW}Uncommitted changes found, creating backup of dirty files...${NC}"
-        # Collect modified/added/untracked files from porcelain output
-        # For renames ("old -> new"), keep only the new path
-        FILE_LIST=$(echo "$DIRTY_FILES" | awk '{
-            s = substr($0, 4)
-            if (i = index(s, " -> ")) s = substr(s, i + 4)
-            print s
-        }')
-        FILE_COUNT=$(echo "$FILE_LIST" | wc -l | tr -d ' ')
-        echo "$FILE_LIST" | tar -czf "$BACKUP" -C "$WORKTREE_DIR" -T - 2>/dev/null \
-            && echo -e "${GREEN}Backup ($FILE_COUNT files): $BACKUP${NC}" \
-            || echo -e "${YELLOW}Backup failed${NC}"
+    if [[ "$NO_BACKUP" = true ]]; then
+        echo -e "${YELLOW}Skipping the backup (--no-backup)${NC}"
+    else
+        # A cheap emptiness probe first, on output nobody parses: nothing dirty
+        # and nothing ignored means nothing to lose, and the apparatus below — a
+        # temp file, tar, an abort if it fails — should not become a
+        # precondition for tearing down a CLEAN tree. This only ever asks "is
+        # there anything at all"; the parse that acts on the answer is the -z
+        # one below.
+        #
+        # --ignored, because the ignored files are the ones whose loss hurts.
+        # `git status --porcelain` alone sees only tracked and untracked-but-not-
+        # ignored paths, and in a real worktree the irreplaceable half is exactly
+        # what .gitignore covers: `.env`, `data/`, `CLAUDE.local.md`,
+        # `.worktree-port`, `.claude/`. Everything the old list DID cover is
+        # either committed elsewhere or trivially regenerated, so the backup was
+        # archiving the recoverable half and dropping the rest.
+        DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain --ignored 2>/dev/null || true)
+        if [[ -n "$DIRTY_FILES" ]]; then
+            FILE_LIST_FILE=$(mktemp "${TMPDIR:-/tmp}/remove-worktree-backup.XXXXXX" 2>/dev/null)
+            if [[ -z "$FILE_LIST_FILE" ]]; then
+                die "Could not create a temporary file for the backup list.
+  Nothing has been deleted. Fix the temp directory, or re-run with --no-backup
+  if you have looked at $WORKTREE_DIR and do not want its contents."
+            fi
+            git -C "$WORKTREE_DIR" status --porcelain --ignored -z 2>/dev/null \
+                | collect_dirty_files "$WORKTREE_DIR" > "$FILE_LIST_FILE"
+            # Records, not lines: the list is NUL-delimited, and a path may
+            # itself contain a newline — which is the whole reason for -z.
+            FILE_COUNT=$(tr -cd '\0' < "$FILE_LIST_FILE" | wc -c | tr -d ' ')
+            if [[ "$FILE_COUNT" -gt 0 ]]; then
+                BACKUP="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+                echo -e "${YELLOW}Uncommitted changes found, creating backup of dirty files...${NC}"
+                # A FAILED BACKUP ABORTS. This used to be `|| echo "Backup
+                # failed"` with no exit, so the recursive delete below ran
+                # anyway: the one teardown on which the backup matters was the
+                # one on which it was skipped. `--null -T` rather than a piped
+                # list, because the list is NUL-delimited too.
+                if tar --null -czf "$BACKUP" -C "$WORKTREE_DIR" -T "$FILE_LIST_FILE" 2>/dev/null; then
+                    echo -e "${GREEN}Backup ($FILE_COUNT files): $BACKUP${NC}"
+                else
+                    rm -f "$BACKUP" "$FILE_LIST_FILE"
+                    die "Backup of $WORKTREE_DIR failed — nothing has been deleted.
+  $FILE_COUNT dirty or ignored file(s) were to be archived to
+  $BACKUP
+  Free some disk, or re-run with --no-backup if you have looked at the tree
+  and do not want its contents."
+                fi
+            fi
+            rm -f "$FILE_LIST_FILE"
+        fi
     fi
     cd "$MAIN_REPO"
 fi
