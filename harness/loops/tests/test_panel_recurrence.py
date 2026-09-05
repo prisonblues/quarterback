@@ -351,6 +351,69 @@ def test_a_dismissed_finding_is_nobody_s_premise(tmp_path):
     assert b.fixed_here == {"s.py": {"ssss000000000005"}}
 
 
+def test_a_BELOW_FIX_FLOOR_finding_is_nobody_s_premise_either(tmp_path):
+    """#746, and the same shape as the dismissed case above. The payload's `to_fix`
+    bucket carries every master-confirmed finding; the cut down to the list a fixer is
+    handed happens in the REPORT, which prints the below-floor rows under "Reported, not
+    this round's work". So a row flagged `below_fix_floor` was reported and recorded and
+    no fixer was ever sent to it — and counting it makes every file the panel merely
+    MENTIONED look like a place the fix pass was answering a complaint.
+
+    Invisible at the shipped `fix_severity_floor: P4`, where nothing is ever below the
+    fix floor, which is why this round has to raise it."""
+    b = panel.load_baseline(
+        [_round(tmp_path, "r2.json", 2, head_sha="b" * 40,
+                review_panel={"fix_severity_floor": "P2",
+                              "round_trigger_floor": "P2"},
+                to_fix=[{**_finding("aaaa000000000001", file="briefed.py"),
+                         "below_fix_floor": False},
+                        {**_finding("cccc000000000003", file="mentioned.py",
+                                    sev="P3"),
+                         "below_fix_floor": True}])],
+        THIS_RUN)
+    assert b.fixed_here == {"briefed.py": {"aaaa000000000001"}}
+    assert [k for k, *_ in b.fixed_findings] == ["aaaa000000000001"]
+    # …and counted where counting can only DECLINE the strict premise, which is the
+    # standing asymmetry between these two fields and the reason `fix_budget` loses
+    # nothing to the filter above.
+    assert b.fixed_severities == ["P2", "P3"]
+
+
+def test_a_SONAR_issue_below_the_fix_floor_is_still_work_the_fixer_was_SENT_TO(
+        tmp_path):
+    """The flag is computed on the `sonar_findings` rows too, and there it means
+    nothing: a hard-gate issue is exempt from both severity floors at every rule in
+    `round_stop`, the report renders the whole SonarCloud section whatever the severities
+    in it, and so it IS in the brief at any floor. Filtering on the flag in that bucket
+    would drop a P3 Sonar issue the fixer really was sent to — the exemption
+    `fixed_gate` protects on the way out, applied here on the way in."""
+    b = panel.load_baseline(
+        [_round(tmp_path, "r2.json", 2, head_sha="b" * 40,
+                review_panel={"fix_severity_floor": "P2",
+                              "round_trigger_floor": "P2"},
+                sonar_findings=[{**_finding("ssss000000000005", file="s.py",
+                                            sev="P3"),
+                                 "below_fix_floor": True}])],
+        THIS_RUN)
+    assert b.fixed_here == {"s.py": {"ssss000000000005"}}
+    assert b.fixed_gate == {"ssss000000000005"}
+
+
+def test_a_payload_written_before_the_flag_existed_reads_as_the_OLD_behaviour(
+        tmp_path):
+    """`is True` and not truthiness, for the reason the `excised` guard beside it gives:
+    a baseline outlives the release that wrote it, `--baseline` is fed old payloads by
+    design, and a missing key must read as "every row was in the brief" rather than
+    silently emptying one. A hand-edited junk value reads the same way."""
+    b = panel.load_baseline(
+        [_round(tmp_path, "r2.json", 2, head_sha="b" * 40,
+                to_fix=[_finding("aaaa000000000001", file="a.py"),
+                        {**_finding("bbbb000000000002", file="b.py"),
+                         "below_fix_floor": "yes"}])],
+        THIS_RUN)
+    assert set(b.fixed_here) == {"a.py", "b.py"}
+
+
 def test_only_the_round_that_supplied_the_anchor_counts(tmp_path):
     """The fix range under attribution is ONE round wide, so the only complaints
     it can have been answering are that round's. A union over every earlier round

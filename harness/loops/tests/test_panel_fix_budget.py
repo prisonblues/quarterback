@@ -881,6 +881,27 @@ def test_an_UNPLACEABLE_finding_still_counts_against_the_premise(tmp_path):
     assert panel_rounds.budgeted_brief(got, 2, 40, 2)["all_budgeted"] is False
 
 
+def test_a_BELOW_FIX_FLOOR_finding_still_counts_against_the_premise(tmp_path):
+    """#746 moved the below-floor filter to the population site, and this is the
+    consumer that had to be checked before it could move. `fixed_findings` answers "what
+    was the fixer sent to" and now drops those rows; this list answers "was ALL of the
+    brief budgeted", where dropping an entry is the one thing that must never happen —
+    so the two fields diverge here exactly as they already do on an unplaceable record.
+
+    The direction is what makes it safe either way: a below-floor severity is not in the
+    budgeted band, so an extra entry can only ever make `all_budgeted` FALSE, and
+    declining is what `budgeted_brief` is documented to prefer."""
+    got = _loaded(tmp_path, _payload([
+        {"severity": "P3", "file": "a.py", "key": "k1", "below_fix_floor": False},
+        {"severity": "P1", "file": "b.py", "key": "k2", "below_fix_floor": True},
+    ]))
+    assert got.fixed_severities == ["P3", "P1"]
+    assert [k for k, *_ in got.fixed_findings] == ["k1"]
+    assert list(got.fixed_here) == ["a.py"]
+    brief = panel_rounds.budgeted_brief(got, 2, 40, 2)
+    assert brief["findings"] == 2 and brief["all_budgeted"] is False
+
+
 def test_a_MALFORMED_entry_DECLINES_the_brief_rather_than_vanishing_from_it(tmp_path):
     """The defect a different-vendor review found in PR #694's first cut, and it is the
     same shape as the guard one line below it.

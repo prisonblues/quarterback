@@ -1844,6 +1844,13 @@ class Baseline:
     #: where the fix pass was working is only *circling* if that pass was working
     #: there in answer to a complaint, and this is the complaint.
     #:
+    #: **The BRIEF, not the payload bucket it is read out of.** `to_fix` holds every
+    #: master-confirmed finding and the report is what cuts it down to the fixer's
+    #: list, so the two rows the report takes out — `excised` and `below_fix_floor` —
+    #: are dropped here on the way in (#627, #746). Everything in this file that says
+    #: "the fixer was sent to it" depends on that, and until #746 it was not true of a
+    #: repo that had raised `fix_severity_floor`.
+    #:
     #: **From the anchor round alone**, not a union over every earlier round, and
     #: the reason is the same one ``head_sha`` gives for taking the latest rather
     #: than the earliest: the fix range under attribution is one round wide, so the
@@ -1860,6 +1867,15 @@ class Baseline:
     #: ``fixed_here`` rather than derived from it because the two are read by
     #: different consumers at different grains: the mechanical test wants a file
     #: index, and the judge wants sentences it can recognise the fix in.
+    #:
+    #: Filtered to the BRIEF by the same two rules ``fixed_here`` is, and every one of
+    #: its readers wants that rather than the whole confirmed list:
+    #: :func:`recurrence_brief` prints it to the judge under the heading "findings the
+    #: previous round asked the fixer to fix", :func:`fix_pass_outcome` prices a revert
+    #: by what the pass was asked for, and :func:`sub_floor_brief` and the excision
+    #: built on it ask whether the pass answered anything it could give back. A reader
+    #: that genuinely wants the WHOLE list has one: ``fixed_severities`` below, which
+    #: is why moving this filter costs :func:`budgeted_brief` nothing.
     fixed_findings: list[tuple[str, str, str, int | None, str]] = field(default_factory=list)
     #: The anchor round's ``{round-local id: key}`` map — #627's other spelling for a
     #: finding, and the only one a fixer is actually shown.
@@ -1906,7 +1922,10 @@ class Baseline:
     #: no file, or no key — which is right for recurrence (a finding nothing can place
     #: is no evidence the fixer was working anywhere) and would be exactly wrong here:
     #: dropping an unplaceable P1 turns a mixed list into an all-budgeted one and
-    #: manufactures the premise for an accusation.
+    #: manufactures the premise for an accusation. It also drops the two rows the
+    #: report takes out of **To fix** (`excised`, `below_fix_floor`), and this keeps
+    #: both for the same reason it keeps the unreadable one: an extra entry can only
+    #: ever make ``all_budgeted`` false, which is the declining direction.
     #:
     #: **So EVERY ENTRY IN THE TWO BRIEF BUCKETS IS COUNTED, including one that is not
     #: a mapping at all.** Both unreadable shapes — a record whose severity nothing
@@ -2933,6 +2952,52 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                     # must read as the old behaviour rather than silently emptying a
                     # brief.
                     if f.get("excised") is True:
+                        continue
+                    # #746, AND THE SECOND. The `to_fix` bucket carries every
+                    # master-confirmed finding, and the cut down to the list a fixer is
+                    # actually handed happens in the REPORT, not in the payload:
+                    # `panel.py` builds its **To fix** section as `to_fix` minus the
+                    # below-floor and below-threshold rows, and prints the below-floor
+                    # ones under "Reported, not this round's work". So a payload row
+                    # flagged `below_fix_floor` is a finding that was reported, banded
+                    # and recorded — and that no fixer was ever sent to.
+                    #
+                    # Left in, every reader below drew the same false conclusion the
+                    # `excised` case produced, for the same reason: `sub_floor_brief`
+                    # counted it as sub-floor work THE PASS WAS SENT TO and so accused a
+                    # fixer of ignoring its brief when the brief never named it,
+                    # `fix_pass_outcome` counted it `cleared` and inflated the cost
+                    # column of the revert proposal a human weighs, `_recurrence` read a
+                    # new finding in that file as circling a fix nobody attempted, and
+                    # `recurrence_brief` told the judge the fixer had been asked to fix
+                    # it. Measured on lexray#1656 round 2 at `fix_severity_floor: P2`: a
+                    # brief of 3 was reported as 19, with 16 of them named as sub-floor
+                    # work the pass had been sent to.
+                    #
+                    # **`to_fix` only.** The flag is computed on the `sonar_findings`
+                    # rows too, and there it means nothing: a hard-gate issue is exempt
+                    # from both severity floors at every rule in :func:`round_stop`, it
+                    # is rendered whole under its own heading whatever its severity, and
+                    # so it IS in the brief at any floor. Filtering on it there would
+                    # drop a P3 Sonar issue the fixer really was sent to — the same
+                    # exemption `fixed_gate` two lines down exists to protect, applied
+                    # on the way in rather than on the way out.
+                    #
+                    # `fixed_severities` KEEPS it, on this loop's standing asymmetry:
+                    # that list answers "was ALL of the brief budgeted", it can only
+                    # ever DECLINE on an extra entry, and declining is the direction
+                    # :func:`budgeted_brief` is documented to prefer.
+                    #
+                    # `is True` and not truthiness, for the reason one comment up: a
+                    # payload written before the key existed carries none, and it must
+                    # read as the old behaviour rather than silently emptying a brief.
+                    #
+                    # NOT YET the below-THRESHOLD rows (#78), which the report takes out
+                    # of **To fix** on exactly this argument and which are still counted
+                    # here. That is a live gap rather than a decision — a different dial,
+                    # unmeasured, and no repo in evidence has raised it — so it is filed
+                    # (#753) rather than fixed on the strength of this one's evidence.
+                    if bucket == "to_fix" and f.get("below_fix_floor") is True:
                         continue
                     file = str(f.get("file") or "")
                     key = str(f.get("key") or "") or _key_from_title(file, _baseline_title(f))
@@ -5730,11 +5795,24 @@ def sub_floor_brief(brief: Iterable[tuple], dials: dict | None,
     and both are needed: one keeps a gate issue out of the list an excision drops, the
     other keeps a gate issue's own fix from being the thing excised.
 
-    Severity is the only test otherwise. `fix_severity_floor` is deliberately NOT
-    applied: a finding below the fix floor was never in the brief to begin with — no
-    fixer was sent to it, so no fix answered it — and adding the floor as a second
-    condition would only describe the same set in a way that a later change to one dial
-    could break.
+    Severity against the trigger floor is the only test otherwise, and
+    `fix_severity_floor` is still not applied here — but not for the reason this
+    paragraph used to give. It said a finding below the fix floor "was never in the
+    brief to begin with", which is the right argument and was a false statement about
+    ``brief``: the payload's `to_fix` bucket carries EVERY master-confirmed finding, and
+    the cut down to the list a fixer is handed happens in the report rather than in the
+    payload. So on a repo that had raised `fix_severity_floor` above `P4` this function
+    was handed findings no fixer was ever sent to and classified them as sub-floor work
+    the pass answered — lexray#1656 round 2 named 16 of them against a brief of 3, which
+    accused a fixer of ignoring an instruction it had followed and put 16 findings into
+    the cost column of a revert proposal a human was meant to weigh (#746).
+
+    The premise is now made TRUE at the source rather than restated as a second
+    condition here: :class:`Baseline` drops a `below_fix_floor` row on the way in, so
+    every entry in ``brief`` really is one the fixer was sent to. That keeps ONE answer
+    to "what was the fixer sent to" in one place — a second floor test written here
+    would be a second spelling of it, and two spellings are how a report and a payload
+    come to disagree about which findings a round asked for.
 
     An entry whose severity nothing can parse is not sub-floor. That falls out of
     :func:`severity_at_least`, which reads an unparseable severity as P1, and P1 is at or

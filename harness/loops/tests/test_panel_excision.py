@@ -107,9 +107,10 @@ def _state(**over):
 
 def test_the_sub_floor_findings_are_the_ones_below_the_ANCHORS_trigger_floor():
     """The set this whole rule is scoped to. `fix_severity_floor` is deliberately not
-    a second condition: a finding below it was never in the brief, so no fix answered
-    it, and naming the floor twice would only give a later dial change a way to break
-    one of the two spellings."""
+    a second condition HERE: `Baseline` already dropped the below-floor rows on the way
+    in (#746, and the test two functions down), so every entry in `brief` is one the
+    fixer was really sent to and naming the floor twice would only give a later dial
+    change a way to break one of the two spellings."""
     got, floor, why = panel_rounds.sub_floor_brief(BRIEF, WAS)
     assert why is None and floor == "P2"
     assert set(got) == {CHEAP[0]}
@@ -233,6 +234,81 @@ def test_an_EXCISED_finding_is_not_the_next_rounds_BRIEF(tmp_path):
                  body="Excised 77-F09, which the docstring fix caused.")],
         sub, got.fixed_findings, got.fixed_ids)
     assert seams == {} and refused == []
+
+
+def test_a_BELOW_FIX_FLOOR_finding_is_not_the_next_rounds_BRIEF(tmp_path):
+    """#746, the second row the report takes out of **To fix** and the second one this
+    has to drop on the way in. `sub_floor_brief` filters on the trigger floor alone and
+    its docstring said why — "a finding below the fix floor was never in the brief to
+    begin with". The argument is right and the statement was false: `to_fix` carries
+    every master-confirmed finding and the report is what cuts it to the brief.
+
+    Measured on lexray#1656 round 2 at `fix_severity_floor: P2`, and both consequences
+    are pinned below. The pass was sent 3 findings and answered 3; the round reported
+    "none of the 3 commit(s) in this fix pass names one of the 16 sub-floor finding(s)
+    IT WAS SENT TO", which `panel-review-pr.md` documents as the fixer's brief not being
+    followed — a discipline that had been kept. And `fix_pass_outcome` counted all 19
+    `cleared`, so `round_stop.revert.costs` offered a human 16 findings the pass never
+    touched, on a column documented as a CEILING.
+
+    The floors here MEET, which is the lexray shape: at `fix_severity_floor: P2` with a
+    P2 trigger floor there is no sub-floor band at all, and the honest answer is that
+    this pass had no sub-floor work to excise."""
+    path = tmp_path / "r2.json"
+    path.write_text(json.dumps({
+        "round": 2, "cycle": "abc123", "reviewed": True, "repo": "e2e",
+        "github": "acme/e2e", "pr": 77, "head_sha": "b" * 40, "dismissed": [],
+        "sonar_findings": [],
+        "review_panel": {"round_trigger_floor": "P2", "fix_severity_floor": "P2"},
+        "to_fix": [
+            {"key": BLOCKER[0], "id": "77-F02", "severity": "P2", "file": BLOCKER[2],
+             "line": BLOCKER[3], "synthesis": BLOCKER[4], "below_fix_floor": False},
+            {"key": CHEAP[0], "id": "77-F01", "severity": "P3", "file": CHEAP[2],
+             "line": CHEAP[3], "synthesis": CHEAP[4], "below_fix_floor": True},
+        ],
+    }))
+    got = panel.load_baseline(
+        [str(path)], {"repo": "e2e", "github": "acme/e2e", "pr": 77, "round": 3})
+    assert {k for k, *_ in got.fixed_findings} == {BLOCKER[0]}
+    assert got.fixed_here == {BLOCKER[2]: {BLOCKER[0]}}
+    assert got.fixed_ids == {"77-F02": BLOCKER[0]}
+    # …and counted where counting can only decline the strict premise, exactly as the
+    # excised row above it is.
+    assert got.fixed_severities == ["P2", "P3"]
+    # The first consequence: no sub-floor work, so no complaint about a seam.
+    sub, floor, why = panel_rounds.sub_floor_brief(got.fixed_findings, got.fixed_dials,
+                                                   got.fixed_gate)
+    assert why is None and floor == "P2" and sub == {}
+    # The second: the revert's cost column is the brief, not the whole confirmed list.
+    cleared, still_open = panel_rounds.fix_pass_outcome(got.fixed_findings, [])
+    assert [c["key"] for c in cleared] == [BLOCKER[0]] and still_open == []
+
+
+def test_the_same_finding_IS_the_brief_at_the_shipped_fix_floor(tmp_path):
+    """The bug is invisible at the shipped defaults, which is why it survived: with
+    `fix_severity_floor: P4` nothing is ever below the fix floor, `to_fix` and the brief
+    are one list, and the premise `sub_floor_brief` rested on holds. The same payload at
+    the default floor must therefore behave exactly as it did before #746 — the P3 is in
+    the brief, it is sub-floor, and its fix is excisable."""
+    path = tmp_path / "r2.json"
+    path.write_text(json.dumps({
+        "round": 2, "cycle": "abc123", "reviewed": True, "repo": "e2e",
+        "github": "acme/e2e", "pr": 77, "head_sha": "b" * 40, "dismissed": [],
+        "sonar_findings": [], "review_panel": WAS,
+        "to_fix": [
+            {"key": BLOCKER[0], "id": "77-F02", "severity": "P2", "file": BLOCKER[2],
+             "line": BLOCKER[3], "synthesis": BLOCKER[4], "below_fix_floor": False},
+            {"key": CHEAP[0], "id": "77-F01", "severity": "P3", "file": CHEAP[2],
+             "line": CHEAP[3], "synthesis": CHEAP[4], "below_fix_floor": False},
+        ],
+    }))
+    got = panel.load_baseline(
+        [str(path)], {"repo": "e2e", "github": "acme/e2e", "pr": 77, "round": 3})
+    assert {k for k, *_ in got.fixed_findings} == {CHEAP[0], BLOCKER[0]}
+    assert got.fixed_ids == IDS
+    sub, floor, why = panel_rounds.sub_floor_brief(got.fixed_findings, got.fixed_dials,
+                                                   got.fixed_gate)
+    assert why is None and floor == "P2" and set(sub) == {CHEAP[0]}
 
 
 def test_a_severity_NOTHING_CAN_READ_is_not_sub_floor():
