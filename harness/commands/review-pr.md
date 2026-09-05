@@ -42,14 +42,20 @@ repo, and the plan went on offering the work (#713). `/panel-review-pr` had the
 same hole until #715 gave `panel.py` a claim of its own; this command still had
 none, and this one *fixes and pushes*, so a duplicate here is not merely wasteful.
 
-Take it **in this conversation, before you launch the sub-agent**. The claim then
-names this session, so ending the session releases it (#681) — a sub-agent's
-session is not this one, and a claim taken inside the fixer would go back to being
-something only a TTL could end.
+Take it **in this conversation, before §2 launches the sub-agent** — and the reason
+is not that the sub-agent has a session of its own. Measured on this fleet: a Task
+sub-agent **inherits** `CLAUDE_CODE_SESSION_ID` from its parent and is distinguished
+only by `CLAUDE_CODE_CHILD_SESSION=1`, so a `qb-claim` run inside the fixer would
+stamp this same session and `POST /session/end` would still reach it. The ordering
+is right for two other reasons. A claim is the only thing that can *prevent*
+duplicated work, and one taken after the fixer has started reading can only record
+it. And this conversation outlives the sub-agent: a fixer that dies mid-pass carries
+no release step with it, so the claim has to belong to the conversation that is
+still here to hand it back.
 
 - **A PR number was given:**
   ```bash
-  qb-claim pr <n> --no-plan-item --ttl 10800 --note "review-pr: reviewing and fixing PR #<n>"
+  qb-claim pr <n> --no-plan-item --ttl 28800 --note "review-pr: reviewing and fixing PR #<n>"
   ```
   `--no-plan-item` is #722. A claim on an issue or a PR normally writes that repo's
   plan item at rank 1, because picking work up is the one act that should put work
@@ -71,6 +77,24 @@ Whichever line ran: **exit 0** is expected; **exit 1** names a holder — say so
 the user before the sub-agent starts, because a second reviewer-fixer on one PR is
 two agents pushing to one branch; **exit 2** is a board that could not be reached,
 which is worth a line in the relay and stops nothing.
+
+**Eight hours, and every exit after this releases it.** #715's three-hour figure is
+right for a panel round because `panel.py` is a program and `release_pr` runs at the
+end of one whether or not anybody remembers; the release here is a step in a brief,
+which an agent can stop before reaching. Nothing renews a work claim while it is
+held — `qb-hook`'s `_lease` heartbeats the session lease and never touches
+`POST /claim` — so a three-hour fuse on the very case §1b opens with, an agent three
+hours into a review, would report the PR free while the fixer was still in it. That
+is worse than a claim that lingers: one delays a peer, the other manufactures the
+collision. So the fuse is eight hours, and it is `qb-release` that ends it — at §3
+on the happy path, and as part of stopping on every other. A sub-agent that returns
+an error, a user who says stop, an escalation you relay without fixing: release
+before you report.
+
+Do not lean on the session-end backstop for those. `POST /session/end` fires when
+the SESSION ends, not when a command stops, and the pane routinely lives for hours
+after a command has given up — so an abort with no release holds the PR for the
+whole fuse, which is precisely the window in which that fuse gets exercised.
 
 ## 2. Launch the fixer sub-agent
 

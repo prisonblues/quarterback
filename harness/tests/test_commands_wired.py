@@ -916,3 +916,72 @@ def test_the_worktree_routes_adopt_the_checkout_claim_onto_their_session(name: s
     assert "#681" in command(name), (
         f"{name}.md runs the adoption without saying what it is for, so the next reader deletes it "
         "as a redundant claim on something already claimed")
+
+
+#: The fuse `create-worktree` gives a checkout claim, in seconds. Spelled here rather than read
+#: out of the script because this suite's `READS` declaration is the briefs and the module — see
+#: `test_the_reads_are_declared_rather_than_summarised`, which is what makes that set a
+#: declaration rather than a summary. The number is asserted as a FLOOR below, so a brief may
+#: only ever hold work for at least as long as the checkout that would have claimed it.
+CHECKOUT_TTL = 28800
+
+
+@pytest.mark.parametrize("name", ("fix-issue", "fix-issue-here", "review-pr"))
+def test_no_brief_holds_work_on_a_shorter_fuse_than_the_checkout_would(name: str):
+    """The TTL on a work claim is a FUSE, not a duration, and nothing renews one while it is
+    held: `qb-hook`'s `_lease` heartbeats the session lease and never touches `POST /claim`. So a
+    fuse shorter than the work reports the resource free while an agent is demonstrably in it, and
+    the next agent is told to take it — which manufactures exactly the collision a claim exists to
+    prevent, where an over-long claim merely delays a peer.
+
+    #715's three hours is right for a panel round and wrong here, and the difference is mechanical
+    rather than a matter of taste: `panel.py` is a program and `release_pr` runs at the end of a
+    round whether or not anybody remembers it, while every release on these paths is a step in a
+    brief that an agent can stop before reaching. A number sized for a guaranteed release must not
+    be reused where the release is not guaranteed.
+
+    Scoped to `issue` and `pr` claims. `fix-and-land`'s `qb-claim branch "$BASE" --ttl 1800` is a
+    merge claim held across a single `gh pr merge` and released by the same block — a different
+    kind of thing, correctly short, and it has its own guard above.
+    """
+    for ttl in re.findall(r"qb-claim (?:issue|pr) \S+[^\n]*?--ttl (\d+)", _fenced(command(name))):
+        assert int(ttl) >= CHECKOUT_TTL, (
+            f"{name}.md claims work on a {int(ttl)}s fuse, shorter than the {CHECKOUT_TTL}s "
+            "`create-worktree` gives the same work. Nothing renews it, so the claim expires under "
+            "live work and the board reports the issue free with an agent still in it")
+
+
+@pytest.mark.parametrize("name", ("fix-issue-here", "review-pr"))
+def test_the_in_place_briefs_release_on_every_exit_and_not_only_the_last_step(name: str):
+    """The property `fix-and-land` already carries for its merge claim, applied to the two routes
+    that now take a work claim. Both write their release as the final step of the happy path, and
+    the paths that matter are the others: tests that will not go green and a user who says stop, a
+    guard halting early, a fixer sub-agent returning an error. `POST /session/end` fires when the
+    SESSION ends and not when a command stops, and the pane routinely lives for hours afterwards —
+    so an abort with no release holds the work for the whole fuse, which is the window in which
+    that fuse is actually exercised."""
+    text = command(name)
+    assert re.search(r"every exit", text, re.IGNORECASE), (
+        f"{name}.md's release reads as a step in the happy path only, so an abort between the "
+        "claim and that step leaves the work held until the TTL burns")
+    assert re.search(r"session ends|SESSION ends", text), (
+        f"{name}.md does not say that a command stopping is not a session ending, so the release "
+        "looks redundant with the session-end backstop and is the first thing an abort skips")
+
+
+def test_the_review_brief_does_not_claim_a_sub_agent_has_its_own_session():
+    """It does not. Measured: a Task sub-agent INHERITS `CLAUDE_CODE_SESSION_ID` from its parent
+    and is distinguished only by `CLAUDE_CODE_CHILD_SESSION=1`, so a `qb-claim` run inside the
+    fixer stamps the same session and `POST /session/end` reaches it either way.
+
+    The ordering the brief asks for is still right — a claim taken after the fixer has started
+    reading can only record a collision, and this conversation outlives the sub-agent that would
+    otherwise owe the release — but an instruction resting on a false fact is one measurement away
+    from being dropped along with the behaviour it was holding up."""
+    text = command("review-pr")
+    assert not re.search(r"sub-agent's session is not this one", text), (
+        "review-pr.md justifies claiming before the launch with a sub-agent having its own "
+        "session, which it does not have")
+    assert "CLAUDE_CODE_CHILD_SESSION" in text, (
+        "review-pr.md no longer records what actually distinguishes a sub-agent, so the next "
+        "reader has to re-measure it to know whether the ordering still matters")

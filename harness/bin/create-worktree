@@ -1709,6 +1709,20 @@ step "Writing worktree context (CLAUDE.local.md)..."
     # So this hands the claim over without moving it: same key, same history, same
     # plan item, and an owner that `POST /session/end` can find.
     #
+    # **It also restarts the fuse, and that is a real cost on one path.**
+    # `_renew_onto` sets `expires_at = now + ttl`, so an adopted claim stands
+    # CLAIM_TTL from the adoption rather than from the checkout — and an agent
+    # re-entering a reused worktree adopts again, pushing it out again. On the
+    # ordinary path that is what a fuse should do: the work is demonstrably live, so
+    # the claim tracking it is the point, and the session's ending is what actually
+    # ends it. The path where it costs something is the residual #681 names as its
+    # smaller half — a session dying without SessionEnd firing (`kill -9`, a crash,
+    # a reboot) — where the leak this fixes is left the same shape and made longer
+    # lived. Shortening the TTL is the wrong remedy: it would expire under live work
+    # and report the issue free while somebody was in it, which is the collision the
+    # claim exists to prevent. The right one is the liveness check #681 records
+    # against `~/.claude/sessions/<pid>.json` and `/proc`, which is not built.
+    #
     # Written HERE rather than into the command briefs because this file is what an
     # agent opening the tree actually reads, whichever route brought it there —
     # `/fix-issue`, the epic driver, `qb-start`, or a human who ran the checkout by

@@ -51,7 +51,7 @@ in one repo, `claims(repo_path=…)` empty for the whole repo, and `lapsed_claim
 empty too, so none had ever been taken.
 
 ```bash
-qb-claim issue $ISSUE_NUMBER --ttl 10800 \
+qb-claim issue $ISSUE_NUMBER --ttl 28800 \
   --note "fixing in place on $(git branch --show-current)"
 ```
 
@@ -67,11 +67,30 @@ qb-claim issue $ISSUE_NUMBER --ttl 10800 \
   be reached must not stop the work; that is the rule `create-worktree` follows on
   the same failure and this path takes it unchanged.
 
-**Three hours, not `create-worktree`'s eight.** The claim is handed back at §10 and
-by this session ending, so the TTL is only the fuse for the case where neither
-happens, and what it has to outlast is the fix in front of you rather than the
-working day (#608, #135). A fix that runs longer than that renews it — the same
-command again, same arguments — rather than carrying on unclaimed.
+**Every exit after this line releases it, not only §10.** The release below is
+written as the last step of the happy path, and the paths that matter are the other
+ones: tests that will not go green and a user who says stop, the DB guard halting
+at §2, a self-review turning up something you cannot fix here. `POST /session/end`
+fires when the SESSION ends, not when a command stops, and the pane commonly lives
+for hours after a command has given up. So if you stop early for any reason, run
+`qb-release issue $ISSUE_NUMBER` as part of stopping, and say in your report that
+you did.
+
+**Eight hours — `create-worktree`'s own fuse — and a shorter one would be wrong
+here.** #715 gave a panel round three hours, on the argument that a released claim's
+TTL only has to outlast the slowest round. That argument holds *there* because
+`panel.py` is a program: `release_pr` runs at the end of the round whether or not
+anybody remembers it. Every release on THIS path is a step in a brief, executed by
+an agent that may stop before it reaches the step, so the TTL here is not backed by
+a mechanical release and must not be sized as though it were.
+
+Nothing renews a work claim while you hold it, either — `qb-hook`'s `_lease`
+heartbeats the session lease and never touches `POST /claim` — so a three-hour fuse
+on a fix that runs longer does not degrade, it inverts: at t+3h the board reports
+the issue free while you are demonstrably in it, and the next agent is told to take
+it. A claim that lingers delays somebody; a claim that expires under live work
+causes the collision the claim exists to prevent (#608, #135). Eight hours is what a
+fuse is for — the session that never ended — not a duration anybody waits out.
 
 **No `--no-plan-item` here.** That flag records a key without asserting a pickup,
 and it exists for a review round holding the PR it is reading (#722). This command
