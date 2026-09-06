@@ -1557,6 +1557,28 @@ for item in "${SYMLINKS[@]}"; do
         continue
     fi
 
+    if [[ ! -d "$MAIN_REPO/$item" ]] && tracked_in_main "$item"; then
+        # Tracked *file* in main — a repo that commits its own CLAUDE.md, say.
+        # Same reasoning as the tracked-dir case below, and simpler, because a
+        # file has no untracked entries inside it to share: git owns this path
+        # on this branch, so its checkout stays exactly where it is.
+        #
+        # Symlinking it instead is a quiet trap. git reports a permanent type
+        # change (T), which the quieting step at the end then hides behind
+        # skip-worktree — so the file looks fine and is in fact unusable. Every
+        # edit made from the worktree writes through the link into the main
+        # checkout, lands on whatever branch that has checked out, and cannot be
+        # committed from here at all. An agent asked to update CLAUDE.md from a
+        # worktree therefore either scribbles on the main checkout or gives up
+        # and puts the content somewhere worse; both have happened. Building the
+        # link also destroys git's own checkout of a tracked path first, which
+        # is a write the branch never asked for. Repos that do not track the
+        # file are unaffected — tracked_in_main is false for them and the
+        # wholesale symlink below still applies.
+        echo -e "  ${YELLOW}$item${NC} (tracked file — git-owned; left as-is, not symlinked)"
+        continue
+    fi
+
     if [[ -d "$MAIN_REPO/$item" ]] && tracked_in_main "$item"; then
         # Tracked directory in main: git already checked it out in the worktree —
         # leave it alone and share only the untracked top-level entries from main.
