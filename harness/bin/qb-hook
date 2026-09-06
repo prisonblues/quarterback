@@ -824,24 +824,38 @@ _remember_pane() {   # record THIS conversation as the one in this pane
   return 0
 }
 
+# WHAT PROTECTS A TASK SUB-AGENT'S PARENT, and it is NOT a CLAUDE_CODE_CHILD_SESSION
+# check. That variable is set on EVERY hook Claude Code runs and means "spawned by
+# Claude Code", not "is a sub-agent" — measured 2026-09-06 on 2.1.258 by starting a
+# CLI with the entire parent environment stripped (`env -u CLAUDE_CODE_CHILD_SESSION
+# -u CLAUDE_CODE_SESSION_ID …`) and reading what its SessionStart hook was handed:
+# `CLAUDE_CODE_CHILD_SESSION=1`, on a session with no parent at all. A guard on it
+# refuses every hook there is, which would leave the pane file unwritten and this
+# whole mechanism inert — with the suite green, which is the failure this branch
+# exists to make impossible. `test_qb_hook_pane.py` now runs every case under the
+# environment that measurement captured, so a guard that refuses production cannot
+# pass again.
+#
+# TWO things protect the parent instead, and neither needs a marker.
+#
+# 1. A Task SUB-AGENT DOES NOT FIRE SessionStart. Measured the same way: a run that
+#    launched one produced exactly one SessionStart (the main session's) and one
+#    SubagentStop. This function only ever runs on SessionStart, so a sub-agent
+#    never reaches it.
+# 2. And if one ever did, it would carry the PARENT's session_id — a sub-agent
+#    shares it, along with the parent's socket and therefore the parent's pane —
+#    so `prev != sid` below is false and nothing is handed back. That is the
+#    arithmetic, not a special case, and `test_a_start_carrying_the_panes_own
+#    _conversation_releases_nothing` pins it.
+#
+# A nested `claude -p` (harness_rules.run_agent, so lander.py and epic.py) is a
+# different shape again and needs nothing here: measured, it inherits the parent's
+# socket in its own environment and then exports `<its own pid>.sock` to everything
+# it spawns, so its hook and its MCP server compute their own pane. The
+# live-ancestor guard in `qb_pane_key` covers the one remaining shape — a process
+# left holding a socket whose owner is dead or unrelated.
 _supersede_previous() {   # end the conversation this pane held before this one
   local prev
-  # A CHILD SESSION never supersedes, and with the pane keyed on the CLI process
-  # this stops being insurance and starts being load-bearing. A Task sub-agent
-  # shares its parent's messaging socket — measured, and it shares the parent's
-  # CLAUDE_CODE_SESSION_ID too — so it computes the parent's pane exactly, and
-  # without this line a sub-agent starting up would end its parent's session and
-  # hand back the claims a live agent is still working. That is the worst thing
-  # this function could ever do, and it is one comparison away.
-  #
-  # A nested `claude -p` (harness_rules.run_agent, so lander.py and epic.py) does
-  # NOT need this and does not set it. Measured 2026-09-06: a `claude -p` started
-  # from inside a session inherits the parent's socket in its OWN environment and
-  # then exports `<its own pid>.sock` to everything it spawns — its hook and its
-  # MCP server both compute their own pane, distinct from the parent's. The
-  # live-ancestor guard in `qb_pane_key` is what covers the remaining shape, a
-  # process left holding a socket whose owner is dead or unrelated.
-  [ -z "${CLAUDE_CODE_CHILD_SESSION:-}" ] || return 0
   _pane_resolve
   prev=""
   [ -n "$_panefile" ] && prev=$(cat "$_panefile" 2>/dev/null)

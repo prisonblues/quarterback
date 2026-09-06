@@ -41,6 +41,18 @@ BEFORE = "4c8f6a8a-4dea-4bd9-9f1e-2a1f0b6d4c11"
 AFTER = "e267ef87-b7d5-40f9-a528-a02de04c2ca9"
 
 
+@pytest.fixture(autouse=True)
+def _forget_panes():
+    """`pane._LAST_SEEN` is process-wide and deliberately sticky in production —
+    a pane that has answered once keeps answering, so a momentarily unreadable
+    file cannot flip an agent's identity. Two tests a second apart share a pane
+    key (same pid, same socket second), so without this a case about "no answer
+    yet" would read the previous case's answer."""
+    pane._LAST_SEEN.clear()
+    yield
+    pane._LAST_SEEN.clear()
+
+
 @pytest.fixture
 def paned(tmp_path, monkeypatch):
     """A pane this process genuinely owns, with the socket to prove it.
@@ -101,6 +113,44 @@ def test_an_empty_or_blank_pane_file_is_not_an_answer(paned):
     for blank in ("", "  \n"):
         paned.holds(blank)
         assert pane.pane_session() is None
+
+
+def test_a_pane_that_has_answered_once_keeps_answering(paned, monkeypatch):
+    """Hysteresis, and it is not a nicety. Falling straight back to the
+    environment when the file is briefly unreadable would send the caller to the
+    conversation this process was SPAWNED with — which after a `/clear` has
+    ended — so a flicker would move an agent's board identity for one request
+    and move it back. The newer answer is still the better one."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", BEFORE)
+    paned.holds(AFTER)
+    assert pane.pane_session() == AFTER
+
+    os.unlink(pane.pane_file())
+    assert pane.pane_session() == AFTER
+
+    paned.holds("")
+    assert pane.pane_session() == AFTER
+
+
+def test_the_memory_belongs_to_the_pane_and_not_to_the_process(tmp_path, monkeypatch):
+    """A different CLI inherits none of it. The socket's mtime is in the pane
+    key, so a new process — even at a recycled pid — asks a question the memory
+    has no answer to, and falls back to the environment as it should."""
+    socks = tmp_path / "cc-socks"
+    socks.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.delenv("QUARTERBACK_INSTANCE", raising=False)
+    sock = socks / f"{os.getpid()}.sock"
+    sock.write_bytes(b"")
+    monkeypatch.setenv("CLAUDE_CODE_MESSAGING_SOCKET", str(sock))
+
+    os.utime(sock, (1_700_000_000, 1_700_000_000))
+    with open(pane.pane_file(), "w", encoding="utf-8") as fh:
+        fh.write(AFTER)
+    assert pane.pane_session() == AFTER
+
+    os.utime(sock, (1_700_000_500, 1_700_000_500))   # a new CLI, same pid
+    assert pane.pane_session() is None
 
 
 def test_the_conversation_is_stripped_of_the_newline_a_writer_may_add(paned):
@@ -203,6 +253,39 @@ def test_a_session_that_moves_is_stamped_on_the_write_that_follows_it():
     client.post({"type": "status", "summary": "two"})
     import json
     assert [json.loads(r.content)["session"] for r in seen] == [BEFORE, AFTER]
+
+
+def test_the_identity_is_resolved_once_per_request_not_once_per_read():
+    """The body used to read the conversation twice while the header read it a
+    third time at send, so a conversation that moved in between produced a
+    request whose body named one and whose header named the identity of another.
+
+    Asserted as a call COUNT rather than as a split, because the split is
+    microseconds wide and cannot be arranged reliably — but the read that makes
+    it possible can be counted, and one read per request is the property.
+    """
+    reads: list[str] = []
+
+    def session() -> str:
+        reads.append(f"s{len(reads) + 1}")
+        return reads[-1]
+
+    keys: list[str] = []
+
+    def key() -> str:
+        keys.append(f"k{len(keys) + 1}")
+        return keys[-1]
+
+    client, seen = _client(key=key, session=session)
+    client.post({"type": "status", "summary": "one"})
+    assert (len(reads), len(keys)) == (1, 1), (reads, keys)
+    client.post({"type": "status", "summary": "two"})
+    assert (len(reads), len(keys)) == (2, 2), (reads, keys)
+
+    import json
+    bodies = [json.loads(r.content)["session"] for r in seen]
+    headers = [r.headers["X-Agent-Key"] for r in seen]
+    assert bodies == ["s1", "s2"] and headers == ["k1", "k2"]
 
 
 def test_a_plain_string_key_is_still_a_key():

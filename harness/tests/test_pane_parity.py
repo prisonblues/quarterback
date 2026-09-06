@@ -22,7 +22,8 @@ So the table below is deliberately unkind, and every case in it was chosen
 because it is a way the two languages differ rather than a way a session does:
 `\\d` in Python matches Arabic-Indic digits and `[0-9]` in bash does not, `$` in
 Python matches before a trailing newline and bash's `case` glob does not, and
-`tr` counts bytes where `re.sub` counts characters.
+`tr` counts bytes where `re.sub` counts characters, and `st_mtime` is a float
+whose spacing at 1.7e9 is coarse enough to round a socket into the next second.
 
 BOTH HALVES RUN AS SUBPROCESSES OF THIS TEST, which is what lets the ancestry
 cases be real: the pytest process is a genuine live ancestor of each, so
@@ -299,15 +300,34 @@ def test_the_sockets_mtime_is_part_of_the_key(socket_dir):
     assert _agree(_env(CLAUDE_CODE_MESSAGING_SOCKET=str(sock))) == f"{owner}-1600000099"
 
 
-def test_a_fractional_mtime_floors_the_same_way_on_both_sides(socket_dir):
-    """`stat -c %Y` floors and `int()` truncates, which is the same thing for a
-    time after 1970 and not the same thing before it. The seconds have to match
-    exactly or the two halves name different files."""
+@pytest.mark.parametrize("ns", [
+    0,
+    1,
+    500_000_000,
+    999_000_000,
+    999_999_000,
+    # The rows that matter, and the reason `int(st.st_mtime)` is not good enough.
+    # `st_mtime` is a float; float64 spacing at 1.7e9 is about 238ns, so an mtime
+    # this close to the next second rounds UP and Python names a file one second
+    # later than bash does. Measured: ns=…999999999 gives `stat -c %Y`
+    # 1700000000 and `int(st_mtime)` 1700000001.
+    999_999_900,
+    999_999_999,
+])
+def test_the_sub_second_part_of_the_mtime_is_discarded_identically(socket_dir, ns):
+    """The seconds have to match exactly or the two halves name different files.
+
+    A `.999` fixture sat inside the safe band and proved nothing about the band
+    that is not safe — which is the shape of a parity table that enumerates a
+    class and then samples only the easy part of it. The odds of the bad rows in
+    life are about one in eight million, which is exactly the kind of number that
+    turns up once and is never reproduced.
+    """
     owner = os.getpid()
     sock = socket_dir / f"{owner}.sock"
     sock.write_bytes(b"")
-    os.utime(sock, (1_600_000_000.999, 1_600_000_000.999))
-    assert _agree(_env(CLAUDE_CODE_MESSAGING_SOCKET=str(sock))) == f"{owner}-1600000000"
+    os.utime(sock, ns=(1_700_000_000_000_000_000 + ns,) * 2)
+    assert _agree(_env(CLAUDE_CODE_MESSAGING_SOCKET=str(sock))) == f"{owner}-1700000000"
 
 
 def test_a_live_process_that_is_not_an_ancestor_owns_no_pane(socket_dir, stranger):

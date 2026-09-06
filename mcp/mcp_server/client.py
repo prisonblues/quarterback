@@ -98,6 +98,9 @@ class QuarterbackClient:
         # a test, a runtime with one conversation per process.
         self._session_src = session
         self._key_src = key
+        #: This request's `(key, session)`, so the body and the header describe
+        #: one conversation. See `_identity`.
+        self._identity_local = threading.local()
         # No token ⇒ no header at all, rather than a "Bearer " that authenticates
         # nothing. That is the tokenless client the board TUI starts with on a
         # host that has no credential: every authed call 401s, and ``health()``
@@ -166,22 +169,49 @@ class QuarterbackClient:
         value = src() if callable(src) else src
         return value or None
 
+    def _identity(self) -> tuple[str | None, str | None]:
+        """`(key, session)` — resolved ONCE per request, not once per read.
+
+        Both halves come from the same source under Claude Code (the pane file,
+        which the lifecycle hook rewrites when the conversation moves), and a
+        body used to read it several times while the header read it again at send
+        — so a conversation that changed in between produced a request whose body
+        named one conversation and whose header named the identity of another.
+        Microseconds wide and harmless today; this is about to carry landing
+        order, where a claim that is silently WRONG costs more than one that is
+        missing.
+
+        Thread-local, because a snapshot shared between two concurrent requests
+        would be the same bug wearing a different hat. Cleared as the request goes
+        on the wire — the last moment both halves are needed — so the next body
+        resolves afresh. A body built for a request that then fails to send
+        leaves its snapshot for the next one, which is stale by microseconds and,
+        crucially, still SELF-CONSISTENT: the two halves agree with each other,
+        which is the property this exists to hold.
+        """
+        snapshot = getattr(self._identity_local, "snapshot", None)
+        if snapshot is None:
+            snapshot = (self._resolve(self._key_src), self._resolve(self._session_src))
+            self._identity_local.snapshot = snapshot
+        return snapshot
+
     @property
     def _session(self) -> str | None:
-        """The conversation to stamp on a write, read at the moment of writing."""
-        return self._resolve(self._session_src)
+        """The conversation to stamp on a write, from this request's snapshot."""
+        return self._identity()[1]
 
     @property
     def agent_key(self) -> str | None:
         """The opaque key the board allocates this agent's name against."""
-        return self._resolve(self._key_src)
+        return self._identity()[0]
 
     def _stamp_key(self, request: httpx.Request) -> None:
-        key = self.agent_key
+        key, _ = self._identity()
         if key:
             request.headers["X-Agent-Key"] = key
         else:
             request.headers.pop("X-Agent-Key", None)
+        self._identity_local.snapshot = None
 
     # -------------------------------------------------------------- delegated
 

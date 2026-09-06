@@ -5345,10 +5345,20 @@ Two facts about the surrounding fleet, both measured rather than reasoned about,
 previous attempt (#765) was withdrawn over the second one:
 
 * A **Task sub-agent** shares its parent's socket AND its parent's `CLAUDE_CODE_SESSION_ID`,
-  so it computes the parent's pane exactly. `_supersede_previous` refuses to run for anything
-  carrying `CLAUDE_CODE_CHILD_SESSION`, and that refusal is now load-bearing rather than
-  insurance: without it a sub-agent would end its parent's session and hand back claims a
-  live agent is working.
+  so it computes the parent's pane exactly — and two independent things mean it takes nothing
+  off its parent anyway. It **does not fire `SessionStart`**: a run that launched one produced
+  exactly one `SessionStart`, the main session's, and one `SubagentStop` carrying that same id,
+  and `_supersede_previous` runs only on `SessionStart`. And if one ever did, the id it carried
+  would be the parent's, so `prev != sid` is false and nothing is released.
+* **`CLAUDE_CODE_CHILD_SESSION` is not a sub-agent marker and must never be used as one.** It
+  is set on EVERY hook Claude Code runs: a CLI started with the entire parent environment
+  stripped (`env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID … claude -p`) still
+  hands its `SessionStart` hook `CLAUDE_CODE_CHILD_SESSION=1`. It means "spawned by Claude
+  Code". The first cut of this mechanism guarded on it, which refused every event there was
+  and left the pane file unwritten — inert, with a green suite, because
+  `_path_sandbox.sandbox_env` drops every `CLAUDE_` variable and so every test ran in a state
+  production is never in. `test_qb_hook_pane.py` now supplies the measured hook environment to
+  every case and requires the outcome to be the same with the variable and without it.
 * A **nested `claude -p`** (`harness_rules.run_agent`, so `lander.py` and `epic.py`) does
   NOT share its parent's pane. It inherits the parent's socket in its own environment and
   then exports `<its own pid>.sock` to everything it spawns, so its hook and its MCP server

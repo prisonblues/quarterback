@@ -39,6 +39,32 @@ from test_qb_hook_end import Hooked, pytestmark  # noqa: F401  (the jq/bash skip
 
 QB_ENV = Path(__file__).resolve().parents[1] / "bin" / "qb-env"
 
+#: THE ENVIRONMENT CLAUDE CODE REALLY HANDS A HOOK, captured 2026-09-06 on
+#: 2.1.258 and applied to every case below. It is here because leaving it out is
+#: how the first cut of this file shipped a hook that refused every event in
+#: production while eleven tests passed: `_path_sandbox.sandbox_env` builds an
+#: environment from scratch and drops everything matching `CLAUDE_`, so every
+#: test ran in a state production is never in, and a guard on
+#: `CLAUDE_CODE_CHILD_SESSION` looked sound because the variable was absent.
+#:
+#: It is not absent. It is set on EVERY hook Claude Code runs. Measured by
+#: starting a CLI with the whole parent environment stripped —
+#: `env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID
+#: -u CLAUDE_CODE_MESSAGING_SOCKET … claude -p` — and reading what its
+#: SessionStart hook was handed. A session with no parent at all, and the
+#: variable is `1`. It means "spawned by Claude Code", not "is a sub-agent".
+#:
+#: `CLAUDE_CODE_MESSAGING_SOCKET` is deliberately NOT here: it is the subject of
+#: most of these tests and each supplies its own. Everything else is verbatim,
+#: with the values that identify a particular run replaced.
+HOOK_ENV = {
+    "CLAUDE_CODE_CHILD_SESSION": "1",
+    "CLAUDE_CODE_ENTRYPOINT": "cli",
+    "CLAUDE_CODE_MESSAGING_TOKEN": "tok-messaging",
+    "CLAUDE_PID": "1607423",
+    "CLAUDE_PROJECT_DIR": "/home/rich/source/quarterback",
+}
+
 
 @pytest.fixture
 def hook(tmp_path):
@@ -82,7 +108,15 @@ class Pane:
 
 
 def started(hook, sid: str, source: str = "startup", **over):
-    hook.fire("SessionStart", env=hook.env(**over), session_id=sid, source=source)
+    """A SessionStart, in the environment Claude Code actually supplies.
+
+    `HOOK_ENV` is merged for EVERY case rather than for the one test that thinks
+    it needs it. A hook that behaves differently under the real environment is
+    exactly the bug this file was written to catch, and it cannot be caught by a
+    suite whose default is an environment that never occurs.
+    """
+    env = hook.env(**{**HOOK_ENV, "CLAUDE_CODE_SESSION_ID": sid, **over})
+    hook.fire("SessionStart", env=env, session_id=sid, source=source)
 
 
 # ------------------------------------------------------- the reset that fires
@@ -121,11 +155,12 @@ def test_the_pane_carries_the_current_conversation_to_the_other_half(hook):
     assert marker.read_text() == "sid-new"
 
 
-def test_compact_and_fork_are_not_resets_but_are_still_supersessions(hook):
-    """Both carry memory forward, so neither is a context reset — and both still
-    mean a different conversation is in this pane, which is what `superseded`
-    claims and all it claims."""
-    for source in ("compact", "fork"):
+def test_a_fork_is_not_a_reset_but_is_still_a_supersession(hook):
+    """A fork carries memory forward, so it is not a context reset — and it does
+    mint a new conversation, so a different one IS in this pane, which is what
+    `superseded` claims and all it claims. An older Claude Code that sends no
+    `source` at all lands in the same arm for the same reason."""
+    for source in ("fork", None):
         root = hook.root / f"case-{source}"
         root.mkdir()
         other = Hooked(root)
@@ -133,10 +168,31 @@ def test_compact_and_fork_are_not_resets_but_are_still_supersessions(hook):
         pane = Pane(root)
         env = {"CLAUDE_CODE_MESSAGING_SOCKET": str(pane.path)}
         started(other, "sid-old", **env)
-        started(other, "sid-new", source=source, **env)
+        if source is None:
+            other.fire("SessionStart",
+                       env=other.env(**{**HOOK_ENV, "CLAUDE_CODE_SESSION_ID": "sid-new",
+                                        **env}),
+                       session_id="sid-new")
+        else:
+            started(other, "sid-new", source=source, **env)
         ended = other.to("/session/end")
         assert len(ended) == 1, (source, other.sent())
         assert '"reason":"superseded"' in ended[0], source
+
+
+def test_a_compact_hands_nothing_back_because_it_is_the_same_conversation(hook):
+    """`/compact` does NOT mint a new conversation — verified in three
+    transcripts, where the post-compaction entries keep the same `sessionId` and
+    point back into the pre-compaction thread. So it reaches this path with the
+    pane already holding its own id and no arm of the `case` runs. Written as
+    the state that actually occurs rather than as the one the source name
+    suggests: a compact with a DIFFERENT session id is not a thing to assert on."""
+    pane = Pane(hook.root)
+    env = {"CLAUDE_CODE_MESSAGING_SOCKET": str(pane.path)}
+    started(hook, "sid-same", **env)
+    started(hook, "sid-same", source="compact", **env)
+    assert hook.to("/session/end") == [], hook.sent()
+    assert pane.file_in(hook.run_dir).read_text() == "sid-same"
 
 
 # --------------------------------------------- the two that must never fire
@@ -168,21 +224,63 @@ def test_a_resume_to_a_DIFFERENT_conversation_in_the_pane_hands_nothing_back(hoo
     assert pane.file_in(hook.run_dir).read_text() == "sid-other"
 
 
-def test_a_sub_agent_never_ends_its_parents_session(hook):
-    """This was insurance and the pane makes it load-bearing. A Task sub-agent
-    shares its parent's messaging socket — measured — so it computes the parent's
-    pane EXACTLY. Without this refusal a sub-agent starting up would end the
-    session its parent is working in and hand back the parent's claims, which is
-    the worst outcome available anywhere in this issue."""
+def test_a_start_carrying_the_panes_own_conversation_releases_nothing(hook):
+    """WHAT ACTUALLY PROTECTS A TASK SUB-AGENT'S PARENT.
+
+    A sub-agent shares its parent's messaging socket, so it computes the parent's
+    pane exactly — and it shares the parent's `session_id` too. So if one ever
+    reached this path it would find the pane already holding its own
+    conversation, and hand nothing back. That is the arithmetic rather than a
+    special case, and it is the property to pin, because the marker that looked
+    like a discriminator is not one (see `HOOK_ENV`).
+
+    Measured 2026-09-06 on 2.1.258: a run that launched a Task sub-agent produced
+    exactly ONE `SessionStart` — the main session's — and one `SubagentStop`
+    carrying that same session id. A sub-agent does not fire the event this path
+    hangs off at all, so the arithmetic below is the second of two reasons rather
+    than the only one.
+    """
     pane = Pane(hook.root)
     env = {"CLAUDE_CODE_MESSAGING_SOCKET": str(pane.path)}
     started(hook, "sid-parent", **env)
-    started(hook, "sid-child", CLAUDE_CODE_CHILD_SESSION="1", **env)
+    started(hook, "sid-parent", **env)          # the sub-agent's id IS this one
 
     assert hook.to("/session/end") == [], hook.sent()
-    # And the parent's record is untouched: a sub-agent that overwrote it would
-    # make the NEXT start supersede the sub-agent instead of the parent.
     assert pane.file_in(hook.run_dir).read_text() == "sid-parent"
+
+
+def test_the_child_session_marker_decides_nothing(hook):
+    """The regression guard for the bug this file shipped and had to take back.
+
+    `CLAUDE_CODE_CHILD_SESSION=1` is in the environment of EVERY hook — a
+    top-level session started with the whole parent environment stripped still
+    gets it. A guard on it refuses everything, leaves the pane file unwritten and
+    makes #146 and #263 inert while the suite reports green. So the outcome is
+    required to be the SAME with it and without it: if a future change keys on it
+    again, this fails rather than the fleet does.
+    """
+    outcomes = []
+    for present in (True, False):
+        root = hook.root / f"marker-{present}"
+        root.mkdir()
+        other = Hooked(root)
+        (other.bin / "qb-env").write_text((hook.bin / "qb-env").read_text())
+        pane = Pane(root)
+        env = {"CLAUDE_CODE_MESSAGING_SOCKET": str(pane.path)}
+        if not present:
+            env["CLAUDE_CODE_CHILD_SESSION"] = ""
+        started(other, "sid-old", **env)
+        started(other, "sid-new", source="clear", **env)
+        outcomes.append((other.to("/session/end"),
+                         pane.file_in(other.run_dir).read_text()))
+
+    with_marker, without_marker = outcomes
+    assert with_marker == without_marker, (
+        "the hook behaves differently under the environment Claude Code really "
+        "supplies than under the one this suite invents — which is how a guard "
+        "that refused every event in production passed eleven tests")
+    assert len(with_marker[0]) == 1 and '"reason":"context_reset"' in with_marker[0][0]
+    assert with_marker[1] == "sid-new"
 
 
 # ------------------------------------------------------- when there is no pane
@@ -230,7 +328,8 @@ def test_an_older_qb_env_costs_the_pane_and_nothing_else(hook):
         "qb_resolve_token() { QUARTERBACK_TOKEN=tok-test; return 0; }\n"
     )
     pane = Pane(hook.root)
-    env = {"CLAUDE_CODE_MESSAGING_SOCKET": str(pane.path)}
+    env = {**HOOK_ENV, "CLAUDE_CODE_MESSAGING_SOCKET": str(pane.path),
+           "CLAUDE_CODE_SESSION_ID": "sid-old"}
     got = hook.fire("SessionStart", env=hook.env(**env),
                     session_id="sid-old", source="startup")
     assert got.stderr == "", got.stderr

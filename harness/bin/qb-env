@@ -217,8 +217,17 @@ qb_requested_name() {
 #    need this guard as it turns out (measured: the CLI exports its own
 #    `<pid>.sock` to everything it spawns, overriding the one it inherited, so a
 #    nested agent's hook and MCP server already compute their own pane) — but the
-#    guard costs one /proc walk and the thing it forecloses is a nested agent
-#    ending its parent's session and handing back claims a live agent is working.
+#    guard costs one /proc walk and it is what keeps a process holding somebody
+#    else's socket from speaking for somebody else's pane.
+#
+#    NOTE FOR THE NEXT PERSON: the ownership question is about the SOCKET, and
+#    there is no environment variable that answers "am I a sub-agent".
+#    `CLAUDE_CODE_CHILD_SESSION` looks like one and is not — it is set on every
+#    hook Claude Code runs, on a top-level session with no parent at all
+#    (measured 2026-09-06, 2.1.258, with the whole parent environment stripped).
+#    A guard on it refuses everything. What protects a Task sub-agent's parent is
+#    in `_supersede_previous` in `qb-hook`, and it is that a sub-agent fires no
+#    SessionStart and would carry the parent's session id if it did.
 #
 # 2. RECENCY. Pids are recycled and `$XDG_RUNTIME_DIR` is not swept, so
 #    `qb-pane-<pid>` could be a file a previous CLI at the same pid left behind.

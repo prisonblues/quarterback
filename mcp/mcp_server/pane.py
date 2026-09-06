@@ -119,12 +119,20 @@ def pane_key() -> str | None:
         return None
     owner = named.group(1)
     try:
-        mtime = int(os.stat(sock).st_mtime)
+        # NANOSECONDS, integer-divided — never `int(st.st_mtime)`. `st_mtime` is a
+        # float, and float64 spacing at 1.7e9 is about 238ns, so an mtime within
+        # roughly 100ns of the next second ROUNDS UP: measured, ns=…000999999999
+        # gives `stat -c %Y`=1700000000 and `int(st_mtime)`=1700000001, and the
+        # two halves then name different files. One in ~8 million sockets, which
+        # is exactly the kind of odds that turns up once and is never reproduced.
+        mtime = os.stat(sock).st_mtime_ns // 10**9
     except OSError:
         return None
-    # `int()` truncates toward zero where `stat -c %Y` floors, so the two differ
-    # on a pre-epoch mtime and agree on every other. Refused rather than
-    # reconciled: a socket dated before 1970 is not one this CLI just created.
+    # A negative second is refused rather than reconciled: `//` floors, so it
+    # would agree with `stat -c %Y` — but the bash half tests the string for
+    # digits and a `-` is not one, so it declines. Agreeing to decline is the
+    # parity that matters, and a socket dated before 1970 is not one this CLI
+    # just created.
     if mtime < 0:
         return None
     if not os.path.isdir(f"/proc/{owner}"):
@@ -142,15 +150,24 @@ def pane_key() -> str | None:
     return None
 
 
-def pane_file() -> str | None:
-    """The file holding this pane's current conversation, or None."""
-    key = pane_key()
-    if not key:
-        return None
+def _file_for(key: str) -> str:
     # Concatenated, NOT `os.path.join`: bash's `"${XDG_RUNTIME_DIR:-/tmp}/…"`
     # keeps a double slash where `join` collapses it, and the two halves have to
     # name the same string as well as the same file.
     return f'{os.environ.get("XDG_RUNTIME_DIR") or "/tmp"}/qb-pane-{key}'
+
+
+def pane_file() -> str | None:
+    """The file holding this pane's current conversation, or None."""
+    key = pane_key()
+    return _file_for(key) if key else None
+
+
+#: The last conversation each pane was seen holding, so a momentary unreadable
+#: file does not move an agent's identity. Keyed on the pane, so a different CLI
+#: never inherits it; one entry per process in practice, because a process has
+#: one socket for its whole life.
+_LAST_SEEN: dict[str, str] = {}
 
 
 def pane_session() -> str | None:
@@ -160,12 +177,25 @@ def pane_session() -> str | None:
     board-less host, a runtime that is not Claude Code at all. The caller falls
     back to its own environment, which is what it did before this existed — so
     the worst this mechanism can do when it is wrong is nothing.
+
+    **A pane that has answered once keeps answering.** Without that, a file that
+    is briefly unreadable would send the caller back to the conversation this
+    process was SPAWNED with — which after a `/clear` is a conversation that has
+    ended, so a flicker would flip an agent's board identity for one request and
+    flip it back. Falling back to the environment is right when the pane has
+    never spoken; it is wrong once it has, because the newer answer is still the
+    better one. The memory is per pane, so a new CLI at the same pid gets none of
+    it.
     """
-    path = pane_file()
-    if not path:
+    key = pane_key()
+    if not key:
         return None
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            return fh.read(4096).strip() or None
+        with open(_file_for(key), encoding="utf-8", errors="replace") as fh:
+            seen = fh.read(4096).strip()
     except OSError:
-        return None
+        seen = ""
+    if seen:
+        _LAST_SEEN[key] = seen
+        return seen
+    return _LAST_SEEN.get(key)
