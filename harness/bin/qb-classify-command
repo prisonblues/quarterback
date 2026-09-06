@@ -64,21 +64,58 @@ destroying a peer's uncommitted work and ABSORBING it, and only the first had
 ever been guarded.
 
 What it deliberately does NOT do is win an argument with a determined caller.
-`env git reset --hard`, `sudo git …`, a `$VAR` target, a `cd` in an earlier
-clause, an alias, a shell function, `xargs` — all documented, none chased. The
-threat model is two co-operating agents in one tree, the cost of a miss is the
-same as before this existed, and the cost of the arms race is two rounds and
-eighty-four findings that never touched three of the five incidents.
+`env git reset --hard`, `sudo git …`, a `$VAR` target, an alias, a shell
+function, `xargs` — all documented, none chased. The threat model is two
+co-operating agents in one tree, the cost of a miss is the same as before this
+existed, and the cost of the arms race is two rounds and eighty-four findings
+that never touched three of the five incidents.
+
+**A literal `cd` in an earlier clause came OFF that list, and it is not a
+precedent for a second (#741).** It was on it for the list's own reason and the
+reason did not fit. The other entries are an adversary spelling their way around
+a static reader; `cd <path> && git checkout -- <file>` is how nearly every
+multi-repo command in this fleet is written, which puts it inside the bar this
+module sets for itself — the accident that actually happens — rather than
+outside it. Leaving it there was wrong in both directions at once, from one
+cause: the clause named no tree, the guard substituted the session cwd, and so
+it read a tree the command never opened. Judged that way a safe command in
+another repo is refused on evidence from this one (observed 2026-09-04: a
+refusal citing `?? plan.md`, an untracked file `git checkout -- flake.lock`
+could not touch in any repository), and `cd <shared tree> && …` typed from a
+private worktree is waved through, which is the exact command the guard exists
+to stop. One resolution removes both. It is one construct and NOT a precedent:
+the next spelling is still no.
 
 Reads the command on stdin. Writes one JSON object on stdout:
 
     {"destructive": bool,       # does a clause destroy, absorb OR take uncommitted work?
      "harm": str|null,          # "destroys", "sweeps" or "takes" — different words
-     "target": str|null,        # the tree that clause names (-C / --work-tree), if any
+     "target": str|null,        # the tree that clause runs on — its `cd`, `-C` or
+                                #   `--work-tree` — relative to the caller's cwd
+                                #   when relative, null when that IS the caller's cwd
+     "cwd_unknown": bool,       # the clause's working directory could not be resolved;
+                                #   the caller must assert nothing about ANY tree —
+                                #   nor about the repo, which silences `takes` too
      "verb": str|null,          # what it was, for the refusal message
      "allowed_by": str|null,    # the escape hatch for THIS harm, if the clause carried it
      "parsed": bool,            # false when the command could not be tokenised
      "harms": [{...}]}          # EVERY harmful clause, in order
+
+**`cwd_unknown` is the load-bearing half of reading `cd`, not a detail of it.**
+A `cd` to a `$VAR`, a glob or a `$(…)` is UNKNOWN, and unknown has to mean *do
+not assert anything about a tree you did not check* — never *assume the session
+cwd*, which is the fallback that manufactured the refusal above. A guard that
+invents evidence is the one people learn to ignore, and the cost of staying
+quiet is one missed refusal on a command nobody could read statically anyway.
+
+It silences `takes` as well as the two tree harms, and that is a decision rather
+than a side effect. A stash stack is not a tree, so the sentence above does not
+cover it on its own: what covers it is that `refs/stash` belongs to a REPOSITORY,
+and a command whose directory cannot be read is a command whose repository cannot
+be read either. `cd "$D" && git stash pop` went from refused to allowed, which is
+a real loss — refusing it because the session's repo has a shared stack is
+evidence about a repo the command may never open, and that is the same reasoning,
+but the cost is a cost. Both halves are pinned in `test_qb_hook_shared_tree.py`.
 
 `allowed_by` is per-harm, because the harms are not one hazard. A shared working
 tree and a shared `refs/stash` are different configurations, they are escaped by
@@ -92,7 +129,7 @@ about the tree you are standing in, `takes` asks about the repo's stash stack �
 summary naming one harm hides the others behind a question that was never put to
 them. `git stash pop; git reset --hard` summarises as `takes`, and a caller that
 finds nothing on the stack must still ask about the reset. Each entry carries
-`harm`, `target`, `verb` and its own `allowed_by`.
+`harm`, `target`, `cwd_unknown`, `verb` and its own `allowed_by`.
 
 `parsed: false` is NOT a refusal. The hook's contract is fail-open and an
 unparseable command is a command we know nothing about, which is the one state
@@ -102,9 +139,26 @@ this must never dress up as knowledge.
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import shlex
 import sys
 from pathlib import Path
+
+# WHERE THE CALLER IS STANDING, when the caller says. Two things in here ask the
+# filesystem a question — does this path exist in that tree, is that `--prefix`
+# inside it — and a relative target has to be resolved against something before
+# either can be answered. Without this it was resolved against the CLASSIFIER
+# PROCESS's cwd, which is not the caller's: measured with a peer in `../peer`,
+# `cd ../peer && git clean -fd` was refused (the tree walk is right) while
+# `cd ../peer && git checkout -- app.py` was allowed, because the path check had
+# read a different base. `-C ../peer` always had this; reading `cd` makes
+# relative targets the ordinary case rather than the odd one.
+#
+# Absent, it falls back to the process cwd, which is exactly the old behaviour —
+# so an old hook running this file is no worse off than it was, and the emitted
+# `target` stays caller-relative either way.
+_CALLER_CWD = os.environ.get("QB_CWD", "")
 
 # Global options that swallow the NEXT token. Getting this list wrong is what
 # made `git -c core.filemode=false reset --hard` invisible: the scanner has to
@@ -133,6 +187,49 @@ SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 
 SEPARATORS = {";", "&&", "||", "|", "&", "\n"}
 
+# Separators across which a `cd` in the clause BEFORE governs the clause after.
+# `&&` is exact; `;` and a newline are the one approximation, since a `cd` to a
+# directory that does not exist fails and the clause after it runs in the old
+# cwd. Measured in bash: `( cd /tmp || echo failed; pwd )` prints `/tmp`.
+CD_CARRIES_OVER = {"&&", ";", "\n"}
+
+# `||` is neither, on EITHER side of it. Its own clause runs only where the `cd`
+# FAILED — but every clause after that runs wherever the winner left the shell,
+# and which one won is exactly what cannot be read here. `cd X || exit 1` is the
+# ordinary idiom and it lands in X; `cd X || echo oops` may land in either; and
+# `cd X || cd Y && …` may land in either of two named directories, so a `cd` that
+# FOLLOWS a `||` cannot re-anchor us any more than the one before it could. So a
+# `cd` on either side of a `||` makes the cwd UNKNOWN rather than silently
+# keeping the old one, which is the rule this module already applies to a `cd` it
+# cannot read.
+#
+# The first cut discarded the `cd` for the whole remainder instead, and that was
+# wrong in the fail-open direction: `cd <peer> || exit 1; git clean -fd` fell
+# back to the payload cwd and allowed a swing in the peer's tree.
+#
+# One thing here is knowable and is NOT modelled, stated so the next reader does
+# not have to find it: the clause IMMEDIATELY after `||` runs only where the
+# `cd` failed, which is the cwd we started in. Tracking that is a third state for
+# `cd X || git clean -fd`, a form nobody writes, and the module's answer to
+# ambiguity is silence rather than a guess in either direction.
+CD_AMBIGUOUS = {"||"}
+
+# `|` and `&` are left out of both: each runs its clause in a subshell, so
+# `cd /tmp | git clean -fd` cleans the cwd we are standing in and the `cd` dies
+# with the subshell. Measured: `( cd /tmp ); pwd` prints the old directory.
+
+# Characters that make a path something only a shell can work out. Nothing here
+# expands anything, so a value carrying one of these is UNKNOWN — for a `cd`
+# operand and for a `-C` target alike, since they are the same question asked
+# about the same string.
+UNRESOLVABLE = "$`~*?"
+
+# …and the same question asked about a PATHSPEC, which has more spellings than a
+# path: `[` is a glob character, and a leading `:` opens git's own pathspec magic
+# (`:/` is the whole repository, `:(glob)**` is every file in it). An operand
+# carrying any of these is not one literal path and cannot be weighed as one.
+PATHSPEC_MAGIC = UNRESOLVABLE + "["
+
 # One hatch per HAZARD, not one per gate. `destroys` and `sweeps` are both about
 # standing in a tree somebody else is also standing in; `takes` is about a stash
 # stack every worktree of the repo shares, which is a hazard whether or not
@@ -160,20 +257,116 @@ def _tokenise(text: str) -> list[str]:
     return list(lexer)
 
 
-def _clauses(tokens: list[str]) -> list[list[str]]:
-    """Split a token stream on shell separators.
+def _clauses(tokens: list[str]) -> list[tuple[list[str], str]]:
+    """Split a token stream into `(clause, the separator that FOLLOWS it)`.
 
     The whole point: `git clean -n && git reset --hard` is TWO commands, and a
     dry run in the first says nothing about the second. Every exemption below is
     scoped to the clause it was found in, which is the bug class this removes.
+
+    The separator comes back with the clause because scoping is not the only
+    thing it decides. Whether a `cd` reaches the next clause is a property of
+    what joins them — see `CD_CARRIES_OVER` — and the clause on its own cannot
+    say. An empty clause (a leading `;`, a line ending in `&&`) contributes no
+    separator, so a wrapped command reports the `&&` that wrapped it rather than
+    the newline after it.
     """
-    out: list[list[str]] = [[]]
+    out: list[tuple[list[str], str]] = []
+    cur: list[str] = []
     for t in tokens:
         if t in SEPARATORS:
-            out.append([])
+            if cur:
+                out.append((cur, t))
+                cur = []
         else:
-            out[-1].append(t)
-    return [c for c in out if c]
+            cur.append(t)
+    if cur:
+        out.append((cur, ""))
+    return out
+
+
+def _cd_target(clause: list[str]) -> tuple[bool, str | None]:
+    """`(is this clause a cd, the directory it names)` — None for unresolvable.
+
+    Only the literal builtin, and only with one operand it can read. `cd` with
+    no operand is `$HOME`, `cd -` is `$OLDPWD` and `cd "$d"` is whatever the
+    shell holds: three directories this cannot name, and naming the wrong one is
+    the defect being fixed rather than a smaller version of it. They come back
+    `(True, None)` — a `cd` happened and where it went is UNKNOWN — which is a
+    different answer from `(False, None)`, no `cd` at all.
+
+    `-L`/`-P`/`-e`/`-@` are skipped; `--` ends them. Two operands is not a path
+    either (`cd a b` is bash's substitution form, or an error), so it is unknown
+    too rather than half-read.
+
+    A `cd` OPENING A GROUP — `( cd /x && …`, `{ cd /x; …` — is seen and not
+    placed, because where the group ends is not something a clause can say. It
+    is unknown for the same reason `cd "$d"` is: this can see that the shell
+    moved and cannot say where to. The one exception is a `( … )` that CLOSES in
+    the same clause, `( cd /x )`, where the subshell has already taken its cwd
+    with it — measured, `( cd /tmp ); pwd` prints the old directory — so that
+    one is not a `cd` at all. Without this the clause after a subshell inherited
+    the OUTER `cd` and named a tree with confidence, which is the one failure
+    this module says is worse than saying nothing.
+    """
+    if not clause:
+        return False, None
+    if clause[0] in ("(", "{") and clause[1:2] == ["cd"]:
+        return (False, None) if ")" in clause else (True, None)
+    if clause[0] != "cd":
+        return False, None
+    operands: list[str] = []
+    rest = clause[1:]
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--":
+            operands.extend(rest[i + 1:])
+            break
+        if rest[i].startswith("-") and rest[i] != "-":
+            i += 1
+            continue
+        operands.append(rest[i])
+        i += 1
+    if len(operands) != 1:
+        return True, None
+    path = operands[0]
+    if path == "-" or any(ch in path for ch in UNRESOLVABLE):
+        return True, None
+    return True, path
+
+
+def _is_pattern(operand: str) -> bool:
+    """Is this operand something other than one literal path?
+
+    A glob, a `$`, git's `:`-prefixed pathspec magic. The point is not to
+    classify the pattern, it is to notice that `Path(tree) / operand` is about to
+    answer a question nobody asked: `-- '*'` restores every modified file in the
+    tree and `Path(tree) / "*"` does not exist, so the sweep read as a named file
+    that happened to be missing.
+    """
+    return operand.startswith(":") or any(ch in operand for ch in PATHSPEC_MAGIC)
+
+
+def _resolve(tree: str | None, cwd: str, cwd_unknown: bool) -> tuple[str | None, bool]:
+    """`(target, cwd_unknown)` for a clause naming `tree` and running in `cwd`.
+
+    `cwd` is where the command's own `cd`s have put this clause, expressed the
+    way the caller reads a target: absolute, or relative to the cwd the caller
+    was given. `""` means the caller's cwd unchanged, which is reported as no
+    target at all — the shape every caller of this already handles.
+
+    An unknown cwd poisons only what depends on it. An ABSOLUTE `-C` or
+    `--work-tree` names its tree whatever directory git is run from, so
+    `cd "$d" && git -C /peer clean -fd` still resolves; a relative one does not,
+    and says so rather than resolving against a guess.
+    """
+    if tree is None:
+        return (None, True) if cwd_unknown else ((cwd or None), False)
+    if tree.startswith("/"):
+        return tree, False
+    if cwd_unknown:
+        return None, True
+    return posixpath.join(cwd, tree), False
 
 
 def _strip_assignments(clause: list[str]) -> tuple[list[str], dict[str, str]]:
@@ -231,6 +424,18 @@ def _git_args(clause: list[str]) -> tuple[list[str], dict] | None:
     return clause[i:], globals_
 
 
+def _fs(tree: str | None) -> str | None:
+    """The path to ASK THE FILESYSTEM about, for a target reported to the caller.
+
+    The two are not the same string when the target is relative: what goes out is
+    relative to the caller's cwd, because that is what the caller can resolve,
+    and what gets stat'd has to be resolved here.
+    """
+    if not tree or tree.startswith("/") or not _CALLER_CWD:
+        return tree
+    return posixpath.join(_CALLER_CWD, tree)
+
+
 def _target(globals_: dict) -> str | None:
     """The tree this clause names.
 
@@ -250,7 +455,14 @@ def _target(globals_: dict) -> str | None:
         # shrug at a command about to hard-reset whatever the variable holds.
         # Returning None puts it back on the cwd, which is where the first cut
         # put every command and is the conservative half of being wrong.
-        if any(ch in value for ch in "$`~*?"):
+        #
+        # NOT the same question as an unresolvable `cd`, though it is the same
+        # test (#741). Here the clause is running in a cwd we DO know and has
+        # merely aimed elsewhere, so the cwd is a tree we can still speak about.
+        # An unresolvable `cd` leaves us knowing no tree at all, and inventing
+        # one there is what produced a refusal about a repository the command
+        # never opened.
+        if any(ch in value for ch in UNRESOLVABLE):
             return None
         return value[:-5] if key == "--git-dir" and value.endswith("/.git") else value
     return None
@@ -291,8 +503,6 @@ def _destroys(verb: str, args: list[str], tree: str | None) -> bool:
         if _has(args, "-f", "--force", "--discard-changes") or "f" in flags:
             return True
         if verb == "checkout":
-            if "--" in args:
-                return True
             # `git checkout .` / `./src` — and `git checkout <trackedfile>`,
             # which overwrites that file and looks exactly like checking out a
             # branch. The only thing that tells them apart is the filesystem.
@@ -300,6 +510,62 @@ def _destroys(verb: str, args: list[str], tree: str | None) -> bool:
                 if p == "." or p.startswith("./") or p.startswith("../"):
                     return True
                 if tree and (Path(tree) / p).exists():
+                    return True
+            # `--` LAST, and only where the loop above could not answer (#741).
+            # It is a DISAMBIGUATOR — "what follows is a path, not a ref" — not a
+            # scope, and it used to short-circuit the whole loop, so `git
+            # checkout -- flake.lock` and `git checkout -- .` classified
+            # identically. That is backwards twice over: the form carrying `--`
+            # is the one whose operands are unambiguously paths, which makes it
+            # the EASIEST to reason about, and the loop above is already the
+            # careful half of this function.
+            #
+            # Three cases the loop cannot answer, and all three keep the old
+            # verdict rather than falling through it.
+            #
+            # A PATHSPEC THAT IS NOT A FILENAME is the one that matters, and
+            # leaving it out was a hole with a measurement behind it. The loop
+            # answers for `.`, `./…`, `../…` and paths that exist on disk; a
+            # pattern is none of those, and `Path(tree) / "*"` does not exist, so
+            # the whole-tree sweep read as a named file. Measured on git 2.54.0,
+            # each of these restored EVERY modified file in the tree:
+            # `checkout -- '*'`, `checkout -- ':/'`, `checkout -- ':(glob)**'`.
+            # Unquoted `-- *` reads the same here — the shell expands it and this
+            # never sees the expansion — and so does an operand carrying a `$` or
+            # a `$(…)`. So: an operand this cannot resolve to one literal path is
+            # an operand it cannot weigh, and it keeps the verdict.
+            #
+            # NO TREE is the everyday spelling: `git checkout -- <file>` typed in
+            # the tree you are standing in names no tree, so there is nowhere to
+            # weigh its paths, and going quiet there would drop the exact command
+            # this guard's own refusal text lists as destroying a peer's work.
+            #
+            # NO OPERANDS AFTER `--` is the degenerate one, kept conservative
+            # rather than claimed destructive: measured on git 2.54.0, bare `git
+            # checkout --` prints the modified paths and writes nothing. It is
+            # not a form anyone types, and True costs one refusal that never
+            # happens where False would need this branch to reason about a
+            # command git itself treats as a query.
+            #
+            # WHAT THIS COSTS, MEASURED AND NOT WAVED AWAY: for `--` with a
+            # LITERAL path that is not on disk, coverage goes DOWN. On the old
+            # short-circuit `git -C <peer> checkout -- gone.py` was refused; here
+            # it is allowed, and one of the paths that is not on disk is a
+            # tracked file a peer deleted without committing — `git checkout --
+            # gone.txt` put it straight back, measured, which is the undelete
+            # `checkout-index -a` above is guarded for. It is NOT true that this
+            # merely matches the bare spelling: `git checkout gone.py` was
+            # already allowed, so the two now agree by the `--` form losing
+            # cover, not by anything gaining it. The trade is one refusal on a
+            # command git rejects outright (`pathspec did not match`) against one
+            # miss on a peer's uncommitted deletion of a file the caller names by
+            # hand, and the honest way to close it is the dirty-set intersection
+            # #741 asks for in the hook, which is not this change.
+            if "--" in args:
+                operands = args[args.index("--") + 1:]
+                if not operands or not tree:
+                    return True
+                if any(_is_pattern(p) for p in operands):
                     return True
         return False
     if verb == "restore":
@@ -493,7 +759,8 @@ def _is_shared_stash(ref: str) -> bool:
 
 
 def classify(command: str, depth: int = 0) -> dict:
-    miss = {"destructive": False, "harm": None, "target": None, "verb": None,
+    miss = {"destructive": False, "harm": None, "target": None,
+            "cwd_unknown": False, "verb": None,
             "allowed_by": None, "parsed": True, "harms": []}
 
     # LINE BY LINE FIRST, and this is not a nicety. `shlex` counts a newline as
@@ -541,9 +808,42 @@ def classify(command: str, depth: int = 0) -> dict:
     # rather than nothing.
     found: list[dict] = []
 
-    for clause in _clauses(tokens):
+    # WHERE THE NEXT CLAUSE RUNS, carried along the walk (#741). `""` is the
+    # caller's own cwd — the state every command starts in and most stay in —
+    # and `cwd_unknown` is a `cd` we could not read, which is not a directory and
+    # must never decay into one. Both are per-command: `classify` is called once
+    # per tool call, and a nested `bash -c` gets its own pair below.
+    cwd = ""
+    cwd_unknown = False
+
+    sep_before = ""
+    for clause, sep_after in _clauses(tokens):
+        prev_sep, sep_before = sep_before, sep_after
         clause, hatches = _strip_assignments(clause)
         if not clause:
+            continue
+
+        # A `cd` clause is not a git clause; it moves the ones after it. Only
+        # where the separator actually carries it — `cd /tmp | git clean -fd`
+        # cleans here, not /tmp, and a subshell's `cd` is nobody else's.
+        is_cd, cd_path = _cd_target(clause)
+        if is_cd:
+            if sep_after in CD_AMBIGUOUS or prev_sep in CD_AMBIGUOUS \
+                    or (cd_path is None and sep_after in CD_CARRIES_OVER):
+                cwd, cwd_unknown = "", True
+            elif sep_after in CD_CARRIES_OVER:
+                if cd_path.startswith("/"):
+                    # An absolute `cd` re-anchors, and that is worth having: it
+                    # takes us back out of unknown rather than staying lost for
+                    # the rest of the command.
+                    cwd, cwd_unknown = cd_path, False
+                elif not cwd_unknown:
+                    # NORMALISED, because bash's `cd` is logical by default and
+                    # so is this: measured, `cd link/inner && cd ..` lands in
+                    # `link`, not in the symlink's physical parent. Leaving
+                    # `a/../b` for the filesystem to resolve would follow the
+                    # link and answer a different question.
+                    cwd = posixpath.normpath(posixpath.join(cwd, cd_path))
             continue
 
         # `bash -c '<command>'` — one level down, cheap now that we have tokens.
@@ -557,9 +857,18 @@ def classify(command: str, depth: int = 0) -> dict:
                 # deliberate act — but only for the harm it answers to. Looked up
                 # defensively: `harm` is set with `destructive` and cannot be
                 # absent, and a KeyError would take the classifier down over it.
+                #
+                # The inner command inherits the outer `cd` for the same reason
+                # every other clause does: `cd /peer && bash -c 'git clean -fd'`
+                # runs that shell in /peer. An inner cwd we could not read stays
+                # unreadable whatever the outer one was.
                 for h in inner["harms"]:
                     outer = hatches.get(HATCHES.get(h["harm"] or "", ""))
-                    found.append({**h, "allowed_by": outer or h["allowed_by"]})
+                    entry = {**h, "allowed_by": outer or h["allowed_by"]}
+                    if not h.get("cwd_unknown"):
+                        entry["target"], entry["cwd_unknown"] = _resolve(
+                            h.get("target"), cwd, cwd_unknown)
+                    found.append(entry)
         else:
             parsed = _git_args(clause)
             if parsed is None:
@@ -572,12 +881,15 @@ def classify(command: str, depth: int = 0) -> dict:
             # itself is not running it.
             if _has(rest, "--help", "-h") or "--help" in globals_ or "-h" in globals_:
                 continue
-            tree = _target(globals_)
-            harm = ("destroys" if _destroys(verb, rest, tree)
+            tree, unknown = _resolve(_target(globals_), cwd, cwd_unknown)
+            # `_fs` and not `tree`: the verdict asks the filesystem, the report
+            # goes to a caller that resolves relative paths itself.
+            harm = ("destroys" if _destroys(verb, rest, _fs(tree))
                     else "sweeps" if _sweeps(verb, rest)
                     else "takes" if _takes(verb, rest) else None)
             if harm:
-                found.append({"harm": harm, "target": tree, "verb": verb,
+                found.append({"harm": harm, "target": tree,
+                              "cwd_unknown": unknown, "verb": verb,
                               "allowed_by": hatches.get(HATCHES[harm])})
 
     if not found:
@@ -588,6 +900,7 @@ def classify(command: str, depth: int = 0) -> dict:
     primary = next((h for h in found if not h["allowed_by"]), found[0])
     return {"destructive": True, "parsed": True, "harms": found,
             "harm": primary["harm"], "target": primary["target"],
+            "cwd_unknown": primary.get("cwd_unknown", False),
             "verb": primary["verb"], "allowed_by": primary["allowed_by"]}
 
 

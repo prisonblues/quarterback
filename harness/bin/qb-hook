@@ -1364,8 +1364,14 @@ _shared_tree_guard() {
   # without python3, a classifier that errors, output that will not parse.
   [ -n "$_QB_CLASSIFY" ] || return 0
   command -v python3 >/dev/null 2>&1 || return 0
+  # `QB_CWD` is where the CALLER is standing, and the classifier needs it to
+  # resolve a relative target — `cd ../peer && git checkout -- app.py` — before
+  # asking the filesystem about it. Without it that question was answered against
+  # whatever directory this hook's own process happened to be in. It changes no
+  # verdict this hook then reads: `target` comes back caller-relative either way,
+  # and the join below is unchanged.
   verdict=$(printf '%s' "$cmd" \
-            | timeout 5 python3 "$_QB_CLASSIFY" 2>/dev/null) || return 0
+            | QB_CWD="$cwd" timeout 5 python3 "$_QB_CLASSIFY" 2>/dev/null) || return 0
   [ -n "$verdict" ] || return 0
 
   case $(printf '%s' "$verdict" | jq -r '.destructive // false' 2>/dev/null) in
@@ -1401,7 +1407,7 @@ _shared_tree_guard() {
   # still a real answer, and one harm guarded beats none.
   harms=$(printf '%s' "$verdict" | jq -c '
       if (.harms | type) == "array" and (.harms | length) > 0 then .harms[]
-      else {harm, target, verb, allowed_by} end' 2>/dev/null) || return 0
+      else {harm, target, cwd_unknown, verb, allowed_by} end' 2>/dev/null) || return 0
   [ -n "$harms" ] || return 0
 
   while IFS= read -r one; do
@@ -1414,11 +1420,26 @@ _shared_tree_guard() {
 
     harm=$(printf '%s' "$one" | jq -r '.harm // "destroys"' 2>/dev/null)
 
+    # A CLAUSE WHOSE WORKING DIRECTORY WE COULD NOT READ IS ONE WE SAY NOTHING
+    # ABOUT (#741). `cd "$d" && git clean -fd` runs somewhere only the shell
+    # knows; the one thing certain is that it is not necessarily HERE. Falling
+    # back to the payload cwd is what produced a refusal about this repository
+    # over a command in another one, citing an untracked file that command could
+    # not have touched — evidence gathered from a tree nobody had checked. That
+    # refusal is worse than silence, because it is the kind that teaches the next
+    # reader to reach for the hatch by reflex. Fail-open here is the same
+    # contract as `parsed: false` above, for the same reason.
+    case $(printf '%s' "$one" | jq -r '.cwd_unknown // false' 2>/dev/null) in
+      true) continue ;;
+    esac
+
     # WHICH TREE IS THIS CLAUSE GOING TO TOUCH? Not necessarily the one we are
     # standing in — `git -C ../peer-tree reset --hard` destroys somebody else's
     # while the payload cwd stays clean and unshared, and refusing its mirror
     # image (a private tree, from a shared cwd) is the same defect pointed the
-    # other way. Per clause, because two clauses can name two different trees.
+    # other way. Per clause, because two clauses can name two different trees,
+    # and a `cd` in an earlier clause moves the ones after it — which the
+    # classifier has already folded into `target`.
     target=$(printf '%s' "$one" | jq -r '.target // empty' 2>/dev/null)
     if [ -n "$target" ]; then
       case "$target" in /*) ;; *) target="$cwd/$target" ;; esac
