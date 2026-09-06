@@ -3530,6 +3530,34 @@ disagreements:
 **No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. The writes
 it can make are one board post (`--post`) and one plan transition (`--apply`), both opt-in.
 
+#### `stale_claim` — and the two claims it cannot answer the same way (#681)
+
+A claim taken by a SESSION is checked against `/active`, session first and holder second, and
+the case it reports is the one passive expiry can never reach: the holder is live, the session
+that took the claim is not, so a reset conversation is still holding it and it cannot lapse
+while the pane lives. Absence alone is never the finding — `/active` lists only unexpired
+leases, a lease runs 30 minutes against a claim's hour, and a single long autonomous turn drops
+a working agent out of it with its claim perfectly live.
+
+A claim taken by a **checkout** cannot be checked that way at all. `create-worktree` claims the
+issue a branch names before the tree exists, with no session, so the row's holder is the bare
+machine — `zeus`, not `zeus/amber-otter`. Every holder in `/active` carries an agent name, so a
+bare machine name can never appear there: looking one up is not a hard case that came out
+unknown, it is a comparison with no favourable answer available. It used to be reported as one
+anyway, with the lease-asymmetry sentence under it, which described something that was not
+happening to any of the nine such claims standing on zeus the day #681 was written. Adoption
+(PR #763) turns one into a session claim, and those are answered as session claims; what is
+left is the ones nobody adopted, which now say so, name the tree from the claim's own note, and
+name `remove-worktree` and the TTL as the two things that end one.
+
+**What settles either of them is the work, not the holder.** When the item's own ref is a PR
+GitHub reports merged or an issue closed as completed — the `done_candidate` this same pass
+computed for the same row, a few lines earlier — the claim has outlived its work whoever holds
+it, and that is a `stale_claim` finding rather than a check that could not be made. Only an
+unknown is promoted this way: a claim a live session holds is left alone, because an agent's
+last turn happens with its own issue already closed. Nothing is released either way — this
+report has no `--release`, and #685 is what stops a finished worktree standing to its TTL.
+
 **It never *judges* — which is a narrowing of "it never edits the plan", and #552 is why.**
 That was the rule, and it was measured: ranks 1, 2 and 3 of this repo's plan were closed
 work, flagged `done_candidate` and re-confirmed every fifteen minutes for days, while on
