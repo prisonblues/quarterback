@@ -3530,6 +3530,56 @@ disagreements:
 **No agent, no claims, no hooks.** It resolves refs, compares, prints and exits. The writes
 it can make are one board post (`--post`) and one plan transition (`--apply`), both opt-in.
 
+#### `stale_claim` — and the claim no lease can answer for (#681)
+
+A claim taken by a SESSION is checked against `/active`, session first and holder second, and
+the case it reports is the one passive expiry can never reach: the holder is live, the session
+that took the claim is not, so a reset conversation is still holding it and it cannot lapse
+while the pane lives. Absence alone is never the finding — `/active` lists only unexpired
+leases, a lease runs 30 minutes against a claim's hour, and a single long autonomous turn drops
+a working agent out of it with its claim perfectly live.
+
+A **machine claim** cannot be checked that way at all. `qb-claim --session ""` writes a row that
+names no session, and `qbdata.BoardClient` sends no `X-Agent-Key`, so its holder is the bare
+machine — `zeus`, not `zeus/amber-otter`. Every caller that takes a *lease* does send that
+header, so no lease in `/active` carries a bare machine name and looking one up there is not a
+hard case that came out unknown, it is a comparison with no favourable answer available. It was
+reported as one anyway, with the lease-asymmetry sentence under it, which described something
+that was not happening to any of the nine such claims standing on zeus the day #681 was written.
+(Not *cannot be*: `app/auth.py` gives a keyless caller the bare machine name for a lease too. The
+report says which of the two it saw, because a machine that IS in `/active` has somebody else's
+keyless lease and that is still not evidence about a claim no session ever took.)
+
+**Which script took it comes from the note, and the remedy differs.** `create-worktree` records
+`worktree <create-name> on <host>`, and the create-name is the argument `remove-worktree` takes.
+`qb-start` takes the same shape of claim for `/review-pr` and `/fix-issue-here`, where no
+worktree is created at all — so those get `qb-release <kind> <n>`, named, because bare
+`qb-release` reads the resource off the *reader's* current branch and would do nothing on a host
+sitting on `main`. The note is parsed on the BOARD (`claim.worktree`, `app/api/claims.py`) and
+not here: that docstring refuses a second reader of the grammar by name. Adoption (PR #763)
+turns a checkout claim into a session claim, and those are answered as session claims.
+
+**What settles either of them is the work, not the holder.** When the item's own ref is a PR
+GitHub reports merged, or an issue closed — the `done_candidate` this same pass computed for the
+same row, a few lines earlier — the item has outlived its work and the claim outlived it with
+the item, and that is a `stale_claim` finding rather than a check that could not be made. The
+assertion is `ref_verdict`'s own and no stronger: a closed issue says the ITEM outlived its
+work, and that the code landed is what `--apply` declines to infer from an issue ref at all.
+Only an unknown is promoted: a claim a live session holds is left alone, because an agent's last
+turn happens with its own issue already closed. Nothing is released either way — this report has
+no `--release`, and #685 is what stops a finished worktree standing to its TTL.
+
+**A promoted finding takes no plan row.** `POST /plan/reconcile` stores one row per
+`(repo, ref_kind, ref_value)`, and a promoted `stale_claim` is on the same ref as the
+`done_candidate` that settled it, always. Sent, it would take that row under the board's "last
+one wins" and `_reconciled_caveat` would stop saying the item is already finished — while saying
+nothing the row it displaced does not, the two being one fact. So it is not sent, and the plan
+write is unchanged from before this condition existed. The wider question — that list order
+decides a durable row whenever any two conditions land on one ref, `done_candidate` with
+`note_contradicted` among them — is real, predates this, and is filed separately (#768): a general
+precedence makes the stored condition depend on which checks could RUN, so a pass that could not
+reach GitHub stores something else and `first_seen` restarts on the flip.
+
 **It never *judges* — which is a narrowing of "it never edits the plan", and #552 is why.**
 That was the rule, and it was measured: ranks 1, 2 and 3 of this repo's plan were closed
 work, flagged `done_candidate` and re-confirmed every fifteen minutes for days, while on

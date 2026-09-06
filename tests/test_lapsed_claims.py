@@ -104,6 +104,33 @@ async def test_a_claim_whose_holder_vanished_is_returned(client, repo):
     assert rows[0]["worktree"] == {"branch": "feat/qb-dash-buttons", "host": "zeus"}
 
 
+async def test_a_LIVE_claim_reports_its_worktree_too(client, repo):
+    """#681. The grammar has one parser and this file's own subject is why, but
+    only `lapsed_view` was reading it — so a consumer of a LIVE claim (`GET /plan`
+    embeds `claim_view` on every item) had nowhere to get the tree but its own copy
+    of the regex, which is the second reader `worktree_of`'s docstring refuses by
+    name. `qb-reconcile` had grown exactly that copy; it reads this instead.
+
+    On `claim_view`, so every view of a claim carries it: the take, the renew, the
+    plan item, the release refusal and the lapsed row are one shape."""
+    claim = await take(client, repo, 205, note="worktree fix/issue-205 on zeus")
+    assert claim["worktree"] == {"branch": "fix/issue-205", "host": "zeus"}
+
+    listed = await client.get("/claims", params={"repo": repo}, headers=LAPTOP)
+    assert listed.status_code == 200, listed.text
+    row = next(c for c in listed.json()["claims"] if c["key"].endswith("#205"))
+    assert row["worktree"] == {"branch": "fix/issue-205", "host": "zeus"}
+
+
+async def test_a_live_claim_whose_note_names_no_tree_says_None(client, repo):
+    """`qb-start` takes the same shape of claim for routes that create no worktree,
+    and its note is a spawn record. None is what tells a reader that
+    `remove-worktree` is not the command for this one."""
+    claim = await take(client, repo, 206,
+                       note="spawned /review-pr 742 by qb-start via dash")
+    assert claim["worktree"] is None
+
+
 async def test_a_claim_the_holder_RELEASED_is_not_returned(client, repo):
     """The distinction the whole design rests on. They said they were done: the
     work landed, the branch merged, and redirecting a new agent there is noise."""
