@@ -249,6 +249,16 @@
           # suite runs; without this line both would ERROR on a missing file rather
           # than be evaluated, which is #163's mechanism exactly.
           install -Dm644 ${./.harness-rules.sample} .harness-rules.sample
+          # The OTHER half of the pane derivation (#146). `test_pane_parity.py` runs the
+          # bash rule in `bin/qb-env` and the Python rule in `mcp/mcp_server/pane.py` over
+          # one table and requires the same answer of each, because two spellings of one
+          # rule silently drifting apart is what withdrew PR #765 — the hook wrote one
+          # filename, the server read another, nothing joined up and the suite was green.
+          # A guard that cannot reach one of the two halves cannot compare them, so
+          # without this line the check that exists to catch that failure would BE it.
+          # One file, not the tree: `pane.py` is stdlib-only precisely so the parity
+          # check can load it by path with no venv, and the suite loads it that way.
+          install -Dm644 ${./mcp/mcp_server/pane.py} mcp/mcp_server/pane.py
           chmod -R u+w harness
           # test_release_numbers.py is not a harness test and cannot run in this
           # sandbox: it reads CHANGELOG.md, README.md, pyproject.toml, app/main.py

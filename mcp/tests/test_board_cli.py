@@ -369,7 +369,19 @@ def test_a_failed_exec_says_what_to_run_by_hand(home, monkeypatch):
 
 
 def headers(client):
-    return dict(client._http.headers)
+    """The headers a request from this client actually carries.
+
+    NOT `client._http.headers`. Since #146 the agent key is stamped per request
+    by an event hook rather than fixed at construction — a Claude Code session's
+    key moves when the conversation does, and this client is built once for a
+    process that outlives its own conversation — so the client's defaults now
+    report "no key" for a client that sends one on every call. Building a request
+    and running the hooks over it is what the board would receive.
+    """
+    request = client._http.build_request("GET", "http://board.test/whoami")
+    for hook in client._http.event_hooks["request"]:
+        hook(request)
+    return dict(request.headers)
 
 
 def test_by_default_the_client_sends_no_agent_key():

@@ -190,3 +190,91 @@ qb_requested_name() {
   [ -n "$n" ] && printf '%s' "$n"
   return 0
 }
+
+# ---- the pane: one CLI process, however many conversations (#146) ------------
+#
+# A `/clear` does not restart the Claude Code CLI. It mints a NEW conversation id
+# inside the SAME process — measured 2026-09-06: pid 352423 ran `4c8f6a8a…` from
+# 13:24 and `e267ef87…` from 16:36:59 without ever exec'ing again. Every process
+# Claude Code spawns is given the CURRENT conversation's id, so `qb-hook` (a fresh
+# process per event) is always right; `qb-mcp` is the one process that is spawned
+# ONCE and so keeps answering with a conversation that may have ended hours ago.
+#
+# The PANE is what the two halves need in common: a name for the CLI process,
+# derivable by both, that a clear does not move. `CLAUDE_CODE_MESSAGING_SOCKET` is
+# it — `/run/user/<uid>/cc-socks/<cli pid>.sock`, created when the CLI starts and
+# unchanged across a conversation switch 25 hours later. The hook writes the
+# current conversation to a file named after the pane; the MCP server reads that
+# file per call instead of trusting the environment it was spawned with.
+#
+# TWO GUARDS, and both are load-bearing.
+#
+# 1. OWNERSHIP. A process may hold a socket variable it did not earn: a shell a
+#    dead CLI left behind still carries the dead CLI's. So the pane is ours only
+#    if the pid the socket is named for is BOTH alive AND an ancestor of us —
+#    measured, a live process here carries `3524155.sock` for a pid that is dead
+#    and not in its ancestry, and it must decline. A nested `claude -p` does NOT
+#    need this guard as it turns out (measured: the CLI exports its own
+#    `<pid>.sock` to everything it spawns, overriding the one it inherited, so a
+#    nested agent's hook and MCP server already compute their own pane) — but the
+#    guard costs one /proc walk and the thing it forecloses is a nested agent
+#    ending its parent's session and handing back claims a live agent is working.
+#
+# 2. RECENCY. Pids are recycled and `$XDG_RUNTIME_DIR` is not swept, so
+#    `qb-pane-<pid>` could be a file a previous CLI at the same pid left behind.
+#    The socket's mtime goes in the KEY rather than being compared against
+#    anything: a stale file simply has a different name and is never found.
+#
+# THIS IS ONE OF TWO IMPLEMENTATIONS — `mcp/mcp_server/pane.py` is the other, and
+# they are pinned against each other over a shared table by
+# `harness/tests/test_pane_parity.py`. That test is not decoration. The previous
+# attempt at this (PR #765) shipped two slug implementations that disagreed about
+# trailing whitespace and about byte-vs-character classes; the hook wrote one
+# filename and the server read another, so the mechanism was a silent no-op with
+# a green suite. Every rule below is written to be spellable identically in both
+# languages — string comparison rather than integer, `[0-9]` rather than `\d`,
+# a full-string match rather than one anchored with `$` (which in Python also
+# matches before a trailing newline) — and any new rule needs a row in that table.
+
+qb_pane_ppid() {   # qb_pane_ppid <pid>: that process's parent pid, or nothing
+  local s
+  s=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+  # `comm` is parenthesised and may itself contain spaces and parens, so the
+  # fields are unambiguous only after the LAST ") ". Same rule in pane.py.
+  s=${s##*") "}
+  # shellcheck disable=SC2086  # deliberate word splitting: these are stat fields
+  set -- $s
+  [ $# -ge 2 ] && printf '%s' "$2"
+  return 0
+}
+
+qb_pane_key() {   # echo <cli pid>-<socket mtime>, or nothing if we own no pane
+  local sock base owner mtime p hops
+  sock="${CLAUDE_CODE_MESSAGING_SOCKET:-}"
+  [ -n "$sock" ] || return 0
+  base=${sock##*/}
+  case "$base" in *.sock) ;; *) return 0 ;; esac
+  owner=${base%.sock}
+  case "$owner" in ''|*[!0-9]*) return 0 ;; esac
+  mtime=$(stat -c %Y "$sock" 2>/dev/null) || return 0
+  case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
+  [ -d "/proc/$owner" ] || return 0
+  # Compared as STRINGS, never as numbers: `0123` and `123` are different panes
+  # here and in pane.py, rather than the same one on whichever side happens to
+  # parse an integer.
+  p=$$; hops=0
+  while [ -n "$p" ] && [ "$p" != "0" ] && [ "$hops" -lt 64 ]; do
+    [ "$p" = "$owner" ] && { printf '%s-%s' "$owner" "$mtime"; return 0; }
+    p=$(qb_pane_ppid "$p")
+    hops=$((hops + 1))
+  done
+  return 0
+}
+
+qb_pane_file() {   # echo the file holding this pane's current conversation
+  local k
+  k=$(qb_pane_key)
+  [ -n "$k" ] || return 0
+  printf '%s/qb-pane-%s' "${XDG_RUNTIME_DIR:-/tmp}" "$k"
+  return 0
+}
