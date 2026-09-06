@@ -144,6 +144,34 @@ CONDITIONS = (
     "untracked_pr",
 )
 
+#: The conditions that say the item's OWN WORK HAS ENDED, and the reason
+#: :func:`report_findings` has to rank rather than emit in list order.
+#:
+#: `POST /plan/reconcile` stores one row per `(repo, ref_kind, ref_value)` —
+#: `uq_plan_reconcile_ref` — and keys the request's findings into a dict under a
+#: comment reading "LAST ONE WINS". So when one pass reports two conditions about
+#: one ref, the board keeps whichever this file happened to append last, and the
+#: plan row that `plan_read`'s caveat is built on is decided by the order of the
+#: checks in :func:`reconcile` rather than by anything anybody chose.
+#:
+#: Measured on this branch, both pairings real: a merged PR whose note asserts
+#: readiness emits `done_candidate` then `note_contradicted`, and the board keeps
+#: the second — that one predates this change. A claim over finished work now
+#: emits `done_candidate` then `stale_claim`, on exactly the rows #681 is about,
+#: and the board kept the second. `_reconciled_caveat` then stops saying the item
+#: is already finished and falls back to offering it as next, which is #463's
+#: worked example arriving through the fix for #681. `first_seen` restarts on a
+#: condition change too, so the "for 2 days" the caveat's docstring calls the
+#: sentence that turns a report into an argument would reset and then oscillate.
+#:
+#: These two win because the plan row exists to answer ONE question — is this
+#: still work to do — and they are the two conditions that answer it. A stale
+#: claim, a contradicted note and an untracked PR are all things that are true
+#: AROUND an item that is still open. Within a tier the pass's own order stands,
+#: first seen winning, so the write is a function of the report rather than of
+#: which check runs last.
+WORK_ENDED = ("done_candidate", "dropped_candidate")
+
 #: Conditions only an :class:`Unknown` carries — a check that is not any single
 #: finding condition's. `ref_unresolved` is the ref lookup that answers conditions
 #: 1 AND 2 at once; `plan_incomplete` is about the report, not about an item.
@@ -521,25 +549,58 @@ _LEASE_ASYMMETRY = ("a lease is renewed per prompt and runs 30 minutes against a
                     "own TTL")
 
 
-def is_checkout_claim(claim: dict) -> bool:
-    """Was this claim taken by a CHECKOUT rather than by an agent's session?
+#: A claim's note when `create-worktree` took it: ``worktree <create-name> on
+#: <host>``. The create-name is what `remove-worktree` takes as its argument and
+#: what the claim was derived from, so quoting it turns a report into the command
+#: that acts on it. Anchored, because the note is free text and a claim whose note
+#: merely MENTIONS a worktree is not one a checkout took.
+_WORKTREE_NOTE = re.compile(r"^worktree\s+(\S+)\s+on\s+\S+\s*$")
 
-    Two facts together, and neither alone is enough. It names no session, and its
-    holder carries no agent name — ``zeus``, not ``zeus/amber-otter``. That is
-    exactly what `create-worktree` writes: it claims the issue a branch names
-    before the tree exists, with ``--session ""`` on purpose, because the agent
-    that will work in the tree has a different session and does not exist yet
-    (#337, and the long comment above `claim_the_branch`).
 
-    **Why it has to be recognised by name.** `/active` lists LEASES, and a lease's
+def worktree_of(claim: dict) -> str | None:
+    """The create-name of the worktree this claim was taken for, or None.
+
+    `qb-claim` is called with `--session ""` by two callers and only one of them
+    has a tree. `create-worktree` writes ``worktree fix/issue-663 on zeus``;
+    `qb-start` writes ``spawned /review-pr 742 by qb-start via …`` for routes
+    where no worktree exists at all (`qb-start`, §8). Telling them apart matters
+    because the remedy differs: `remove-worktree` ends the first and can do
+    nothing about the second, so naming it for both would send a reader at a
+    command that cannot work.
+    """
+    match = _WORKTREE_NOTE.match((claim.get("note") or "").strip())
+    return match.group(1) if match else None
+
+
+def is_machine_claim(claim: dict) -> bool:
+    """Was this claim taken by a script on a machine's behalf, with no session?
+
+    The two facts are that it names no session and that its holder carries no
+    agent name — ``zeus``, not ``zeus/amber-otter``. **The session is the one that
+    discriminates**, and the holder shape is a corroborating fact rather than a
+    second independent one: `qbdata.BoardClient._request` sends only
+    `Authorization`, no `X-Agent-Key`, so per `app.auth` ("No key: the bare
+    machine name") EVERY claim written through `qb-claim` lands with a bare
+    machine holder — not just `create-worktree`'s. A named holder means the write
+    came through an addressed identity (the `qb` shell client or the MCP server,
+    which do send the header), and a claim taken there with no session is a
+    different thing: the recycled-name branch answers it.
+
+    **Why the class has to be recognised at all.** `/active` lists LEASES. A lease
     holder is composed by `app.identity.compose` from the machine and the agent's
-    board name, so every holder in it carries the separator. A bare machine name
-    can therefore never appear there — not "is not there today", *cannot be*. So
-    checking one against `/active` is not a hard case that came out unknown, it is
-    a comparison with no possible favourable answer, and :data:`_LEASE_ASYMMETRY`
-    — which explains an absence by a working agent going quiet — describes
-    something that is not happening here. Nine such claims stood on zeus the day
-    #681 was written and every one of them read that sentence.
+    board name, and every caller that takes one today sends the key header, so no
+    lease in `/active` carries a bare machine name — which means looking one up
+    there is not a hard case that came out unknown, it is a comparison with no
+    favourable answer available. Reported as one anyway, under
+    :data:`_LEASE_ASYMMETRY`, it explained the absence by a working agent going
+    quiet between lease renewals: something that was not happening to any of the
+    nine such claims standing on zeus the day #681 was written.
+
+    Not *cannot be*, though, and the caller has to allow for it. `app.auth` gives
+    a keyless caller the bare machine name for a lease too, and `qb-hook` sends
+    the header conditionally — so a machine name in `/active` is possible, and
+    when it happens it is a keyless lease and still not evidence about a claim no
+    session ever took. :func:`claim_verdict` says which of the two it saw.
 
     An ADOPTED claim is not one of these and must not be caught by it. The first
     agent to work in the tree re-claims the same issue from inside its own session
@@ -594,12 +655,12 @@ def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
     expiry can never reach — the holder is demonstrably live, so its lease is being
     renewed and its absence explains nothing.
 
-    A CHECKOUT claim (:func:`is_checkout_claim`) is answered before either of the
+    A MACHINE claim (:func:`is_machine_claim`) is answered before either of the
     holder branches, because for it `/active` is not a register that came back
-    empty — it is the wrong register, and cannot hold an answer. The fact that
-    settles one is not liveness at all: it is whether the work is finished, which
-    :func:`reconcile` reads across from the `done_candidate` it computed for the
-    same item a few lines earlier.
+    empty — it is the wrong register. The fact that settles one is not liveness at
+    all: it is whether the item has outlived its work, which :func:`reconcile`
+    reads across from the `done_candidate` it computed for the same item a few
+    lines earlier.
     """
     session = (claim.get("session") or "").strip() or None
     holder = (claim.get("holder") or "").strip() or None
@@ -616,36 +677,57 @@ def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
                              f"({clip(session, 8)}) is not — a reset conversation still "
                              "holding it, which cannot expire while the pane lives")
 
-    # Taken by a checkout, not by an agent — see :func:`is_checkout_claim` for why
-    # `/active` is the wrong register for it and not merely a quiet one. Placed
-    # after the two session branches so an ADOPTED claim (PR #763) is answered as
-    # the session claim it has become, and before the holder-name branch below,
-    # which is about names being recycled and has nothing to say about a machine.
-    if is_checkout_claim(claim):
+    # Taken by a script on the machine's behalf, not by an agent — see
+    # :func:`is_machine_claim` for why `/active` is the wrong register for it and
+    # not merely a quiet one. Placed after the two session branches so an ADOPTED
+    # claim (PR #763) is answered as the session claim it has become, and before
+    # the holder-name branch below, which is about names being recycled and has
+    # nothing to say about a machine.
+    if is_machine_claim(claim):
         live = _claim_live(claim, at)
+        # WHICH script, from the note, because the remedy differs and naming the
+        # wrong one sends a reader at a command that cannot work.
+        # `create-worktree` writes `worktree <create-name> on <host>` and the
+        # create-name is `remove-worktree`'s argument; `qb-start` takes the same
+        # kind of claim for `/review-pr` and `/fix-issue-here`, where there is no
+        # tree for `remove-worktree` to be about at all.
+        tree = worktree_of(claim)
+        took_it = (f"`create-worktree` took it for the tree {tree!r}"
+                   if tree else
+                   "a script took it with no session"
+                   + (f" (its note records {clip(claim.get('note'), 60)!r})"
+                      if claim.get("note") else ""))
         if live is False:
             return CLAIM_STALE, (
-                f"the checkout claim held by {holder} is past its own expiry, and "
-                "nothing renews one — it was taken by `create-worktree` on behalf of a "
-                "tree rather than by a session, so no lifecycle hook extends it")
-        ends_it = ("`remove-worktree` hands one back once the tree is gone, and "
-                   "otherwise it stands to its own TTL" if live else
-                   "`remove-worktree` hands one back once the tree is gone, and this "
-                   f"one carries no readable `expires` ({claim.get('expires') or 'none'!r}), "
-                   "so not even its own TTL could be read")
-        # The note is `worktree <create-name> on <host>`, which is the argument
-        # `remove-worktree` wants — so it is quoted rather than described. A reason
-        # that says a tree is holding a claim and leaves the reader to work out
-        # WHICH tree is one more lookup between the report and the fix.
-        names_it = clip(claim.get("note"), 80)
+                f"the claim held by {holder} is past its own expiry and nothing "
+                f"renews one: {took_it}, so there is no session for a lifecycle hook "
+                "to extend it from")
+        # Whether the machine is in `/active` changes what can honestly be said,
+        # so it is READ rather than assumed. A keyless caller gets the bare machine
+        # name for a lease too (`app.auth`), so the name CAN be there — and when it
+        # is, it is somebody else's lease and still says nothing about a claim no
+        # session ever took. Asserting "nothing in /active names it" over a board
+        # that did name it is the invented-justification failure this file exists
+        # to report on, in its own new branch.
+        register = (f"the machine ({holder}) does appear in /active, but that is a "
+                    "lease somebody else's keyless caller took and not evidence "
+                    "about a claim no session ever took"
+                    if holder in live_holders else
+                    f"no lease in /active names the holder ({holder}): a lease "
+                    "holder is composed machine + agent name for every caller that "
+                    "sends the key header, so /active is not a register that can "
+                    "answer for this claim")
+        ends_it = ("its own TTL" if live else
+                   "its own TTL, which could not be read here — `expires` is "
+                   f"{claim.get('expires') or 'none'!r}")
+        remedy = (f"`remove-worktree {tree}` hands it back once that tree is gone, "
+                  f"and otherwise it stands to {ends_it}"
+                  if tree else
+                  f"`qb-release` hands it back, and otherwise it stands to {ends_it}")
         return CLAIM_UNKNOWN, (
-            f"the holder ({holder}) is a bare machine name and the claim names no "
-            "session, so it was taken by a CHECKOUT: /active lists leases, every lease "
-            "holder carries an agent name, and a machine name can never appear there — "
-            "so its absence from /active is not evidence about this claim either way. "
-            f"{ends_it}"
-            + (f" (the claim's note records {names_it!r})" if names_it else "")
-            + ". Nothing here classifies a live worktree as finished, which is #685")
+            f"the claim names no session and its holder is the bare machine, so "
+            f"{took_it}. {register}. {remedy}. Nothing here classifies live work as "
+            "finished, which is #685")
 
     if not session and holder and holder in live_holders:
         return CLAIM_UNKNOWN, ("the claim names no session, so it can only be checked by "
@@ -657,9 +739,17 @@ def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
     # here and every branch below is one of its three answers: a bare `if` would
     # collapse "the board did not say when this expires" into "it expired", and
     # report a comparison this pass never made under a sentence asserting it did.
+    # The tree, when the note names one. An ADOPTED claim (PR #763) reaches here
+    # rather than the machine branch — it has a session — and a session that died
+    # without `SessionEnd` firing leaves it looking exactly like a long turn. This
+    # pass cannot tell those apart and does not try; naming the tree costs one
+    # clause and is the difference between an unknown a reader can act on and one
+    # they have to go and look up.
+    tree = worktree_of(claim)
     absent = (f"nothing in /active names the holder ({holder or 'unnamed'})"
               + (f" or the session that took this claim ({clip(session, 8)})"
-                 if session else ""))
+                 if session else "")
+              + (f", whose note records the tree {tree!r}" if tree else ""))
     live = _claim_live(claim, at)
     if live:
         return CLAIM_UNKNOWN, (
@@ -1033,19 +1123,32 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
             # says anybody died.
             if verdict == CLAIM_UNKNOWN and work_over:
                 verdict = CLAIM_STALE
-                # The unknown's own reason is DROPPED rather than appended. It is a
-                # page of prose about why `/active` could not answer, and once the
-                # question is settled on an external fact that prose is the reason
-                # a check nobody needs any more came out empty. The one line of it
-                # a reader still acts on is which KIND of claim this is, and the
-                # finding's `evidence` carries the rest.
-                shape = ("a checkout claim names no session and can never appear in "
-                         "/active" if is_checkout_claim(claim) else
-                         "nothing in /active named this claim either way")
-                why = (f"{kind}#{value} is {work_over}, so the work this claim covers "
-                       f"is finished and the claim outlived it — whoever holds it, and "
-                       f"whether or not they are still here. Liveness was never going to "
-                       f"settle it: {shape}")
+                # The unknown's own reason is CARRIED, clipped, rather than
+                # replaced by a summary of it. The first version wrote its own
+                # one-line gloss for the two branches it expected and got the
+                # other one wrong: an unknown from the recycled-name branch fires
+                # BECAUSE the holder is in `/active`, and the gloss said nothing in
+                # `/active` named it. Quoting the branch's own sentence cannot
+                # drift from the branch, which is the same reason `ref_verdict`
+                # returns a readability flag instead of letting a caller sniff its
+                # prose.
+                #
+                # And the assertion is `ref_verdict`'s own, not a stronger one:
+                # "the item has outlived its work" is what a closed issue says even
+                # when GitHub states no reason for the close, which is a
+                # `done_candidate` too. "The work is finished" would be a claim
+                # about the code that `--apply` itself declines to make for an
+                # issue ref (see :data:`ISSUE_LIMB`).
+                #
+                # The branch's FIRST sentence, not a character clip of the whole
+                # reason: each of these opens by saying what kind of claim it is
+                # looking at and closes with prose about what would have settled
+                # it, and a mid-word cut through the second half reads as a
+                # truncated argument rather than as a quotation.
+                why = (f"{kind}#{value} is {work_over}, so the item has outlived its "
+                       f"work and the claim outlived it with the item — whoever holds "
+                       f"it, and whether or not they are still here. Liveness was never "
+                       f"going to settle it: {clip(why.split('. ')[0], 200)}")
             if verdict == CLAIM_STALE:
                 report.findings.append(Finding(
                     condition="stale_claim", subject=label, repo=repo,
@@ -1063,7 +1166,13 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
                               # query — and None when the verdict came from
                               # liveness alone, which is a different finding.
                               "work_over": work_over,
-                              "checkout_claim": is_checkout_claim(claim)}))
+                              # What KIND of claim, and which tree if any: the two
+                              # things that decide what a reader does about it.
+                              # `worktree` is None for a `qb-start` spawn claim,
+                              # which is machine-held with no session and has no
+                              # tree at all.
+                              "machine_claim": is_machine_claim(claim),
+                              "worktree": worktree_of(claim)}))
             elif verdict == CLAIM_UNKNOWN:
                 report.unknowns.append(Unknown(
                     condition="stale_claim", subject=label, repo=repo,
@@ -1745,6 +1854,12 @@ def report_findings(report: Report) -> None:
     absent ref was absent from, and the answer would be "both" — silently
     resolving the other repo's findings.
 
+    **One row per ref, and the pass picks which.** The board stores one row per
+    `(repo, ref_kind, ref_value)` and keys a request's findings under "last one
+    wins", so a pass reporting two conditions about one ref has already decided
+    which survives — by the order its checks happen to run in. It is decided here
+    instead, and :data:`WORK_ENDED` says on what.
+
     Best-effort, like the post beside it: a pass whose report reached the log has
     done its job, and telemetry that can fail the thing it reports on is worse
     than none.
@@ -1758,19 +1873,29 @@ def report_findings(report: Report) -> None:
     # item is never, because `run` reads open rows only. A write that FAILED keeps its
     # finding: there the item is still open and the disagreement still stands.
     applied = {row["item_id"] for row in report.applied if row.get("item_id")}
+    # ONE ROW PER REF, chosen here rather than left to the board's "last one wins".
+    # See :data:`WORK_ENDED` for what is ranked and why. Sending both and letting
+    # the far side pick would make the stored condition a function of the order of
+    # the checks in `reconcile`, which is not a decision anybody made.
+    chosen: dict[tuple[str, str, str], dict] = {}
     for finding in report.findings:
         kind, _, value = (finding.ref or "").partition("#")
         if kind not in ("pr", "issue") or not value or not finding.repo:
             continue
         if finding.item_id and finding.item_id in applied:
             continue
-        by_repo.setdefault(finding.repo, []).append({
-            "ref_kind": kind, "ref_value": value,
-            "condition": finding.condition,
-            # The pass's own sentence, so the plan quotes what was observed rather
-            # than paraphrasing it a second time on the other side.
-            "said": finding.summary,
-        })
+        row = {"ref_kind": kind, "ref_value": value,
+               "condition": finding.condition,
+               # The pass's own sentence, so the plan quotes what was observed
+               # rather than paraphrasing it a second time on the other side.
+               "said": finding.summary}
+        key = (finding.repo, kind, value)
+        held = chosen.get(key)
+        if held is None or (finding.condition in WORK_ENDED
+                            and held["condition"] not in WORK_ENDED):
+            chosen[key] = row
+    for (repo, _kind, _value), row in chosen.items():
+        by_repo.setdefault(repo, []).append(row)
     if not by_repo:
         return
     try:

@@ -329,16 +329,23 @@ def test_a_claim_naming_no_session_is_not_asserted_to_be_healthy():
     assert "recycled" in why
 
 
-# ---- condition 3a: the claim a CHECKOUT took (#681) --------------------------
+# ---- condition 3a: the claim a SCRIPT took, with no session (#681) ----------
 #
 # `create-worktree` claims the issue a branch names before the tree exists, with
 # `--session ""`, so the row lands with `session: null` and a bare machine holder.
 # The live board carried nine of these the day #681 was written; this is one of
 # them, copied from `qb-reconcile --json` on zeus.
+#
+# `qb-start` (§8) takes the SAME shape of claim for `/review-pr` and
+# `/fix-issue-here`, routes where no worktree is created at all — so the note is
+# the only thing that says which script took it, and what could end it.
 
 CHECKOUT = {"holder": "zeus", "session": None,
             "claim_id": "0f0a4a44-2b4f-4a0e-9d3b-1b5f2b1e3a77",
             "note": "worktree fix/issue-663 on zeus"}
+SPAWNED = {"holder": "zeus", "session": None,
+           "claim_id": "b1c2d3e4-2b4f-4a0e-9d3b-1b5f2b1e3a77",
+           "note": "spawned /review-pr 742 by qb-start via dash (session a1b2c3d4)"}
 
 
 def _checkout(**over) -> dict:
@@ -347,45 +354,92 @@ def _checkout(**over) -> dict:
     return claim
 
 
-def test_a_bare_machine_holder_is_read_as_a_checkout_claim():
-    """Both halves are required and neither alone is enough: an adopted claim (PR
-    #763) keeps the machine holder and GAINS a session, and a hand-taken CLI claim
-    names an agent and no session."""
-    assert qr.is_checkout_claim(_checkout()) is True
-    assert qr.is_checkout_claim(_checkout(session="a" * 36)) is False
-    assert qr.is_checkout_claim(SESSIONLESS) is False
-    assert qr.is_checkout_claim({"holder": "", "session": None}) is False
+def _spawned(**over) -> dict:
+    claim = dict(SPAWNED, expires=(qr._utcnow() + timedelta(hours=7)).isoformat())
+    claim.update(over)
+    return claim
 
 
-def test_a_checkout_claim_is_not_explained_by_a_lease_that_went_quiet():
-    """RED/GREEN, and the whole of #681's first half. Every lease holder in
-    `/active` is composed `machine/name`, so a bare `zeus` can never be in it —
-    not "is not today", CANNOT BE. The check therefore had no favourable answer
-    available, and said so in `_LEASE_ASYMMETRY`'s words: that a working agent had
-    gone quiet for half an hour. Nine claims read that sentence every fifteen
-    minutes, and it described something that was not happening to any of them."""
+def test_a_sessionless_bare_machine_holder_is_read_as_a_machine_claim():
+    """The SESSION is what discriminates, and the holder shape corroborates it.
+
+    `qbdata.BoardClient._request` sends only `Authorization` — no `X-Agent-Key` —
+    so per `app/auth.py` every claim written through `qb-claim` lands with a bare
+    machine holder, not just `create-worktree`'s. A NAMED holder therefore means
+    the write came through an addressed identity (the `qb` shell client, or the
+    MCP server), and a claim taken there with no session is the recycled-name case
+    rather than this one. An adopted claim (PR #763) keeps the machine holder and
+    gains a session, which is the other exclusion."""
+    assert qr.is_machine_claim(_checkout()) is True
+    assert qr.is_machine_claim(_spawned()) is True
+    assert qr.is_machine_claim(_checkout(session="a" * 36)) is False
+    assert qr.is_machine_claim(SESSIONLESS) is False
+    assert qr.is_machine_claim({"holder": "", "session": None}) is False
+
+
+def test_the_tree_is_read_from_the_note_and_only_from_a_notes_own_shape():
+    """`worktree <create-name> on <host>` is what `create-worktree` writes, and the
+    create-name is `remove-worktree`'s argument. Anchored, because a note that
+    merely MENTIONS a worktree is not one a checkout took — and `qb-start`'s note
+    is a spawn record with no tree in it at all."""
+    assert qr.worktree_of(_checkout()) == "fix/issue-663"
+    assert qr.worktree_of(_spawned()) is None
+    assert qr.worktree_of({"note": "rebasing the worktree fix/x on zeus later"}) is None
+    assert qr.worktree_of({"note": None}) is None
+
+
+def test_a_machine_claim_is_not_explained_by_a_lease_that_went_quiet():
+    """RED/GREEN, and the whole of #681's first half. A lease holder is composed
+    machine + agent name for every caller that sends the key header, so no lease in
+    `/active` names a bare `zeus`: the check had no favourable answer available,
+    and said so in `_LEASE_ASYMMETRY`'s words — that a working agent had gone quiet
+    for half an hour between renewals. Nine claims read that sentence every fifteen
+    minutes and it described something that was not happening to any of them."""
     verdict, why = qr.claim_verdict(_checkout(), LIVE_SESSIONS, LIVE_HOLDERS)
     assert verdict == qr.CLAIM_UNKNOWN
     assert "30 minutes against a claim's hour" not in why
-    assert "bare machine name" in why
-    assert "can never appear there" in why
-    # And it names what DOES end one, and which tree — `worktree <create-name> on
-    # <host>` is what `create-worktree` writes into the note, and the create-name
-    # is the argument `remove-worktree` takes.
-    assert "remove-worktree" in why
-    assert "worktree fix/issue-663 on zeus" in why
+    assert "no session" in why
+    assert "not a register that can answer" in why
+    # And it names what DOES end one, and which tree, as the command to type.
+    assert "remove-worktree fix/issue-663" in why
     assert "#685" in why
+
+
+def test_a_spawn_claim_is_not_sent_at_a_command_that_cannot_release_it():
+    """RED/GREEN. `qb-start` takes a machine claim with `--session ""` for routes
+    where NO worktree exists, so the first version of this branch called it a
+    checkout claim, named `remove-worktree` as the remedy — which can do nothing
+    about it — and quoted a spawn record in a sentence whose whole point was that
+    the note is the argument `remove-worktree` takes."""
+    verdict, why = qr.claim_verdict(_spawned(), LIVE_SESSIONS, LIVE_HOLDERS)
+    assert verdict == qr.CLAIM_UNKNOWN
+    assert "remove-worktree" not in why
+    assert "qb-release" in why
+    assert "spawned /review-pr 742" in why
+
+
+def test_a_machine_that_does_appear_in_active_is_not_said_to_be_absent():
+    """RED/GREEN. `app/auth.py` gives a keyless caller the bare machine name for a
+    LEASE too, so `zeus` can be in `/active` — and asserting "nothing in /active
+    names the holder" over a board that just did is the invented-justification
+    failure this file exists to report on. What is true either way is that the
+    lease is not this claim's: no session ever took this one."""
+    verdict, why = qr.claim_verdict(_checkout(), set(), {"zeus"})
+    assert verdict == qr.CLAIM_UNKNOWN
+    assert "does appear in /active" in why
+    assert "not evidence about a claim no session ever took" in why
 
 
 def test_a_live_agent_on_the_same_machine_is_not_the_checkout():
     """The tempting near-miss: `zeus/amber-otter` is live, and it is not evidence
     that the tree `zeus` took the claim for is being worked. The claim belongs to a
     checkout, not to whoever else happens to be on the box."""
-    verdict, _ = qr.claim_verdict(_checkout(), {"a" * 36}, {"zeus/amber-otter"})
+    verdict, why = qr.claim_verdict(_checkout(), {"a" * 36}, {"zeus/amber-otter"})
     assert verdict == qr.CLAIM_UNKNOWN
+    assert "no lease in /active names the holder (zeus)" in why
 
 
-def test_a_checkout_claim_past_its_own_expiry_is_stale():
+def test_a_machine_claim_past_its_own_expiry_is_stale():
     """The one thing that ever ended one on its own, said as a finding rather than
     blamed on `/active`."""
     verdict, why = qr.claim_verdict(
@@ -396,13 +450,13 @@ def test_a_checkout_claim_past_its_own_expiry_is_stale():
     assert "nothing renews one" in why
 
 
-def test_a_checkout_claim_with_no_readable_expiry_says_so():
+def test_a_machine_claim_with_no_readable_expiry_says_so():
     """Not "it expired": `_claim_live` is three-valued and the machine branch has
     to keep the third answer apart from the second, exactly as the branch below it
     does."""
     verdict, why = qr.claim_verdict(_checkout(expires=None), LIVE_SESSIONS, LIVE_HOLDERS)
     assert verdict == qr.CLAIM_UNKNOWN
-    assert "no readable `expires`" in why
+    assert "could not be read here" in why
     assert "past its own expiry" not in why
 
 
@@ -416,7 +470,20 @@ def test_an_adopted_checkout_claim_is_answered_as_the_session_claim_it_became():
     adopted = _checkout(session="dc539d16-d910-496f-a320-ed0b6838d9fb")
     verdict, why = qr.claim_verdict(adopted, LIVE_SESSIONS, LIVE_HOLDERS)
     assert verdict == qr.CLAIM_HELD
-    assert "bare machine name" not in why
+    assert "bare machine" not in why
+
+
+def test_an_adopted_claim_whose_session_is_gone_still_names_its_tree():
+    """The gap this does NOT close, said as well as it can be. An adopted claim
+    whose session died without `SessionEnd` firing looks exactly like a long
+    autonomous turn, and this pass cannot tell those apart — so it stays the
+    lease-asymmetry unknown. Naming the tree costs one clause and is the difference
+    between an unknown a reader can act on and one they have to look up."""
+    adopted = _checkout(session="24e8ee23-0ce6-4c8f-a265-925f1fd3ba2b")
+    verdict, why = qr.claim_verdict(adopted, set(), set())
+    assert verdict == qr.CLAIM_UNKNOWN
+    assert "30 minutes against a claim's hour" in why
+    assert "the tree 'fix/issue-663'" in why
 
 
 # ---- condition 4: the note is fiction ---------------------------------------
@@ -988,10 +1055,16 @@ def test_a_claim_over_finished_work_is_settled_not_unknown():
     assert report.exit_code == 0
     stale = next(f for f in report.findings if f.condition == "stale_claim")
     assert "issue#663 is closed as completed" in stale.summary
+    # `ref_verdict`'s own sentence, not a stronger one. A closed issue says the
+    # ITEM outlived its work; that the code landed is what `--apply` declines to
+    # infer from an issue ref at all (ISSUE_LIMB), so this must not assert it.
+    assert "outlived its work" in stale.summary
+    assert "the work this claim covers is finished" not in stale.summary
     # The settling fact is carried, not just asserted — and so is the shape of the
     # claim, because "a checkout still holds this" is what a reader acts on.
     assert stale.evidence["work_over"] == "closed as completed"
-    assert stale.evidence["checkout_claim"] is True
+    assert stale.evidence["machine_claim"] is True
+    assert stale.evidence["worktree"] == "fix/issue-663"
     assert stale.evidence["holder"] == "zeus"
     # The `done_candidate` on the same row is untouched: the row outliving its work
     # and the claim outliving it are two disagreements, not one told twice.
@@ -1031,11 +1104,46 @@ def test_a_quiet_agents_claim_over_merged_work_is_settled_on_the_work():
     stale = next(f for f in report.findings if f.condition == "stale_claim")
     assert "pr#182 is merged" in stale.summary
     assert "whether or not they are still here" in stale.summary
-    assert stale.evidence["checkout_claim"] is False
+    assert stale.evidence["machine_claim"] is False
+    assert stale.evidence["worktree"] is None
     # The absence-based accusation is NOT what is being made, so its words are not
     # in the finding: no holder is asserted dead and no lease TTL is blamed.
     assert "past its own expiry" not in stale.summary
     assert "30 minutes against a claim's hour" not in stale.summary
+
+
+def test_a_promoted_finding_quotes_the_branch_that_could_not_settle_it(monkeypatch):
+    """RED/GREEN. The first version wrote its own one-line gloss for the two
+    branches it expected, and got the third wrong: the recycled-name unknown fires
+    BECAUSE the holder is in `/active`, and the gloss underneath it said nothing in
+    `/active` had named the claim either way. Quoting the branch's own sentence
+    cannot drift from the branch, which is why `ref_verdict` returns a readability
+    flag rather than letting a caller sniff its prose."""
+    report = full_report(items=[item(rank=2, claim=dict(SESSIONLESS))],
+                         ref_states={(REPO, "pr", "182"): {"state": "MERGED"}},
+                         open_prs=[])
+
+    stale = next(f for f in report.findings if f.condition == "stale_claim")
+    assert "names are recycled" in stale.summary
+    assert "nothing in /active named this claim" not in stale.summary
+
+
+def test_a_reason_less_close_is_not_reported_as_landed_work():
+    """`ref_verdict` gives a closed issue with no `stateReason` a `done_candidate`,
+    because the item has outlived its work either way — but `--apply` declines
+    every issue-ref `done_candidate` (ISSUE_LIMB) precisely because a closed issue
+    is not the same fact as landed work in every repo. The cross-read must not make
+    the stronger claim the actor refuses to."""
+    report = full_report(
+        items=[item(rank=5, ref={"kind": "issue", "value": "663"},
+                    claim=_checkout())],
+        ref_states={(REPO, "issue", "663"): {"state": "CLOSED", "state_reason": None}},
+        open_prs=[])
+
+    stale = next(f for f in report.findings if f.condition == "stale_claim")
+    assert "closed (GitHub stated no reason)" in stale.summary
+    assert "outlived its work" in stale.summary
+    assert "finished" not in stale.summary
 
 
 def test_work_still_open_leaves_a_checkout_claim_unsettled():
@@ -1050,7 +1158,8 @@ def test_work_still_open_leaves_a_checkout_claim_unsettled():
 
     assert [f.condition for f in report.findings] == []
     unknown = next(u for u in report.unknowns if u.condition == "stale_claim")
-    assert "bare machine name" in unknown.reason
+    assert "bare machine" in unknown.reason
+    assert "remove-worktree fix/issue-663" in unknown.reason
     assert report.exit_code == 1
 
 
@@ -2215,6 +2324,67 @@ def test_a_finding_with_nothing_the_plan_can_key_on_is_left_out(monkeypatch):
     qr.report_findings(report)
 
     assert [f["ref_value"] for _p, b in board.posts for f in b["findings"]] == ["5"]
+
+
+def test_the_plan_row_for_a_ref_is_the_one_that_says_its_work_ended(monkeypatch):
+    """BLOCKER, RED/GREEN, and the reason #681's fix could have undone #463's.
+
+    `POST /plan/reconcile` stores one row per `(repo, ref_kind, ref_value)` —
+    `uq_plan_reconcile_ref` — and keys a request's findings under a comment that
+    reads "LAST ONE WINS". The promoted `stale_claim` is on the SAME ref as the
+    `done_candidate` that settled it, by construction, and condition 3 appends
+    after conditions 1+2 — so the board kept the `stale_claim`, `plan_read`'s
+    caveat stopped saying the item was already finished, and `first_seen` restarted
+    on every condition flip. Measured through `report_findings` because the Report
+    is not where it went wrong: both findings are in the Report, correctly, and one
+    of them was being dropped on the far side.
+
+    The `note_contradicted` pairing beside it PREDATES this change and had the same
+    outcome, which is why the rule is a precedence rather than a special case."""
+    board = PostingBoard({"items": []})
+    _wire_board(monkeypatch, board)
+    report = qr.Report(generated="now", repos=["acme/one"], findings=[
+        qr.Finding(condition="done_candidate", subject="rank 5", repo="acme/one",
+                   ref="issue#663", summary="issue#663 is closed as completed"),
+        qr.Finding(condition="stale_claim", subject="rank 5", repo="acme/one",
+                   ref="issue#663", summary="the claim outlived the item"),
+        qr.Finding(condition="done_candidate", subject="rank 1", repo="acme/one",
+                   ref="pr#216", summary="pr#216 is merged"),
+        qr.Finding(condition="note_contradicted", subject="rank 1", repo="acme/one",
+                   ref="pr#216", summary="the board says 22 findings"),
+    ])
+
+    qr.report_findings(report)
+
+    sent = [b for path, b in board.posts if path == "/plan/reconcile"][0]["findings"]
+    # One row per ref, so nothing depends on which check runs last.
+    assert [(f["ref_kind"], f["ref_value"]) for f in sent] == [
+        ("issue", "663"), ("pr", "216")]
+    assert [f["condition"] for f in sent] == ["done_candidate", "done_candidate"]
+
+
+def test_the_ranking_only_moves_a_condition_that_says_the_work_ended(monkeypatch):
+    """Within a tier the pass's own order stands, and a ref with no `done_candidate`
+    is untouched — the rule is a precedence between two kinds of statement, not a
+    reordering of the report."""
+    board = PostingBoard({"items": []})
+    _wire_board(monkeypatch, board)
+    report = qr.Report(generated="now", repos=["acme/one"], findings=[
+        qr.Finding(condition="stale_claim", subject="s", repo="acme/one",
+                   ref="pr#9", summary="first"),
+        qr.Finding(condition="note_contradicted", subject="s", repo="acme/one",
+                   ref="pr#9", summary="second"),
+        qr.Finding(condition="dropped_candidate", subject="s", repo="acme/one",
+                   ref="pr#10", summary="closed unmerged"),
+        qr.Finding(condition="stale_claim", subject="s", repo="acme/one",
+                   ref="pr#10", summary="and claimed"),
+    ])
+
+    qr.report_findings(report)
+
+    sent = [b for path, b in board.posts if path == "/plan/reconcile"][0]["findings"]
+    by_ref = {f["ref_value"]: f["condition"] for f in sent}
+    assert by_ref == {"9": "stale_claim", "10": "dropped_candidate"}
 
 
 def test_a_board_that_refuses_the_endpoint_says_so_and_does_not_stop_the_pass(monkeypatch,
