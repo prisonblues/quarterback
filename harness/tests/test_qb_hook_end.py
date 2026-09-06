@@ -441,16 +441,28 @@ def test_a_resume_hands_nothing_back(hook):
     assert hook.to("/session/end") == []
 
 
-def test_a_child_session_never_ends_its_parents_session(hook):
-    """Insurance rather than a fix for anything observed, and cheap. A Task
-    sub-agent inherits whatever QUARTERBACK_INSTANCE its parent had, so on a box
-    where one is set by hand it would share the supersede record with its parent
-    and hand back claims a live agent is still working. Nothing on this fleet
-    sets the variable and a sub-agent's payload carries the parent's session id
-    anyway — but this is the one thing this path must never do by accident."""
-    env = hook.env(QUARTERBACK_INSTANCE="seat-9")
-    hook.fire("SessionStart", env=env, session_id="sid-parent", source="startup")
-    child = hook.env(QUARTERBACK_INSTANCE="seat-9", CLAUDE_CODE_CHILD_SESSION="1")
-    hook.fire("SessionStart", env=child, session_id="sid-child", source="startup")
+def test_the_child_session_marker_is_not_a_sub_agent_marker(hook):
+    """This test used to assert the opposite, and it was WRONG in the direction
+    that matters (#146).
 
-    assert hook.to("/session/end") == [], hook.sent()
+    It read `CLAUDE_CODE_CHILD_SESSION` as "a Task sub-agent is starting" and
+    required the supersede to be refused for it. That variable is set on EVERY
+    hook Claude Code runs — measured 2026-09-06 on 2.1.258 by starting a CLI with
+    the entire parent environment stripped and reading what its SessionStart hook
+    was handed: a session with no parent at all, and the variable is `1`. It
+    means "spawned by Claude Code". A hook that refuses on it refuses every event
+    there is, which is what the first cut of the pane mechanism shipped: the pane
+    file was never written and #146 and #263 stayed open with a green suite.
+
+    What actually protects a sub-agent's parent is that a sub-agent does not fire
+    `SessionStart` at all (measured: one launched produced one SessionStart, the
+    main session's, and one SubagentStop carrying the same id), and that if one
+    did it would carry the PARENT's session id and fail the `prev != sid`
+    comparison. `test_qb_hook_pane.py` pins both."""
+    env = hook.env(QUARTERBACK_INSTANCE="seat-9", CLAUDE_CODE_CHILD_SESSION="1")
+    hook.fire("SessionStart", env=env, session_id="sid-parent", source="startup")
+    hook.fire("SessionStart", env=env, session_id="sid-new", source="clear")
+
+    ended = hook.to("/session/end")
+    assert len(ended) == 1, hook.sent()
+    assert '"reason":"context_reset"' in ended[0]

@@ -5410,25 +5410,60 @@ server all send that request (#156); before they did, the label was a key nobody
 The name shape is stricter than the key shape — `^[a-z0-9]+(?:-[a-z0-9]+)*$` — so `Deploy_1`
 is asked for as `deploy-1`, and a label with nothing usable in it asks for no name at all.
 
-**Nothing sets one on this fleet, and that is why `/clear` still forks an agent in two**
-(#146). `qb-seats` unsets `QUARTERBACK_INSTANCE` and puts nothing in its place (#540), so
-every session the fleet runs keys on its own session-id prefix — and `/clear` mints a new
-session id. `qb-hook` picks the new one up on its next event; `qb-mcp` is spawned once and
-never respawned, so it cannot, and from that moment one agent has two board identities that
-post under different names, hold different leases and poll different inboxes. A seat is not
-exempt from this and has not been since #540; the claim that it is predates that change.
+**Nothing sets one on this fleet, which is why every session keys on its own session-id
+prefix.** `qb-seats` unsets `QUARTERBACK_INSTANCE` and puts nothing in its place (#540), so
+a seat is not exempt from anything a plain session suffers, and has not been since #540 —
+the claim that it is predates that change.
 
-Closing it needs a key BOTH halves can derive after the session id has moved, and the two
-candidates in the environment do not survive contact with the fleet. `CLAUDE_CODE_MESSAGING_SOCKET`
-is inherited verbatim by a nested `claude -p` — measured, a CLI process running under its
-parent's socket with no `CLAUDE_CODE_CHILD_SESSION` — so it names the outermost terminal
-rather than this one, and two live agents sharing a key is far worse than one agent with two:
-they would share `qb-sid-<agent>-<key>`, and the next `SessionStart` in either would end the
-other's session and hand back the claims it is still working. `CLAUDE_CODE_SESSION_ID` is
-injected per spawn rather than frozen at launch, so it moves with the clear too. Process
-ancestry is the remaining candidate — a Claude Code CLI process has no `CLAUDE_CODE_SESSION_ID`
-of its own while everything it spawns does — and it is unmeasured at the step that matters,
-which is the shape of the process tree above a hook.
+`/clear` then mints a new session id. `qb-hook` picks it up on its next event, because
+Claude Code injects the CURRENT conversation's id into every process it spawns and this hook
+is a fresh process per event. `qb-mcp` is the one process that is never respawned, so it
+could not — and from that moment one agent had two board identities, posting under different
+names, holding different leases and polling different inboxes (#146), while the claims taken
+through the server carried a conversation that had ended (#263).
+
+**The PANE is what closed it.** `CLAUDE_CODE_MESSAGING_SOCKET` is
+`/run/user/<uid>/cc-socks/<cli pid>.sock`, created when the CLI starts, and a clear does not
+restart the CLI: measured 2026-09-06, one socket served two conversations 25 hours apart. So
+the frozen environment `qb-mcp` holds is WRONG for the session id and RIGHT for the socket,
+and that asymmetry is the whole mechanism. `qb-hook` writes the current conversation to
+`$XDG_RUNTIME_DIR/qb-pane-<cli pid>-<socket mtime>`; `qb-mcp` reads it per call. The mtime is
+in the name rather than compared against anything, so a file a previous CLI at a recycled pid
+left behind is simply never found.
+
+Two facts about the surrounding fleet, both measured rather than reasoned about, because the
+previous attempt (#765) was withdrawn over the second one:
+
+* A **Task sub-agent** shares its parent's socket AND its parent's `CLAUDE_CODE_SESSION_ID`,
+  so it computes the parent's pane exactly — and two independent things mean it takes nothing
+  off its parent anyway. It **does not fire `SessionStart`**: a run that launched one produced
+  exactly one `SessionStart`, the main session's, and one `SubagentStop` carrying that same id,
+  and `_supersede_previous` runs only on `SessionStart`. And if one ever did, the id it carried
+  would be the parent's, so `prev != sid` is false and nothing is released.
+* **`CLAUDE_CODE_CHILD_SESSION` is not a sub-agent marker and must never be used as one.** It
+  is set on EVERY hook Claude Code runs: a CLI started with the entire parent environment
+  stripped (`env -u CLAUDE_CODE_CHILD_SESSION -u CLAUDE_CODE_SESSION_ID … claude -p`) still
+  hands its `SessionStart` hook `CLAUDE_CODE_CHILD_SESSION=1`. It means "spawned by Claude
+  Code". The first cut of this mechanism guarded on it, which refused every event there was
+  and left the pane file unwritten — inert, with a green suite, because
+  `_path_sandbox.sandbox_env` drops every `CLAUDE_` variable and so every test ran in a state
+  production is never in. `test_qb_hook_pane.py` now supplies the measured hook environment to
+  every case and requires the outcome to be the same with the variable and without it.
+* A **nested `claude -p`** (`harness_rules.run_agent`, so `lander.py` and `epic.py`) does
+  NOT share its parent's pane. It inherits the parent's socket in its own environment and
+  then exports `<its own pid>.sock` to everything it spawns, so its hook and its MCP server
+  compute their own pane. #765 assumed the opposite and withdrew its mechanism over it.
+
+The remaining shape — a process holding a socket whose owner is dead or unrelated, measured
+here as a leftover shell still carrying `3524155.sock` — is refused by the derivation itself:
+a pane is ours only if the pid the socket names is alive AND an ancestor of us.
+
+The rule is spelled twice, in `qb_pane_key` (`bin/qb-env`) and `pane_key`
+(`mcp/mcp_server/pane.py`), because one half of a Claude Code agent is bash. That is the
+hazard #765 actually died of — two slug implementations that disagreed about trailing
+whitespace and byte-vs-character classes, so the hook wrote one filename and the server read
+another and the mechanism was a green no-op — and it is why
+`harness/tests/test_pane_parity.py` runs both halves over one table.
 
 `qb-reconcile` is the one piece here that cannot run at all without a board — the plan it
 reconciles *is* the board — so unlike `worktree-holder`, which degrades to "no occupancy

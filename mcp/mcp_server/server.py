@@ -36,6 +36,7 @@ from mcp_server.gitctx import (
     sync_state,
     upstream_contains,
 )
+from mcp_server.pane import key_slug, pane_session
 
 # How much of the caller's history to send with a sync check. Deep enough that a
 # checkout idle for a while still matches a publish it already holds.
@@ -66,13 +67,7 @@ class AppContext:
 # Any stable per-process string will do — the board stores it verbatim and never
 # interprets it — which is what makes the contract runtime-agnostic instead of
 # breaking silently on whatever runtime doesn't set the one variable we guessed.
-_NOT_ALLOWED = re.compile(r"[^A-Za-z0-9._~-]")
 _SID_PREFIX = 8
-
-
-def _slug(value: str) -> str | None:
-    """Coerce a value to something the board accepts as a key, or None."""
-    return _NOT_ALLOWED.sub("-", value.strip()).lstrip("._~-")[:40] or None
 
 
 def _name(value: str) -> str | None:
@@ -85,6 +80,15 @@ def _name(value: str) -> str | None:
 
 
 @lru_cache(maxsize=1)
+def _process_nonce() -> str:
+    """This process's key when nothing in the environment names a conversation.
+
+    Cached, because with a nonce in play "resolve it twice" would mean "be two
+    agents" — the stdio transport gives one process per session, so one key.
+    """
+    return f"p{uuid.uuid4().hex[:11]}"
+
+
 def resolve_key() -> str:
     """This agent's opaque key — what the board allocates a name against.
 
@@ -96,15 +100,19 @@ def resolve_key() -> str:
     not a fallback, because this server is stdio and one process genuinely is one
     agent. That is the whole point: nothing has to be taught about codex.
 
-    Cached, because with a nonce in play "resolve it twice" would mean "be two
-    agents" — the stdio transport gives us one process per session, so one key.
+    **Resolved per call, and that is #146.** It used to be cached for the life of
+    the process, which is exactly as long as the process is wrong for: `/clear`
+    leaves the CLI running and gives it a new conversation, the hook moves to the
+    new id on its next event, and this server — never respawned — went on sending
+    the old one. Measured 2026-09-06: `whoami` returned a conversation whose
+    transcript had stopped 22 hours earlier while five claims taken that day
+    carried the dead id. The nonce is still cached, for the reason above; only
+    the part that has an answer to move to moves.
     """
-    explicit = _slug(os.environ.get("QUARTERBACK_INSTANCE", ""))
+    explicit = key_slug(os.environ.get("QUARTERBACK_INSTANCE", ""))
     if explicit:
         return explicit
-    return _slug(os.environ.get("CLAUDE_CODE_SESSION_ID", "")[:_SID_PREFIX]) or (
-        f"p{uuid.uuid4().hex[:11]}"
-    )
+    return key_slug((resolve_session() or "")[:_SID_PREFIX]) or _process_nonce()
 
 
 def resolve_requested_name() -> str | None:
@@ -123,8 +131,23 @@ def resolve_session() -> str | None:
     can't group it under the agent that wrote it, and `peers` can't offer a peer's
     `last_post_id` to thread a reply onto — the exact affordance that turns a
     detected overlap into a conversation.
+
+    **The pane first, this process's own environment second** (#146, #263). Our
+    environment was frozen when Claude Code spawned us and is right until the
+    first `/clear`; the pane file is written by `qb-hook`, which gets a fresh
+    process — and therefore the current conversation — on every event. So the
+    fallback is not a degraded answer, it is the same answer for as long as it is
+    still true: a host with no hook, a runtime that is not Claude Code, or a
+    session that has never been reset all read the environment and are right to.
+
+    Read per call rather than cached. A claim stamped with a conversation that
+    ended hours ago is what #263's release cannot reach — `/session/end` hands
+    back the claims stamped with the session it names, and after the second reset
+    in a terminal none of them were.
     """
-    return os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip() or None
+    return (pane_session()
+            or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+            or None)
 
 
 @asynccontextmanager
@@ -144,9 +167,13 @@ async def app_lifespan(server: FastMCP):
     client = QuarterbackClient(
         base_url,
         token,
-        key=resolve_key(),
+        # CALLABLES, not values (#146). This client is built once per MCP
+        # session — i.e. once per CLI process — and a `/clear` gives that process
+        # a new conversation without restarting it. Anything captured here is
+        # captured for the life of a process that outlives its own answer.
+        key=resolve_key,
         requested_name=resolve_requested_name(),
-        session=resolve_session(),
+        session=resolve_session,
         elevated=os.environ.get("QUARTERBACK_ELEVATED_TOKEN", "").strip() or None,
         elevated_cmd=os.environ.get("QUARTERBACK_ELEVATED_TOKEN_CMD", "").strip() or None,
         elevated_refresh_cmd=os.environ.get(

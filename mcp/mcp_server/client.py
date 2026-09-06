@@ -14,7 +14,7 @@ import hashlib
 import json
 import subprocess
 import threading
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 import httpx
 
@@ -80,16 +80,27 @@ class QuarterbackClient:
         self,
         base_url: str,
         api_token: str,
-        key: str | None = None,
+        key: str | Callable[[], str | None] | None = None,
         requested_name: str | None = None,
-        session: str | None = None,
+        session: str | Callable[[], str | None] | None = None,
         transport: httpx.BaseTransport | None = None,
         elevated: str | None = None,
         elevated_cmd: str | None = None,
         elevated_refresh_cmd: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        self._session = session
+        # `key` and `session` may be CALLABLES, and under Claude Code they are
+        # (#146). The identity of a stdio MCP server is not fixed for the life of
+        # the process: `/clear` gives the same CLI a new conversation without
+        # restarting anything, so a value captured at construction is captured
+        # for the life of a process that outlives the answer. A plain string is
+        # still accepted and still right for every other caller — the board TUI,
+        # a test, a runtime with one conversation per process.
+        self._session_src = session
+        self._key_src = key
+        #: This request's `(key, session)`, so the body and the header describe
+        #: one conversation. See `_identity`.
+        self._identity_local = threading.local()
         # No token ⇒ no header at all, rather than a "Bearer " that authenticates
         # nothing. That is the tokenless client the board TUI starts with on a
         # host that has no credential: every authed call 401s, and ``health()``
@@ -97,8 +108,6 @@ class QuarterbackClient:
         headers = {}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
-        if key:
-            headers["X-Agent-Key"] = key
         if requested_name:
             headers["X-Agent-Name"] = requested_name
         # This machine's DELEGATED credential (#478), for the narrow set of writes
@@ -143,10 +152,66 @@ class QuarterbackClient:
         # MockTransport, a proxy's), the httpx.Client is then always ours to
         # configure, and two QuarterbackClients over one transport hold their own
         # credentials — which is the property that was actually wanted.
-        self._http = httpx.Client(timeout=30, headers=headers, transport=transport)
+        # `X-Agent-Key` is stamped by the hook below rather than set here, so
+        # that a key which moves is re-read on every request. One choke point,
+        # rather than the forty call sites that reach for `self._http` directly.
+        self._http = httpx.Client(timeout=30, headers=headers, transport=transport,
+                                  event_hooks={"request": [self._stamp_key]})
 
     def close(self) -> None:
         self._http.close()
+
+    # ----------------------------------------------------------- who we are
+
+    @staticmethod
+    def _resolve(src) -> str | None:
+        """A value that may be a string, a callable returning one, or None."""
+        value = src() if callable(src) else src
+        return value or None
+
+    def _identity(self) -> tuple[str | None, str | None]:
+        """`(key, session)` — resolved ONCE per request, not once per read.
+
+        Both halves come from the same source under Claude Code (the pane file,
+        which the lifecycle hook rewrites when the conversation moves), and a
+        body used to read it several times while the header read it again at send
+        — so a conversation that changed in between produced a request whose body
+        named one conversation and whose header named the identity of another.
+        Microseconds wide and harmless today; this is about to carry landing
+        order, where a claim that is silently WRONG costs more than one that is
+        missing.
+
+        Thread-local, because a snapshot shared between two concurrent requests
+        would be the same bug wearing a different hat. Cleared as the request goes
+        on the wire — the last moment both halves are needed — so the next body
+        resolves afresh. A body built for a request that then fails to send
+        leaves its snapshot for the next one, which is stale by microseconds and,
+        crucially, still SELF-CONSISTENT: the two halves agree with each other,
+        which is the property this exists to hold.
+        """
+        snapshot = getattr(self._identity_local, "snapshot", None)
+        if snapshot is None:
+            snapshot = (self._resolve(self._key_src), self._resolve(self._session_src))
+            self._identity_local.snapshot = snapshot
+        return snapshot
+
+    @property
+    def _session(self) -> str | None:
+        """The conversation to stamp on a write, from this request's snapshot."""
+        return self._identity()[1]
+
+    @property
+    def agent_key(self) -> str | None:
+        """The opaque key the board allocates this agent's name against."""
+        return self._identity()[0]
+
+    def _stamp_key(self, request: httpx.Request) -> None:
+        key, _ = self._identity()
+        if key:
+            request.headers["X-Agent-Key"] = key
+        else:
+            request.headers.pop("X-Agent-Key", None)
+        self._identity_local.snapshot = None
 
     # -------------------------------------------------------------- delegated
 
