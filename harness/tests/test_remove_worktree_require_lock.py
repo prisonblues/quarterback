@@ -37,7 +37,12 @@ REMOVE = BIN / "remove-worktree"
 TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
          "wc", "date", "basename", "dirname", "rm", "mkdir", "env", "timeout",
          "jq", "chmod", "find", "sort", "mv", "ln", "readlink", "tar", "mktemp",
-         "curl", "gzip")
+         "curl", "gzip",
+         # `--require-lock` means the lock too, not only the holder check (#743),
+         # so a host with no `flock` refuses under it. That is its own subject in
+         # `test_worktree_lock.py`; here the tools are present so each test below
+         # is about the answer it names.
+         "flock", "sha256sum")
 
 
 def git(cwd, *args):

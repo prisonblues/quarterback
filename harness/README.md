@@ -1899,13 +1899,14 @@ and adds anyone whose lease cwd is the worktree itself.
 holder, not a reason a worktree becomes unusable: `remove-worktree --force` always wins,
 leases expire on their own, and "could not tell" is a distinct exit code precisely so a
 board that is down never stops anyone working. The failure being prevented is the
-*silent* rewrite, not the deliberate one.
+*silent* rewrite, not the deliberate one. `worktree-lock` below is what makes an answer
+this gives still true when the caller acts on it; the answer itself stays advisory.
 
 Where it is wired in:
 
 | Script | What it does with the answer |
 |---|---|
-| `remove-worktree` | Refuses before destroying anything, names the holder, suggests `--force` |
+| `remove-worktree` | Refuses before destroying anything, names the holder, suggests `--force` — and asks **twice**, once up front and once immediately before the directory goes |
 | `prune-worktrees` | Reports a held directory separately and never counts it as a leftover, so `--remove-dirs` cannot `rm -rf` it (and the container sweep, which takes its evidence from that list, inherits the protection) |
 | `create-worktree` | Already refused an existing directory; now says *whose* it is, because "already exists" sends you looking for debris and the answer is sometimes an agent still working |
 
@@ -1913,6 +1914,113 @@ Agents typing raw `git rebase` / `git reset --hard` in someone else's worktree r
 out of reach, and that is accepted: the slash commands that drive worktree teardown
 (`/wt`, `/drop-worktree`, `/tree-shake`) tell the model to ask first, and an agent
 running raw git was never going to be caught by tooling it did not invoke.
+
+### `worktree-lock` — the answer above, made to last as long as the act
+
+`worktree-holder` is a read, and a read is worth only what it is still worth when the
+caller acts on it. `remove-worktree` spends seconds to minutes between asking and
+deleting — a `gh` call that allows itself 20 seconds, a `docker compose down`, an nginx
+restart — and what it does at the end of that is delete a worktree, its docker stack, its
+database and its local branch. That was tolerable while teardown was something a person
+typed. It stopped being tolerable on 2026-09-04, when zeus started running `stack-reaper`
+hourly and unattended ([#743]).
+
+`worktree-lock` is a `flock` over a lockfile keyed to the worktree's path, kept in the
+repository's own common git directory: `<repo>/.git/quarterback/worktree/`. It is both a
+library the two worktree scripts source as a sibling of `$0` — the way the board client's
+four source `qb-env` — and a small CLI:
+
+```bash
+worktree-lock --path <dir>     # which lockfile that worktree keys to
+worktree-lock --enter <dir>    # take the lock, check the tree is still there,
+                               # and record this session in it
+```
+
+**The root is the repository, and it must not be the caller's environment.** The first cut
+of this chose `$XDG_RUNTIME_DIR/quarterback` when that was set and
+`$TMPDIR/quarterback-<uid>` when it was not — which is a fact about *who is calling*, not
+about the tree. An interactive agent has a runtime directory; a systemd unit does not, and
+`PrivateTmp=yes` gives one its own `/tmp` as well. So the hourly reaper and the agent it
+was racing computed the same key, the same digest, and locked two different files: the
+mechanism was inert for exactly the pairing [#743] is about, and every test passed, because
+a harness gives both sides of a test one environment. The common git directory is one
+answer per repository, the same from a linked worktree as from the main checkout, and
+nothing an environment can move. When it cannot be resolved there is **no** lock (exit 4)
+rather than a second place to put one.
+
+| Who | When it takes the lock | What it does if it cannot get it |
+|---|---|---|
+| `remove-worktree` | first, before it reads anything; holds to the end | aborts, having destroyed nothing, and names the holder (`--ignore-lock` is the way past) |
+| `create-worktree` | before the "already exists" refusal; holds to the end | aborts, having created nothing (same flag) |
+| `worktree-lock --enter` | around writing the session marker | exit 5, and the marker is not written |
+
+**What it closes.** Two teardowns cannot interleave. An agent cannot be handed a tree
+mid-teardown: `--enter` takes the same lock to write the session marker that makes an
+agent visible to `worktree-holder` at all, so either the marker lands first and the
+teardown then sees a holder and refuses, or the teardown holds the lock and the handover
+waits and then finds no tree and says so. And a teardown and a creation of the same name
+cannot overlap — which used to end with the fresh worktree's database dropped and its
+branch deleted by the teardown finishing underneath it.
+
+**What it does not.** An agent that enters with no marker — a person typing `cd`, so only
+its board lease says where it is — is stopped by nothing, because nothing intercepts that.
+That route is narrowed rather than closed, by `remove-worktree` asking `worktree-holder`
+again immediately before the directory goes instead of trusting an answer from before the
+pre-flight.
+
+Nor can the lock make the board answer. Serialising the handover against the teardown
+guarantees the *order*; it does not guarantee that the teardown can then READ the marker,
+because `worktree-holder` needs the board to say which session is live. With the board
+unreachable that is "could not tell", which the interactive default proceeds on —
+deliberately, and that is what `--require-lock` exists to change. So the marker route ends
+in a refusal **when the board answers** and in a fail-open teardown when it does not.
+
+**No git child may outlive its holder.** A descriptor is inherited across fork and exec,
+and git runs auto-maintenance detached — `git maintenance run --auto --detach` after
+`fetch`, `merge`, `pull`, `commit`, `rebase` and `am`, daemonising before it decides
+whether it has work. Such a child inherits the lock and keeps it through a repack, long
+after the script that took it has gone. The lock therefore sets `gc.auto=0` and
+`maintenance.auto=false` through `GIT_CONFIG_*` when it is taken, which every git the
+holder runs inherits — rather than closing the descriptor at each call site, which is a
+list somebody has to keep correct and which was wrong within a day of being written.
+
+**And when a lock is wedged anyway** — an old git that ignores those variables, say —
+`--ignore-lock` on either script is the way past, and the refusal first says whether the
+process recorded in the lockfile is still alive. "pid 4711 is tearing this down right now"
+about a pid that exited an hour ago sends somebody looking for a process that is not there.
+
+**No TTL, deliberately.** [#743] asked for one so that a killed session frees its tree
+with nobody intervening. `flock` already does that and does it better: the lock lives on
+an open file descriptor, so the kernel drops it the instant the holder dies — a kill, an
+OOM, a power cut — with no reaper and no clock. A TTL would keep a dead holder's lock for
+the rest of its term, which is the state the requirement exists to prevent. For the same
+reason the lockfiles are never deleted: unlinking a file while holding a `flock` on it is
+how two processes come to hold the same lock.
+
+**Machine-local, and not a board claim.** A worktree can only be rewritten from the
+machine holding it — the same reasoning that makes `worktree-holder`'s markers
+machine-local — and the case that bites is zeus's own reaper racing zeus's own agents. The
+board's claim could not carry this anyway: it is keyed on an **issue**, so a worktree whose
+branch names no issue has nothing to take, and `worktree_of()` on a claim is what was
+written down at checkout rather than a statement that the tree is still there.
+
+**Fail-open, like everything else here.** No `flock`, no resolvable common git directory,
+no `worktree-lock` installed, or a filesystem with no locking at all — the teardown says so
+and proceeds, because a coordination tool that is missing must never make a worktree
+unusable. (That last one is why `flock`'s stderr is read rather than only its exit status:
+it spends exit 1 on both "somebody else has it" and "this filesystem cannot do that", and
+reading the second as the first would wedge every worktree on an NFS mount without lockd.) `--require-lock` (or
+`QB_UNATTENDED=1`) is what turns that into a refusal, for the caller that has nobody
+watching it.
+
+`flock` is therefore a **runtime dependency**, and the package wraps `create-worktree` and
+`remove-worktree` with util-linux on `PATH` because of where the caller that needs it runs:
+util-linux is not in stdenv's initial path, and on NixOS `flock` lives in
+`/run/current-system/sw/bin`, which a systemd *system* unit's stock `PATH` does not have. A
+reaper that quietly found no `flock` would refuse every hour under `QB_UNATTENDED=1` and
+rebuild the pile of orphaned stacks it exists to clear. `worktree-lock` itself is
+deliberately not wrapped: it is *sourced*, and a wrapper is a stub that `exec`s the real
+file, which would replace the calling script's own process.
 
 ### `qb-catchup` — the ending the ⬇️ advisory never had
 
@@ -2060,6 +2168,7 @@ directly, and it is the true positive this must never drop.
 [#80]: https://github.com/prisonblues/quarterback/issues/80
 [#422]: https://github.com/prisonblues/quarterback/issues/422
 [#573]: https://github.com/prisonblues/quarterback/issues/573
+[#743]: https://github.com/prisonblues/quarterback/issues/743
 
 ### `qb-seat` — retired (#540)
 

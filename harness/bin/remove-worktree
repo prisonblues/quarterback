@@ -18,8 +18,16 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        backup makes the worktree permanently un-removable,
 #                        because the failure aborts the teardown (#743)
 #   --require-lock       Refuse unless the occupancy check gives a DEFINITE
-#                        answer. For unattended callers — see the header on
-#                        holder_check (#743)
+#                        answer, and unless the worktree lock was really taken.
+#                        For unattended callers — see the header on holder_check
+#                        and on acquire_the_lock (#743)
+#   --lock-wait <secs>   How long to wait for the worktree lock before giving up
+#                        (default 10). Only another create-worktree or
+#                        remove-worktree on THIS tree can hold it.
+#   --ignore-lock        Tear down even though the lock is held. The last resort
+#                        for a lock a dead process left behind — the refusal says
+#                        when that is what it is looking at. Look with
+#                        `fuser -v <the lockfile it names>` first (#743)
 
 # ============================================
 # COLORS & HELPERS
@@ -147,9 +155,12 @@ drop_db_forcefully() {
 #      and any other code, because an answer this script does not recognise is
 #      not evidence that the tree is free)
 #
-# Still not a lock. Between this answering and the `rm -rf` landing, an agent can
-# still be handed the tree; closing that needs a real claim on both sides, which
-# is the other half of #743 and is not this.
+# Still not a lock BY ITSELF, and that is why `acquire_the_lock` below runs first:
+# this is a read, and a read is worth only what it is still worth when the
+# recursive delete lands. It is asked TWICE for the same reason — once under the
+# lock before anything is touched, and once more after the pre-flight has
+# finished, because the `gh` call in the post-PR guard is a 20-second window on
+# its own and `docker compose down` is another.
 holder_check() {
     local dir="$1" hb="" rc
     hb=$(command -v worktree-holder 2>/dev/null || true)
@@ -165,6 +176,98 @@ holder_check() {
     [[ $rc -eq 3 ]] && return 1
     return 2
 }
+
+# >>> lock (extracted verbatim by harness/tests/test_worktree_lock.py)
+# Take the worktree's lock before anything is read, and hold it to the end.
+#
+# THE READ WAS NEVER THE PROBLEM; THE GAP AFTER IT WAS. `holder_check` above is
+# honest about who is in the tree at the instant it is asked, and then this script
+# spends seconds to minutes — a `gh` call, `docker compose down`, an nginx restart
+# — before the delete lands. Anything that arrives in that gap is invisible to a
+# check that has already answered, and what this script does at the end of it is
+# delete a worktree, its docker stack, its database and its local branch. A racing
+# agent does not get a merge conflict; it gets a working directory that vanishes
+# underneath it (#743).
+#
+# The lock closes two of the three ways in, and narrows the third:
+#
+#   * TWO TEARDOWNS CANNOT INTERLEAVE. The second waits --lock-wait and then
+#     aborts, having destroyed nothing. That is a refusal, and it is the only
+#     refusal this change adds: it fires when another create-worktree or
+#     remove-worktree is genuinely running against THIS tree, which is a state in
+#     which continuing was never what anybody wanted.
+#   * AN AGENT CANNOT BE HANDED THE TREE MID-TEARDOWN. `worktree-lock --enter`
+#     takes this same lock to write the session marker that makes an agent visible
+#     to `holder_check` at all, so there are only two orderings: the marker lands
+#     first and the check below sees it, or this holds the lock and the handover
+#     waits, then finds no tree and says so — a failure the agent can act on,
+#     rather than a directory disappearing mid-session.
+#     WHAT THE LOCK CANNOT DO IS MAKE THE BOARD ANSWER. In the first ordering the
+#     check still has to be able to READ that marker, and `worktree-holder` needs
+#     the board to say which session is live: with it unreachable the answer is
+#     "could not tell", which the interactive default proceeds on, deliberately.
+#     So this ordering ends in a refusal when the board answers and in a fail-open
+#     teardown when it does not — which is what --require-lock is for, and it is
+#     the reason that flag turns "could not tell" into a refusal rather than
+#     something being wrong with the lock.
+#   * An agent that enters with NO marker — started inside the checkout by hand, so
+#     only its board lease says where it is — is locked out by nothing, because
+#     nothing intercepts a person typing `cd`. That one is narrowed rather than
+#     closed, by asking `holder_check` a second time after the pre-flight rather
+#     than trusting the first answer for the whole run.
+#
+# NOT A BOARD CLAIM, deliberately. Machine-local is the right scope because a
+# worktree can only be rewritten from the machine holding it — the same reasoning
+# that makes `worktree-holder`'s markers machine-local — and the board's own claim
+# cannot carry this anyway: it is keyed on an ISSUE rather than a path, so a
+# worktree whose branch names no issue has nothing to take, and `worktree_of()` on
+# a claim is what was written down at checkout rather than a statement that the
+# tree is still there.
+#
+# NO TTL. The issue asked for one so that a killed session frees its tree with
+# nobody intervening; `flock` does that better, because the lock lives on an open
+# file descriptor and the kernel drops it the instant the holder dies. A TTL would
+# keep a dead holder's lock for the rest of its term, which is the state the
+# criterion exists to prevent.
+#
+# Fail-open on "this host cannot lock", exactly as `holder_check` fails open on
+# "could not tell": no `flock`, no resolvable common git directory, no
+# `worktree-lock` installed. --require-lock is what turns that into a refusal — the flag has been
+# named for a lock since #760 shipped it against the holder check alone.
+LOCK_WHY=""
+acquire_the_lock() {
+    local dir="$1" wl rc
+    wl=$(command -v worktree-lock 2>/dev/null || true)
+    # The `*/*` guard matters: invoked by bare name with no worktree-lock on
+    # PATH, `${0%/*}` leaves $0 untouched and would build a nonsense path.
+    if [[ -z "$wl" && "$0" == */* ]]; then wl="${0%/*}/worktree-lock"; fi
+    if [[ -z "$wl" || ! -r "$wl" ]]; then
+        LOCK_WHY="worktree-lock is not installed here"
+        return 2
+    fi
+    # shellcheck disable=SC1090
+    if ! . "$wl"; then
+        LOCK_WHY="worktree-lock could not be sourced"
+        return 2
+    fi
+    # Assigned, not prefixed onto the call: whether a `VAR=x func` assignment
+    # survives the function differs between bash versions, and the holder line
+    # this writes into the lockfile is the whole of what the next caller's refusal
+    # has to tell somebody.
+    WORKTREE_LOCK_WHAT="remove-worktree $BRANCH_NAME"
+    # $MAIN_REPO, because the lockfile lives in the repository's own common git
+    # directory rather than anywhere the environment can put it — see the header
+    # on worktree_lock_root for the failure that cost.
+    worktree_lock_acquire "$dir" "$LOCK_WAIT" "$MAIN_REPO"
+    rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        5) return 1 ;;
+        *) LOCK_WHY="${WORKTREE_LOCK_WHY:-no flock, or no repository to key a lockfile against}"
+           return 2 ;;
+    esac
+}
+# <<< lock
 
 # >>> release (extracted verbatim by harness/tests/test_remove_worktree_claim.py)
 # Hand back what `create-worktree` took (#337).
@@ -319,6 +422,18 @@ NO_BACKUP=false
 # already set it, and a wrapper script would be one more thing to keep in step.
 REQUIRE_LOCK=false
 [[ "${QB_UNATTENDED:-}" = "1" ]] && REQUIRE_LOCK=true
+# Long enough that a teardown queued behind a short one simply waits, short enough
+# that somebody who has hit a genuinely stuck lock finds out rather than watching a
+# prompt. Waiting longer is the flag.
+LOCK_WAIT="${QB_WORKTREE_LOCK_WAIT:-10}"
+# The escape hatch, and it exists for the same reason --no-backup does: a guard
+# with no way past it is a guard somebody deletes rather than obeys. The state it
+# is for is a lock held by a process that is not a worktree command — a git
+# `maintenance --detach` that inherited the descriptor, say — which no amount of
+# waiting clears. It is a flag rather than something --force implies, because
+# --force means "the agent in there has finished" and has never meant "run two
+# teardowns over one directory at once".
+IGNORE_LOCK=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -337,6 +452,12 @@ while [[ $# -gt 0 ]]; do
             NO_BACKUP=true; shift ;;
         --require-lock)
             REQUIRE_LOCK=true; shift ;;
+        --lock-wait)
+            [[ -z "${2:-}" ]] && die "--lock-wait requires a number of seconds"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--lock-wait takes whole seconds, not '$2'"
+            LOCK_WAIT="$2"; shift 2 ;;
+        --ignore-lock)
+            IGNORE_LOCK=true; shift ;;
         --*)
             die "Unknown option: $1" ;;
         *)
@@ -430,34 +551,92 @@ if [[ -d "$WORKTREE_DIR" ]]; then
 fi
 
 # ============================================
+# TAKE THE LOCK
+# ============================================
+# First, and before anything is read: everything below is a decision made from a
+# reading of the tree, and the lock is what keeps those readings true until the
+# teardown acts on them. Taken over WORKTREE_DIR even when that directory has
+# already gone, because the steps that follow still drop this worktree's database
+# and delete its branch, and a `create-worktree` for the same name is creating
+# exactly those.
+#
+# Held for the rest of the process. Nothing releases it: the file descriptor
+# closes when this script exits, however it exits, which is the whole reason for
+# using flock rather than a file somebody has to remember to remove.
+#
+# A DESCRIPTOR IS INHERITED BY CHILDREN, so a child that detached and outlived
+# this script would keep the lock after it. Every command below was checked
+# against that and none of them detaches: `docker`, `git worktree`, `git branch`,
+# `tar`, `gh`, `psql` through `docker exec` and `qb-release` are all synchronous
+# and reaped. The one that does is `git fetch`, which runs `gc --auto` in the
+# background — this script never fetches, and `create-worktree`, which does,
+# closes the descriptor for that one command.
+acquire_the_lock "$WORKTREE_DIR"
+LOCK_RC=$?
+if [[ $LOCK_RC -eq 1 && "$IGNORE_LOCK" = true ]]; then
+    echo -e "${YELLOW}Ignoring the worktree lock (--ignore-lock):${NC}" >&2
+    echo -e "${YELLOW}    ${WORKTREE_LOCK_OWNER:-no owner recorded}${NC}" >&2
+elif [[ $LOCK_RC -eq 1 ]]; then
+    echo "" >&2
+    die "Another worktree command already holds $WORKTREE_DIR:
+    ${WORKTREE_LOCK_OWNER:-no owner recorded}
+  Nothing has been deleted. Wait for it to finish, or pass --lock-wait <secs> to
+  wait longer than $LOCK_WAIT. If the line above says the recorded holder has
+  exited, the lock is a descriptor some child inherited — find what holds it with
+  \`fuser -v <file>\` or \`lsof <file>\`, and --ignore-lock once you have looked."
+elif [[ $LOCK_RC -eq 2 ]]; then
+    if [[ "$REQUIRE_LOCK" = true ]]; then
+        echo "" >&2
+        die "Could not lock $WORKTREE_DIR ($LOCK_WHY),
+  and --require-lock says an unattended teardown must not guess.
+  Nothing has been deleted."
+    fi
+    echo -e "${YELLOW}Proceeding without a worktree lock ($LOCK_WHY)${NC}" >&2
+fi
+
+# ============================================
 # IS SOMEBODY ELSE WORKING IN IT?
 # ============================================
 # Asked before anything is destroyed, and only about a *live* holder. An agent
 # three commits into a review cycle in this directory has no way to defend it:
 # the tooling that rewrites a worktree never had to ask who was in it, so the
 # only signal was the other agent noticing its own branch had moved. This is
-# that question, asked once, and it is advisory — --force always wins.
+# that question, and it is advisory — --force always wins.
 #
 # --require-lock (or QB_UNATTENDED=1) is what an unattended caller passes, and it
 # only changes the "could not tell" answer: held is still a refusal and clear is
 # still a go. See holder_check's header for why the default stays permissive.
-if [[ -d "$WORKTREE_DIR" && "$FORCE" != true ]]; then
+#
+# ASKED TWICE, and the two are placed for different jobs. This one is the CLEAN
+# refusal: nothing has been touched, so an abort here costs nothing, and it covers
+# the post-PR guard's `gh` call below, which allows itself 20 seconds. The second
+# is in STEP 4, immediately before the directory goes, because that is the step
+# that is not recoverable and an answer from minutes earlier is an answer about a
+# tree as it was. Both sit under the lock, so the second can only ever differ
+# because of an agent that entered with no session marker — the marked route takes
+# the same lock and cannot land in between.
+assert_nobody_home() {
+    local rc
+    [[ -d "$WORKTREE_DIR" && "$FORCE" != true ]] || return 0
     holder_check "$WORKTREE_DIR"
-    HOLDER_RC=$?
-    if [[ $HOLDER_RC -eq 1 ]]; then
+    rc=$?
+    if [[ $rc -eq 1 ]]; then
         echo "" >&2
         die "Another live agent is working in $WORKTREE_DIR (see above).
   Talk to it, or re-run with --force if you are certain it has finished.
   This is advisory only: a lapsed lease never blocks, and neither does an
   unreachable board."
-    elif [[ $HOLDER_RC -eq 2 && "$REQUIRE_LOCK" = true ]]; then
+    elif [[ $rc -eq 2 && "$REQUIRE_LOCK" = true ]]; then
         echo "" >&2
         die "Could not confirm nobody is working in $WORKTREE_DIR (see above),
   and --require-lock says an unattended teardown must not guess.
   Either worktree-holder is not installed here or the board did not answer.
   Fix the board, or re-run with --force if you have looked at the tree yourself."
     fi
-fi
+    return 0
+}
+
+assert_nobody_home
 
 # ============================================
 # IS THERE WORK ON THE BRANCH THE PR NEVER TOOK?
@@ -703,6 +882,38 @@ if [[ -d "$WORKTREE_DIR" ]]; then
         fi
     fi
     cd "$MAIN_REPO"
+fi
+
+# THE LAST ASK, AND THE ONE THAT MATTERS. Everything up to here is recoverable —
+# a stopped stack comes back with `docker compose up`, an nginx block is rewritten
+# by the next `create-worktree`, and the backup above has been taken. What follows
+# is not recoverable: it is the working directory going away, and an agent that
+# arrived while this teardown was stopping containers finds that out by its own cwd
+# evaporating. So the question is asked again here rather than trusted from before
+# the pre-flight, and the refusal says what has already been undone, because an
+# abort at this point does leave the stack down.
+#
+# The lock means this can only ever have changed for one reason: an agent that
+# entered WITHOUT a session marker, which is the one route into a worktree that
+# nothing intercepts (a person typing `cd`, and a board lease that follows). The
+# marked route takes the same lock this process is holding, so it cannot land in
+# between at all.
+if [[ -d "$WORKTREE_DIR" && "$FORCE" != true ]]; then
+    holder_check "$WORKTREE_DIR"
+    LATE_RC=$?
+    if [[ $LATE_RC -eq 1 ]]; then
+        echo "" >&2
+        die "Another live agent is in $WORKTREE_DIR (see above) — it arrived while
+  this teardown was running, so the directory has NOT been deleted.
+  Its containers are down and its nginx block is gone: \`docker compose up -d\` in
+  the worktree brings the first back, and re-running this teardown once the agent
+  has finished does the rest. Or --force if you are certain."
+    elif [[ $LATE_RC -eq 2 && "$REQUIRE_LOCK" = true ]]; then
+        echo "" >&2
+        die "Could not confirm nobody entered $WORKTREE_DIR while this teardown ran,
+  and --require-lock says an unattended teardown must not guess. The directory has
+  NOT been deleted; its containers are down and its nginx block is gone."
+    fi
 fi
 
 # Remove git worktree. A worktree with a copied apps/models (hundreds of MB of

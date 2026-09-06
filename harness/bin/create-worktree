@@ -35,6 +35,11 @@ WORKTREE_SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pw
 #   --no-bound           Skip the in-flight window check (#337). The checkout
 #                        still takes its claim and still counts; it is only the
 #                        refusal that is waived
+#   --lock-wait <secs>   How long to wait for the worktree lock (default 10; the
+#                        environment spelling is QB_WORKTREE_LOCK_WAIT)
+#   --ignore-lock        Build even though the lock is held. The last resort for a
+#                        lock a dead process left behind — the refusal says when
+#                        that is what it is looking at (#743)
 
 # ============================================
 # COLORS
@@ -726,6 +731,8 @@ FETCH=true                # fetch origin before worktree-add; --no-fetch to skip
 CONFIG_FILE=""
 CONFIG_JSON=""
 CLAIM=true                # take the issue claim this branch names (#172)
+IGNORE_LOCK=false         # build anyway if the worktree lock is held (#743)
+LOCK_WAIT_ARG=""          # --lock-wait, which beats QB_WORKTREE_LOCK_WAIT
 REQUIRE_CLAIM=false       # ...and refuse the checkout if it cannot be taken
 CLAIM_TTL=28800           # 8h: a worktree outlives an hour, and a lapsed claim
                           # reads as "free" to the next agent
@@ -765,6 +772,12 @@ while [[ $# -gt 0 ]]; do
             CLAIM=false; shift ;;
         --require-claim)
             REQUIRE_CLAIM=true; shift ;;
+        --lock-wait)
+            [[ -n "${2:-}" ]] || die "--lock-wait requires a number of seconds"
+            [[ "$2" =~ ^[0-9]+$ ]] || die "--lock-wait takes whole seconds, not '$2'"
+            LOCK_WAIT_ARG="$2"; shift 2 ;;
+        --ignore-lock)
+            IGNORE_LOCK=true; shift ;;
         --no-bound)
             BOUND=false; shift ;;
         --claim-ttl)
@@ -947,6 +960,69 @@ done
 SAFE_NAME=$(echo "$BRANCH_NAME" | tr "/" "-")
 WORKTREE_DIR="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}"
 WORKTREE_DB=""   # set below if an isolated DB copy is created; used in CLAUDE.local.md
+
+# ============================================
+# TAKE THE WORKTREE'S LOCK
+# ============================================
+# >>> lock (extracted verbatim by harness/tests/test_worktree_lock.py)
+# The other end of #743's race, and the half that is easy to miss: the danger is
+# not only a teardown deleting a tree an agent is in, it is a teardown and a
+# creation of the SAME NAME overlapping. `remove-worktree` deletes the directory
+# early and drops the database and the branch afterwards, so a `create-worktree`
+# that starts in between finds the directory absent, builds a fresh worktree —
+# and then has its database dropped and its branch deleted out from under it by
+# the teardown finishing. The same lock on both sides is what makes that ordering
+# impossible.
+#
+# Taken HERE, before the "already exists" refusal, so the answer to that question
+# is one nobody can change while it is being acted on. Held for the rest of the
+# run, because the whole run is the critical section: the tree is not safe to
+# reap until its database, its port entry and its context file are all there.
+#
+# Fail-open when the host cannot lock at all (no flock, no resolvable common git
+# directory, no `worktree-lock` installed) — a checkout must not be stopped by a
+# coordination tool that is missing, which is the same rule the claim below
+# follows. Failing to WIN the lock is different: something is working on this
+# exact tree right now, and there is no version of proceeding that is right.
+LOCK_WAIT="${LOCK_WAIT_ARG:-${QB_WORKTREE_LOCK_WAIT:-10}}"
+lock_the_worktree() {
+    local wl rc=0
+    wl=$(command -v worktree-lock 2>/dev/null || true)
+    # The `*/*` guard matters: invoked by bare name with no worktree-lock on
+    # PATH, `${0%/*}` leaves $0 untouched and would build a nonsense path.
+    if [[ -z "$wl" && "$0" == */* ]]; then wl="${0%/*}/worktree-lock"; fi
+    if [[ -z "$wl" || ! -r "$wl" ]]; then
+        echo -e "  ${YELLOW}unlocked:${NC} worktree-lock is not installed here" >&2
+        return 0
+    fi
+    # shellcheck disable=SC1090
+    . "$wl" || { echo -e "  ${YELLOW}unlocked:${NC} worktree-lock could not be sourced" >&2; return 0; }
+    WORKTREE_LOCK_WHAT="create-worktree $BRANCH_NAME"
+    # $MAIN_REPO, because the lockfile lives in the repository's own common git
+    # directory rather than anywhere the environment can put it: a root chosen
+    # from $XDG_RUNTIME_DIR or $TMPDIR is a property of the CALLER, and an
+    # interactive agent and a systemd timer then lock two different files for one
+    # tree — which is the pairing #743 is about.
+    worktree_lock_acquire "$WORKTREE_DIR" "$LOCK_WAIT" "$MAIN_REPO" || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        5) [[ "$IGNORE_LOCK" = true ]] && {
+               echo -e "  ${YELLOW}ignoring the worktree lock (--ignore-lock):${NC}" >&2
+               echo -e "  ${YELLOW}  ${WORKTREE_LOCK_OWNER:-no owner recorded}${NC}" >&2
+               return 0
+           }
+           die "Another worktree command already holds $WORKTREE_DIR:
+    ${WORKTREE_LOCK_OWNER:-no owner recorded}
+  Nothing has been created. Wait for it to finish and look again. If the line
+  above says the recorded holder has exited, the lock is a descriptor some child
+  inherited — look with \`fuser -v <file>\` or \`lsof <file>\`, and --ignore-lock
+  once you have." ;;
+        *) echo -e "  ${YELLOW}unlocked:${NC} ${WORKTREE_LOCK_WHY:-no flock, or no repository to key a lockfile against}" >&2
+           return 0 ;;
+    esac
+}
+lock_the_worktree
+# <<< lock
 
 if [[ -d "$WORKTREE_DIR" ]]; then
     # Refusing was already right — the directory is somebody's working state and
@@ -1233,6 +1309,12 @@ step "Creating git worktree and branch..."
 # (e.g. working offline). Skip with --no-fetch.
 if [[ "$FETCH" = true ]] && git remote get-url origin >/dev/null 2>&1; then
     echo -e "  Fetching origin..."
+    # Auto-maintenance is off for every git this script runs — see
+    # `worktree_lock_quiet_git` in worktree-lock, which the lock sets up when it is
+    # taken. `git fetch` detaches a `git maintenance run --auto --detach` that
+    # would otherwise inherit the lock's descriptor and hold it through a repack,
+    # and so does the `git merge --ff-only` further down; the environment covers
+    # both, and the ones nobody has written yet.
     if ! git fetch --quiet --prune origin 2>/dev/null; then
         echo -e "  ${YELLOW}fetch failed (offline?) — continuing with cached refs${NC}"
     fi

@@ -47,7 +47,10 @@ REMOVE = BIN / "remove-worktree"
 TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
          "wc", "date", "basename", "dirname", "rm", "mkdir", "env", "timeout",
          "jq", "chmod", "find", "sort", "mv", "ln", "readlink", "tar", "mktemp",
-         "curl", "gzip")
+         "curl", "gzip",
+         # The worktree lock (#743): present here so the backup is exercised on
+         # the locked path, which is the one a real teardown takes.
+         "flock", "sha256sum")
 
 
 def git(cwd, *args):

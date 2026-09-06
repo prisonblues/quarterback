@@ -90,7 +90,19 @@ than tearing down under a live agent. If it does refuse, **do not reach for
 `--force`** — tell the user who holds it, and offer to message that agent on the
 board instead. `--force` is for the case where the user, having seen the name,
 says go ahead. The check is advisory by design: it stays quiet when the board is
-unreachable, so a refusal means a genuinely live holder.
+unreachable, so a refusal means a genuinely live holder. It is asked twice — once
+up front and once immediately before the directory goes — so a refusal can also
+arrive after the containers are already down; the message says so and says how to
+bring them back.
+
+**A different refusal: "Another worktree command already holds …".** That is the
+worktree lock (#743), not the holder check, and `--force` does not lift it. It
+means a `create-worktree` or `remove-worktree` is running against that exact tree
+right now. Wait for it and look again — the message names the process. `--lock-wait
+<secs>` waits longer than the default 10 if you know the other one is nearly done.
+If the message says the recorded holder **has exited**, the lock is a descriptor
+some stray child inherited and no amount of waiting will clear it: look at the
+file it names (`fuser -v <file>` or `lsof <file>`), then `--ignore-lock`.
 
 Pass the **create-name** — the identifier the worktree was *created* with (see
 "Naming model" below). The script resolves the worktree's *current* branch
