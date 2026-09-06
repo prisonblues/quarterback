@@ -46,7 +46,13 @@ REMOVE = BIN / "remove-worktree"
 TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
          "wc", "date", "basename", "dirname", "rm", "mkdir", "env", "timeout",
          "jq", "chmod", "find", "sort", "mv", "ln", "readlink", "tar", "gzip",
-         "mktemp")
+         "mktemp",
+         # `flock` and `sha256sum` are how the teardown takes the worktree lock
+         # (#743). Absent, it proceeds unlocked — which is a real host state and
+         # is tested for on purpose in `test_worktree_lock.py`, but it is not
+         # what THIS suite is about, and leaving them out here would mean the
+         # branch guard was only ever exercised on the unlocked path.
+         "flock", "sha256sum")
 
 
 def git(cwd, *args):

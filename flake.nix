@@ -136,6 +136,14 @@
               # nobody notices is worse than an absent one — the CI summary reads
               # green either way.
               pkgs.tmux
+              # util-linux for `flock`, which is the worktree lock (#743) and is
+              # NOT in stdenv's initial path — coreutils, findutils, gnused and
+              # their neighbours are, and util-linux is not. Without it here every
+              # suite naming `flock` in its sandbox tools errors on a binary this
+              # host does not have, and `test_worktree_lock.py` skips itself
+              # wholesale: the lock would be unexercised in the only check that
+              # runs it, which is #163's mechanism again.
+              pkgs.util-linux
             ];
           } ''
           mkdir harness

@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# NO `set` AT THE TOP LEVEL. This file is sourced by scripts that have chosen
+# their own shell options — `remove-worktree` runs `set +e` on purpose so that
+# every cleanup step is attempted — and a `set -u` here would silently impose
+# itself on them. The options belong to the CLI, and that is where they are set.
+
+# worktree-lock — mutual exclusion over one worktree, for the moment a caller
+# acts on it. Both a LIBRARY (sourced by create-worktree and remove-worktree, as
+# a sibling of $0, the way the board client's four source `qb-env`) and a small
+# CLI for the one caller that is a slash command rather than a script.
+#
+# Usage:
+#   worktree-lock --path <dir>              print the lockfile <dir> keys to,
+#                                           without locking anything
+#   worktree-lock [--wait N] --enter <dir>  take the lock, check <dir> is still
+#                                           there, and record this session in it
+#   worktree-lock -h | --help
+#
+# Exit codes:
+#   0  done
+#   2  usage, or --enter on something that is not a worktree any more
+#   4  cannot lock HERE (no flock, no hasher, no writable runtime dir) — the
+#      same shape of answer as worktree-holder's exit 4, and callers treat it the
+#      same way: advisory-absent, permissive by default, fatal under --require-lock
+#   5  somebody else holds it and --wait ran out
+#
+# WHAT THIS IS FOR, AND WHAT IT IS DELIBERATELY NOT.
+#
+# It is a latch around a read-then-act sequence, held by a live process for as
+# long as that process is acting. `remove-worktree` reads "is anybody in this
+# tree" and then destroys the tree, its docker stack, its database and its local
+# branch; between the read and the act, an agent can be handed the tree, and the
+# result is not a merge conflict but a working directory that vanishes under a
+# running process (#743). Holding this across the sequence is what makes the read
+# still true when the act lands.
+#
+# It is NOT a record of occupancy, and building one here would have been the
+# mistake. The fleet already has that, in two halves that `worktree-holder`
+# unions: the per-session marker under `~/.cache/claude-code/session-cwd` says
+# which session was handed which tree, and the board's lease says which of those
+# sessions is still answering. A third mechanism with its own idea of "who is
+# here" is `app/api/claims.py:213`'s complaint — three readers with their own
+# idea of the note's shape — rebuilt in a lockfile. So occupancy stays where it
+# is and stays advisory, and this serialises the moment of change: `--enter`
+# takes the lock to write the marker, so an entry either lands before a teardown
+# reads (and the teardown then sees it and refuses) or waits until after the
+# teardown has finished (and then finds the tree gone and says so). There is no
+# order in which both happen.
+#
+# NOR IS IT A BOARD CLAIM, and that is scope rather than oversight. The lock is
+# machine-local because a worktree can only be rewritten from the machine holding
+# it — the same reasoning that makes `worktree-holder`'s markers machine-local —
+# and the case that bites today is zeus's own hourly `stack-reaper` racing zeus's
+# own agents. Cross-machine exclusion would have to be the existing claim
+# machinery rather than a second one, and the claim is keyed on an ISSUE, not on
+# a path: a worktree whose branch names no issue has no claim to take, and
+# `worktree_of()` on a claim is what was WRITTEN DOWN at checkout and never a
+# statement that the tree is still there. Neither shape can carry a teardown's
+# mutual exclusion.
+#
+# NO TTL, AND THAT IS THE FEATURE. The issue asked for a lock that expires on its
+# own so a killed session frees its tree with nobody intervening. `flock` already
+# does exactly that and does it better than a TTL could: the lock lives on an open
+# file descriptor, so the kernel drops it the instant the holder dies — a kill, an
+# OOM, a power cut — with no reaper, no clock skew and no window in which a dead
+# holder still owns the tree. A TTL would be strictly worse here: it would keep a
+# dead holder's lock for the remainder of its term, which is the very state the
+# criterion exists to prevent.
+#
+# Lockfiles are never deleted. Unlinking a file while holding a flock on it is
+# the classic way to hand two processes the same lock — the next caller opens the
+# name, gets a fresh inode, and locks something nobody else is looking at. They
+# hold one line describing whoever last took the lock, they live in a runtime
+# directory that is cleared on reboot, and one per worktree is not a quantity
+# worth tidying.
+
+WORKTREE_LOCK_FD=""      # set by worktree_lock_acquire on success
+WORKTREE_LOCK_OWNER=""   # on rc 5: what the current holder wrote about itself
+
+# The lockfile's key. TWO WORKTREES ARE THE SAME WORKTREE WHEN THEY ARE THE SAME
+# DIRECTORY, however each caller spelled it — and the callers genuinely spell it
+# differently: `remove-worktree` holds a directory that exists, `create-worktree`
+# one that does not exist yet, and under a symlinked home the two resolve to
+# different strings. So the PARENT is canonicalised (it exists in both cases) and
+# the basename is appended, rather than canonicalising the target itself, which
+# would silently key a creation and a teardown of one tree to two different locks.
+worktree_lock_key() {
+    local target="${1%/}" parent base real
+    if [[ "$target" != */* ]]; then parent="."; base="$target"
+    else parent="${target%/*}"; base="${target##*/}"; [[ -n "$parent" ]] || parent="/"
+    fi
+    if real=$(cd -P "$parent" 2>/dev/null && pwd -P); then
+        [[ "$real" = "/" ]] && real=""
+        printf '%s/%s' "$real" "$base"
+    else
+        printf '%s' "$target"
+    fi
+}
+
+# Where the lockfiles live. `$XDG_RUNTIME_DIR` first, because it is per-user,
+# 0700 by specification and cleared on logout — the right lifetime for a thing
+# that means "a process is running right now". A systemd timer or a cron job has
+# no runtime dir, and that is the caller this whole issue is about, so there is a
+# fallback under `$TMPDIR` — made 0700 and asserted to be OURS, because a
+# world-writable /tmp is where somebody else's file can be waiting under the name
+# we are about to trust.
+worktree_lock_dir() {
+    local root dir
+    if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
+        root="${XDG_RUNTIME_DIR}/quarterback"
+    else
+        root="${TMPDIR:-/tmp}/quarterback-${EUID}"
+    fi
+    dir="$root/worktree"
+    mkdir -p "$dir" 2>/dev/null || return 1
+    chmod 700 "$root" 2>/dev/null || true
+    # -O and not -L together: owned by us, and not a symlink somebody else
+    # planted pointing at a directory that is.
+    [[ -O "$root" && ! -L "$root" && -d "$dir" && -w "$dir" ]] || return 1
+    printf '%s' "$dir"
+}
+
+# A short digest of the key, so the filename is bounded whatever the path is.
+# Named as well as hashed — `quarterback-fix-issue-743-lock-1f0c…lock` is
+# something a person can recognise in a directory listing, and a bare digest is
+# not. No hasher at all is a "cannot lock here", not a reason to invent a
+# truncated spelling that could collide.
+worktree_lock_digest() {
+    local s="$1" out=""
+    if command -v sha256sum >/dev/null 2>&1; then out=$(printf '%s' "$s" | sha256sum 2>/dev/null)
+    elif command -v shasum >/dev/null 2>&1; then out=$(printf '%s' "$s" | shasum -a 256 2>/dev/null)
+    elif command -v md5sum >/dev/null 2>&1; then out=$(printf '%s' "$s" | md5sum 2>/dev/null)
+    fi
+    out="${out%% *}"
+    [[ -n "$out" ]] || return 1
+    printf '%s' "${out:0:16}"
+}
+
+worktree_lock_path() {
+    local key dir digest base
+    key=$(worktree_lock_key "$1")
+    dir=$(worktree_lock_dir) || return 4
+    digest=$(worktree_lock_digest "$key") || return 4
+    base="${key##*/}"
+    base="${base//[^A-Za-z0-9._-]/-}"
+    printf '%s/%s-%s.lock' "$dir" "${base:0:48}" "$digest"
+}
+
+# Take it, or say precisely why not. $2 is how long to wait, in seconds.
+#
+# The fd is allocated by bash rather than hardcoded, because the callers are
+# whole scripts that hold this for their lifetime and a number picked here would
+# be a number they cannot use for anything else.
+worktree_lock_acquire() {
+    local dir="$1" wait="${2:-10}" file
+    WORKTREE_LOCK_FD=""; WORKTREE_LOCK_OWNER=""
+    command -v flock >/dev/null 2>&1 || return 4
+    file=$(worktree_lock_path "$dir") || return 4
+    [[ -n "$file" ]] || return 4
+    # `>>`, never `>`: truncating on open would wipe the current holder's own
+    # description of itself before we have found out whether we can have the lock
+    # at all, and that description is the whole of what the refusal below has to
+    # tell somebody.
+    # BRACES, NOT A BARE `exec … 2>/dev/null`. `exec` with no command applies its
+    # redirections to THE SHELL and never restores them, so the obvious spelling
+    # sends this script's stderr to /dev/null for the rest of its life — every
+    # refusal it was about to print, silently discarded. A group's redirection is
+    # undone when the group ends.
+    if ! { exec {WORKTREE_LOCK_FD}>>"$file"; } 2>/dev/null; then
+        WORKTREE_LOCK_FD=""
+        return 4
+    fi
+    if flock -w "$wait" -x "$WORKTREE_LOCK_FD" 2>/dev/null; then
+        printf 'pid %s · %s · %s · since %s\n' \
+            "$$" "${WORKTREE_LOCK_WHAT:-${0##*/}}" \
+            "$(hostname -s 2>/dev/null || echo host)" \
+            "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)" \
+            >"$file" 2>/dev/null || true
+        return 0
+    fi
+    WORKTREE_LOCK_OWNER=$(head -1 "$file" 2>/dev/null || true)
+    worktree_lock_release
+    return 5
+}
+
+# Give the lock back early. Not needed by the two worktree scripts — the kernel
+# closes their descriptor when they exit, which is the point — but `--enter` is a
+# short act inside a longer session and must not sit on the tree afterwards.
+worktree_lock_release() {
+    [[ -n "${WORKTREE_LOCK_FD:-}" ]] || return 0
+    { exec {WORKTREE_LOCK_FD}>&-; } 2>/dev/null || true
+    WORKTREE_LOCK_FD=""
+}
+
+# ============================================
+# CLI
+# ============================================
+# Only when run, never when sourced — the two worktree scripts source this file
+# for the functions above and must not have a main() go off underneath them.
+worktree_lock_main() {
+    local mode="" target="" wait=10 marker_dir marker written
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --path)   mode="path"; shift ;;
+            --enter)  mode="enter"; shift ;;
+            --wait)   [[ -n "${2:-}" ]] || { echo "worktree-lock: --wait needs a number" >&2; return 2; }
+                      wait="$2"; shift 2 ;;
+            -h|--help) sed -n '/^# worktree-lock —/,/^#   5  somebody/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
+            --*)      echo "worktree-lock: unknown option: $1" >&2; return 2 ;;
+            *)        [[ -z "$target" ]] || { echo "worktree-lock: unexpected argument '$1'" >&2; return 2; }
+                      target="$1"; shift ;;
+        esac
+    done
+    [[ -n "$mode" ]]   || { echo "worktree-lock: --path or --enter is required" >&2; return 2; }
+    [[ -n "$target" ]] || { echo "worktree-lock: a worktree path is required" >&2; return 2; }
+
+    if [[ "$mode" = "path" ]]; then
+        local file
+        file=$(worktree_lock_path "$target") || {
+            echo "worktree-lock: cannot make a lockfile here (no hasher, or no writable runtime dir)" >&2
+            return 4
+        }
+        printf '%s\n' "$file"
+        return 0
+    fi
+
+    # --enter: the handover, made atomic.
+    #
+    # The marker is what makes a session VISIBLE to `worktree-holder`, so writing
+    # it is the moment the tree acquires a defender — before it, an agent working
+    # there is invisible to every teardown on the box. Under the lock, and with
+    # the tree's existence re-checked after the lock is held, there is no
+    # interleaving left: either this lands first and the teardown that starts
+    # afterwards sees a holder and refuses, or the teardown holds the lock and
+    # this waits, and then finds no tree and says so — which is a failure the
+    # caller can act on, rather than a directory disappearing mid-session.
+    [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]] || {
+        echo "worktree-lock: --enter needs \$CLAUDE_CODE_SESSION_ID (who is entering?)" >&2
+        return 2
+    }
+    local rc=0
+    WORKTREE_LOCK_WHAT="worktree-lock --enter"
+    worktree_lock_acquire "$target" "$wait" || rc=$?
+    if [[ $rc -eq 5 ]]; then
+        echo "worktree-lock: $target is locked by another process — ${WORKTREE_LOCK_OWNER:-no owner recorded}" >&2
+        echo "  It is most likely being created or torn down. Wait for it to finish and look again." >&2
+        return 5
+    fi
+    # rc 4 is "this host cannot lock", and it is not a reason to refuse the
+    # handover: the marker is still worth writing, and an unwritten one is a
+    # session no teardown can see at all. Said out loud, because a machine that
+    # has silently stopped locking is a machine where #743 is back.
+    if [[ $rc -eq 4 ]]; then
+        echo "worktree-lock: proceeding without a lock (no flock, or no writable runtime dir)" >&2
+    fi
+    if [[ ! -d "$target" ]]; then
+        echo "worktree-lock: $target is not there any more — it was removed while you waited." >&2
+        worktree_lock_release
+        return 2
+    fi
+    if ! git -C "$target" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo "worktree-lock: $target is not a git worktree." >&2
+        worktree_lock_release
+        return 2
+    fi
+    marker_dir="${QB_SESSION_CWD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-code/session-cwd}"
+    mkdir -p "$marker_dir" 2>/dev/null || {
+        echo "worktree-lock: cannot create $marker_dir" >&2
+        worktree_lock_release
+        return 2
+    }
+    marker="$marker_dir/$CLAUDE_CODE_SESSION_ID"
+    # ABSOLUTE, because `worktree-holder` compares the marker's CONTENT against the
+    # worktree path as a string. A relative spelling matches nothing there, and the
+    # session it names is then invisible to every teardown on the box — the exact
+    # failure this command exists to prevent, arrived at by writing the marker
+    # successfully. Logical rather than `pwd -P`: that is the spelling
+    # `git worktree list` produces and the one the holder keeps as WT_LOGICAL, and
+    # it compares both anyway.
+    written=$(cd "$target" 2>/dev/null && pwd) || written="$target"
+    [[ -n "$written" ]] || written="$target"
+    # `tee`, not a `>` redirect: the marker lives under $HOME and the `dcg`
+    # pre-tool guard refuses a truncating redirect there, so the obvious spelling
+    # is the one that never runs. Kept here even though this is a script, so the
+    # rule stays in one place rather than being rediscovered by whoever copies it.
+    if printf '%s' "$written" | tee "$marker" >/dev/null 2>&1; then
+        echo "worktree-lock: session ${CLAUDE_CODE_SESSION_ID:0:8} is now recorded in $written"
+        worktree_lock_release
+        return 0
+    fi
+    echo "worktree-lock: could not write $marker" >&2
+    worktree_lock_release
+    return 2
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    set -uo pipefail
+    worktree_lock_main "$@"
+    exit $?
+fi
