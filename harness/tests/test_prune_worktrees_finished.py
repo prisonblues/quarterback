@@ -459,6 +459,46 @@ def test_the_whole_script_reports_every_registered_tree_with_its_teardown(sandbo
         "in-progress", "review/x", "-", "no PR, and the tip is in no remote branch")
 
 
+def test_a_fetch_that_fails_demotes_every_finished_row_to_cannot_verify(sandbox):
+    """Containment is judged against remote-tracking refs, and a fetch that failed
+    left them at whatever age they were. A "finished" resting on that is a verdict
+    nobody refreshed — so it is not one. The row keeps its reason and says why."""
+    tmp_path, repo = sandbox
+    sib = repo.worktree("done", "feat/done")
+    set_prs(sandbox, [{"number": 7, "state": "MERGED", "headRefName": "feat/done",
+                       "headRefOid": repo.head(sib)}])
+    repo.git("remote", "set-url", "origin", str(tmp_path / "no-such-origin.git"))
+    got = subprocess.run(
+        [BASH, str(SCRIPT), "--finished", "--porcelain", "--project", "proj"],
+        cwd=repo.main, env=repo.env, capture_output=True, text=True)
+    assert got.returncode == 0, got.stderr + got.stdout
+    rows = [line.split("\t") for line in got.stdout.splitlines() if "\t" in line]
+    mine = [r for r in rows if r[1] == str(sib)]
+    assert mine and mine[0][0] == "cannot-verify", rows
+    assert "PR #7 merged" in mine[0][4] and "not refreshed" in mine[0][4]
+    assert any(r[0] == "note" and "refreshed" in r[1] for r in rows), rows
+
+
+def test_a_deleted_remote_branch_stops_vouching_for_a_tip(sandbox):
+    """Without `--prune`, a tracking ref for a branch the remote deleted stays
+    here forever, and a tip reachable only from it reads as "on the remote"."""
+    _, repo = sandbox
+    wt = repo.worktree("a", "scratch", push=False)
+    repo.git("branch", "carrier", "scratch")
+    repo.git("push", "-q", "origin", "carrier")
+    assert classify(sandbox, wt, "scratch") == ("finished", "no PR; tip is in origin/carrier")
+    repo.git("push", "-q", "origin", "--delete", "carrier")
+    # The classifier alone still sees the stale tracking ref — the driver's
+    # fetch is what removes it — so this runs the whole script.
+    got = subprocess.run(
+        [BASH, str(SCRIPT), "--finished", "--porcelain", "--project", "proj"],
+        cwd=repo.main, env=repo.env, capture_output=True, text=True)
+    assert got.returncode == 0, got.stderr + got.stdout
+    rows = [line.split("\t") for line in got.stdout.splitlines() if "\t" in line]
+    mine = [r for r in rows if r[1] == str(wt)]
+    assert mine and mine[0][0] == "in-progress", rows
+
+
 def test_a_destructive_flag_beside_finished_is_refused(sandbox):
     _, repo = sandbox
     got = subprocess.run(

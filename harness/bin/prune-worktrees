@@ -553,11 +553,16 @@ classify_worktree() {
 
 if [[ "$FINISHED" = true ]]; then
     GH_BIN=$(command -v gh 2>/dev/null || true)
-    # Containment is judged against remote-tracking refs, so they should be
-    # current. Best-effort: a fetch that fails is said once, not treated as a
-    # reason to answer nothing.
+    # Containment is judged against remote-tracking refs, so they have to be
+    # current in BOTH directions. `--prune` is the one that matters: without it
+    # a remote branch deleted last month is still here as a tracking ref, and a
+    # tip reachable only from it reads as "on the remote" when the remote no
+    # longer has it — the false "finished" this whole mode must not produce.
+    # And a fetch that fails leaves every ref at whatever age it was, so a
+    # "finished" verdict then rests on evidence nobody refreshed: those rows are
+    # demoted to cannot-verify below, rather than printed with a footnote.
     FETCH_NOTE=""
-    git fetch --quiet --all 2>/dev/null || FETCH_NOTE="remote refs were NOT refreshed (git fetch failed) — containment answers may be stale"
+    git fetch --quiet --all --prune 2>/dev/null || FETCH_NOTE="remote refs were NOT refreshed (git fetch failed), so nothing can be called finished"
     while IFS=$'\t' read -r wt_path wt_branch wt_locked; do
         [[ -z "$wt_path" || "$wt_path" = "$MAIN_REPO" ]] && continue
         # What `remove-worktree` needs is the create-name, and only a sibling
@@ -571,6 +576,10 @@ if [[ "$FINISHED" = true ]]; then
         verdict=$(classify_worktree "$wt_path" "$wt_branch" "$wt_locked")
         bucket="${verdict%%$'\t'*}"; reason="${verdict#*$'\t'}"
         row="$wt_path	${wt_branch:-(detached)}	$cname	$reason"
+        if [[ "$bucket" = finished && -n "$FETCH_NOTE" ]]; then
+            bucket=cannot-verify
+            row="$wt_path	${wt_branch:-(detached)}	$cname	$reason — but remote refs were not refreshed"
+        fi
         case "$bucket" in
             finished)    FINISHED_ROWS+=("$row") ;;
             in-progress) INPROGRESS_ROWS+=("$row") ;;
