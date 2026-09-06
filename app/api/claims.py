@@ -177,6 +177,15 @@ def claim_view(c: ResourceLease) -> dict:
         "note": c.note,
         "acquired": c.acquired_at.isoformat(),
         "expires": c.expires_at.isoformat(),
+        # Parsed HERE, on every view of a claim rather than only on a lapsed one.
+        # :func:`worktree_of`'s own docstring says why the grammar is read on the
+        # board and not by each of its readers, and `lapsed_view` was the only
+        # view honouring it — so `qb-reconcile`, which reads live claims off
+        # `GET /plan` and wants the tree for exactly the reason `lapsed_row` does
+        # (naming the checkout a claim belongs to), had nowhere to get it but its
+        # own copy of the regex, which is the second reader the docstring refuses
+        # (#681). None when the note named no tree, which is most claims.
+        "worktree": worktree_of(c.note),
     }
 
 
@@ -277,7 +286,9 @@ def lapsed_view(c: ResourceLease, now: datetime) -> dict:
         # later and says nothing at all about the work.
         "stopped_answering": c.expires_at.isoformat(),
         "silent_hours": round((now - c.expires_at).total_seconds() / 3600, 1),
-        "worktree": worktree_of(c.note),
+        # `worktree` comes up through `claim_view` now, which every view of a
+        # claim shares — it was here first, and a second call to the same parser
+        # on the same note is the shape this file's own docstring argues against.
     }
 
 

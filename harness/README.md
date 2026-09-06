@@ -3550,13 +3550,14 @@ that was not happening to any of the nine such claims standing on zeus the day #
 report says which of the two it saw, because a machine that IS in `/active` has somebody else's
 keyless lease and that is still not evidence about a claim no session ever took.)
 
-**Which script took it comes from the note, and the remedy differs.** `create-worktree` writes
-`worktree <create-name> on <host>`, and the create-name is the argument `remove-worktree` takes,
-so it is quoted back as the command. `qb-start` takes the same shape of claim for `/review-pr`
-and `/fix-issue-here`, where no worktree is created at all — naming `remove-worktree` for one of
-those would send a reader at a command that cannot release it, so those say `qb-release`.
-Adoption (PR #763) turns a checkout claim into a session claim, and those are answered as session
-claims.
+**Which script took it comes from the note, and the remedy differs.** `create-worktree` records
+`worktree <create-name> on <host>`, and the create-name is the argument `remove-worktree` takes.
+`qb-start` takes the same shape of claim for `/review-pr` and `/fix-issue-here`, where no
+worktree is created at all — so those get `qb-release <kind> <n>`, named, because bare
+`qb-release` reads the resource off the *reader's* current branch and would do nothing on a host
+sitting on `main`. The note is parsed on the BOARD (`claim.worktree`, `app/api/claims.py`) and
+not here: that docstring refuses a second reader of the grammar by name. Adoption (PR #763)
+turns a checkout claim into a session claim, and those are answered as session claims.
 
 **What settles either of them is the work, not the holder.** When the item's own ref is a PR
 GitHub reports merged, or an issue closed — the `done_candidate` this same pass computed for the
@@ -3568,16 +3569,27 @@ Only an unknown is promoted: a claim a live session holds is left alone, because
 turn happens with its own issue already closed. Nothing is released either way — this report has
 no `--release`, and #685 is what stops a finished worktree standing to its TTL.
 
-**One plan row per ref, chosen here.** `POST /plan/reconcile` stores one row per
-`(repo, ref_kind, ref_value)` and keys a request's findings under "last one wins", so a pass
-reporting two conditions about one ref has already decided which survives — by the order its
-checks happen to run in. A `done_candidate` and a `note_contradicted` on one merged PR was
-already losing the first that way, and a settled claim would have lost it on every row #681 is
-about, which is #463's worked example arriving through the fix for #681: `plan_read`'s caveat
-stops saying the item is already finished, and `first_seen` restarts on the condition flip. So
-`report_findings` sends one row per ref and `done_candidate`/`dropped_candidate` win it — the
-plan row answers one question, *is this still work to do*, and those are the two conditions that
-answer it.
+**A promoted finding takes no plan row.** `POST /plan/reconcile` stores one row per
+`(repo, ref_kind, ref_value)`, and a promoted `stale_claim` is on the same ref as the
+`done_candidate` that settled it, always. Sent, it would take that row under the board's "last
+one wins" and `_reconciled_caveat` would stop saying the item is already finished — while saying
+nothing the row it displaced does not, the two being one fact. So it is not sent, and the plan
+write is unchanged from before this condition existed. The wider question — that list order
+decides a durable row whenever any two conditions land on one ref, `done_candidate` with
+`note_contradicted` among them — is real, predates this, and is filed separately (#768): a general
+precedence makes the stored condition depend on which checks could RUN, so a pass that could not
+reach GitHub stores something else and `first_seen` restarts on the flip.
+
+**It never *judges* — which is a narrowing of "it never edits the plan", and #552 is why.**
+That was the rule, and it was measured: ranks 1, 2 and 3 of this repo's plan were closed
+work, flagged `done_candidate` and re-confirmed every fifteen minutes for days, while on
+lexray **thirteen finished items sat on top of a thirty-one-item human-ordered plan** with
+every one of their claims already expired. Picking work up writes a plan item (#427) and
+nothing writes it back, and the two halves decay differently: a claim expires on its TTL and
+needs nobody, an item has no TTL at all. So the residue is permanent, and it lands at the
+*top*, because picked-up items rank first. The detector had been right and unheard the whole
+time; what was missing was an actor. `dropped` stays a decision the plan's model keeps apart
+from `done`, and nothing here infers one.
 
 #### `--apply` — the one transition it may make (#552)
 

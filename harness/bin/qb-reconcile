@@ -144,34 +144,6 @@ CONDITIONS = (
     "untracked_pr",
 )
 
-#: The conditions that say the item's OWN WORK HAS ENDED, and the reason
-#: :func:`report_findings` has to rank rather than emit in list order.
-#:
-#: `POST /plan/reconcile` stores one row per `(repo, ref_kind, ref_value)` —
-#: `uq_plan_reconcile_ref` — and keys the request's findings into a dict under a
-#: comment reading "LAST ONE WINS". So when one pass reports two conditions about
-#: one ref, the board keeps whichever this file happened to append last, and the
-#: plan row that `plan_read`'s caveat is built on is decided by the order of the
-#: checks in :func:`reconcile` rather than by anything anybody chose.
-#:
-#: Measured on this branch, both pairings real: a merged PR whose note asserts
-#: readiness emits `done_candidate` then `note_contradicted`, and the board keeps
-#: the second — that one predates this change. A claim over finished work now
-#: emits `done_candidate` then `stale_claim`, on exactly the rows #681 is about,
-#: and the board kept the second. `_reconciled_caveat` then stops saying the item
-#: is already finished and falls back to offering it as next, which is #463's
-#: worked example arriving through the fix for #681. `first_seen` restarts on a
-#: condition change too, so the "for 2 days" the caveat's docstring calls the
-#: sentence that turns a report into an argument would reset and then oscillate.
-#:
-#: These two win because the plan row exists to answer ONE question — is this
-#: still work to do — and they are the two conditions that answer it. A stale
-#: claim, a contradicted note and an untracked PR are all things that are true
-#: AROUND an item that is still open. Within a tier the pass's own order stands,
-#: first seen winning, so the write is a function of the report rather than of
-#: which check runs last.
-WORK_ENDED = ("done_candidate", "dropped_candidate")
-
 #: Conditions only an :class:`Unknown` carries — a check that is not any single
 #: finding condition's. `ref_unresolved` is the ref lookup that answers conditions
 #: 1 AND 2 at once; `plan_incomplete` is about the report, not about an item.
@@ -311,6 +283,13 @@ class Finding:
     item_id: str | None = None
     rank: int | None = None
     evidence: dict = field(default_factory=dict)
+    #: Set when this finding was DERIVED from another finding on the same ref
+    #: rather than observed on its own — the value is what that other finding
+    #: read. Only the promoted `stale_claim` carries it (#681): the claim is
+    #: settled by its item's own `done_candidate`, so the two are one fact said
+    #: twice, on one ref, and :func:`report_findings` gives the plan row to the
+    #: observation rather than to the sentence drawn from it.
+    derived_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -549,27 +528,22 @@ _LEASE_ASYMMETRY = ("a lease is renewed per prompt and runs 30 minutes against a
                     "own TTL")
 
 
-#: A claim's note when `create-worktree` took it: ``worktree <create-name> on
-#: <host>``. The create-name is what `remove-worktree` takes as its argument and
-#: what the claim was derived from, so quoting it turns a report into the command
-#: that acts on it. Anchored, because the note is free text and a claim whose note
-#: merely MENTIONS a worktree is not one a checkout took.
-_WORKTREE_NOTE = re.compile(r"^worktree\s+(\S+)\s+on\s+\S+\s*$")
-
-
 def worktree_of(claim: dict) -> str | None:
-    """The create-name of the worktree this claim was taken for, or None.
+    """The branch of the worktree this claim was taken for, as the BOARD parsed it.
 
-    `qb-claim` is called with `--session ""` by two callers and only one of them
-    has a tree. `create-worktree` writes ``worktree fix/issue-663 on zeus``;
-    `qb-start` writes ``spawned /review-pr 742 by qb-start via …`` for routes
-    where no worktree exists at all (`qb-start`, §8). Telling them apart matters
-    because the remedy differs: `remove-worktree` ends the first and can do
-    nothing about the second, so naming it for both would send a reader at a
-    command that cannot work.
+    Read off `claim.worktree`, never parsed here. The grammar is
+    ``worktree <branch> on <host>`` and `app.api.claims` owns it, in a docstring
+    that refuses exactly this: *"Parsed here, on the board, and not in the harness
+    and the MCP layer and the dashboard: three readers with their own idea of the
+    note's shape is app.claimkey's argument about keys, moved into a text
+    column."* A regex here that agrees with the board's today is one nobody would
+    think to change with it.
+
+    `None` on a board too old to send the key, which is the safe direction: the
+    caller then names the resource rather than the tree, which is a less specific
+    remedy and never a wrong one.
     """
-    match = _WORKTREE_NOTE.match((claim.get("note") or "").strip())
-    return match.group(1) if match else None
+    return ((claim.get("worktree") or {}).get("branch")) or None
 
 
 def is_machine_claim(claim: dict) -> bool:
@@ -629,7 +603,8 @@ def _claim_live(claim: dict, now: datetime) -> bool | None:
 
 
 def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
-                  now: datetime | None = None) -> tuple[str, str]:
+                  now: datetime | None = None,
+                  ref: tuple[str | None, str | None] = (None, None)) -> tuple[str, str]:
     """``(verdict, why)`` for a live claim on an open item — one of :data:`CLAIM_HELD`,
     :data:`CLAIM_STALE`, :data:`CLAIM_UNKNOWN`.
 
@@ -654,6 +629,15 @@ def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
     :data:`_LEASE_ASYMMETRY`. Only one case is a finding, and it is the one passive
     expiry can never reach — the holder is demonstrably live, so its lease is being
     renewed and its absence explains nothing.
+
+    ``ref`` is the item's own ``(kind, value)`` and is used for one thing: naming
+    the resource in the command that would release the claim. `qb-release` with no
+    argument derives the resource from the READER's current branch, so a sentence
+    that printed the bare command would do nothing on a reconcile host sitting on
+    `main` and would release the wrong claim from inside an unrelated worktree.
+    This function does not otherwise know what the item points at, and must not
+    start: the ref's own verdict is conditions 1 and 2, and :func:`reconcile`
+    keeps them apart.
 
     A MACHINE claim (:func:`is_machine_claim`) is answered before either of the
     holder branches, because for it `/active` is not a register that came back
@@ -720,10 +704,19 @@ def claim_verdict(claim: dict, live_sessions: set[str], live_holders: set[str],
         ends_it = ("its own TTL" if live else
                    "its own TTL, which could not be read here — `expires` is "
                    f"{claim.get('expires') or 'none'!r}")
+        # NAMED, both of them. `remove-worktree` takes the create-name; `qb-release`
+        # with no argument reads the resource off the READER's current branch, so
+        # the bare command does nothing on a host sitting on `main` and releases
+        # somebody else's claim from inside an unrelated worktree. A reason that
+        # names a command which cannot work is the failure this branch was rewritten
+        # to stop making about `remove-worktree`, and it applies to both arms.
+        kind, value = ref
+        by_hand = (f"`qb-release {kind} {value}`" if kind and value
+                   else "`qb-release <kind> <n>` (this item names no ref to quote)")
         remedy = (f"`remove-worktree {tree}` hands it back once that tree is gone, "
                   f"and otherwise it stands to {ends_it}"
                   if tree else
-                  f"`qb-release` hands it back, and otherwise it stands to {ends_it}")
+                  f"{by_hand} hands it back, and otherwise it stands to {ends_it}")
         return CLAIM_UNKNOWN, (
             f"the claim names no session and its holder is the bare machine, so "
             f"{took_it}. {register}. {remedy}. Nothing here classifies live work as "
@@ -1094,7 +1087,8 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
         # 3 — the claim against who is actually here.
         claim = item.get("claim")
         if claim:
-            verdict, why = claim_verdict(claim, live_sessions, live_holders, now=at)
+            verdict, why = claim_verdict(claim, live_sessions, live_holders, now=at,
+                                         ref=(kind, value))
             # **The fact that settles it was fetched thirty lines up and nothing
             # read it across (#681).** One `qb-reconcile --json` reported "rank 5
             # issue#663 — open item, but issue#663 is closed as completed" under
@@ -1121,39 +1115,47 @@ def reconcile(items: list[dict], ref_states: dict[tuple[str, str, str], dict | N
             # make on a quiet agent, which asserted the holder was gone on the
             # strength of an absence: nothing here is released, and nothing here
             # says anybody died.
-            if verdict == CLAIM_UNKNOWN and work_over:
+            promoted = verdict == CLAIM_UNKNOWN and bool(work_over)
+            if promoted:
                 verdict = CLAIM_STALE
-                # The unknown's own reason is CARRIED, clipped, rather than
-                # replaced by a summary of it. The first version wrote its own
-                # one-line gloss for the two branches it expected and got the
-                # other one wrong: an unknown from the recycled-name branch fires
-                # BECAUSE the holder is in `/active`, and the gloss said nothing in
-                # `/active` named it. Quoting the branch's own sentence cannot
-                # drift from the branch, which is the same reason `ref_verdict`
-                # returns a readability flag instead of letting a caller sniff its
-                # prose.
+                # WHAT THE CLAIM IS, computed — not a gloss, and not a quotation
+                # either. Both of those have now been wrong here. A hand-written
+                # summary of the branch drifted from it (the recycled-name unknown
+                # fires BECAUSE the holder is in `/active`, and the gloss under it
+                # said nothing in `/active` had named the claim). Quoting the
+                # branch's own words instead put a 200-character cut through
+                # `_LEASE_ASYMMETRY`, and what survived was that branch's argument
+                # for why the claim may be perfectly fine — "still inside its own
+                # TTL" — truncated immediately before the clause resolving it, under
+                # a summary saying the claim is stale.
                 #
-                # And the assertion is `ref_verdict`'s own, not a stronger one:
-                # "the item has outlived its work" is what a closed issue says even
-                # when GitHub states no reason for the close, which is a
-                # `done_candidate` too. "The work is finished" would be a claim
-                # about the code that `--apply` itself declines to make for an
-                # issue ref (see :data:`ISSUE_LIMB`).
-                #
-                # The branch's FIRST sentence, not a character clip of the whole
-                # reason: each of these opens by saying what kind of claim it is
-                # looking at and closes with prose about what would have settled
-                # it, and a mid-word cut through the second half reads as a
-                # truncated argument rather than as a quotation.
+                # These are facts this function holds, rendered whole. Nothing here
+                # can drift from a branch it is not derived from, and nothing here
+                # can be cut into a sentence that says the opposite of what it meant.
+                shape = ("machine-held with no session"
+                         + (f", for the tree {tree!r}" if (tree := worktree_of(claim))
+                            else "")
+                         if is_machine_claim(claim) else
+                         f"held by {claim.get('holder') or 'nobody named'}"
+                         + (f", session {clip(claim.get('session'), 8)}"
+                            if claim.get("session") else ", naming no session"))
+                # `ref_verdict`'s own assertion and no stronger one. A closed issue
+                # says the ITEM has outlived its work even when GitHub states no
+                # reason for the close, and that IS a `done_candidate`; that the code
+                # landed is what `--apply` declines to infer from an issue ref at all
+                # (see :data:`ISSUE_LIMB`).
                 why = (f"{kind}#{value} is {work_over}, so the item has outlived its "
                        f"work and the claim outlived it with the item — whoever holds "
-                       f"it, and whether or not they are still here. Liveness was never "
-                       f"going to settle it: {clip(why.split('. ')[0], 200)}")
+                       f"it, and whether or not they are still here. The claim is "
+                       f"{shape}; liveness was never going to settle it")
             if verdict == CLAIM_STALE:
                 report.findings.append(Finding(
                     condition="stale_claim", subject=label, repo=repo,
                     ref=f"{kind}#{value}" if kind and value else None,
                     item_id=item.get("item_id"), rank=item.get("rank"),
+                    # Set only for the promotion: a claim that was stale on its own
+                    # evidence is an observation like any other and keeps its row.
+                    derived_from=work_over if promoted else None,
                     summary=f"claimed, but the claim is stale: {why} — {title}",
                     evidence={"holder": claim.get("holder"),
                               "session": claim.get("session"),
@@ -1854,11 +1856,12 @@ def report_findings(report: Report) -> None:
     absent ref was absent from, and the answer would be "both" — silently
     resolving the other repo's findings.
 
-    **One row per ref, and the pass picks which.** The board stores one row per
-    `(repo, ref_kind, ref_value)` and keys a request's findings under "last one
-    wins", so a pass reporting two conditions about one ref has already decided
-    which survives — by the order its checks happen to run in. It is decided here
-    instead, and :data:`WORK_ENDED` says on what.
+    **A finding this pass DERIVED takes no row.** The board stores one row per
+    `(repo, ref_kind, ref_value)`, so two findings about one ref contend for it —
+    and a `stale_claim` promoted by its item's own `done_candidate` is on that
+    ref by construction. It says nothing the `done_candidate` does not, and taking
+    the row would cost `plan_read` the sentence that reads it. See the comment
+    below for why this is not a general precedence.
 
     Best-effort, like the post beside it: a pass whose report reached the log has
     done its job, and telemetry that can fail the thing it reports on is worse
@@ -1873,29 +1876,40 @@ def report_findings(report: Report) -> None:
     # item is never, because `run` reads open rows only. A write that FAILED keeps its
     # finding: there the item is still open and the disagreement still stands.
     applied = {row["item_id"] for row in report.applied if row.get("item_id")}
-    # ONE ROW PER REF, chosen here rather than left to the board's "last one wins".
-    # See :data:`WORK_ENDED` for what is ranked and why. Sending both and letting
-    # the far side pick would make the stored condition a function of the order of
-    # the checks in `reconcile`, which is not a decision anybody made.
-    chosen: dict[tuple[str, str, str], dict] = {}
     for finding in report.findings:
         kind, _, value = (finding.ref or "").partition("#")
         if kind not in ("pr", "issue") or not value or not finding.repo:
             continue
         if finding.item_id and finding.item_id in applied:
             continue
-        row = {"ref_kind": kind, "ref_value": value,
-               "condition": finding.condition,
-               # The pass's own sentence, so the plan quotes what was observed
-               # rather than paraphrasing it a second time on the other side.
-               "said": finding.summary}
-        key = (finding.repo, kind, value)
-        held = chosen.get(key)
-        if held is None or (finding.condition in WORK_ENDED
-                            and held["condition"] not in WORK_ENDED):
-            chosen[key] = row
-    for (repo, _kind, _value), row in chosen.items():
-        by_repo.setdefault(repo, []).append(row)
+        # A DERIVED finding takes no plan row (#681). The board stores one row per
+        # `(repo, ref_kind, ref_value)` and keys a request's findings under "last
+        # one wins", so two findings about one ref are a fight this pass decides by
+        # the order its checks happen to run in — and the promoted `stale_claim` is
+        # on the same ref as the `done_candidate` it was settled BY, always, by
+        # construction. Sent, it would take that row and `_reconciled_caveat` would
+        # stop saying the item is already finished; and it would say nothing the
+        # row it displaced does not already say, since the two are one fact.
+        #
+        # NARROW ON PURPOSE. Every other pairing on one ref — `done_candidate` with
+        # `note_contradicted`, `untracked_pr` with `note_contradicted` — is decided
+        # by list order here and always has been, on `main` too. That is a real
+        # problem and it is NOT this one: a general precedence makes the stored
+        # condition a function of which checks could RUN, so a pass that could not
+        # reach GitHub stores a different condition than the pass before it and
+        # `first_seen` restarts on the flip — measured, and the opposite of what
+        # such a rule would be written for (#768). Skipping only what this pass derived
+        # leaves every other ref byte-identical to what it sent before #681, which
+        # is the most a fix for #681 should be doing to this write.
+        if finding.derived_from:
+            continue
+        by_repo.setdefault(finding.repo, []).append({
+            "ref_kind": kind, "ref_value": value,
+            "condition": finding.condition,
+            # The pass's own sentence, so the plan quotes what was observed rather
+            # than paraphrasing it a second time on the other side.
+            "said": finding.summary,
+        })
     if not by_repo:
         return
     try:
