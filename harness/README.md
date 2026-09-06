@@ -1046,10 +1046,19 @@ precedent — and it follows it only across `&&`, `;` and a newline, since `|`, 
 leave the shell where it was.
 
 **A `cd` it cannot read asserts nothing at all**, which is the load-bearing half rather than a
-detail of it. `cd "$d"`, `cd -`, a bare `cd`, a glob: the command is somewhere only the shell
-knows, so the guard says nothing about any tree instead of reporting this one's dirty files as if
-they were the ones at risk. Inventing evidence is how a gate teaches people to type its hatch by
-reflex, and that costs more than the refusal it buys.
+detail of it. `cd "$d"`, `cd -`, a bare `cd`, a glob, a `cd` on either side of a `||` (which says
+only that one of two things happened), a `cd` opening a `( … )` or `{ … }` group: the command is
+somewhere only the shell knows, so the guard says nothing about any tree instead of reporting this
+one's dirty files as if they were the ones at risk. Inventing evidence is how a gate teaches people
+to type its hatch by reflex, and that costs more than the refusal it buys.
+
+**That silence reaches the shared-stash gate too, and it is a real loss.** `cd "$D" && git stash
+pop` was refused before and is allowed now: `takes` is on the same per-harm walk, and a command
+whose directory cannot be read is a command whose repository cannot be read either. The reasoning
+is the same one — refusing because THIS repo has a shared stack is evidence about a repo the
+command may never open — and it is still a case that used to be caught and now is not. Following a
+`cd` into a sibling worktree still finds that worktree's shared stack, which is the half that
+gains; both are pinned by tests.
 
 **And it is the worktree ROOT, not the directory.** #185 says so in as many words: *"an agent
 sitting in `65lowther/viz` is in the same tree with a different cwd"*. Both sides are asked —
@@ -1099,8 +1108,12 @@ verb.
 **What it still cannot do, stated plainly.** Tokenising closed most of what a regex could not
 reach — nested shells, quoting, clause scoping, `echo`ing the words — but not the parts that need
 a shell to actually run: `${GIT:-git} reset --hard`, `env git`, `sudo git`, a `$VAR` target, an
-alias, a shell function, a command assembled by `xargs`, a `cd` inside `( … )` or `{ … }`, a `cd`
-before a `;` to a directory that does not exist. All documented, none chased. A `-C` target it
+alias, a shell function, a command assembled by `xargs`, a `cd` before a `;` to a directory that
+does not exist, a `);` that welds into one token and hides the clause behind it. All documented,
+none chased. Two more are *seen and not placed*, which is a different answer: a `cd` inside a
+`( … )` or `{ … }` group, and the clause immediately after a `||` (which runs only where the `cd`
+failed, so it is in fact knowable — a third state for a form nobody writes). Both come back
+unknown, so the guard stays quiet rather than naming a tree it worked out wrongly. A `-C` target it
 cannot resolve (`git -C "$SOME_DIR" …`) is treated as *unknown* and falls back to the cwd, which
 is the conservative half of being wrong rather than a fix; an unreadable `cd` is unknown in a
 stronger sense and refuses nothing, because there the cwd is not a fallback but a guess (#741). It

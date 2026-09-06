@@ -622,17 +622,61 @@ def test_an_absolute_target_survives_an_unknown_cwd():
     assert out["target"] is None and out["cwd_unknown"] is True
 
 
-def test_a_cd_does_not_reach_across_a_separator_that_does_not_carry_it():
-    """Each side of a pipeline is its own subshell, and the right-hand side of
-    `||` runs only where the `cd` FAILED — which leaves the shell where it was.
-    Following the `cd` in either case names a directory the command demonstrably
-    did not reach, so all three fall back to the caller's cwd, as they should."""
+def test_a_cd_in_a_subshell_does_not_move_the_clauses_after_it():
+    """Each side of a pipeline is its own subshell, and a subshell takes its cwd
+    with it when it ends — measured, `( cd /tmp ); pwd` prints the old
+    directory. Following the `cd` here would name a directory the command
+    demonstrably did not reach, so both fall back to the caller's cwd."""
     for cmd in ("cd /tmp | git reset --hard",
-                "cd /nope || git reset --hard",
-                "cd /tmp & git reset --hard"):
+                "cd /tmp & git reset --hard",
+                "( cd /tmp ) ; git reset --hard"):
         out = classify(cmd)
         assert out["destructive"] is True, cmd
         assert out["target"] is None and out["cwd_unknown"] is False, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd /peer || exit 1; git clean -fd",
+    "cd /peer || echo failed; git clean -fd",
+    "cd /peer || cd /other && git clean -fd",
+])
+def test_a_cd_joined_by_or_is_ambiguous_not_ignored(cmd):
+    """`||` is the separator that says nothing about where we ended up. Its own
+    clause runs only where the `cd` FAILED, but everything after it runs where
+    the winner left the shell — and measured in bash, `( cd /tmp || echo failed;
+    pwd )` prints `/tmp`, because the `cd` won. `cd X || exit 1` is the ordinary
+    idiom and it lands in X.
+
+    Discarding it was wrong in the fail-open direction, which is the one that
+    matters: `cd <peer tree> || exit 1; git clean -fd` fell back to the payload
+    cwd and swung in the peer's tree unremarked. Unknown is the honest answer,
+    and it is the same one an unreadable `cd` gets."""
+    out = classify(cmd)
+    assert out["destructive"] is True, cmd
+    assert out["cwd_unknown"] is True and out["target"] is None, cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd /tmp && (cd /elsewhere && git clean -fd)",
+    "cd /tmp && { cd /elsewhere; git clean -fd; }",
+])
+def test_a_cd_opening_a_group_is_seen_and_not_placed(cmd):
+    """A `cd` inside `( … )` or `{ … }` stays on the not-chased list, and there
+    is a difference between not chasing it and answering confidently about the
+    wrong tree. Before this the clause inside the group inherited the OUTER
+    `cd` and named /tmp with confidence while the command ran in /elsewhere —
+    the invented evidence this whole change is about. Unknown instead."""
+    out = classify(cmd)
+    assert out["destructive"] is True, cmd
+    assert out["cwd_unknown"] is True and out["target"] is None, cmd
+
+
+def test_a_relative_cd_normalises_the_way_bash_does(tmp_path):
+    """bash's `cd` is logical by default: measured, `cd link/inner && cd ..`
+    lands in `link`, not in the symlink's physical parent. Leaving `a/../b` for
+    the filesystem would follow the link and answer a different question."""
+    assert classify("cd a/b && cd .. && git clean -fd")["target"] == "a"
+    assert classify(f"cd {tmp_path}/x && cd .. && git clean -fd")["target"] == str(tmp_path)
 
 
 def test_a_cd_that_is_only_words_is_not_a_cd():
@@ -664,6 +708,28 @@ def test_a_named_path_after_the_double_dash_is_not_a_whole_tree_sweep(tmp_path):
     assert destructive(f"git -C {tmp_path} checkout HEAD -- app.py")
 
 
+@pytest.mark.parametrize("spec", [
+    "*",                # the shell's glob, quoted — and unquoted, once expanded
+    "'*'",
+    ":/",               # git's pathspec magic: the whole repository
+    ":(glob)**",
+    "sub/*.py",
+    "$FILES",           # an operand only a shell can produce
+])
+def test_a_pathspec_that_is_not_a_filename_is_still_a_whole_tree_sweep(spec, tmp_path):
+    """THE HOLE THE FIRST CUT OF THIS LEFT, and it is not an adversary spelling
+    — `git checkout -- '*'` is what you type when you mean put everything back.
+
+    The path loop answers for `.`, `./…`, `../…` and paths that exist on disk. A
+    pattern is none of those and `Path(tree) / "*"` does not exist, so a sweep
+    read as a named file that happened to be missing, and `git -C <peer tree>
+    checkout -- '*'` went from refused to allowed. Measured on git 2.54.0: each
+    of `--  '*'`, `-- ':/'` and `-- ':(glob)**'` restored EVERY modified file in
+    the tree."""
+    (tmp_path / "app.py").write_text("x\n")
+    assert destructive(f"git -C {tmp_path} checkout -- {spec}"), spec
+
+
 def test_the_double_dash_keeps_its_verdict_where_the_paths_cannot_be_weighed():
     """Two cases the path loop cannot answer, and neither may go quiet.
 
@@ -676,15 +742,22 @@ def test_the_double_dash_keeps_its_verdict_where_the_paths_cannot_be_weighed():
 
 
 def test_what_reading_the_paths_costs(tmp_path):
-    """The gap the `--` change opens, pinned rather than left to be found.
+    """The gap the `--` change opens, pinned rather than left to be found, and
+    stated as a LOSS because that is what it is.
 
-    A named path that is not on disk reads as harmless here, and one of those is
-    a tracked file a peer deleted without committing: measured on git 2.54.0,
-    `git checkout -- gone.txt` puts it straight back, which is the same undelete
-    `checkout-index -a` is guarded for. `Path.exists()` cannot tell that from a
-    typo, and asking git would put a subprocess on the hot path — so the two
-    spellings now agree instead of `--` being special, which is the trade this
-    made. The loop has always had this gap for the spelling below."""
+    A literal named path that is not on disk reads as harmless here, and one of
+    those is a tracked file a peer deleted without committing: measured on git
+    2.54.0, `git checkout -- gone.txt` puts it straight back, which is the
+    undelete `checkout-index -a` is guarded for. The old short-circuit refused
+    that; this allows it, so coverage went DOWN for this one form. It is not
+    "the same gap the bare spelling has" in any sense that excuses it — the bare
+    spelling was already allowed, so the two agree by `--` losing cover.
+
+    The trade taken: one refusal on a command git rejects outright against one
+    miss on a peer's uncommitted deletion of a file the caller names by hand.
+    `Path.exists()` cannot tell those apart and asking git would put a
+    subprocess on the hot path; the honest close is the dirty-set intersection
+    #741 asks for in the hook, which is not this change."""
     (tmp_path / "here.py").write_text("x\n")
     assert not destructive(f"git -C {tmp_path} checkout -- deleted-by-a-peer.py")
     assert not destructive(f"git -C {tmp_path} checkout deleted-by-a-peer.py")

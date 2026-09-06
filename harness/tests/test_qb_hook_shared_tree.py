@@ -795,6 +795,67 @@ def test_a_cd_we_cannot_read_refuses_nothing(shared):
     assert shared.decision(shared.bash('cd "$WT" && git reset --hard')) is None
 
 
+@pytest.mark.parametrize("spec", ["'*'", ":/", "':(glob)**'"])
+def test_a_whole_tree_restore_spelled_as_a_pathspec_is_still_refused(guard, spec):
+    """Reading the paths after `--` must not turn a sweep into a named file.
+    `Path(tree) / "*"` does not exist, so a first cut of that read `git checkout
+    -- '*'` as a file that was missing and allowed it — in a peer's tree, named
+    by `-C`, which is #185's own listed mechanism. Measured on git 2.54.0: each
+    of these restores EVERY modified file in the tree."""
+    peer_tree = guard.other_checkout("peer")
+    (peer_tree / "wip.py").write_text("a peer's in-flight edit\n")
+    guard.peers(PEER, in_tree=peer_tree)
+    d = guard.decision(guard.bash(f"git -C {peer_tree} checkout -- {spec}"))
+    assert d is not None and d["permissionDecision"] == "deny", spec
+
+
+def test_a_relative_cd_is_judged_against_the_callers_cwd_by_the_path_check_too(guard):
+    """Two questions, one answer required. The tree walk resolves `../peer`
+    against the payload cwd; the path check inside the classifier used to resolve
+    it against whatever directory that process happened to be in, so the same
+    command was refused when it named no path and allowed when it named one."""
+    peer_tree = guard.other_checkout("peer")
+    (peer_tree / "app.py").write_text("a peer's in-flight edit\n")
+    guard.peers(PEER, in_tree=peer_tree)
+    d = guard.decision(guard.bash("cd ../peer && git checkout -- app.py"))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_a_cd_joined_by_or_does_not_convict_the_tree_we_are_standing_in(shared):
+    """`||` says nothing about where we ended up, and measured in bash the `cd`
+    usually WON — `( cd /tmp || echo failed; pwd )` prints /tmp. Convicting this
+    tree on that is the same invented evidence as convicting it on an unreadable
+    `cd`; the honest answer is silence."""
+    private = shared.other_checkout("private")
+    assert shared.decision(shared.bash(f"cd {private} || exit 1; git reset --hard")) is None
+
+
+def test_a_cd_into_a_sibling_worktree_still_finds_the_shared_stack(guard):
+    """The other half of the stash silencing below: following a `cd` is not a
+    weakening of the stash gate, it is what points it at the right repository."""
+    guard.commit("app.py", "original\n")
+    sibling = guard.linked_worktree()
+    guard.stash_from(sibling, "app.py", "SIBLING WORK\n", "sibling wip")
+    guard.peers(ALONE)
+    d = guard.decision(guard.bash(f"cd {sibling} && git stash pop"))
+    assert d is not None and d["permissionDecision"] == "deny"
+
+
+def test_an_unreadable_cd_silences_the_stash_gate_too_and_that_is_the_trade(shared_stash):
+    """PINNED IN BOTH DIRECTIONS BECAUSE IT IS A LOSS. `cd "$D" && git stash pop`
+    was refused before and is allowed now: the harm walk skips a clause whose cwd
+    could not be read, and `takes` is on that walk with the other two.
+
+    It is the same argument — refusing because THIS repo has a shared stack is
+    evidence about a repository the command may never open — but the header's
+    words for it were about trees, and a stash stack is not a tree. It is
+    written down here so a later change cannot flip it quietly."""
+    assert shared_stash.decision(shared_stash.bash('cd "$D" && git stash pop')) is None
+    # …and with the cwd readable, nothing changed.
+    assert shared_stash.decision(shared_stash.bash("git stash pop"))[
+        "permissionDecision"] == "deny"
+
+
 # ----------------------------------------------------- the tree, not the directory
 
 
