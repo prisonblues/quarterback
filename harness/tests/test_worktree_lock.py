@@ -121,16 +121,21 @@ def run_remove(repo, tmp_path, *args, path_extra=(), tools=TOOLS, script=REMOVE,
                                                  **over), check=False)
 
 
-def lock_path(tmp_path, target, tools=TOOLS, **over):
-    """What `worktree-lock --path` says `target` keys to, in this sandbox."""
-    proc = subprocess.run([str(LOCK), "--path", str(target)], capture_output=True,
-                          text=True, check=False,
+def lock_path(tmp_path, target, repo, tools=TOOLS, **over):
+    """What `worktree-lock --path` says `target` keys to, given that repository.
+
+    `--repo` is not decoration: the lockfile lives in the repository's own common
+    git directory, and `create-worktree` asks this question about a worktree that
+    does not exist yet and so cannot answer it from the target alone.
+    """
+    proc = subprocess.run([str(LOCK), "--repo", str(repo), "--path", str(target)],
+                          capture_output=True, text=True, check=False,
                           env=env_for(tmp_path, tools=tools, **over))
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     return proc.stdout.strip()
 
 
-def hold_the_lock(tmp_path, target, seconds=60, tools=TOOLS, **over):
+def hold_the_lock(tmp_path, target, repo, seconds=60, tools=TOOLS, **over):
     """A live process holding `target`'s lock, through the library the scripts use.
 
     It `exec`s `sleep`, so the process holding the descriptor IS the process this
@@ -145,11 +150,11 @@ def hold_the_lock(tmp_path, target, seconds=60, tools=TOOLS, **over):
     script.write_text(
         f"#!{BASH}\n"
         f'. "{LOCK}"\n'
-        'worktree_lock_acquire "$1" 1 || exit 9\n'
+        'worktree_lock_acquire "$1" 1 "$3" || exit 9\n'
         'echo ready\n'
         'exec sleep "$2"\n')
     script.chmod(0o755)
-    proc = subprocess.Popen([str(script), str(target), str(seconds)],
+    proc = subprocess.Popen([str(script), str(target), str(seconds), str(repo)],
                             stdout=subprocess.PIPE, text=True,
                             env=env_for(tmp_path, tools=tools, **over))
     line = proc.stdout.readline()
@@ -161,7 +166,7 @@ def hold_the_lock(tmp_path, target, seconds=60, tools=TOOLS, **over):
 # The key. Everything else here is worthless if two callers disagree about it.
 
 def test_a_tree_that_does_not_exist_yet_keys_the_same_lock_as_the_tree_that_does(
-        tmp_path):
+        repo, tmp_path):
     """`create-worktree` locks before the directory exists; `remove-worktree` after.
 
     Canonicalising the TARGET would give those two different answers under a
@@ -177,12 +182,14 @@ def test_a_tree_that_does_not_exist_yet_keys_the_same_lock_as_the_tree_that_does
     # the combination the mutant survives if only the target is canonicalised.
     # `create-worktree` is exactly this caller: a path built by string
     # concatenation onto a repo's parent, for a directory that is not there yet.
-    absent = lock_path(tmp_path, real / "proj-fix-issue-43")
-    absent_via_symlink = lock_path(tmp_path, tmp_path / "alias" / "proj-fix-issue-43")
+    absent = lock_path(tmp_path, real / "proj-fix-issue-43", repo)
+    absent_via_symlink = lock_path(tmp_path, tmp_path / "alias" / "proj-fix-issue-43",
+                                   repo)
     (real / "proj-fix-issue-43").mkdir()
-    present = lock_path(tmp_path, real / "proj-fix-issue-43")
-    present_via_symlink = lock_path(tmp_path, tmp_path / "alias" / "proj-fix-issue-43")
-    trailing_slash = lock_path(tmp_path, str(real / "proj-fix-issue-43") + "/")
+    present = lock_path(tmp_path, real / "proj-fix-issue-43", repo)
+    present_via_symlink = lock_path(tmp_path, tmp_path / "alias" / "proj-fix-issue-43",
+                                    repo)
+    trailing_slash = lock_path(tmp_path, str(real / "proj-fix-issue-43") + "/", repo)
 
     assert (absent == absent_via_symlink == present == present_via_symlink
             == trailing_slash), (
@@ -194,17 +201,95 @@ def test_a_tree_that_does_not_exist_yet_keys_the_same_lock_as_the_tree_that_does
         f"  trailing slash     {trailing_slash}")
 
 
-def test_two_different_worktrees_do_not_share_a_lock(tmp_path):
+def test_two_different_worktrees_do_not_share_a_lock(repo, tmp_path):
     """The other direction: a lock that serialised the whole box would be a bug
     that only ever shows up as everything being slow."""
-    assert lock_path(tmp_path, tmp_path / "proj-a") != \
-           lock_path(tmp_path, tmp_path / "proj-b")
+    assert lock_path(tmp_path, tmp_path / "proj-a", repo) != \
+           lock_path(tmp_path, tmp_path / "proj-b", repo)
 
 
-def test_the_lockfile_is_named_after_the_worktree_as_well_as_hashed(tmp_path):
+def test_the_lockfile_is_named_after_the_worktree_as_well_as_hashed(repo, tmp_path):
     """A directory of bare digests is a directory nobody can debug."""
-    assert Path(lock_path(tmp_path, tmp_path / "proj-fix-issue-43")).name.startswith(
-        "proj-fix-issue-43-")
+    name = Path(lock_path(tmp_path, tmp_path / "proj-fix-issue-43", repo)).name
+    assert name.startswith("proj-fix-issue-43-")
+
+
+def test_the_lockfile_lives_in_the_repository_not_in_the_environment(repo, worktree,
+                                                                     tmp_path):
+    """Where it is, said out loud, because WHERE is the whole of the last defect."""
+    assert lock_path(tmp_path, worktree, repo).startswith(
+        str(repo / ".git" / "quarterback" / "worktree"))
+
+
+# --------------------------------------------------------------------------
+# THE ROOT MUST NOT COME FROM THE CALLER. This is the class the first cut of this
+# change shipped: the lock DIRECTORY was chosen from `$XDG_RUNTIME_DIR` when it
+# was set and `$TMPDIR` when it was not, which is a fact about who is calling
+# rather than about the tree. An interactive agent has a runtime directory and a
+# systemd unit does not, so the hourly reaper and the agent it was racing computed
+# the same key, the same digest, and two different files — inert for exactly the
+# pairing #743 is about. Every test passed, because the harness hands both sides
+# of every test one environment.
+#
+# So these run the two sides with DIFFERENT ambient environments on purpose.
+
+def unattended(env):
+    """The environment of a systemd unit: no runtime directory, its own TMPDIR."""
+    env = dict(env)
+    env.pop("XDG_RUNTIME_DIR", None)
+    env["TMPDIR"] = env["HOME"] + "/private-tmp"
+    Path(env["TMPDIR"]).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+def test_an_attended_and_an_unattended_caller_key_the_same_lockfile(
+        repo, worktree, tmp_path):
+    attended = env_for(tmp_path)
+    timer = unattended(attended)
+
+    def ask(env):
+        proc = subprocess.run([str(LOCK), "--repo", str(repo), "--path", str(worktree)],
+                              capture_output=True, text=True, env=env, check=False)
+        assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+        return proc.stdout.strip()
+
+    assert ask(attended) == ask(timer), (
+        "an agent and a timer locked two different files for one worktree")
+
+
+def test_an_unattended_teardown_is_blocked_by_an_attended_holder(
+        repo, worktree, tmp_path):
+    """The behaviour the test above is only a proxy for, driven end to end.
+
+    A holder in an ordinary agent environment; a teardown run the way a systemd
+    unit runs one — no `$XDG_RUNTIME_DIR`, a private `$TMPDIR` — with
+    `--require-lock`, which is what `stack-reaper` passes. It must refuse.
+    """
+    holder = hold_the_lock(tmp_path, worktree, repo)
+    try:
+        proc = subprocess.run(
+            [str(REMOVE), "--require-lock", "--lock-wait", "1", "fix-issue-43"],
+            cwd=repo, capture_output=True, text=True, check=False,
+            env=unattended(env_for(tmp_path, holder_stub(tmp_path, 0))))
+
+        assert proc.returncode != 0, (
+            f"a timer deleted a worktree an agent was holding the lock on:\n"
+            f"{proc.stdout}\n{proc.stderr}")
+        assert worktree.is_dir()
+        assert "already holds" in proc.stderr
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+@pytest.mark.parametrize("spelling", ["{}/", "{}//", "{}/.", "{}/./", "{}/sub/.."])
+def test_dot_segments_and_extra_slashes_key_the_same_lock(repo, worktree, tmp_path,
+                                                          spelling):
+    """`--enter` is a CLI a slash command drives, so its argument is somebody's
+    prose. `${1%/}` took one trailing slash off and nothing else."""
+    (worktree / "sub").mkdir(exist_ok=True)
+    plain = lock_path(tmp_path, worktree, repo)
+    assert lock_path(tmp_path, spelling.format(worktree), repo) == plain
 
 
 # --------------------------------------------------------------------------
@@ -267,7 +352,7 @@ def test_the_lock_is_still_held_deep_into_the_teardown(repo, worktree, tmp_path)
 
 
 def test_a_lock_held_by_a_live_process_blocks_the_teardown(repo, worktree, tmp_path):
-    holder = hold_the_lock(tmp_path, worktree)
+    holder = hold_the_lock(tmp_path, worktree, repo)
     try:
         proc = run_remove(repo, tmp_path, "--lock-wait", "1", "fix-issue-43",
                           path_extra=(holder_stub(tmp_path, 0),))
@@ -283,7 +368,7 @@ def test_a_lock_held_by_a_live_process_blocks_the_teardown(repo, worktree, tmp_p
 
 def test_the_refusal_names_who_is_holding_it(repo, worktree, tmp_path):
     """A refusal you cannot act on is a refusal somebody works around."""
-    holder = hold_the_lock(tmp_path, worktree)
+    holder = hold_the_lock(tmp_path, worktree, repo)
     try:
         proc = run_remove(repo, tmp_path, "--lock-wait", "1", "fix-issue-43",
                           path_extra=(holder_stub(tmp_path, 0),))
@@ -299,7 +384,7 @@ def test_force_does_not_beat_the_lock(repo, worktree, tmp_path):
     It has never meant "run two recursive deletes over one directory at once",
     and there is no reading of the flag under which that is what the user wanted.
     """
-    holder = hold_the_lock(tmp_path, worktree)
+    holder = hold_the_lock(tmp_path, worktree, repo)
     try:
         proc = run_remove(repo, tmp_path, "--force", "--lock-wait", "1",
                           "fix-issue-43")
@@ -317,7 +402,7 @@ def test_a_lock_whose_holder_was_killed_does_not_block(repo, worktree, tmp_path)
     """`flock` lives on an open descriptor, so the kernel frees it when the holder
     dies. No TTL, no reaper, no window in which a dead session still owns a tree —
     which is what a TTL would have left, for the length of its term."""
-    holder = hold_the_lock(tmp_path, worktree)
+    holder = hold_the_lock(tmp_path, worktree, repo)
     os.kill(holder.pid, signal.SIGKILL)
     holder.wait(timeout=10)
 
@@ -333,7 +418,7 @@ def test_a_lockfile_left_behind_by_a_finished_run_does_not_block(
     """Lockfiles are never unlinked — unlinking one while holding a flock on it is
     how two processes come to hold the same lock. So the file from yesterday's
     teardown is still there, and it must mean nothing."""
-    stale = Path(lock_path(tmp_path, worktree))
+    stale = Path(lock_path(tmp_path, worktree, repo))
     stale.parent.mkdir(parents=True, exist_ok=True)
     stale.write_text("pid 999999 · remove-worktree · zeus · since 1999-01-01 00:00:00\n")
 
@@ -439,10 +524,11 @@ def test_entering_a_worktree_records_the_session_where_worktree_holder_reads_it(
     assert marker_of(tmp_path).read_text() == str(worktree)
 
 
-def test_entering_waits_for_a_teardown_rather_than_racing_it(worktree, tmp_path):
+def test_entering_waits_for_a_teardown_rather_than_racing_it(repo, worktree,
+                                                            tmp_path):
     """The ordering that used to be possible and now is not: the marker landing
     while a teardown is between its check and its delete."""
-    holder = hold_the_lock(tmp_path, worktree)
+    holder = hold_the_lock(tmp_path, worktree, repo)
     try:
         proc = run_enter(tmp_path, worktree, "--wait", "1")
         assert proc.returncode == 5, f"{proc.stdout}\n{proc.stderr}"
@@ -599,8 +685,12 @@ def test_neither_script_works_out_the_lockfile_for_itself(script):
     block = marker_region(BIN / script, "lock")
     assert "worktree_lock_acquire" in block, (
         f"{script} does not go through the library at all")
+    # CODE only. These blocks argue in prose about the environment variables the
+    # root must NOT be built from, and a scan that reads the argument as the
+    # offence would push the argument out of the file.
+    code = "\n".join(ln for ln in block.splitlines() if not ln.strip().startswith("#"))
     for forbidden in ("XDG_RUNTIME_DIR", "sha256sum", "TMPDIR", "flock -"):
-        assert forbidden not in block, (
+        assert forbidden not in code, (
             f"{script}'s lock block spells `{forbidden}` itself instead of asking "
             f"worktree-lock — that is a second key derivation waiting to diverge")
 
@@ -630,3 +720,236 @@ def test_the_marker_is_written_absolute_even_from_a_relative_argument(
 
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     assert marker_of(tmp_path).read_text() == str(worktree)
+
+
+# --------------------------------------------------------------------------
+# NO GIT CHILD MAY OUTLIVE THE HOLDER STILL HOLDING ITS LOCK.
+#
+# A descriptor survives fork and exec, and git runs auto-maintenance DETACHED. On
+# git 2.54 both of these were traced doing it:
+#
+#   git fetch  -> git maintenance run --auto --quiet    --detach
+#   git merge  -> git maintenance run --auto --no-quiet --detach
+#
+# `--detach` daemonises before deciding whether there is any work, so the child
+# exists on every one of them. The first cut of this change closed the lock's
+# descriptor for `git fetch` alone and asserted in a comment that everything else
+# was synchronous; the `git merge --ff-only` in `create-worktree` says otherwise.
+# The rule is set once, in the environment, and these pin it.
+
+def test_the_lock_turns_off_git_auto_maintenance_for_its_holder():
+    """Set where the lock is taken, so no call site has to remember."""
+    lib = LOCK.read_text()
+    assert "worktree_lock_quiet_git" in lib
+    assert "maintenance.auto" in lib and "gc.auto" in lib
+    acquire = lib.split("worktree_lock_acquire() {", 1)[1].split("\n}", 1)[0]
+    assert "worktree_lock_quiet_git" in acquire, (
+        "the rule is not applied where the lock is taken, so it depends on each "
+        "caller remembering — which is the failure it exists to replace")
+
+
+@pytest.mark.parametrize("script", ["remove-worktree", "create-worktree"])
+def test_neither_script_closes_the_descriptor_by_hand_any_more(script):
+    """An enumeration of "the git commands that can auto-maintain" is a list
+    somebody has to keep correct, and it was already wrong once."""
+    assert "{WORKTREE_LOCK_FD}>&-" not in (BIN / script).read_text(), (
+        f"{script} closes the lock descriptor at a call site — that is the "
+        "per-command enumeration the environment rule replaced")
+
+
+def test_a_git_that_detaches_a_child_does_not_leave_the_lock_held(repo, worktree,
+                                                                  tmp_path):
+    """The behaviour, end to end, with a `git` that detaches the way the real one does.
+
+    A shim rather than real git, because the real detached child usually finds no
+    work and exits in milliseconds — a test built on it would be green whether or
+    not the rule held. The shim spawns a background child on `fetch` and `merge`
+    *unless git config says auto-maintenance is off*, which it asks the real git,
+    so it honours `GIT_CONFIG_*` exactly as git does. That is the one thing being
+    modelled; the leak itself — an inherited descriptor outliving its parent — is
+    the kernel's behaviour and is real here.
+    """
+    real_git = shutil.which("git")
+    shim = tmp_path / "git-shim"
+    shim.mkdir()
+    (shim / "git").write_text(
+        "#!/bin/sh\n"
+        f'REAL="{real_git}"\n'
+        # The SUBCOMMAND, which is the first argument that is not an option and
+        # not an option's value. `case "$1"` was wrong and silently so: the call
+        # under test is `git -C <dir> fetch`, whose $1 is `-C`, and the shim then
+        # modelled nothing at all while the test stayed green.
+        'sub=""\n'
+        'for a in "$@"; do\n'
+        '  case "$a" in\n'
+        '    -C|-c|--git-dir|--work-tree) skip=1 ;;\n'
+        '    -*) ;;\n'
+        '    *) if [ "${skip:-0}" = 1 ]; then skip=0; else sub="$a"; break; fi ;;\n'
+        '  esac\n'
+        'done\n'
+        'case "$sub" in\n'
+        '  fetch|merge)\n'
+        '    if [ "$("$REAL" config --get maintenance.auto 2>/dev/null || echo true)" '
+        '!= "false" ]; then\n'
+        # >/dev/null on the child, or it holds the pipe this test reads and
+        # `subprocess.run` waits for it — which waits out the very leak the
+        # test is arranging and then measures a lock already released.
+        '      sleep 30 >/dev/null 2>&1 &\n'
+        '    fi ;;\n'
+        'esac\n'
+        'exec "$REAL" "$@"\n')
+    (shim / "git").chmod(0o755)
+
+    holder = tmp_path / "fetch-then-go"
+    holder.write_text(
+        f"#!{BASH}\n"
+        f'. "{LOCK}"\n'
+        'worktree_lock_acquire "$1" 1 "$2" || exit 9\n'
+        # Whether these SUCCEED is irrelevant — the fixture repo has no remote,
+        # and the shim spawns its child before it execs the real git, exactly as
+        # the real one does.
+        'git -C "$1" fetch origin >/dev/null 2>&1 || true\n'
+        'git -C "$1" merge --ff-only "@{u}" >/dev/null 2>&1 || true\n'
+        'exit 0\n')
+    holder.chmod(0o755)
+
+    env = env_for(tmp_path, shim)
+    assert subprocess.run([str(holder), str(worktree), str(repo)], env=env,
+                          capture_output=True, text=True).returncode == 0
+
+    lock = lock_path(tmp_path, worktree, repo)
+    free = subprocess.run(["flock", "-n", lock, "true"], capture_output=True)
+    assert free.returncode == 0, (
+        "a git child outlived the holder still holding its lock — the next "
+        "teardown of this worktree would refuse, naming a pid that is gone")
+
+    # AND THE SHIM MODELS SOMETHING. The same sequence, holding the same lockfile
+    # by hand so the library's rule is not applied at all, must leave the lock
+    # STUCK. Without this the assertion above would be green against a shim that
+    # spawned nothing — which is how its first cut passed, matching `$1` against a
+    # `git -C <dir> fetch` whose first argument is `-C`.
+    control = tmp_path / "control"
+    control.write_text(
+        f"#!{BASH}\n"
+        'exec {FD}>>"$2"\n'
+        'flock -x "$FD"\n'
+        'git -C "$1" fetch origin >/dev/null 2>&1 || true\n'
+        'exit 0\n')
+    control.chmod(0o755)
+    subprocess.run([str(control), str(worktree), lock], env=env,
+                   capture_output=True, text=True)
+    stuck = subprocess.run(["flock", "-n", lock, "true"], capture_output=True)
+    assert stuck.returncode != 0, (
+        "nothing held the lock after a git run with auto-maintenance left on — "
+        "the shim is not modelling a detaching git, so the assertion above is "
+        "empty")
+
+
+# --------------------------------------------------------------------------
+# When the lock IS wedged: say so accurately, and leave a way past it.
+
+def leave_a_child_holding_it(tmp_path, target, repo):
+    """A holder that exits leaving a background child with the descriptor.
+
+    This is what a detached `git maintenance` does, and it is the state in which
+    the lockfile's own record of who holds the lock is wrong.
+    """
+    script = tmp_path / "leak-it"
+    script.write_text(
+        f"#!{BASH}\n"
+        f'. "{LOCK}"\n'
+        'worktree_lock_acquire "$1" 1 "$2" || exit 9\n'
+        # >/dev/null on the child, or it holds the pipe the caller reads and the
+        # caller waits out the very leak it is arranging.
+        'sleep 30 >/dev/null 2>&1 &\n'
+        'echo "$$"\n')
+    script.chmod(0o755)
+    out = subprocess.run([str(script), str(target), str(repo)], capture_output=True,
+                         text=True, env=env_for(tmp_path))
+    assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+    return int(out.stdout.strip())
+
+
+def test_a_refusal_says_when_the_recorded_holder_has_already_exited(
+        repo, worktree, tmp_path):
+    """"pid 4711 is tearing this down right now" about a pid that exited an hour
+    ago sends somebody looking for a process that is not there."""
+    dead = leave_a_child_holding_it(tmp_path, worktree, repo)
+
+    proc = run_remove(repo, tmp_path, "--lock-wait", "1", "fix-issue-43",
+                      path_extra=(holder_stub(tmp_path, 0),))
+
+    assert proc.returncode != 0
+    assert worktree.is_dir()
+    assert "WHICH HAS EXITED" in proc.stderr, (
+        f"the refusal named pid {dead} as the live holder:\n{proc.stderr}")
+    assert "lsof" in proc.stderr or "fuser" in proc.stderr
+
+
+def test_ignore_lock_is_the_way_past_a_lock_nothing_will_release(
+        repo, worktree, tmp_path):
+    """A guard with no escape hatch gets deleted rather than obeyed — the same
+    argument `--no-backup` carries. Waiting does not clear a descriptor a stray
+    child is sitting on, so there has to be something that does."""
+    leave_a_child_holding_it(tmp_path, worktree, repo)
+
+    proc = run_remove(repo, tmp_path, "--ignore-lock", "--lock-wait", "1",
+                      "fix-issue-43", path_extra=(holder_stub(tmp_path, 0),))
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert "Ignoring the worktree lock" in proc.stderr
+
+
+def test_ignore_lock_is_not_implied_by_force(repo, worktree, tmp_path):
+    """--force means "the agent in there has finished". It has never meant "run
+    two teardowns over one directory at once", and a live holder is exactly that."""
+    holder = hold_the_lock(tmp_path, worktree, repo)
+    try:
+        proc = run_remove(repo, tmp_path, "--force", "--lock-wait", "1",
+                          "fix-issue-43")
+        assert proc.returncode != 0
+        assert worktree.is_dir(), f"{proc.stdout}\n{proc.stderr}"
+    finally:
+        holder.kill()
+        holder.wait(timeout=10)
+
+
+def test_a_filesystem_that_cannot_lock_is_not_read_as_a_lock_being_held(
+        repo, worktree, tmp_path):
+    """`flock` spends exit 1 on two answers, and only one of them means "wait".
+
+    A timeout is silent; a filesystem with no locking ("Function not implemented",
+    "No locks available") says so. Reading the second as "somebody holds it" would
+    wedge every worktree on that filesystem permanently, with `--ignore-lock` the
+    only way to touch any of them. It is a "cannot lock here", which the
+    interactive default proceeds through.
+    """
+    broken = tmp_path / "broken-flock"
+    broken.mkdir()
+    (broken / "flock").write_text(
+        '#!/bin/sh\necho "flock: bad: Function not implemented" >&2\nexit 1\n')
+    (broken / "flock").chmod(0o755)
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43",
+                      path_extra=(broken, holder_stub(tmp_path, 0)))
+
+    assert not worktree.exists(), (
+        f"a filesystem that cannot lock read as a lock being held:\n"
+        f"{proc.stdout}\n{proc.stderr}")
+    assert "Function not implemented" in proc.stderr
+
+
+def test_require_lock_still_refuses_a_filesystem_that_cannot_lock(
+        repo, worktree, tmp_path):
+    """It is the same answer as no flock at all, so it gets the same treatment."""
+    broken = tmp_path / "broken-flock"
+    broken.mkdir()
+    (broken / "flock").write_text(
+        '#!/bin/sh\necho "flock: bad: No locks available" >&2\nexit 1\n')
+    (broken / "flock").chmod(0o755)
+
+    proc = run_remove(repo, tmp_path, "--require-lock", "fix-issue-43",
+                      path_extra=(broken, holder_stub(tmp_path, 0)))
+
+    assert proc.returncode != 0
+    assert worktree.is_dir(), f"{proc.stdout}\n{proc.stderr}"

@@ -1,4 +1,4 @@
-{ lib, stdenvNoCC, python3, bash, makeWrapper }:
+{ lib, stdenvNoCC, python3, bash, makeWrapper, util-linux }:
 
 # The harness is plain bash and stdlib Python — no build step, no third-party
 # imports. So this derivation copies rather than compiles, and its only real job
@@ -17,6 +17,11 @@
 # nixpkgs into the wrapper would point the scripts at a different machine's idea
 # of the world than the one they are provisioning. Requirements are documented in
 # harness/README.md and checked at runtime by the scripts themselves.
+#
+# `flock` is the exception, and it is one because it is not that kind of tool:
+# it touches nothing of the host's, it behaves identically wherever it comes
+# from, and the caller that needs it is a systemd unit whose PATH the host does
+# not furnish. See postInstall.
 let
   # The dashboard's interpreter, and the ONLY third-party imports in the harness.
   # Carried by the package rather than hunted for on the host: `qb` is the first
@@ -93,8 +98,25 @@ stdenvNoCC.mkDerivation {
 
   # qb-dash-tui execs qb-dash, so wrapping the one covers both. --set-default,
   # not --set: a developer running against a venv of their own still wins.
+  #
+  # `flock` IS A RUNTIME DEPENDENCY OF THE WORKTREE LOCK (#743) and is not on the
+  # PATH of the caller that needs it most. util-linux is not in stdenv's initial
+  # path, and on NixOS `flock` lives in `/run/current-system/sw/bin`, which a
+  # systemd SYSTEM unit with a stock PATH does not have — so an unattended teardown
+  # would find no flock, and under QB_UNATTENDED=1 refuse every hour, silently
+  # rebuilding the orphan-stack pile the reaper exists to clear. --prefix, so a
+  # host with its own util-linux still wins.
+  #
+  # `worktree-lock` is deliberately NOT wrapped. It is SOURCED by the two scripts
+  # as a sibling of $0, and wrapProgram would replace it with a shell stub that
+  # `exec`s the real file — sourcing that would replace the calling script's own
+  # process. The two entry points carry the PATH instead, and the library reads it
+  # from them.
   postInstall = ''
     wrapProgram $out/bin/qb-dash --set-default QB_DASH_PYTHON ${dashPython}/bin/python
+    for w in create-worktree remove-worktree; do
+      wrapProgram $out/bin/$w --prefix PATH : ${lib.makeBinPath [ util-linux ]}
+    done
   '';
 
   # Rewrites `#!/usr/bin/env bash|python3` to store paths, so an installed

@@ -24,6 +24,10 @@ set +e  # Don't exit on errors — try all cleanup steps
 #   --lock-wait <secs>   How long to wait for the worktree lock before giving up
 #                        (default 10). Only another create-worktree or
 #                        remove-worktree on THIS tree can hold it.
+#   --ignore-lock        Tear down even though the lock is held. The last resort
+#                        for a lock a dead process left behind — the refusal says
+#                        when that is what it is looking at. Look with
+#                        `fuser -v <the lockfile it names>` first (#743)
 
 # ============================================
 # COLORS & HELPERS
@@ -195,9 +199,17 @@ holder_check() {
 #   * AN AGENT CANNOT BE HANDED THE TREE MID-TEARDOWN. `worktree-lock --enter`
 #     takes this same lock to write the session marker that makes an agent visible
 #     to `holder_check` at all, so there are only two orderings: the marker lands
-#     first and the check below sees it and refuses, or this holds the lock and the
-#     handover waits, then finds no tree and says so — a failure the agent can act
-#     on, rather than a directory disappearing mid-session.
+#     first and the check below sees it, or this holds the lock and the handover
+#     waits, then finds no tree and says so — a failure the agent can act on,
+#     rather than a directory disappearing mid-session.
+#     WHAT THE LOCK CANNOT DO IS MAKE THE BOARD ANSWER. In the first ordering the
+#     check still has to be able to READ that marker, and `worktree-holder` needs
+#     the board to say which session is live: with it unreachable the answer is
+#     "could not tell", which the interactive default proceeds on, deliberately.
+#     So this ordering ends in a refusal when the board answers and in a fail-open
+#     teardown when it does not — which is what --require-lock is for, and it is
+#     the reason that flag turns "could not tell" into a refusal rather than
+#     something being wrong with the lock.
 #   * An agent that enters with NO marker — started inside the checkout by hand, so
 #     only its board lease says where it is — is locked out by nothing, because
 #     nothing intercepts a person typing `cd`. That one is narrowed rather than
@@ -219,8 +231,8 @@ holder_check() {
 # criterion exists to prevent.
 #
 # Fail-open on "this host cannot lock", exactly as `holder_check` fails open on
-# "could not tell": no `flock`, no writable runtime directory, no `worktree-lock`
-# installed. --require-lock is what turns that into a refusal — the flag has been
+# "could not tell": no `flock`, no resolvable common git directory, no
+# `worktree-lock` installed. --require-lock is what turns that into a refusal — the flag has been
 # named for a lock since #760 shipped it against the holder check alone.
 LOCK_WHY=""
 acquire_the_lock() {
@@ -243,12 +255,16 @@ acquire_the_lock() {
     # this writes into the lockfile is the whole of what the next caller's refusal
     # has to tell somebody.
     WORKTREE_LOCK_WHAT="remove-worktree $BRANCH_NAME"
-    worktree_lock_acquire "$dir" "$LOCK_WAIT"
+    # $MAIN_REPO, because the lockfile lives in the repository's own common git
+    # directory rather than anywhere the environment can put it — see the header
+    # on worktree_lock_root for the failure that cost.
+    worktree_lock_acquire "$dir" "$LOCK_WAIT" "$MAIN_REPO"
     rc=$?
     case "$rc" in
         0) return 0 ;;
         5) return 1 ;;
-        *) LOCK_WHY="no flock, or no writable runtime directory"; return 2 ;;
+        *) LOCK_WHY="${WORKTREE_LOCK_WHY:-no flock, or no repository to key a lockfile against}"
+           return 2 ;;
     esac
 }
 # <<< lock
@@ -410,6 +426,14 @@ REQUIRE_LOCK=false
 # that somebody who has hit a genuinely stuck lock finds out rather than watching a
 # prompt. Waiting longer is the flag.
 LOCK_WAIT="${QB_WORKTREE_LOCK_WAIT:-10}"
+# The escape hatch, and it exists for the same reason --no-backup does: a guard
+# with no way past it is a guard somebody deletes rather than obeys. The state it
+# is for is a lock held by a process that is not a worktree command — a git
+# `maintenance --detach` that inherited the descriptor, say — which no amount of
+# waiting clears. It is a flag rather than something --force implies, because
+# --force means "the agent in there has finished" and has never meant "run two
+# teardowns over one directory at once".
+IGNORE_LOCK=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -432,6 +456,8 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" ]] && die "--lock-wait requires a number of seconds"
             [[ "$2" =~ ^[0-9]+$ ]] || die "--lock-wait takes whole seconds, not '$2'"
             LOCK_WAIT="$2"; shift 2 ;;
+        --ignore-lock)
+            IGNORE_LOCK=true; shift ;;
         --*)
             die "Unknown option: $1" ;;
         *)
@@ -547,12 +573,17 @@ fi
 # closes the descriptor for that one command.
 acquire_the_lock "$WORKTREE_DIR"
 LOCK_RC=$?
-if [[ $LOCK_RC -eq 1 ]]; then
+if [[ $LOCK_RC -eq 1 && "$IGNORE_LOCK" = true ]]; then
+    echo -e "${YELLOW}Ignoring the worktree lock (--ignore-lock):${NC}" >&2
+    echo -e "${YELLOW}    ${WORKTREE_LOCK_OWNER:-no owner recorded}${NC}" >&2
+elif [[ $LOCK_RC -eq 1 ]]; then
     echo "" >&2
     die "Another worktree command already holds $WORKTREE_DIR:
     ${WORKTREE_LOCK_OWNER:-no owner recorded}
-  Nothing has been deleted. It is being created or torn down right now — wait for
-  it to finish, or pass --lock-wait <secs> to wait longer than $LOCK_WAIT."
+  Nothing has been deleted. Wait for it to finish, or pass --lock-wait <secs> to
+  wait longer than $LOCK_WAIT. If the line above says the recorded holder has
+  exited, the lock is a descriptor some child inherited — find what holds it with
+  \`fuser -v <file>\` or \`lsof <file>\`, and --ignore-lock once you have looked."
 elif [[ $LOCK_RC -eq 2 ]]; then
     if [[ "$REQUIRE_LOCK" = true ]]; then
         echo "" >&2

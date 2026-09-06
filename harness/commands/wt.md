@@ -100,6 +100,9 @@ worktree lock (#743), not the holder check, and `--force` does not lift it. It
 means a `create-worktree` or `remove-worktree` is running against that exact tree
 right now. Wait for it and look again — the message names the process. `--lock-wait
 <secs>` waits longer than the default 10 if you know the other one is nearly done.
+If the message says the recorded holder **has exited**, the lock is a descriptor
+some stray child inherited and no amount of waiting will clear it: look at the
+file it names (`fuser -v <file>` or `lsof <file>`), then `--ignore-lock`.
 
 Pass the **create-name** — the identifier the worktree was *created* with (see
 "Naming model" below). The script resolves the worktree's *current* branch

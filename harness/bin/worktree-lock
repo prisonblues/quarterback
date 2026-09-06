@@ -10,7 +10,7 @@
 # CLI for the one caller that is a slash command rather than a script.
 #
 # Usage:
-#   worktree-lock --path <dir>              print the lockfile <dir> keys to,
+#   worktree-lock [--repo R] --path <dir>   print the lockfile <dir> keys to,
 #                                           without locking anything
 #   worktree-lock [--wait N] --enter <dir>  take the lock, check <dir> is still
 #                                           there, and record this session in it
@@ -19,7 +19,7 @@
 # Exit codes:
 #   0  done
 #   2  usage, or --enter on something that is not a worktree any more
-#   4  cannot lock HERE (no flock, no hasher, no writable runtime dir) — the
+#   4  cannot lock HERE (no flock, no hasher, no repository to key against) — the
 #      same shape of answer as worktree-holder's exit 4, and callers treat it the
 #      same way: advisory-absent, permissive by default, fatal under --require-lock
 #   5  somebody else holds it and --wait ran out
@@ -67,15 +67,29 @@
 # dead holder's lock for the remainder of its term, which is the very state the
 # criterion exists to prevent.
 #
+# THE LOCKFILE LIVES IN THE REPOSITORY, NOT IN THE CALLER'S ENVIRONMENT, and that
+# is the correction that matters most here. The first cut chose the directory from
+# `$XDG_RUNTIME_DIR` when it was set and `$TMPDIR` when it was not — which is a
+# property of WHO IS CALLING, not of the tree being locked. An interactive agent
+# has a runtime directory; a systemd unit does not; `PrivateTmp=yes` gives a unit
+# its own `/tmp` as well. So the hourly reaper and the agent it was racing took
+# the same key, computed the same digest, and locked two different files: the
+# mechanism was inert for exactly the pairing this issue is about, and every test
+# passed because the harness gives both sides one environment. The root is the
+# repository's own common git directory now — one answer per repository, the same
+# from a linked worktree as from the main checkout, and nothing an environment can
+# move. If it cannot be resolved there is NO lock (exit 4), rather than a second
+# place to put one.
+#
 # Lockfiles are never deleted. Unlinking a file while holding a flock on it is
 # the classic way to hand two processes the same lock — the next caller opens the
 # name, gets a fresh inode, and locks something nobody else is looking at. They
-# hold one line describing whoever last took the lock, they live in a runtime
-# directory that is cleared on reboot, and one per worktree is not a quantity
-# worth tidying.
+# hold one line describing whoever last took the lock, and one per worktree ever
+# created is not a quantity worth tidying.
 
 WORKTREE_LOCK_FD=""      # set by worktree_lock_acquire on success
 WORKTREE_LOCK_OWNER=""   # on rc 5: what the current holder wrote about itself
+WORKTREE_LOCK_WHY=""     # on rc 4 from flock itself: what it said it could not do
 
 # The lockfile's key. TWO WORKTREES ARE THE SAME WORKTREE WHEN THEY ARE THE SAME
 # DIRECTORY, however each caller spelled it — and the callers genuinely spell it
@@ -85,9 +99,22 @@ WORKTREE_LOCK_OWNER=""   # on rc 5: what the current holder wrote about itself
 # the basename is appended, rather than canonicalising the target itself, which
 # would silently key a creation and a teardown of one tree to two different locks.
 worktree_lock_key() {
-    local target="${1%/}" parent base real
+    local target="$1" parent base real
+    # EVERY trailing slash, not one. `${1%/}` took a single character off, so
+    # `<tree>//` keyed a different lockfile from `<tree>` — reachable from the
+    # CLI, which is driven by a slash command rather than by this file.
+    while [[ "$target" == */ && "$target" != "/" ]]; do target="${target%/}"; done
     if [[ "$target" != */* ]]; then parent="."; base="$target"
     else parent="${target%/*}"; base="${target##*/}"; [[ -n "$parent" ]] || parent="/"
+    fi
+    # A dot segment at the END cannot be handled by "canonicalise the parent and
+    # keep the basename" — `<tree>/.` would key on the literal name `.` under the
+    # tree. It only means anything for a path that exists, so resolve the whole
+    # thing when it does and give up honestly when it does not.
+    if [[ "$base" = "." || "$base" = ".." ]]; then
+        if real=$(cd -P "$target" 2>/dev/null && pwd -P); then printf '%s' "$real"; return 0; fi
+        printf '%s' "$target"
+        return 0
     fi
     if real=$(cd -P "$parent" 2>/dev/null && pwd -P); then
         [[ "$real" = "/" ]] && real=""
@@ -97,26 +124,28 @@ worktree_lock_key() {
     fi
 }
 
-# Where the lockfiles live. `$XDG_RUNTIME_DIR` first, because it is per-user,
-# 0700 by specification and cleared on logout — the right lifetime for a thing
-# that means "a process is running right now". A systemd timer or a cron job has
-# no runtime dir, and that is the caller this whole issue is about, so there is a
-# fallback under `$TMPDIR` — made 0700 and asserted to be OURS, because a
-# world-writable /tmp is where somebody else's file can be waiting under the name
-# we are about to trust.
-worktree_lock_dir() {
-    local root dir
-    if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "${XDG_RUNTIME_DIR}" && -w "${XDG_RUNTIME_DIR}" ]]; then
-        root="${XDG_RUNTIME_DIR}/quarterback"
-    else
-        root="${TMPDIR:-/tmp}/quarterback-${EUID}"
-    fi
-    dir="$root/worktree"
+# Where the lockfiles live: `<common git dir>/quarterback/worktree`, and nowhere
+# else. See the header for why this must not come from the environment.
+#
+# The COMMON git directory, which is the one thing every worktree of a repository
+# agrees on: from a linked worktree `--git-common-dir` names the main checkout's
+# `.git`, and from the main checkout it names the same directory. So a teardown, a
+# creation and a handover of one tree all land on one file whatever each caller's
+# environment looks like — and a build that cannot resolve it gets no lock rather
+# than a second candidate.
+#
+# `cd` into the answer rather than asking for `--path-format=absolute`, which git
+# only learned in 2.31: `rev-parse --git-common-dir` prints a path relative to the
+# process's own directory, so resolving it there is the portable spelling.
+worktree_lock_root() {
+    local repo="$1" common dir
+    [[ -n "$repo" ]] || return 1
+    command -v git >/dev/null 2>&1 || return 1
+    common=$(cd "$repo" 2>/dev/null && cd "$(git rev-parse --git-common-dir 2>/dev/null)" 2>/dev/null && pwd -P) || return 1
+    [[ -n "$common" && -d "$common" ]] || return 1
+    dir="$common/quarterback/worktree"
     mkdir -p "$dir" 2>/dev/null || return 1
-    chmod 700 "$root" 2>/dev/null || true
-    # -O and not -L together: owned by us, and not a symlink somebody else
-    # planted pointing at a directory that is.
-    [[ -O "$root" && ! -L "$root" && -d "$dir" && -w "$dir" ]] || return 1
+    [[ -d "$dir" && -w "$dir" ]] || return 1
     printf '%s' "$dir"
 }
 
@@ -136,26 +165,58 @@ worktree_lock_digest() {
     printf '%s' "${out:0:16}"
 }
 
+# $1 the worktree, $2 the repository whose common git dir holds the lockfiles.
 worktree_lock_path() {
     local key dir digest base
     key=$(worktree_lock_key "$1")
-    dir=$(worktree_lock_dir) || return 4
+    dir=$(worktree_lock_root "$2") || return 4
     digest=$(worktree_lock_digest "$key") || return 4
     base="${key##*/}"
     base="${base//[^A-Za-z0-9._-]/-}"
     printf '%s/%s-%s.lock' "$dir" "${base:0:48}" "$digest"
 }
 
-# Take it, or say precisely why not. $2 is how long to wait, in seconds.
+# NO GIT CHILD MAY OUTLIVE THE HOLDER STILL HOLDING ITS LOCK.
+#
+# A descriptor is inherited across fork and exec, and git runs auto-maintenance
+# DETACHED — `git maintenance run --auto --detach`, which daemonises before it
+# decides whether it has any work, so the child exists on every `fetch`, `merge`,
+# `pull`, `commit`, `rebase` and `am`. It inherits this lock and keeps it for the
+# length of a repack, long after the script that took it has exited; the next
+# teardown then refuses, naming a pid that is already dead.
+#
+# Turned off through the ENVIRONMENT rather than by closing the descriptor at each
+# call site, because a list of "the git commands that can auto-maintain" is a list
+# somebody has to keep correct — the first cut of this closed the fd for
+# `git fetch` and missed the `git merge --ff-only` eight hundred lines further
+# down `create-worktree`, which was verified to detach exactly the same way on git
+# 2.54. `GIT_CONFIG_*` is inherited by every git the holder runs, including the
+# ones somebody adds next year. (git >= 2.31; an older one ignores these and the
+# leak comes back, which is why the refusal below says whether the recorded holder
+# is still alive.)
+#
+# Appended to whatever the caller already had rather than assigned, because
+# `GIT_CONFIG_COUNT` is a count of ALL of them and overwriting it would silently
+# drop somebody else's.
+worktree_lock_quiet_git() {
+    local n="${GIT_CONFIG_COUNT:-0}"
+    export "GIT_CONFIG_KEY_$n=gc.auto"           "GIT_CONFIG_VALUE_$n=0"
+    n=$((n + 1))
+    export "GIT_CONFIG_KEY_$n=maintenance.auto"  "GIT_CONFIG_VALUE_$n=false"
+    export GIT_CONFIG_COUNT=$((n + 1))
+}
+
+# Take it, or say precisely why not. $2 is how long to wait in seconds, $3 the
+# repository whose common git dir holds the lockfiles.
 #
 # The fd is allocated by bash rather than hardcoded, because the callers are
 # whole scripts that hold this for their lifetime and a number picked here would
 # be a number they cannot use for anything else.
 worktree_lock_acquire() {
-    local dir="$1" wait="${2:-10}" file
+    local dir="$1" wait="${2:-10}" repo="${3:-$1}" file
     WORKTREE_LOCK_FD=""; WORKTREE_LOCK_OWNER=""
     command -v flock >/dev/null 2>&1 || return 4
-    file=$(worktree_lock_path "$dir") || return 4
+    file=$(worktree_lock_path "$dir" "$repo") || return 4
     [[ -n "$file" ]] || return 4
     # `>>`, never `>`: truncating on open would wipe the current holder's own
     # description of itself before we have found out whether we can have the lock
@@ -170,7 +231,17 @@ worktree_lock_acquire() {
         WORKTREE_LOCK_FD=""
         return 4
     fi
-    if flock -w "$wait" -x "$WORKTREE_LOCK_FD" 2>/dev/null; then
+    # STDERR IS THE DISCRIMINATOR, because `flock` spends exit 1 on two different
+    # answers. A timeout — somebody else has it — is silent. A filesystem that
+    # cannot lock at all (an overlay or an NFS mount without lockd: "Function not
+    # implemented", "No locks available") SAYS so, and reading that as "held" would
+    # wedge every worktree on that filesystem permanently. It is a "cannot lock
+    # here" (4), which the interactive default proceeds through and --require-lock
+    # refuses on — the same two answers as no flock at all.
+    local flock_err
+    flock_err=$(flock -w "$wait" -x "$WORKTREE_LOCK_FD" 2>&1)
+    if [[ $? -eq 0 ]]; then
+        worktree_lock_quiet_git
         printf 'pid %s · %s · %s · since %s\n' \
             "$$" "${WORKTREE_LOCK_WHAT:-${0##*/}}" \
             "$(hostname -s 2>/dev/null || echo host)" \
@@ -178,7 +249,24 @@ worktree_lock_acquire() {
             >"$file" 2>/dev/null || true
         return 0
     fi
+    if [[ -n "$flock_err" ]]; then
+        WORKTREE_LOCK_WHY="$flock_err"
+        worktree_lock_release
+        return 4
+    fi
     WORKTREE_LOCK_OWNER=$(head -1 "$file" 2>/dev/null || true)
+    # IS THE RECORDED HOLDER ACTUALLY THE HOLDER? It is the process that last TOOK
+    # the lock, and a `flock` outlives its taker whenever a child inherited the
+    # descriptor and detached. Telling somebody "pid 4711 is tearing this down
+    # right now" when 4711 exited an hour ago sends them looking for a process
+    # that is not there; saying so instead points them at `fuser`, which finds the
+    # one that is.
+    local pid="${WORKTREE_LOCK_OWNER#pid }"
+    pid="${pid%% *}"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+        WORKTREE_LOCK_OWNER="$WORKTREE_LOCK_OWNER — WHICH HAS EXITED, so the lock is"
+        WORKTREE_LOCK_OWNER="$WORKTREE_LOCK_OWNER held by a child it left behind. Look: $file"
+    fi
     worktree_lock_release
     return 5
 }
@@ -198,11 +286,17 @@ worktree_lock_release() {
 # Only when run, never when sourced — the two worktree scripts source this file
 # for the functions above and must not have a main() go off underneath them.
 worktree_lock_main() {
-    local mode="" target="" wait=10 marker_dir marker written
+    local mode="" target="" repo="" wait=10 marker_dir marker written
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --path)   mode="path"; shift ;;
             --enter)  mode="enter"; shift ;;
+            # The repository whose common git dir holds the lockfiles. Needed only
+            # for `--path` on a worktree that does not exist yet — which is the
+            # question `create-worktree` asks, and the one a test asks to prove the
+            # two sides agree. `--enter` always has a real tree to derive it from.
+            --repo)   [[ -n "${2:-}" ]] || { echo "worktree-lock: --repo needs a path" >&2; return 2; }
+                      repo="$2"; shift 2 ;;
             --wait)   [[ -n "${2:-}" ]] || { echo "worktree-lock: --wait needs a number" >&2; return 2; }
                       wait="$2"; shift 2 ;;
             -h|--help) sed -n '/^# worktree-lock —/,/^#   5  somebody/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; return 0 ;;
@@ -216,8 +310,9 @@ worktree_lock_main() {
 
     if [[ "$mode" = "path" ]]; then
         local file
-        file=$(worktree_lock_path "$target") || {
-            echo "worktree-lock: cannot make a lockfile here (no hasher, or no writable runtime dir)" >&2
+        file=$(worktree_lock_path "$target" "${repo:-$target}") || {
+            echo "worktree-lock: cannot make a lockfile for $target — no hasher, or no" >&2
+            echo "  repository to key it against (pass --repo for a worktree that does not exist yet)" >&2
             return 4
         }
         printf '%s\n' "$file"
@@ -240,7 +335,10 @@ worktree_lock_main() {
     }
     local rc=0
     WORKTREE_LOCK_WHAT="worktree-lock --enter"
-    worktree_lock_acquire "$target" "$wait" || rc=$?
+    # The tree itself is the repository here: it exists (or the checks below say
+    # so), and `--git-common-dir` from inside a linked worktree names the main
+    # checkout's `.git`, which is the same answer the two scripts get.
+    worktree_lock_acquire "$target" "$wait" "${repo:-$target}" || rc=$?
     if [[ $rc -eq 5 ]]; then
         echo "worktree-lock: $target is locked by another process — ${WORKTREE_LOCK_OWNER:-no owner recorded}" >&2
         echo "  It is most likely being created or torn down. Wait for it to finish and look again." >&2
@@ -251,7 +349,7 @@ worktree_lock_main() {
     # session no teardown can see at all. Said out loud, because a machine that
     # has silently stopped locking is a machine where #743 is back.
     if [[ $rc -eq 4 ]]; then
-        echo "worktree-lock: proceeding without a lock (no flock, or no writable runtime dir)" >&2
+        echo "worktree-lock: proceeding without a lock (no flock, or no repository to key against)" >&2
     fi
     if [[ ! -d "$target" ]]; then
         echo "worktree-lock: $target is not there any more — it was removed while you waited." >&2
