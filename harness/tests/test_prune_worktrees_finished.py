@@ -441,6 +441,10 @@ def test_the_whole_script_reports_every_registered_tree_with_its_teardown(sandbo
     tmp_path, repo = sandbox
     sib = repo.worktree("done", "feat/done")
     agent = repo.worktree("agent-1", "review/x", sibling=False)
+    # A detached tree has an EMPTY branch field in the walk. Tab is IFS whitespace
+    # and `read` collapses a run of it, so the field vanished and "false" slid in
+    # as the branch — every detached scratch tree read as a branch with no PR.
+    loose = repo.worktree("loose", None, sibling=False)
     set_prs(sandbox, [{"number": 7, "state": "MERGED", "headRefName": "feat/done",
                        "headRefOid": repo.head(sib)}])
     got = subprocess.run(
@@ -449,14 +453,15 @@ def test_the_whole_script_reports_every_registered_tree_with_its_teardown(sandbo
     assert got.returncode == 0, got.stderr + got.stdout
     rows = {}
     for line in got.stdout.splitlines():
-        if "\t" not in line:
-            continue
+        assert "\t" in line, f"porcelain printed something that is not a row: {line!r}"
         bucket, path, branch, cname, reason = line.split("\t")
         rows[path] = (bucket, branch, cname, reason)
     assert str(repo.main) not in rows, "the main checkout is not a candidate"
     assert rows[str(sib)] == ("finished", "feat/done", "done", "PR #7 merged")
     assert rows[str(agent)] == (
         "in-progress", "review/x", "-", "no PR, and the tip is in no remote branch")
+    assert rows[str(loose)] == (
+        "cannot-verify", "(detached)", "-", "detached HEAD — no branch to judge")
 
 
 def test_a_fetch_that_fails_demotes_every_finished_row_to_cannot_verify(sandbox):

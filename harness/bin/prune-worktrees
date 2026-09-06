@@ -244,10 +244,13 @@ fi
 
 PARENT="$(dirname "$MAIN_REPO")"
 
-echo -e "${GREEN}Pruning worktree detritus for project: $PROJECT${NC}"
-echo -e "  Repo:   $MAIN_REPO"
-echo -e "  Mode:   $([[ "$FINISHED" = true ]] && echo "finished (a report)" || { [[ "$ANY_APPLY" = true ]] && echo "APPLY" || echo "dry-run"; })"
-echo ""
+# Porcelain is for a caller that splits rows on tabs; a banner is not a row.
+if [[ "$PORCELAIN" != true ]]; then
+    echo -e "${GREEN}Pruning worktree detritus for project: $PROJECT${NC}"
+    echo -e "  Repo:   $MAIN_REPO"
+    echo -e "  Mode:   $([[ "$FINISHED" = true ]] && echo "finished (a report)" || { [[ "$ANY_APPLY" = true ]] && echo "APPLY" || echo "dry-run"; })"
+    echo ""
+fi
 
 # ============================================
 # LIVE WORKTREES (the source of truth)
@@ -563,7 +566,12 @@ if [[ "$FINISHED" = true ]]; then
     # demoted to cannot-verify below, rather than printed with a footnote.
     FETCH_NOTE=""
     git fetch --quiet --all --prune 2>/dev/null || FETCH_NOTE="remote refs were NOT refreshed (git fetch failed), so nothing can be called finished"
-    while IFS=$'\t' read -r wt_path wt_branch wt_locked; do
+    # Unit Separator between the three fields, not tab. Tab is IFS *whitespace*,
+    # so `read` collapses a run of them — and a detached tree has an EMPTY branch
+    # field, which then vanished and slid "false" into its place: every detached
+    # scratch tree was classified as a branch called "false" with no PR. The same
+    # trap `worktree-holder` records for its own rows.
+    while IFS=$'\x1f' read -r wt_path wt_branch wt_locked; do
         [[ -z "$wt_path" || "$wt_path" = "$MAIN_REPO" ]] && continue
         # What `remove-worktree` needs is the create-name, and only a sibling
         # `<project>-<name>` directory has one. Everything else — agent trees
@@ -586,10 +594,11 @@ if [[ "$FINISHED" = true ]]; then
             *)           UNVERIFIED_ROWS+=("$row") ;;
         esac
     done < <(printf '%s\n' "$WORKTREE_LIST" | awk '
-        /^worktree /{ if (p != "") print p "\t" b "\t" l; p=substr($0,10); b=""; l="false" }
+        BEGIN       { US = sprintf("%c", 31) }
+        /^worktree /{ if (p != "") print p US b US l; p=substr($0,10); b=""; l="false" }
         /^branch /  { b=substr($0,8); sub(/^refs\/heads\//, "", b) }
         /^locked/   { l="true" }
-        END         { if (p != "") print p "\t" b "\t" l }')
+        END         { if (p != "") print p US b US l }')
 
     if [[ "$PORCELAIN" = true ]]; then
         for r in "${FINISHED_ROWS[@]:-}";   do [[ -n "$r" ]] && printf 'finished\t%s\n' "$r"; done
