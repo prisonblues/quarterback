@@ -1030,8 +1030,26 @@ non-git Bash call, against 137ms before the prefilter was moved ahead of the pre
 `git -C ../peer-tree reset --hard` is checked against `../peer-tree`, and an explicit
 `--work-tree=` is followed the same way. The first cut checked the payload cwd unconditionally,
 which is wrong in both directions: it would let a peer's checkout be destroyed from a clean cwd,
-and refuse a private checkout from a shared one. A target it cannot resolve — a quoted path, a
-`$VAR`, a `$(…)` — falls back to the cwd rather than being guessed at.
+and refuse a private checkout from a shared one. A `-C` target it cannot resolve — a `$VAR`, a
+`$(…)` — falls back to the cwd rather than being guessed at: that clause is running in a cwd we
+do know and has merely aimed elsewhere.
+
+**A literal `cd` in an earlier clause names the tree too (#741), and it is the only entry that
+ever came off the not-chased list below.** `cd <path> && git checkout -- <file>` is how nearly
+every multi-repo command in this fleet is written, and naming no tree meant the payload cwd got
+substituted — so on 2026-09-04 a `git checkout -- flake.lock` in nix-fleet was refused over an
+untracked `plan.md` in quarterback, a file in a repository that command never opened. The other
+direction is the same substitution and the worse half: from a private worktree, `cd <shared tree>
+&& git reset --hard` named nothing, was judged against the private tree, and walked through the
+gate it was built for. It reads the literal builtin and nothing else — one construct, not a
+precedent — and it follows it only across `&&`, `;` and a newline, since `|`, `&` and `||` all
+leave the shell where it was.
+
+**A `cd` it cannot read asserts nothing at all**, which is the load-bearing half rather than a
+detail of it. `cd "$d"`, `cd -`, a bare `cd`, a glob: the command is somewhere only the shell
+knows, so the guard says nothing about any tree instead of reporting this one's dirty files as if
+they were the ones at risk. Inventing evidence is how a gate teaches people to type its hatch by
+reflex, and that costs more than the refusal it buys.
 
 **And it is the worktree ROOT, not the directory.** #185 says so in as many words: *"an agent
 sitting in `65lowther/viz` is in the same tree with a different cwd"*. Both sides are asked —
@@ -1057,6 +1075,12 @@ defects either; they are the next premise — that a *static* reading of command
 what a command will do. It cannot, because the shell is Turing-complete, and chasing it produces
 an unbounded list of spellings.
 
+The `cd` was the exception, and #741 is what told the two apart. The others are an adversary
+spelling around a static reader; `cd elsewhere && …` is the fleet's ordinary idiom for multi-repo
+work, which puts it inside the bar this same paragraph sets — the accident that actually
+happens — rather than outside it. That is the test for anything else proposed for removal from
+the list, and nothing else has met it.
+
 Counting #185's own five incidents by mechanism settles what the bar should be instead:
 
 | incident | mechanism | covered by the first cut? |
@@ -1074,10 +1098,13 @@ verb.
 
 **What it still cannot do, stated plainly.** Tokenising closed most of what a regex could not
 reach — nested shells, quoting, clause scoping, `echo`ing the words — but not the parts that need
-a shell to actually run: `${GIT:-git} reset --hard`, `env git`, `sudo git`, a `cd` in an earlier
-clause, an alias, a shell function, a command assembled by `xargs`. All documented, none chased. A target it cannot resolve (`git -C "$SOME_DIR" …`) is treated as *unknown*
-and falls back to the cwd, which is the conservative half of being wrong rather than a fix. It is
-also time-of-check-to-time-of-use: a peer can arrive in the tree between the check and the
+a shell to actually run: `${GIT:-git} reset --hard`, `env git`, `sudo git`, a `$VAR` target, an
+alias, a shell function, a command assembled by `xargs`, a `cd` inside `( … )` or `{ … }`, a `cd`
+before a `;` to a directory that does not exist. All documented, none chased. A `-C` target it
+cannot resolve (`git -C "$SOME_DIR" …`) is treated as *unknown* and falls back to the cwd, which
+is the conservative half of being wrong rather than a fix; an unreadable `cd` is unknown in a
+stronger sense and refuses nothing, because there the cwd is not a fallback but a guess (#741). It
+is also time-of-check-to-time-of-use: a peer can arrive in the tree between the check and the
 command. The threat model is an accident between co-operating agents, not evasion, and the cost
 of a false positive is one refusal with a named escape hatch rather than a lost morning. The
 structural fix is one worktree per agent, which is what the ⚠️ startup note pushes people

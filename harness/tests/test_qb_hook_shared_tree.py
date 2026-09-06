@@ -440,7 +440,12 @@ def test_a_peers_subagent_counts_as_a_peer(shared):
     "git clean -fd",
     "git clean --force",
     "git worktree remove --force ../wt",
-    "cd /tmp && git reset --hard",              # not at the start of the line
+    # Not at the start of the line. This used to be spelled `cd /tmp && …`, which
+    # asserted something else entirely once the guard learned to read a `cd`: it
+    # asserted that a reset in /tmp is refused because the tree we are STANDING in
+    # is shared, which is the false refusal #741 is about. The property it was
+    # here for — a leading clause does not hide the verb — is what it says now.
+    "echo starting && git reset --hard",
     "git switch -f main",                       # the modern spelling of checkout -f
     "git switch --discard-changes main",
 ])
@@ -749,6 +754,45 @@ def test_a_target_we_cannot_resolve_falls_back_to_the_cwd(shared):
     other — which is what the first cut did for every command."""
     d = shared.decision(shared.bash('git -C "$SOME_DIR" reset --hard'))
     assert d is not None and d["permissionDecision"] == "deny"
+
+
+# ------------------------------------------- the tree the command actually runs in
+#
+# #741. The same defect as the block above, wearing the fleet's commonest
+# spelling: `cd <path> && <git>` names no tree, so the guard took the payload cwd
+# and judged the command against a repository it never opened. Observed on
+# 2026-09-04 as a refusal citing an untracked `plan.md` in quarterback over a
+# `git checkout -- flake.lock` in nix-fleet. The other direction is the one that
+# matters, and it is the same substitution: from a private worktree, `cd <shared
+# tree> && <destructive>` walked straight through the gate it was built for.
+
+
+def test_a_command_that_cds_out_of_a_shared_tree_is_not_refused(shared):
+    """The refusal that was reported. The `cd` takes the command somewhere
+    nobody else is; the tree we are standing in is not evidence about it."""
+    private = shared.other_checkout("private")
+    (private / "flake.lock").write_text("mine alone\n")
+    assert shared.decision(shared.bash(f"cd {private} && git checkout -- flake.lock")) is None
+
+
+def test_a_command_that_cds_into_a_peers_tree_is_refused(guard):
+    """The fail-open half, and the reason this was not just a noise complaint:
+    the payload cwd is a private checkout with nobody in it, and the command
+    swings in somebody else's tree."""
+    peer_tree = guard.other_checkout("peer")
+    (peer_tree / "wip.py").write_text("a peer's in-flight edit\n")
+    guard.peers(PEER, in_tree=peer_tree)
+    d = guard.decision(guard.bash(f"cd {peer_tree} && git clean -fd"))
+    assert d is not None and d["permissionDecision"] == "deny"
+    assert str(peer_tree) in d["permissionDecisionReason"]
+
+
+def test_a_cd_we_cannot_read_refuses_nothing(shared):
+    """A `cd` to a `$VAR` lands somewhere only the shell knows, and the guard
+    says nothing rather than reporting this tree's dirty files as if they were
+    the ones at risk. That invented evidence is what the refusal above was made
+    of, and a guard that invents evidence gets its hatch typed by reflex."""
+    assert shared.decision(shared.bash('cd "$WT" && git reset --hard')) is None
 
 
 # ----------------------------------------------------- the tree, not the directory

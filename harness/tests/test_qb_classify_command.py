@@ -535,3 +535,157 @@ def test_the_new_verbs_answer_to_the_tree_hatch_like_the_rest():
     assert classify("QB_ALLOW_SHARED_TREE=1 git checkout-index -a -f")["allowed_by"]
     assert classify("QB_ALLOW_SHARED_TREE=1 git read-tree --reset -u HEAD")["allowed_by"]
     assert not classify("QB_ALLOW_SHARED_STASH=1 git checkout-index -a -f")["allowed_by"]
+
+
+# --------------------------------------------------------- the cwd a clause runs in
+#
+# #741, and this file had NO `cd` coverage at all while the guard was shipping a
+# refusal built on the assumption that there never was one. Observed 2026-09-04:
+# `cd /home/rich/source/nix-fleet && git checkout -- flake.lock` refused, naming
+# a different repository and an untracked `plan.md` in it that the command could
+# not have touched. One cause, two symptoms — the clause named no tree, so the
+# guard read the session cwd — and the second symptom is the dangerous one, since
+# the same substitution waves `cd <shared tree> && …` through from a private
+# worktree.
+
+
+def test_a_cd_moves_the_clauses_after_it(tmp_path):
+    """The observed command. The tree is the one the `cd` names, and the file it
+    names is judged there rather than wherever the session happens to be."""
+    (tmp_path / "flake.lock").write_text("x\n")
+    out = classify(f"cd {tmp_path} && git checkout -- flake.lock")
+    assert out["target"] == str(tmp_path)
+    assert out["destructive"] is True
+    assert out["cwd_unknown"] is False
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd {t} && git reset --hard",
+    "cd {t}; git reset --hard",
+    "cd {t}\ngit reset --hard",
+    "cd -P {t} && git reset --hard",
+    "cd -- {t} && git reset --hard",
+    "cd {t} && bash -c 'git reset --hard'",   # the shell one level down runs there too
+])
+def test_the_tree_is_the_one_the_cd_named(cmd, tmp_path):
+    """The fail-open half, which is the half that matters: from a private
+    worktree, `cd <shared tree> && <destructive>` is the exact command this guard
+    exists to stop, and it named no tree at all before this."""
+    assert classify(cmd.format(t=tmp_path))["target"] == str(tmp_path)
+
+
+def test_a_relative_cd_stays_relative_to_the_caller():
+    """The caller resolves a relative target against the cwd it was given — it is
+    the one that knows what that is. Chained `cd`s compose."""
+    assert classify("cd ../peer && git clean -fd")["target"] == "../peer"
+    assert classify("cd a && cd b && git clean -fd")["target"] == "a/b"
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd $D && git reset --hard",              # a variable
+    'cd "$HOME/src" && git reset --hard',     # still a variable, quoted
+    "cd $(git rev-parse --show-toplevel) && git reset --hard",
+    "cd ~/src && git reset --hard",           # tilde expansion is the shell's
+    "cd */wt && git reset --hard",            # a glob
+    "cd && git reset --hard",                 # $HOME
+    "cd - && git reset --hard",               # $OLDPWD
+    "cd a b && git reset --hard",             # not one path
+])
+def test_a_cd_we_cannot_read_asserts_nothing(cmd):
+    """THE LOAD-BEARING HALF. Nothing here expands anything, so where these land
+    is unknown — and unknown has to mean *say nothing about a tree you did not
+    check*, never *assume the session cwd*. That assumption is what manufactured
+    a refusal about a repository the command never opened, and a guard that
+    invents its evidence is the one people learn to ignore.
+
+    The harm is still reported. It is the TREE that is unknown, not the verb."""
+    out = classify(cmd)
+    assert out["destructive"] is True, cmd
+    assert out["cwd_unknown"] is True, cmd
+    assert out["target"] is None, cmd
+
+
+def test_an_absolute_cd_takes_us_back_out_of_unknown(tmp_path):
+    """Unknown is a state, not a one-way door: the next `cd` to a literal
+    absolute path knows exactly where it is, whatever came before it."""
+    out = classify(f"cd $D && cd {tmp_path} && git reset --hard")
+    assert out["target"] == str(tmp_path)
+    assert out["cwd_unknown"] is False
+
+
+def test_an_absolute_target_survives_an_unknown_cwd():
+    """`-C /peer` names its tree whatever directory git was run from, so the
+    unknown `cd` costs us nothing here. A RELATIVE one does depend on it, and
+    resolving that against a guess is the defect rather than a smaller one."""
+    assert classify('cd "$d" && git -C /peer reset --hard')["target"] == "/peer"
+    out = classify('cd "$d" && git -C peer reset --hard')
+    assert out["target"] is None and out["cwd_unknown"] is True
+
+
+def test_a_cd_does_not_reach_across_a_separator_that_does_not_carry_it():
+    """Each side of a pipeline is its own subshell, and the right-hand side of
+    `||` runs only where the `cd` FAILED — which leaves the shell where it was.
+    Following the `cd` in either case names a directory the command demonstrably
+    did not reach, so all three fall back to the caller's cwd, as they should."""
+    for cmd in ("cd /tmp | git reset --hard",
+                "cd /nope || git reset --hard",
+                "cd /tmp & git reset --hard"):
+        out = classify(cmd)
+        assert out["destructive"] is True, cmd
+        assert out["target"] is None and out["cwd_unknown"] is False, cmd
+
+
+def test_a_cd_that_is_only_words_is_not_a_cd():
+    """The same property the tokeniser gives every other verb here."""
+    assert classify("echo 'cd /tmp' && git reset --hard")["target"] is None
+    assert not destructive("echo cd /tmp && git status")
+
+
+def test_an_explicit_target_is_read_relative_to_the_cd(tmp_path):
+    """`-C` says where git runs, and the shell reads it from the directory the
+    `cd` left us in — so that is where this reads it from too."""
+    assert classify(f"cd {tmp_path} && git -C peer reset --hard")["target"] \
+        == f"{tmp_path}/peer"
+
+
+# -------------------------------------------------- `--` is a disambiguator (#741)
+
+
+def test_a_named_path_after_the_double_dash_is_not_a_whole_tree_sweep(tmp_path):
+    """`--` says "what follows is a path, not a ref". It used to return True on
+    sight, throwing away the path loop directly below it — so `git checkout --
+    flake.lock` and `git checkout -- .` classified identically, and the form
+    carrying `--` is the one whose operands are unambiguous and therefore the
+    easier of the two to reason about."""
+    (tmp_path / "app.py").write_text("x\n")
+    assert destructive(f"git -C {tmp_path} checkout -- app.py")
+    assert not destructive(f"git -C {tmp_path} checkout -- never-existed.py")
+    assert destructive(f"git -C {tmp_path} checkout -- .")
+    assert destructive(f"git -C {tmp_path} checkout HEAD -- app.py")
+
+
+def test_the_double_dash_keeps_its_verdict_where_the_paths_cannot_be_weighed():
+    """Two cases the path loop cannot answer, and neither may go quiet.
+
+    With no operands there is no path to weigh. With no tree there is nowhere to
+    weigh one — and that is the everyday spelling, typed in the tree you are
+    standing in, where this guard's own refusal text names `git checkout --` as
+    one of the things that destroys a peer's work."""
+    assert destructive("git checkout --")
+    assert destructive("git checkout -- flake.lock")
+
+
+def test_what_reading_the_paths_costs(tmp_path):
+    """The gap the `--` change opens, pinned rather than left to be found.
+
+    A named path that is not on disk reads as harmless here, and one of those is
+    a tracked file a peer deleted without committing: measured on git 2.54.0,
+    `git checkout -- gone.txt` puts it straight back, which is the same undelete
+    `checkout-index -a` is guarded for. `Path.exists()` cannot tell that from a
+    typo, and asking git would put a subprocess on the hot path — so the two
+    spellings now agree instead of `--` being special, which is the trade this
+    made. The loop has always had this gap for the spelling below."""
+    (tmp_path / "here.py").write_text("x\n")
+    assert not destructive(f"git -C {tmp_path} checkout -- deleted-by-a-peer.py")
+    assert not destructive(f"git -C {tmp_path} checkout deleted-by-a-peer.py")
+    assert destructive(f"git -C {tmp_path} checkout -- here.py")
