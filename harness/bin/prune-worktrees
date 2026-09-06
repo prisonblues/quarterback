@@ -43,6 +43,15 @@ set -uo pipefail
 #                      that no longer exist (#337).
 #                      Each --remove-* flag is independent of --prune; combine
 #                      any of them to do several at once.
+#   --finished         Report which LIVE worktrees are finished — PR merged,
+#                      closed with its head landed elsewhere, or superseded by
+#                      a merge; nothing unpushed after it; clean; nobody in it
+#                      — versus in-progress versus cannot-verify (#685). Prints
+#                      and exits; never removes anything. Every registered
+#                      worktree is judged, not only <project>-* siblings.
+#   --porcelain        With --finished: one tab-separated row per worktree,
+#                      `bucket path branch create-name reason` (create-name is
+#                      `-` for a tree create-worktree did not make).
 #   --config <path>    Config file (default: .worktree.json in repo root)
 #   --project <name>   Override the detected project name
 #   -h, --help         Show this help
@@ -153,6 +162,8 @@ REMOVE_CONTAINERS=false
 REMOVE_NGINX=false
 CONFIG_FILE=""
 PROJECT_OVERRIDE=""
+FINISHED=false
+PORCELAIN=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -160,6 +171,8 @@ while [[ $# -gt 0 ]]; do
         --remove-dirs)       REMOVE_DIRS=true; shift ;;
         --remove-containers) REMOVE_CONTAINERS=true; shift ;;
         --remove-nginx)      REMOVE_NGINX=true; shift ;;
+        --finished)          FINISHED=true; shift ;;
+        --porcelain)         PORCELAIN=true; shift ;;
         --config)      [[ -z "${2:-}" ]] && die "--config requires a path"; CONFIG_FILE="$2"; shift 2 ;;
         --project)     [[ -z "${2:-}" ]] && die "--project requires a name"; PROJECT_OVERRIDE="$2"; shift 2 ;;
         # To the first blank line, not to a pinned line number: the header
@@ -172,6 +185,11 @@ done
 # Any --remove-* / --prune flag means we're in APPLY territory for that category.
 ANY_APPLY=false
 [[ "$APPLY" = true || "$REMOVE_DIRS" = true || "$REMOVE_CONTAINERS" = true || "$REMOVE_NGINX" = true ]] && ANY_APPLY=true
+# `--finished` is a report about LIVE worktrees and nothing in it removes
+# anything; a destructive flag beside it has no meaning and is refused rather
+# than quietly ignored, so nobody reads "it ran with --remove-dirs" as a sweep.
+[[ "$FINISHED" = true && "$ANY_APPLY" = true ]] && die "--finished is a report; it takes no --prune or --remove-* flag"
+[[ "$PORCELAIN" = true && "$FINISHED" != true ]] && die "--porcelain only applies to --finished"
 
 # ============================================
 # FIND REPO AND LOAD CONFIG
@@ -228,7 +246,7 @@ PARENT="$(dirname "$MAIN_REPO")"
 
 echo -e "${GREEN}Pruning worktree detritus for project: $PROJECT${NC}"
 echo -e "  Repo:   $MAIN_REPO"
-echo -e "  Mode:   $([[ "$ANY_APPLY" = true ]] && echo "APPLY" || echo "dry-run")"
+echo -e "  Mode:   $([[ "$FINISHED" = true ]] && echo "finished (a report)" || { [[ "$ANY_APPLY" = true ]] && echo "APPLY" || echo "dry-run"; })"
 echo ""
 
 # ============================================
@@ -361,6 +379,242 @@ for d in "$PARENT/${PROJECT}-"*; do
     LIVE_DB["${PROJECT}_$(echo "$suffix" | tr '-' '_')"]=1
 done
 shopt -u nullglob
+
+# ============================================
+# 0. FINISHED WORKTREES (--finished: a report, never a sweep)
+# ============================================
+# The prior question every category below skips: of the worktrees that ARE live,
+# which are done? Until #685 the answer existed only as prose in `/tree-shake` —
+# four shell one-liners an agent re-derived each run, and finished only with a
+# human present to answer the question at the end. So it ran rarely, and the one
+# sweep that clears landed work was the one nobody ran: on 2026-09-06 a lexray
+# checkout carried 78 worktrees, a July merge among them.
+#
+# The rule here is the skill's, made deterministic, and it is wider than "PR
+# merged" in three places the skill's rule missed, each measured on that box:
+#
+#   * a PR CLOSED without merging whose head is reachable from some other remote
+#     branch — the work went into a long-lived integration branch (#700's `fca`
+#     case) and GitHub records it as closed because that was not the PR's base;
+#   * a PR CLOSED with a closing comment saying `Superseded by #N`, where #N is
+#     merged — the rebase-and-reopen pattern, which leaves the old branch's
+#     patches uncontained (they were rewritten) and its PR closed;
+#   * a branch with NO PR whose tip is reachable from a remote branch — a scratch
+#     tree that was merged locally and pushed under another name.
+#
+# Of 29 sibling worktrees on that checkout, "PR merged" found one. The three
+# rules above found six more; the rest were open PRs, and open is in-progress.
+#
+# Three buckets, and the third is never folded into the other two (#244, #735):
+#
+#   finished       — safe to tear down: nothing in the tree is anywhere else
+#                    only. Merged, contained, or superseded by a merge; nothing
+#                    committed after the PR that is not pushed; tree clean;
+#                    nobody live in it.
+#   in-progress    — any of that fails, including a worktree-holder exit 3.
+#   cannot-verify  — the SHA is absent, `gh` did not answer, the board could
+#                    not be asked, or there is no branch to judge.
+#
+# It prints and exits. `remove-worktree` stays the only thing that tears a
+# worktree down; the confirmation step in `/tree-shake` stays where it is,
+# because the detector this replaces has been wrong in exactly the way that
+# destroys work (the SIGPIPE 141 note below). A deterministic classifier earns
+# an unattended READ and nothing more.
+#
+# Scope is every registered worktree, not the `<project>-*` siblings the rest of
+# this file is about: Claude Code's own `.claude/worktrees/agent-*` trees and a
+# session's scratch trees under /tmp are registered too, hold branches, and were
+# 39 of those 78. Each row says whether `create-worktree` made it — the ones it
+# did not have no containers, database or port, and `git worktree remove` is
+# the right teardown for them.
+# >>> finished-classify (extracted verbatim by harness/tests/test_prune_worktrees_finished.py)
+FINISHED_ROWS=()
+INPROGRESS_ROWS=()
+UNVERIFIED_ROWS=()
+
+# Who holds $1, if anyone — one name per line on stdout. Return: 0 held,
+# 1 free, 4 could not tell. Separate from `holder_of` above because that one
+# drops the names and caches "gave up" for the sweep; this report wants the
+# name in the row, and "could not tell" as the row's answer rather than as a
+# reason to stop asking.
+finished_holders() {
+    local dir="$1" out rc
+    [[ -n "$HOLDER_BIN" ]] || return 1
+    out=$("$HOLDER_BIN" --json "$dir" 2>/dev/null)
+    rc=$?
+    [[ $rc -eq 4 ]] && return 4
+    [[ $rc -eq 3 ]] || return 1
+    printf '%s' "$out" | jq -r '.holders[]? | .holder // empty' 2>/dev/null
+    return 0
+}
+
+# A remote branch, other than $2's own tracking ref, from which commit $1 is
+# reachable. Empty when there is none. `origin/HEAD -> origin/main` is a pointer
+# line, not a branch, and is dropped.
+finished_contained_in() {
+    local sha="$1" own="$2"
+    git branch -r --contains "$sha" 2>/dev/null \
+        | sed 's/^[* ]*//' | grep -v ' -> ' \
+        | awk -v own="$own" '{ n=$0; sub(/^[^\/]+\//, "", n); if (n != own) { print; exit } }'
+}
+
+# The successor a closed PR's comments name — `Superseded by #N`, `Replaced by
+# #N` — or empty. The last such phrase wins: a thread that changed its mind
+# ends on the answer.
+finished_successor_of() {
+    local n="$1"
+    "$GH_BIN" pr view "$n" --json comments 2>/dev/null \
+        | jq -r '.comments[]?.body // empty' 2>/dev/null \
+        | grep -oiE '(superseded|replaced) by #[0-9]+' | tail -1 | grep -oE '[0-9]+$'
+}
+
+# One live worktree -> "<bucket>\t<reason>". Cheap local checks first, `gh` last.
+classify_worktree() {
+    local dir="$1" branch="$2" locked="$3"
+    local holders rc dirty pr_json n state head after contained succ succ_state
+    if [[ "$locked" = true ]]; then
+        echo $'in-progress\tlocked (git worktree lock)'; return
+    fi
+    if [[ ! -d "$dir" ]]; then
+        echo $'cannot-verify\tdirectory is missing — `git worktree prune` will drop the registration'; return
+    fi
+    holders=$(finished_holders "$dir"); rc=$?
+    if [[ $rc -eq 4 ]]; then
+        echo $'cannot-verify\tworktree-holder could not ask the board'; return
+    elif [[ $rc -eq 0 ]]; then
+        echo "in-progress	held by a live agent: $(printf '%s' "$holders" | paste -sd, -)"; return
+    fi
+    dirty=$(git -C "$dir" status --porcelain 2>/dev/null | wc -l)
+    if [[ "$dirty" -gt 0 ]]; then
+        echo "in-progress	$dirty uncommitted or untracked path$([[ $dirty -eq 1 ]] || echo s)"; return
+    fi
+    if [[ -z "$branch" ]]; then
+        echo $'cannot-verify\tdetached HEAD — no branch to judge'; return
+    fi
+    if [[ -z "$GH_BIN" ]]; then
+        echo $'cannot-verify\t`gh` is not installed, so the PR was never looked up'; return
+    fi
+    # Newest PR for this head first; `gh` lists in that order.
+    if ! pr_json=$("$GH_BIN" pr list --head "$branch" --state all --limit 1 \
+                       --json number,state,headRefOid 2>/dev/null); then
+        echo $'cannot-verify\t`gh pr list` failed (offline, or not authenticated)'; return
+    fi
+    if ! read -r n state head < <(printf '%s' "$pr_json" \
+            | jq -r '.[0] | select(. != null) | "\(.number) \(.state) \(.headRefOid)"' 2>/dev/null) \
+       || [[ -z "$n" ]]; then
+        # No PR at all. The only evidence left is the tip itself: reachable from a
+        # remote branch means it landed under some other name.
+        contained=$(finished_contained_in "$branch" "$branch")
+        if [[ -n "$contained" ]]; then
+            echo "finished	no PR; tip is in $contained"
+        else
+            echo "in-progress	no PR, and the tip is in no remote branch"
+        fi
+        return
+    fi
+    if [[ "$state" = "OPEN" ]]; then
+        echo "in-progress	PR #$n is open"; return
+    fi
+    if ! git cat-file -e "$head" 2>/dev/null; then
+        # With the object absent `git log` fails and a bare `| wc -l` reads 0 —
+        # "nothing to lose" on exactly the branch this cannot vouch for.
+        echo "cannot-verify	PR #$n's head ${head:0:8} is not in this repository (fetch, then re-run)"; return
+    fi
+    # `--not --remotes` makes this about LOSS rather than tidiness: a post-PR
+    # commit already pushed somewhere survives `remove-worktree`, which deletes
+    # only the local branch, and must not block a teardown.
+    after=$(git log --oneline "$head".."$branch" --not --remotes 2>/dev/null | wc -l)
+    if [[ "$after" -gt 0 ]]; then
+        echo "in-progress	$after commit$([[ $after -eq 1 ]] || echo s) after PR #$n not pushed anywhere"; return
+    fi
+    if [[ "$state" = "MERGED" ]]; then
+        echo "finished	PR #$n merged"; return
+    fi
+    # CLOSED without merging. Three answers, in the order they are cheap.
+    contained=$(finished_contained_in "$head" "$branch")
+    if [[ -n "$contained" ]]; then
+        echo "finished	PR #$n closed; its head is in $contained"; return
+    fi
+    succ=$(finished_successor_of "$n")
+    if [[ -n "$succ" ]]; then
+        succ_state=$("$GH_BIN" pr view "$succ" --json state 2>/dev/null | jq -r '.state // empty' 2>/dev/null)
+        if [[ "$succ_state" = "MERGED" ]]; then
+            echo "finished	PR #$n closed, superseded by #$succ (merged)"
+        elif [[ -n "$succ_state" ]]; then
+            echo "in-progress	PR #$n closed, superseded by #$succ ($succ_state)"
+        else
+            echo "cannot-verify	PR #$n closed, superseded by #$succ — could not read #$succ"
+        fi
+        return
+    fi
+    echo "in-progress	PR #$n closed without merging, and its head is in no remote branch — a human decides"
+}
+# <<< finished-classify
+
+if [[ "$FINISHED" = true ]]; then
+    GH_BIN=$(command -v gh 2>/dev/null || true)
+    # Containment is judged against remote-tracking refs, so they should be
+    # current. Best-effort: a fetch that fails is said once, not treated as a
+    # reason to answer nothing.
+    FETCH_NOTE=""
+    git fetch --quiet --all 2>/dev/null || FETCH_NOTE="remote refs were NOT refreshed (git fetch failed) — containment answers may be stale"
+    while IFS=$'\t' read -r wt_path wt_branch wt_locked; do
+        [[ -z "$wt_path" || "$wt_path" = "$MAIN_REPO" ]] && continue
+        # What `remove-worktree` needs is the create-name, and only a sibling
+        # `<project>-<name>` directory has one. Everything else — agent trees
+        # under .claude/worktrees, scratch trees under /tmp — has no containers,
+        # database or port to reverse, and `git worktree remove` is the teardown.
+        cname="-"
+        if [[ "$(dirname "$wt_path")" = "$PARENT" && "$(basename "$wt_path")" == "${PROJECT}-"* ]]; then
+            cname="${wt_path##*/}"; cname="${cname#${PROJECT}-}"
+        fi
+        verdict=$(classify_worktree "$wt_path" "$wt_branch" "$wt_locked")
+        bucket="${verdict%%$'\t'*}"; reason="${verdict#*$'\t'}"
+        row="$wt_path	${wt_branch:-(detached)}	$cname	$reason"
+        case "$bucket" in
+            finished)    FINISHED_ROWS+=("$row") ;;
+            in-progress) INPROGRESS_ROWS+=("$row") ;;
+            *)           UNVERIFIED_ROWS+=("$row") ;;
+        esac
+    done < <(printf '%s\n' "$WORKTREE_LIST" | awk '
+        /^worktree /{ if (p != "") print p "\t" b "\t" l; p=substr($0,10); b=""; l="false" }
+        /^branch /  { b=substr($0,8); sub(/^refs\/heads\//, "", b) }
+        /^locked/   { l="true" }
+        END         { if (p != "") print p "\t" b "\t" l }')
+
+    if [[ "$PORCELAIN" = true ]]; then
+        for r in "${FINISHED_ROWS[@]:-}";   do [[ -n "$r" ]] && printf 'finished\t%s\n' "$r"; done
+        for r in "${INPROGRESS_ROWS[@]:-}"; do [[ -n "$r" ]] && printf 'in-progress\t%s\n' "$r"; done
+        for r in "${UNVERIFIED_ROWS[@]:-}"; do [[ -n "$r" ]] && printf 'cannot-verify\t%s\n' "$r"; done
+        [[ -n "$FETCH_NOTE" ]] && printf 'note\t%s\n' "$FETCH_NOTE"
+        exit 0
+    fi
+    finished_section() {
+        local colour="$1" title="$2"; shift 2
+        local rows=("$@") r path branch cname reason
+        if [[ ${#rows[@]} -eq 0 || -z "${rows[0]}" ]]; then
+            echo -e "${colour}$title: none${NC}"; return
+        fi
+        echo -e "${colour}$title (${#rows[@]}):${NC}"
+        for r in "${rows[@]}"; do
+            IFS=$'\t' read -r path branch cname reason <<<"$r"
+            printf '    %s  [%s]\n        %s\n' "$path" "$branch" "$reason"
+            if [[ "$cname" != "-" ]]; then
+                printf '        teardown: remove-worktree %s\n' "$cname"
+            else
+                printf '        teardown: git worktree remove %s   (not made by create-worktree: no containers, DB or port)\n' "$path"
+            fi
+        done
+    }
+    echo ""
+    finished_section "$GREEN"  "Finished"      "${FINISHED_ROWS[@]:-}"
+    finished_section "$CYAN"   "In progress"   "${INPROGRESS_ROWS[@]:-}"
+    finished_section "$YELLOW" "Cannot verify" "${UNVERIFIED_ROWS[@]:-}"
+    [[ -n "$FETCH_NOTE" ]] && echo -e "${YELLOW}? $FETCH_NOTE${NC}"
+    echo ""
+    echo -e "${YELLOW}A report, not a sweep — nothing was removed.${NC} Tear finished trees down with the command under each."
+    exit 0
+fi
 
 # ============================================
 # 1. ORPHAN DATABASES

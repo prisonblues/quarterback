@@ -14,45 +14,72 @@ Run from inside the repo whose worktrees you want to clean.
 
 Orphans are what's left when a worktree was removed *badly*. Before sweeping
 orphans, offer to remove **finished** live worktrees the *right* way (which
-cleans their DB, containers, nginx block, port, and dir in one go):
+cleans their DB, containers, nginx block, port, and dir in one go).
 
-- List live worktrees: `git worktree list`.
-- For each linked worktree (not the main checkout), check whether its branch is
-  done — its PR is merged (`gh pr view <branch> --json state,mergedAt` or
-  `gh pr list --head <branch> --state merged`).
-- **Do not judge "done" against the default branch.** `git branch --merged main`
-  is only meaningful where PRs actually target the default branch, and in at
-  least one repo here they do not: lexray merges into `fca` and `test` while
-  `main` sits frozen, so that check calls every branch unmerged.
-- **A merged PR does not mean the branch holds nothing.** Commits added *after*
-  the PR — the post-merge tweak nobody pushed — die with the branch, and
-  `remove-worktree` deletes the branch unless `--keep-branch`. Compare against
-  the PR's own head SHA, which is base-independent:
-  ```bash
-  head=$(gh pr list --head "$br" --state all --json headRefOid -q '.[0].headRefOid')
-  git cat-file -e "$head" || echo "cannot verify — treat as in-progress"
-  git log --oneline "$head".."$br" --not --remotes    # non-empty => do not reap
-  ```
-  `--not --remotes` is what makes this about loss rather than tidiness:
-  `remove-worktree` deletes only the *local* branch, so a post-PR commit already
-  pushed somewhere survives the teardown and must not block it.
-  The `cat-file` guard is load-bearing: with the object absent `git log` fails and
-  a bare `| wc -l` reads 0, i.e. "nothing to lose" on exactly the branch you
-  cannot vouch for. `remove-worktree` refuses these itself, but classify them as
-  in-progress here so the user is not offered them in the first place.
-- **A merged PR does not mean nobody is in there.** Run
-  `worktree-holder <path>` on every candidate before offering it for teardown,
-  and treat exit 3 as in-progress no matter what its PR says — an agent can be
-  addressing review findings on the same branch after the merge. Name the holder
-  when you report it.
-- Show the user the list of worktrees that look **finished** vs **in-progress**.
-  Ask (AskUserQuestion) which to tear down. For each approved one, run
-  `remove-worktree <create-name>` (the dir suffix after `<project>-`). This is
-  the clean path — it handles all trappings and prunes the branch too.
-- Leave in-progress worktrees alone.
+**The classification is the script's, not yours** (#685). Run it and show the
+user the report verbatim:
+```bash
+prune-worktrees --finished
+```
+It fetches, walks **every registered worktree** — the `<project>-*` siblings
+and the trees `create-worktree` never made: Claude Code's own
+`.claude/worktrees/agent-*` subagent trees, a session's scratch trees under
+`/tmp` — and sorts them into three buckets. (About half a second per tree;
+36s for 66 on lexray.)
+
+- **Finished** — safe to tear down. One of: the PR merged; the PR was closed
+  and its head is reachable from some *other* remote branch (work integrated
+  into a long-lived branch — lexray's `fca` — which GitHub records as CLOSED
+  because that was not the PR's base); the PR was closed with a
+  `Superseded by #N` comment and #N merged (the rebase-and-reopen pattern, whose
+  old patches are rewritten and so contained nowhere); or there is no PR and the
+  tip is in a remote branch. In every case: nothing committed after the PR is
+  unpushed, the tree is clean, and nobody live is in it.
+- **In progress** — leave alone. An open PR, a dirty tree, post-PR commits
+  pushed nowhere, a closed PR that landed nowhere anyone can see (*a human
+  decides those* — the report says so), a live holder (named), or a lock.
+- **Cannot verify** — never fold into either bucket. `gh` did not answer, the
+  PR's head SHA is not fetched, the board could not be asked, detached HEAD.
+  Relay these as unresolved and do not offer them for teardown; this is the
+  same rule as step 2's `NOT CHECKED` and `worktree-holder`'s exit 4.
+
+Why the rule is what it is, so you can defend it when the user asks:
+- **Not `git branch --merged main`.** Only meaningful where PRs target the
+  default branch, and in at least one repo here they do not: lexray merges into
+  `fca` and `test` while `main` sits frozen, so that check calls every branch
+  unmerged.
+- **Not "PR merged" alone.** Measured on 2026-09-06: of 29 lexray sibling
+  worktrees, "merged" found one finished; the closed-but-landed rules found six
+  more, and 21 subagent trees had no PR at all but tips sitting on the pushed
+  `fca` feature branch. A rule that stops at "merged" leaves those forever.
+- **Loss, not tidiness.** `remove-worktree` deletes only the *local* branch, so
+  the question is whether any commit's only copy is on it. Containment in a
+  remote ref answers that directly; the post-PR check uses `--not --remotes` for
+  the same reason.
+- **A merged PR does not mean nobody is in there.** The script runs
+  `worktree-holder` on every candidate before anything else; an exit 3 is
+  in-progress whatever the PR says, and the holder is named in the row.
+
+Ask (AskUserQuestion) which of the **finished** ones to tear down. Each row
+says its teardown, and they differ:
+- `remove-worktree <create-name>` for a `<project>-*` sibling — the clean path,
+  which handles all trappings and prunes the branch too.
+- `git worktree remove <path>` then `git branch -D <branch>` for a tree
+  `create-worktree` did not make. It has no containers, database or port to
+  reverse, and `remove-worktree` cannot resolve it. `-D` is safe *because* the
+  report established the tip is on a remote; do not use it on any other row.
 - If `remove-worktree` refuses because another agent holds the worktree, relay
   that verbatim and stop. Do **not** pass `--force` on your own initiative; it
   exists for a user who has seen the holder's name and decided anyway.
+- A directory that survives the teardown usually holds root-owned files from
+  a docker-as-root container; relay the script's elevated-removal suggestion
+  rather than retrying.
+
+You are the check on the script, not its megaphone: if a row it calls finished
+is one you have reason to believe is live — the branch was named in this
+conversation, a peer's board post mentions it — say so and leave it. But do
+not re-derive the classification by hand; two copies of the rule are how they
+came to disagree without anything noticing.
 
 Skip this phase if the user just wants the orphan sweep, or if there are no
 finished worktrees.
