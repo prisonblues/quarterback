@@ -470,6 +470,25 @@ with these overrides:
   findings.** They are already exhaustively reviewed and judged — the sub-agent
   does NOT re-derive them. Paste the full **To fix** list, and the **SonarCloud**
   issues **where that seat ran**, into the brief as the findings to resolve.
+- **Stamp the brief's hypotheses preamble at the head of the pasted list**, verbatim and
+  immediately above the first finding — not elsewhere in the brief. The list is what a
+  fixer reads as the work; a contract several screens further up reads as background. The
+  block says the findings are hypotheses to verify against the current code, that ones no
+  longer valid are skipped with a brief reason, that each is an outcome rather than a
+  patch, and that changes stay minimal and get validated. It matters more here than on a
+  self-derived list, not less: a panel finding arrives seat-verified and judge-confirmed,
+  and that is precisely the provenance that stops a fixer checking — as the bullet below
+  on the consumer line measures.
+- **Hand the findings over as outcomes, not patches.** Paste each finding's synthesis —
+  what must end up true — and not a diff, a rewritten function or a "change X on line N
+  to Y" instruction. A finding delivered as a patch is a fix already chosen, and the
+  fixer's only remaining move is to apply it, which is how a symptom raised at one line
+  becomes an edit across the class and how a fix pass ends up writing the next round's
+  findings. The judge's synthesis is usually already in this form; where a seat wrote a
+  patch into its finding, relay the end condition it was aiming at and leave the shape to
+  the fixer, who is the one reading the surrounding code. This is §4b's `narrowed`
+  argument one step earlier — `narrowed` bounds a fix after the finding has already been
+  written as a patch.
 - **Replacing step 2 does NOT remove step 3's consumer line (#616), and this is the
   path it was written for.** The brief owes one line per finding, before that finding's
   patch, naming who calls the code the fix would change and — where it reaches a response
@@ -490,7 +509,23 @@ with these overrides:
   on is the growth the floor exists to stop, and the floor has already made that
   judgement (#165). The 👥 list under the same words is out for the same reason and a
   different rule — one seat's evidence, and the round has said that is not enough to
-  spend a pass on (#78).
+  spend a pass on (#78). **Generalise both: a finding this round is not asking to be
+  cleared does not go into the brief at all** — not pasted under a caveat, not listed for
+  context, not mentioned in passing. 🔽 and 👥 are the two named cases; anything else the
+  round has excluded is out on the same principle. **An excluded finding is not a finding
+  left unfixed — it is one this round did not ask for**, and pasting it with a note
+  re-opens a judgement that has already been made, in front of the one reader whose whole
+  brief is to clear the list in front of it. §4b records those from the round's payload
+  without the fixer ever seeing them.
+- **A panel-confirmed finding is still subject to the brief's sound + correct + elegant
+  bar.** The brief lets the fixer push back on a finding whose fix would add ceremony
+  without a commensurate correctness benefit, and record it `refuted` with the reason.
+  That right survives confirmation: the judge rules on whether a finding is TRUE, never
+  on whether applying it leaves the code better, and reviewers bias toward recommending
+  additions whether four seats raised something or one. So do not tell the fixer the list
+  is pre-approved, and do not ask for every item back as `fixed`. A push-back is a
+  `refuted` row in §4b like any other, and a round that clears every finding because the
+  brief said they were confirmed is the round that writes the next round's findings.
 - **On a round with no `sonarqube` seat, say nothing about a hard gate at all** — do not
   paste an empty SonarCloud block, and do not tell the fixer the gate is clear. An empty
   list under a heading reads as a gate that looked and found nothing, and the fixer has

@@ -1,0 +1,13 @@
+# The shape a fix pass writes when the review said "implement X" and the budget
+# said no. A declared function with an empty body closes the finding as far as a
+# diff reader is concerned — the symbol the reviewer asked for now exists — and
+# the next round raises the same gap again in different words against the same
+# lines. P2 because the caller gets None (or an exception) at runtime where the
+# review believed behaviour had landed.
+id: slop/placeholder-implementation
+severity: P2
+languages: [python]
+message: Function body is a placeholder, so the behaviour the review asked for is still missing
+remediation: Implement the body, or delete the function until the behaviour is ready. If it is deliberately abstract, decorate it with @abstractmethod or @overload, which this rule already skips.
+match:
+  kind: python_placeholder_body

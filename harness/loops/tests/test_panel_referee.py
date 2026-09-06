@@ -831,13 +831,22 @@ def test_the_measurement_rides_in_the_payload_whether_it_fired_or_not():
     assert off["unrefereed_fix"] == {
         "armed": False, "production": 0, "test": 0, "prose": 0, "churn": 0,
         "unrefereed": 0, "share": None, "min_churn": 4, "over": False,
-        "fired": False}
+        # #779's two. The exact comparison is kept exact on purpose — this test's
+        # claim is about the block's WHOLE shape — and `armed` beside `mode` is the
+        # pair the feature turns on: `armed: False` is a rung that measured and
+        # reached no verdict, while `armed: True, mode: shadow` is one that reached
+        # the verdict and declined to act on it. Two records, not two spellings of
+        # one. `enforce` is what a caller passing no `modes=` gets.
+        "mode": "enforce", "would_fire": False, "fired": False}
     on = panel_rounds.round_stop(2, 5, ["k1", "k2", "k3", "k4"], [], [],
                                  unrefereed=_unrefereed())
     assert on["unrefereed_fix"] == {
         "armed": True, "production": 0, "test": 7, "prose": 3, "churn": 10,
         "unrefereed": 10, "share": 1.0, "min_churn": 4, "over": True,
-        "fired": True}
+        # The verdict WAS reached and the mode applied it, so the two are equal —
+        # which is the property that makes `fired` mean today exactly what it meant
+        # before #779 on every repo that has named no mode.
+        "mode": "enforce", "would_fire": True, "fired": True}
 
 
 def test_the_constructive_pass_follows_this_rung_like_the_others():

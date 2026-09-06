@@ -124,6 +124,31 @@ scope this pass is given, **fix everything you find** — never note a problem a
 move on, never dismiss a finding as "just style" or "minor" or "can do later". The
 standard is not "good enough" — it's "nothing left to improve".
 
+**Every finding you are handed is a HYPOTHESIS about the code, not an instruction to
+edit it.** The block below is that contract. It is fixed text, and it goes at the head
+of a finding list verbatim wherever such a list is handed on: whoever briefed you put it
+above the list you were given, and you put it above each group agent's list when step 3
+fans the work out. A preamble earns its place by being the first thing read and by
+surviving the list being lifted away from the page that explains it — so do not
+paraphrase it, and do not drop it because the agent receiving it "will already know".
+
+> **Findings are hypotheses, not instructions.** Verify each one against the current
+> code before you change anything. Fix only the ones that are still valid; skip the rest
+> with a brief reason. Each finding is an **outcome** — what must end up true — and not a
+> patch: where it names a fix, that fix is one route and not the requirement, and you
+> choose the smallest change that reaches the outcome. Keep changes minimal, and validate
+> what you changed.
+
+**"Outcomes, not patches" is the half of that contract that decides how far a fix
+reaches.** A finding that arrives as a patch is a fix already chosen, and the only move
+left to you is to apply it — which is how a symptom raised at one line becomes a
+class-wide edit, and the class-wide edit is where the next round's findings come from. So
+read every finding for the end state it asserts, and let the shape of the change be
+yours: the finding says what must end up true, you decide which keystrokes get there.
+This is the `narrowed` argument below, one step earlier in the pipeline — `narrowed`
+bounds a fix after the finding has already been written as a patch, and reading the
+finding as an outcome is what stops it being written that way in the first place.
+
 **What that scope IS is a repo setting, not your judgement.** The orchestrator
 tells you which values are in force (`review_panel.*` in `.harness-rules`; a panel
 report prints them on its **Panel dials** line). Five of them define this pass:
@@ -426,6 +451,30 @@ you fixing a finding; it never stops you saying who consumes the code, and a fin
 budget did not reach still gets its line, because the line is what tells a later reader
 whether the finding was worth reaching.
 
+**The bar for ACTING on a finding is sound + correct + elegant — all three.** Having
+named the consumers, ask the question that line was bought for: would applying this
+finding leave the code more sound, more correct AND more elegant? A change that improves
+only one of the three — or that degrades elegance to nominally
+improve correctness — makes the codebase worse, not better. **Two out of three is a
+signal to look harder for a fix that gets all three**, never a licence to ship the two.
+
+**Reviewers are fallible and biased toward recommending additions, and that bias has a
+recognisable texture.** Name it at the moment you are about to write it, because that is
+the only moment it is cheap: a defensive check for a case that cannot happen; an
+abstraction used once; a comment restating the code beside it; a test asserting a
+tautology; a "just-in-case" guard; an error handler for a case the type system already
+rules out. A seat that asks for one of those is not being careless — it is being a
+reviewer, and this is what reviewing biases toward.
+
+**A finding whose fix would add ceremony without a commensurate correctness benefit is
+pushed back on with a reason, not mechanically applied.** That push-back is a
+**refutation** and is recorded as one — it is the false positive named at the top of this
+brief, in its commonest form: the case cannot happen, so the code is already correct in
+the respect the finding names. `refuted` is the outcome, the reason goes in the summary
+table's `Resolution` column, and there is no new word to reach for. It costs one line,
+exactly as the consumer line does, and that is the point: complying with a wrong finding
+must not stay cheaper than disproving it.
+
 **The bar is unchanged: no finding on the list is noted and walked past.** What the
 rest of this section bounds is not how well you fix them — it is **where the work is
 allowed to land**. Thoroughness is spent inside the change under review, not around
@@ -651,10 +700,17 @@ running in parallel instead. Fan out only when all three hold:
 
 A mixed list splits: hand off the mechanical clusters, keep the subtle ones.
 Launch the group agents in a **single message** (max ~4 concurrent). Each brief
-gets: its findings verbatim (file:line + what's wrong), the exact file list it
-owns and an instruction to touch nothing outside it, the project conventions and
-test layout, and — **do not commit, push, or amend; write tests for your own
-fixes; return a summary of what you changed**.
+gets: **the hypotheses preamble above at the head of its finding list**, then its
+findings verbatim (file:line + what's wrong) — and **only the findings that group is
+being asked to clear**, since a finding this round is not asking for does not belong in
+a brief at all — the exact file list it owns and an instruction to touch nothing outside
+it, the project conventions and test layout, and — **do not commit, push, or amend;
+write tests for your own fixes; return a summary of what you changed**.
+
+A group agent reads nothing but the brief you write it, so the preamble is the only
+thing telling it that its findings are hypotheses and that it may skip one with a
+reason. Left out, a group brief is a list of patches to apply, which is the shape that
+turns one line's symptom into an edit across the group's files.
 
 You keep step 4's verification, the full-diff re-read, the commit and the push.
 Never delegate those: parallel fixes meet at seams nobody checked, so the whole
@@ -939,6 +995,17 @@ Read CI config + Makefile to find what the project runs, then:
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** (if used).
 5. **Codegen sync** — if CI has `git diff --exit-code` checks, regenerate.
+
+**Then re-read your whole diff and revert any fix that turned out to be bloat in
+context.** Everything above proves the code runs; none of it can see a fix that works and
+should never have been written, because a green suite says the same thing either way. So
+read the diff back as a reviewer would, against the texture step 3 names — the guard for
+a case that cannot happen, the abstraction with one caller, the comment restating the
+line under it, the test asserting a tautology — and take those lines out again. Judging a
+fix in the finished diff is a different question from judging it against the finding, and
+it is the only place the answer is visible. A fix you revert here is a finding you
+refuted late: record it `refuted` in step 6 with the reason, exactly as if you had never
+written it.
 
 **Red/green every regression test you wrote.** A regression test written alongside
 its fix has never once run against the broken code, so nothing so far has shown it

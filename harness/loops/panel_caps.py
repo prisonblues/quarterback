@@ -184,10 +184,12 @@ magnitude tighter than the ceiling that existed before this, which was none.
 from __future__ import annotations
 
 import json
+import math
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from harness_rules import (
@@ -195,6 +197,11 @@ from harness_rules import (
     DEFAULTS,
     RULES_FILENAME,
     board_config,
+    # #776's curve reader. THE only place the multipliers are indexed, imported rather
+    # than re-derived for the reason every other name on this list is imported: a
+    # second reading of a config key is a second answer, and this one decides how much
+    # a round may spend.
+    round_multiplier,
     ssl_context,
     unattended,
 )
@@ -391,6 +398,39 @@ class Budget:
         past the cap`), not a spend ceiling of nothing dressed as one.
         """
         return max(1, min(int(recorded) + 1, self.max_rounds))
+
+    def released_weight(self, recorded: int,
+                        multiplier: Callable[[int], float] | None = None) -> float:
+        """What those allowances add up to under #776's curve — **a SUM, not a
+        product**.
+
+        The per-round token allowance is released one round at a time
+        (:meth:`rounds_allowed`), and until #776 every release was the same size, so
+        the total in force was `written × rounds` — one multiplication. A curve makes
+        each round's allowance ITS OWN: round 1 at x1.5 and round 3 at x0.75 have
+        released `1.5 + 1.0 + 0.75` allowances between them, and nothing about that
+        total is a product of anything. Multiplying by the LAST round's multiplier
+        would retroactively re-price round 1's spend, which is already spent; by the
+        FIRST would price round 3 at round 1's rate, which is the taper doing nothing.
+        Written as a sum here rather than at the comparison so that the arithmetic and
+        the sentence that quotes it read the same number out of the same expression.
+
+        `multiplier` takes a 1-based round number and is
+        `harness_rules.round_multiplier` bound to a config; `None` — every caller that
+        has not been asked, which is every test and every direct caller — is the FLAT
+        curve, and returns exactly `float(rounds_allowed(recorded))`. That is the
+        pre-#776 arithmetic to the bit: on the shipped `[1.0]` the comparison below
+        computes `limit × rounds` as it always did.
+
+        `math.fsum` and not `sum`, because the addends are operator-written decimals
+        and this number multiplies a token ceiling: `0.1` six times is `0.6000000000001`
+        under naive addition, and a ceiling that refuses a round on the last digit of a
+        float is a refusal nobody can reproduce by reading the config.
+        """
+        rounds = self.rounds_allowed(recorded)
+        if multiplier is None:
+            return float(rounds)
+        return math.fsum(multiplier(i) for i in range(1, rounds + 1))
 
     @property
     def dormant(self) -> bool:
@@ -772,10 +812,41 @@ def check(cfg: dict, panel: dict, pr: int | None, notes: list[str],
                     f"at this boundary cannot be worked out")
                 continue
             rounds = budget.rounds_allowed(recorded)
-            limit_now = limit * rounds
+            # #776's curve, applied as a SUM over the rounds released rather than as a
+            # factor on the total — :meth:`Budget.released_weight` has the argument,
+            # and the short of it is that each round's allowance is now its own, so a
+            # product would either re-price rounds already spent or price this one at
+            # an earlier round's rate. `weight == rounds` exactly on the shipped flat
+            # curve, and the branch below then computes `limit * rounds` as it always
+            # did: `int()` over an integral float is exact for every ceiling a token
+            # budget can hold.
+            #
+            # A weight small enough to floor the ceiling to 0 is not a ceiling of
+            # nothing dressed as one — it is EXHAUSTION, and it arrives as a refusal
+            # through the ordinary `used >= limit_now` below rather than as a special
+            # case: `Verdict.refusal` travels the pre-flight gate, so the round is
+            # recorded `reviewed: false` with a `skip_reason` and cannot read as a
+            # panel that found nothing. That is #55's second acceptance criterion and
+            # #776's "exhaustion is a named stop, never a silent truncation" answered
+            # by the same machinery.
+            weight = budget.released_weight(recorded,
+                                            lambda i: round_multiplier(cfg, i))
+            limit_now = limit * rounds if weight == rounds else int(limit * weight)
             scaled = (f" — {limit:,} per round × {rounds} released "
                       f"({recorded} round{'' if recorded == 1 else 's'} already "
                       f"recorded on this PR, of at most {budget.max_rounds})")
+            if weight != rounds:
+                # The TAPER is what bound, so the taper is what the sentence names —
+                # #776's rule for every ceiling it touches. A refusal quoting only
+                # `limit × rounds` sends the operator to `.harness-rules` for a number
+                # that is not the one they were refused against, and the curve that
+                # produced it is invisible to the person tuning it next.
+                scaled = (f" — {limit:,} per round, tapered by "
+                          f"`round_budgets.multipliers` to x{weight:g} of one "
+                          f"allowance over the {rounds} released ({recorded} "
+                          f"round{'' if recorded == 1 else 's'} already recorded on "
+                          f"this PR, of at most {budget.max_rounds}); the flat "
+                          f"ceiling would have been {limit * rounds:,}")
         if used >= limit_now:
             over.append(f"{key.replace('_', ' ')}: {used:,} of {limit_now:,} "
                         f"{UNIT_NOUN[unit]} already spent on the {where}"

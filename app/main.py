@@ -15,6 +15,7 @@ from app.api.leases import router as leases_router
 from app.api.merge_queue import router as merge_queue_router
 from app.api.plan import router as plan_router
 from app.api.posts import router as posts_router
+from app.api.review_ledger import router as review_ledger_router
 from app.api.review_queue import router as review_queue_router
 from app.api.reviews import router as reviews_router
 from app.api.stream import router as stream_router
@@ -38,6 +39,17 @@ app.include_router(stream_router)
 app.include_router(blobs_router)
 app.include_router(leases_router)
 app.include_router(subagents_router)
+# #772's finding ledger. Its own module and its own router, beside `reviews`
+# rather than inside it: one table, two endpoints and one rule set, importing
+# `reviews` in one direction only so the two never form a cycle.
+#
+# BEFORE `reviews_router`, and that ordering is load-bearing rather than
+# tidiness. `reviews` ends with `GET /review/{run_id}`, a catch-all one segment
+# deep, and Starlette matches routes in registration order — so included after
+# it, `GET /review/ledger` is swallowed by that route and answers "ledger is not
+# a valid integer". Registered first, the literal path wins and `{run_id}` still
+# catches every numeric id, which is all it was ever for.
+app.include_router(review_ledger_router)
 app.include_router(reviews_router)
 app.include_router(review_queue_router)
 app.include_router(worktrees_router)

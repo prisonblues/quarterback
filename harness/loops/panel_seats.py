@@ -42,6 +42,11 @@ from harness_rules import (  # noqa: F401  — re-exported, see __all__
     EFFORTS,
     GROK_EFFORTS,
     PI_EFFORTS,
+    # #776's one scaler. Imported for the reason the four sets above are: the rule
+    # that `None` stays `None` and that a scaled ceiling is floored rather than
+    # allowed to reach zero is written down once, where the key is documented, and a
+    # second `int(x * m)` here would be a taper this file could get wrong on its own.
+    tapered,
 )
 from panel_core import *  # noqa: F401,F403
 
@@ -3364,12 +3369,38 @@ class Dials:
 
 
 def resolve_dials(panel: dict, asked_max_rounds: int | None,
-                  notes: list[str], round_ceiling: int | None = None) -> Dials:
+                  notes: list[str], round_ceiling: int | None = None,
+                  *, round_mult: float = 1.0) -> Dials:
     """Read, validate and report all sixteen at once.
 
     `round_ceiling` is #55's board-set cap and is passed straight to
     :func:`resolve_max_rounds`; `None` — a fleet that has set no dial — is the
     unchanged behaviour this function has always had.
+
+    `round_mult` is #776's per-round budget multiplier, already resolved by the caller
+    through `harness_rules.round_multiplier` — the only place the curve is indexed, so
+    the four ceilings it scales cannot each read it their own way. `1.0` is the shipped
+    curve and the unchanged behaviour, and it is the DEFAULT here rather than a
+    required argument because every existing caller — the suites, and anything reading
+    a repo's policy without running a round — is asking what this repo's dials ARE,
+    which is a question about the file and not about round 4.
+
+    **It scales exactly one dial in this function, and the sixteen it does not touch
+    are the argument.** `low_severity_fix_lines` is an ALLOWANCE: how much churn one
+    round may spend answering the findings its two floors carve out. Every other number
+    here is a verdict about the change — the two floors themselves, the growth
+    ceilings, `max_fix_guard_lines`, `distant_merge_lines`, `next_door_days`,
+    `unrefereed_line_weight`, `threshold_by_severity`, `max_rounds` — and a curve that
+    moved one of those would be a later round CONCLUDING differently about the same
+    code, which is not a budget, it is a policy that drifts.
+
+    **A written `0` is not tapered and is not exhaustion.** `low_severity_budget`'s
+    `0` means "spend nothing on that band", which is a policy the repo wrote; running
+    it through `tapered`, whose floor is 1 because a zero ceiling is an exhaustion
+    rather than a budget, would hand that repo a one-line budget it never asked for —
+    a multiplier LOOSENING a written value, which is the one direction #776 forbids.
+    `None` is left alone by `tapered` itself: no ceiling stays no ceiling, since a
+    taper may tighten a ceiling somebody wrote and may never create one.
 
     `require_failing_test` gets a note of its own when it is ON, and that note is the
     whole of its behaviour: the contract it describes needs a reviewer-emitted test
@@ -3378,6 +3409,28 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
     be shown RED against the unfixed code). A repo that switched it on and saw nothing
     in the report would reasonably conclude findings were being filtered on evidence.
     They are not, and the round says so."""
+    # #776's one tapered dial, read out here rather than inline in the constructor
+    # because the taper has a case to skip and a note to write, and a conditional in an
+    # argument list is where a case gets lost. `if low_lines:` is false for `None` and
+    # for `0` alike, which is exactly the pair the docstring above says must not be
+    # scaled: the first is "no ceiling" and `tapered` would leave it alone anyway, the
+    # second is "spend nothing on that band" and `tapered`'s floor of 1 would hand the
+    # repo a one-line budget it never wrote.
+    low_lines = low_severity_budget(panel, notes)
+    if low_lines and round_mult != 1.0:
+        was, low_lines = low_lines, tapered(low_lines, round_mult)
+        # Named with BOTH numbers and the multiplier between them, because the round's
+        # report and the fixer's brief will print the tapered figure and a reader
+        # comparing it against `.harness-rules` would otherwise find a number that is
+        # in neither file. #776's own rule for an exhausted ceiling — say the TAPER
+        # bound rather than the base, or the curve is invisible to whoever tunes it
+        # next — applied to the ceiling that merely tightened.
+        notes.append(
+            f"`low_severity_fix_lines` is {was} in the rules and {low_lines} this "
+            f"round — this round's budget multiplier is x{round_mult:g} "
+            f"(#776). A budget that a round's answer will not fit inside is an "
+            f"exhaustion and ends the cycle unconfident; it is never a finding "
+            f"quietly dropped")
     dials = Dials(
         fixer_may_defer=panel_flag(panel, "fixer_may_defer",
                                    DEFAULT_FIXER_MAY_DEFER, notes),
@@ -3386,7 +3439,7 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
                                           DEFAULT_FIX_SEVERITY_FLOOR, notes),
         round_trigger_floor=severity_floor(panel, "round_trigger_floor",
                                            DEFAULT_ROUND_TRIGGER_FLOOR, notes),
-        low_severity_fix_lines=low_severity_budget(panel, notes),
+        low_severity_fix_lines=low_lines,
         low_severity_fix_full_chars=low_severity_full_budget_chars(panel, notes),
         unrefereed_line_weight=unrefereed_line_weight(panel, notes),
         max_fix_growth=fix_growth_limit(panel, notes),
@@ -5591,6 +5644,10 @@ __all__ = [
     "LOCAL_SUITE_TIMEOUT_MAX", "LOCAL_SUITE_TIMEOUT_MIN", "trusted_panel_block",
     "local_suite_commands", "local_suite_timeout",
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
+    # #776, re-exported for the efforts' reason: `panel.py` scales the diff budget
+    # with the same function this file scales the fix budget with, and two spellings
+    # of the taper is two ways for a `None` to become a ceiling.
+    "tapered",
     "EFFORTS", "FALLBACK_MAX_ELAPSED_S", "FALLBACK_MIN_TIMEOUT_S",
     "CliFailure", "failure_diag", "cli_hint", "is_rejection", "is_permission_denied",
     "is_deterministic_failure", "member_sandbox", "SANDBOX_ENV", "sandbox_env",

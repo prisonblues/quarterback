@@ -368,7 +368,15 @@ def test_the_measurement_is_on_EVERY_round_whether_it_fired_or_not():
     rather than the cycle's state."""
     got = panel_rounds.round_stop(2, 5, [], [], [])
     assert got.get("guard_churn", "no such block") == {
-        "limit": None, "lines": None, "armed": False, "over": False, "fired": False}
+        "limit": None, "lines": None, "armed": False, "over": False,
+        # #779's two, and the exact comparison is kept exact deliberately: the claim
+        # this test makes is about the block's WHOLE shape on a round that measured
+        # nothing, so a field added to it belongs in the literal rather than being
+        # excused by a subset check. `mode` is `enforce` with no `modes=` argument —
+        # `panel_rounds.brake_mode` argues why an absent argument and an unnamed rung
+        # take opposite defaults — and `would_fire` is the verdict without the mode,
+        # which on a round with no ceiling and no churn is False.
+        "mode": "enforce", "would_fire": False, "fired": False}
 
 
 # ------------------------------------------------------------------- the round table

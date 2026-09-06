@@ -613,6 +613,7 @@ from app.collisions import (
     files_complete,
 )
 from app.db import get_session
+from app.finding_lifecycle import OUTCOME_STATES
 from app.identity import agent_row, compose, machine_of
 from app.models.review import (
     ReviewFinding,
@@ -936,7 +937,15 @@ del _no_column
 #: general form the fix did not take, which is the entire reason the word exists.
 #: A bare ``narrowed`` is a ``fixed`` that has lost the only thing telling the two
 #: apart.
-OUTCOMES = ("fixed", "narrowed", "refuted", "deferred", "superseded")
+#:
+#: **Defined in :mod:`app.finding_lifecycle`, not here** (#772). The ledger's
+#: state vocabulary is a SUPERSET of this tuple — it adds ``raised``, ``unpaid``
+#: and ``escalated``, which are not decisions and so cannot be outcomes — and the
+#: two must never become two vocabularies that mean almost the same thing. Bound
+#: to the shared tuple rather than copied, so a sixth outcome becomes a sixth
+#: lifecycle state on the commit that adds it and there is no second list to
+#: remember. Same rule and same reason as ``NEEDS_HUMAN_CLASSES``.
+OUTCOMES = OUTCOME_STATES
 
 #: The two outcomes that are a judgement about whether the finding was RIGHT, and
 #: therefore the only two in the precision-after-the-fact ratio. ``deferred`` and
@@ -1623,6 +1632,58 @@ class ReviewerIn(BaseModel):
         return _cost_or_none(v)
 
 
+class FixBlastIn(BaseModel):
+    """How dangerous the REPAIR was (#770) — the fix pass's blast radius.
+
+    A finding is graded on severity and nothing else, so a fixer is told how bad
+    the defect is and never how far the fix reaches. ``panel_blast`` classifies the
+    paths the FIX PASS touched — migrations, auth, secrets, irreversible
+    infrastructure, dependencies, public API surface, source with no test beside it
+    — and publishes the worst lane that fired, the categories behind it, the file
+    that fired each one, and a sentence saying so.
+
+    **One field is bound and the other three are not**, on
+    :class:`LocalityRepeatsIn`'s terms. :attr:`lane` is the fleet-wide question —
+    across hundreds of rounds, do fix passes that land in dangerous code write more
+    of the next round's findings — and that correlation is what #770's ``fix_risk``
+    axis will be calibrated against; it cannot be computed from payloads sitting in
+    a temp directory on whichever host ran the panel. ``categories``, ``evidence``
+    and ``reason`` are the round's own working: a reader with a question about one
+    round has that round, and storing them would cost an unbounded structure per
+    run for nothing the lane does not already say.
+    ``tests/test_payload_key_drift.py`` carries that decision in writing, which is
+    the only other way past the drift check.
+
+    A nested object rather than a flat field because the panel sends it as one, on
+    :class:`PrClaimIn`'s precedent — and because the block is ``null`` as a whole
+    exactly where the fix surface could not be measured.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: ``low`` / ``medium`` / ``high``, or None where the producer said something
+    #: this board does not recognise. Never defaulted to ``low``: "the pass opened
+    #: no dangerous file" and "nobody measured" are different claims, and the
+    #: second read as the first would build #770's baseline out of rounds that
+    #: never looked.
+    lane: str | None = None
+
+    @field_validator("lane", mode="before")
+    @classmethod
+    def _lane(cls, v: object) -> str | None:
+        """Against :data:`FIX_BLAST_LANES`, coerced and never rejected —
+        :func:`_handed_to_or_none`'s argument, one tier in.
+
+        An unrecognised word becomes NULL rather than reaching the row, for two
+        reasons that point the same way. A consumer branches on the three, so a
+        fourth would be read as whichever the ``else`` is; and
+        ``ck_review_runs_fix_blast_lane`` would refuse it at the boundary, turning
+        one misspelled word into a 500 that costs the caller its findings, its
+        scorecards and its accounts.
+        """
+        return v if isinstance(v, str) and v in FIX_BLAST_LANES else None
+
+
 class StopIn(BaseModel):
     """The panel's mechanical verdict on whether the loop should go again."""
 
@@ -1651,6 +1712,22 @@ class StopIn(BaseModel):
     #: into the denominator as a failure to converge. So silence stays silence, and
     #: ``GET /review/convergence`` counts it under ``unmeasured``.
     converged: bool | None = None
+    #: Whether the CYCLE attested to anything at all (#782) — ``converged``'s
+    #: fifth conjunct, bound because a rate that cannot say why it did not
+    #: converge is uninterpretable.
+    #:
+    #: "No finding" has two causes — nothing was wrong, and nothing ran — and the
+    #: dry branch reported the first without being able to tell them apart. A
+    #: round 1 whose seats produced nothing anywhere stopped, was confident, had
+    #: no veto and nothing outstanding, and so read as a clean converged finish
+    #: from a panel that never demonstrated it could see the diff at all.
+    #:
+    #: ``None`` and not ``False`` when the caller did not send it, on
+    #: :attr:`converged`'s argument exactly: a silence folded into a denial would
+    #: report every round this board has ever recorded as having attested to
+    #: nothing. It reaches the column unmasked, and the endpoints publish it as a
+    #: three-state field.
+    attested: bool | None = None
     veto: list[str] = Field(default_factory=list)
     #: WHAT THE CYCLE LEFT BEHIND and who it went to (#42, stored by #717): the
     #: ``fixable`` / ``below_floor`` / ``escalated`` / ``narrowed`` / ``declined``
@@ -1700,6 +1777,18 @@ class StopIn(BaseModel):
     #: the findings, the scorecards and the accounts down with it.
     new_below_trigger_floor: Any = None
     repeated_below_trigger_floor: Any = None
+    #: HOW DANGEROUS THE REPAIR WAS (#770) — :class:`FixBlastIn`, of which one
+    #: field reaches a column.
+    #:
+    #: Nested here rather than at the top level because it is a fact about the
+    #: round's FIX PASS, which is what ``round_stop`` reports on: it sits in
+    #: ``fix_surface``'s register and beside it, and like ``fix_surface`` it is
+    #: reported and gates nothing.
+    #:
+    #: ``None`` where the fix surface could not be measured — the producer nulls
+    #: the whole block there — and that silence is load-bearing rather than tidy:
+    #: it is not ``low``. See :attr:`FixBlastIn.lane`.
+    fix_blast: FixBlastIn | None = None
     #: THE ESCALATION RUNGS, as this round measured them (#732). Nine fields and
     #: not one nested block, because the panel nests nine — and the drift check
     #: this issue extended compares field names against the keys the producer
@@ -1744,6 +1833,20 @@ class StopIn(BaseModel):
         """Coerced, not rejected — ``veto: "capped"`` from a hand-rolled caller
         must not cost it the whole run (see :func:`_phrases`)."""
         return _phrases(v)
+
+    @field_validator("fix_blast", mode="before")
+    @classmethod
+    def _fix_blast(cls, v: object) -> object:
+        """Anything that is not an object becomes no block at all.
+
+        Every other field on this model is typed ``Any`` or a scalar so that one
+        unreadable value cannot 422 a round, and a nested model is the one shape
+        that can: ``fix_blast: "high"`` from a hand-rolled caller would be a
+        validation error, taking the findings, the scorecards and the accounts
+        down with it. This is that rule applied to the block itself — the lane
+        inside it is coerced by :meth:`FixBlastIn._lane` on the same terms.
+        """
+        return v if isinstance(v, Mapping) else None
 
     @field_validator("cleared_floor", mode="before")
     @classmethod
@@ -1902,6 +2005,13 @@ OUTSTANDING_REQUIRED = ("fixable", "below_floor", "escalated")
 #: Who a round that ENDED a cycle handed its remainder to (#42). Null on a round
 #: that went again, which is a different fact and not a fourth word.
 HANDED_TO = ("fixer", "human", "nobody")
+#: How dangerous the REPAIR was (#770) — ``panel_blast``'s three lanes, worst last.
+#: A closed vocabulary, where :attr:`StopIn.cleared_floor` beside it deliberately
+#: has none: a floor is a repo dial whose spellings grow and an unknown one
+#: reclassifies nothing, while these three are an ordered scale whose consumers
+#: branch on the word. A fourth spelling would not show up as a fourth group; it
+#: would fall through every branch. See :meth:`FixBlastIn._lane`.
+FIX_BLAST_LANES = ("low", "medium", "high")
 
 #: The measurement blocks ``round_stop`` publishes beside its verdict, stored
 #: together as ``review_runs.stop_rungs`` (#732). Eight of them are the
@@ -2787,6 +2897,56 @@ class PrClaimIn(BaseModel):
     sent: bool | None = None
 
 
+class LocalityRepeatsIn(BaseModel):
+    """How this round recognised a finding it had seen before (#771).
+
+    #771 replaced cross-round finding identity. A repeat used to be a match on
+    ``finding_key`` — a hash of the reviewing model's own wording — so the same
+    defect restated in different words on the next round read as fresh damage: it
+    bought a round it had already bought and it never aged. Findings are now also
+    matched by LOCALITY, the line range against the round's diff hunks within a
+    slack, and the panel passes the union of the two on.
+
+    Which means the change is invisible from the outside, and this block is the
+    only thing that makes it visible. ``only_locality`` is how many repeats the
+    locality matcher caught that the wording hash did not; ``by_key`` is the
+    population the old comparison already had. The ratio of the two, over hundreds
+    of rounds, is the entire argument for whether the matcher earned its place —
+    which is why the two counts are BOUND AND STORED and the rest of the block is
+    not (``tests/test_payload_key_drift.py`` carries that decision in writing).
+
+    A nested object rather than two flat fields because the panel sends it as one,
+    on :class:`PrClaimIn`'s precedent: the pair answers one question at two grains
+    and neither number means anything without the other beside it.
+
+    Both fields default to None and are coerced rather than validated, on this
+    module's standing rule — an unreadable count must not cost a caller its
+    findings, its scorecards and its accounts. None is "this producer did not
+    say", which is every round older than the block and every skip payload, and it
+    is not zero: "the locality matcher caught nothing extra" is the FINDING this
+    block exists to report, and a silence read as that finding is how a feature
+    gets deleted on evidence it never produced.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: Repeats ONLY the locality matcher recognised — the ones a wording hash
+    #: missed. #771's own evidence, and the number the bet turns on.
+    only_locality: int | None = None
+    #: Repeats the wording key already caught. Disjoint from the above by
+    #: construction: the panel subtracts the key matches out of the locality
+    #: matches before counting, so the sum is the round's whole repeat population.
+    by_key: int | None = None
+
+    # `mode="before"`, like every tolerant validator in this module: without it
+    # pydantic coerces against `int | None` FIRST and a malformed count 422s
+    # before the helper written to absorb it is ever called.
+    @field_validator("only_locality", "by_key", mode="before")
+    @classmethod
+    def _count(cls, v: object) -> int | None:
+        return _count_or_none(v)
+
+
 class ReviewIn(BaseModel):
     """The panel's ``--json`` payload, accepted verbatim.
 
@@ -3610,6 +3770,11 @@ class ReviewIn(BaseModel):
     #: independently nullable — a round that asked and dropped says so with the two
     #: disagreeing.
     pr_claim: PrClaimIn | None = None
+    #: How this round recognised a repeat (#771). Optional: absent from every
+    #: producer older than the locality matcher and from every skip payload — a
+    #: round that dispatched no seat compared nothing, and a guessed zero would put
+    #: it in the population that measured and found nothing.
+    locality_repeats: LocalityRepeatsIn | None = None
 
     to_fix: list[FindingIn] = Field(default_factory=list)
     dismissed: list[FindingIn] = Field(default_factory=list)
@@ -3711,6 +3876,20 @@ class ReviewIn(BaseModel):
         """
         stop = self.round_stop
         if stop is not None and stop.converged and not (stop.stop and stop.confident):
+            stop.converged = False
+            self.converged_dropped = True
+        # ...and #782's conjunct, in the same method and by the same argument.
+        # `attested: false` says the cycle raised nothing anywhere, and
+        # `round_stop` computes `converged` with that flag ANDed in, so the pair
+        # `converged: true, attested: false` cannot be emitted by the panel
+        # either. Coerced here rather than left to
+        # `ck_review_runs_converged_implies_attested`, which would 500 and lose
+        # the findings, the scorecards and the accounts with it.
+        #
+        # `is False` and never falsy: `attested: None` is "this producer does not
+        # send the field", which is every round before #782, and reading it as a
+        # denial would strip `converged` off the whole archive as it re-ingested.
+        if stop is not None and stop.converged and stop.attested is False:
             stop.converged = False
             self.converged_dropped = True
         return self
@@ -4207,6 +4386,12 @@ async def record_review(
         # the denominator as failures to converge, and doing it here would undo
         # that one line later.
         converged=body.round_stop.converged if body.round_stop else None,
+        # #782, NULL by `converged`'s three routes and read as three-state
+        # everywhere: NULL is "the panel did not say", False is "this cycle raised
+        # nothing anywhere". Unmasked for the reason one line up — folding the
+        # silence into the denial puts every pre-#782 round into the population
+        # that attested to nothing.
+        attested=body.round_stop.attested if body.round_stop else None,
         # The reasons, not just the verdict. Accepting the list and dropping it
         # left the board able to say a stop was not convergence and unable to say
         # why — which is the half an operator is told to relay.
@@ -4245,6 +4430,35 @@ async def record_review(
         repeated_below_trigger_floor=(
             _below_floor_count(body.round_stop.repeated_below_trigger_floor)
             if body.round_stop else None),
+        # #771's two counts, flattened out of their nested block on `pr_claim`'s
+        # terms. Both kept, because neither has another row to live on and neither
+        # means anything alone: `only_locality` without `by_key` is a count with no
+        # denominator, and the ratio is what says whether matching a finding by
+        # WHERE IT LANDS earned its place over matching it by the reviewer's words.
+        #
+        # NULL and never zero for a producer that sent no block — every round older
+        # than the matcher, and every skip path. "The locality matcher caught
+        # nothing extra" is the finding this measurement exists to report, and a
+        # guessed zero would fill the population with rounds that never looked.
+        # `keys` and `why` ride the same block and are deliberately not stored:
+        # they are per-round detail already in the payload a reader can fetch, and
+        # `tests/test_payload_key_drift.py` holds that decision in writing.
+        repeats_only_locality=(body.locality_repeats.only_locality
+                               if body.locality_repeats else None),
+        repeats_by_key=(body.locality_repeats.by_key
+                        if body.locality_repeats else None),
+        # #770's blast lane, lifted out of its nested block on `handed_to`'s terms:
+        # one word off an object whose other three keys are the round's working.
+        #
+        # NULL by four routes that mean one thing — no nested verdict, a producer
+        # too old to nest the key, a block the round nulled because it could not
+        # measure its fix surface, and a lane word this board does not recognise.
+        # All four are "how dangerous the repair was is not recorded", and none of
+        # them is `low`: the correlation #770's axis will be calibrated on is
+        # between the lane and the NEXT round's findings, and a guessed `low` would
+        # put rounds that never measured into the safe half of it.
+        fix_blast_lane=(body.round_stop.fix_blast.lane
+                        if body.round_stop and body.round_stop.fix_blast else None),
         # #732's nine measurement blocks, verbatim and refused whole. Read off the
         # bound model here and off the raw body for the drop signal, exactly as
         # `outstanding` above is: both are pass-through `Any` fields, so the two
@@ -5447,6 +5661,12 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # together is a below-floor policy stop, which is confident and NOT
         # converged, and either field alone loses it.
         "converged": r.converged,
+        # #782, beside the flag it is a conjunct of. Three-state and read with an
+        # identity test for `converged`'s reason: NULL is "the panel did not say"
+        # and False is "this cycle raised nothing anywhere", and a reader that
+        # cannot tell those apart is back to an unconverged count with two causes
+        # in it.
+        "attested": r.attested,
         # Unmasked, like `could_not_assess` two fields down: ingest stores this
         # AS SENT so that "the stopping rule ran and vetoed nothing" ([]) and "no
         # panel ever said" (NULL) stay apart, and masking it on read handed every
@@ -5483,6 +5703,35 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         "cleared_floor": r.cleared_floor,
         "new_below_trigger_floor": r.new_below_trigger_floor,
         "repeated_below_trigger_floor": r.repeated_below_trigger_floor,
+        # #771: how this round recognised a repeat. On every view rather than
+        # detail-only, on the three scalars' cut directly above and for a sharper
+        # version of their reason — these are not read one round at a time AT ALL.
+        # The question is "over a population, how many repeats did the locality
+        # matcher catch that a hash of the reviewer's wording missed", and a field
+        # a reader has to fetch per round cannot answer it. Two integers, so the
+        # `limit=500` size argument that keeps `stop_rungs` off this view does not
+        # arise.
+        #
+        # Unmasked, both, and read with an identity test. NULL is "this producer
+        # did not measure" — every round predating the columns — and 0 is "it
+        # measured and the locality matcher caught nothing extra". Folding those
+        # together would build the case AGAINST the matcher out of rounds that
+        # never ran it.
+        "repeats_only_locality": r.repeats_only_locality,
+        "repeats_by_key": r.repeats_by_key,
+        # #770: how dangerous the round's own repair was. On every view for the two
+        # counts' reason above and with the same sharpening — the reader is a
+        # CORRELATION over a population ("do fix passes in dangerous code write the
+        # next round's findings"), not a person opening one round, and a field that
+        # had to be fetched per round could not answer it. One short word, so the
+        # `limit=500` size argument that keeps `stop_rungs` off this view does not
+        # arise.
+        #
+        # Unmasked, and read with an identity test against the three lanes. NULL is
+        # "the fix surface was not measured" — every round predating the column,
+        # every producer too old to nest the key, and every round that nulled the
+        # block — and it is not `low`.
+        "fix_blast_lane": r.fix_blast_lane,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -7201,16 +7450,48 @@ async def review_convergence(
     # standing complaint about its own data is answers that read safer than the
     # evidence supports.
     in_cycle = [*filters, ReviewRun.cycle.isnot(None)]
-    runs_total, without_cycle, first_ts, last_ts = (
+    # #771's counts ride this select rather than one of their own: same rows, same
+    # predicate, one scan. They are summed over RUNS and not over cycles, which is
+    # the one place this endpoint's cycle grain would be the wrong answer — a
+    # repeat is a fact about round N against round N-1, so the terminal round holds
+    # a fraction of the evidence and the rounds before it hold the rest.
+    #
+    # `measured_repeats` counts the runs whose producer ANSWERED, on `converged`'s
+    # `unmeasured` rule: NULL is every round recorded before the columns, and a
+    # denominator that included them would report a matcher that had not shipped
+    # yet as having caught nothing.
+    #
+    # #770's lane distribution rides the same select on the same terms, and it is
+    # counted per RUN for a sharper version of the same reason: the lane is a fact
+    # about ONE round's fix pass, so a cycle's terminal round holds one repair and
+    # the rounds before it hold the rest — and the terminal round of a converged
+    # cycle usually ran no fix pass at all, which is the population most likely to
+    # be `low`. Read at cycle grain this would report the safest rounds as the
+    # whole distribution.
+    window_row = (
         await session.execute(
             select(
                 func.count(ReviewRun.id),
                 func.count(ReviewRun.id).filter(ReviewRun.cycle.is_(None)),
                 func.min(ReviewRun.ts),
                 func.max(ReviewRun.ts),
+                func.count(ReviewRun.id).filter(
+                    ReviewRun.repeats_only_locality.isnot(None)),
+                func.sum(ReviewRun.repeats_only_locality),
+                func.sum(ReviewRun.repeats_by_key),
+                *(func.count(ReviewRun.id).filter(ReviewRun.fix_blast_lane == lane)
+                  for lane in FIX_BLAST_LANES),
             ).where(*filters)
         )
     ).one()
+    (runs_total, without_cycle, first_ts, last_ts,
+     measured_repeats, only_locality_sum, by_key_sum) = window_row[:7]
+    # Zipped back against the vocabulary that built the filters rather than
+    # unpacked into three names: the trailing columns ARE `FIX_BLAST_LANES` in
+    # order, and three names would let a reordering of that tuple transpose the
+    # distribution silently. `strict=True` is what says so.
+    lane_counts = {lane: int(n or 0) for lane, n
+                   in zip(FIX_BLAST_LANES, window_row[7:], strict=True)}
 
     # One row per cycle: its terminal round, picked in SQL by a window function
     # rather than by `max(round)` and a second query to fetch that row, which
@@ -7231,6 +7512,7 @@ async def review_convergence(
             ReviewRun.repo.label("repo"),
             ReviewRun.stopped.label("stopped"),
             ReviewRun.converged.label("converged"),
+            ReviewRun.attested.label("attested"),
             ReviewRun.round.label("final_round"),
             ReviewRun.new_findings.label("new_findings"),
             ReviewRun.changed_lines.label("changed_lines"),
@@ -7264,8 +7546,25 @@ async def review_convergence(
     by_kind: dict[str, dict[str, int]] = {}
     by_shape: dict[tuple[str, str], dict[str, int]] = {}
     by_rounds: dict[int, dict[str, int]] = {}
+    # #782, counted BESIDE the buckets and deliberately not as a fifth one.
+    #
+    # A cycle whose terminal round says it attested to nothing is a cycle that
+    # raised no finding anywhere — the panel never demonstrated it could see the
+    # diff — and it is `unconverged` today because `converged` is false. Whether
+    # it belongs in the denominator at all is a real question and it is NOT
+    # settled here: `CYCLE_ENDINGS` is what `_rate` divides, #637's recalibration
+    # of `escalate_on.fix_injection` is measured against exactly that number, and
+    # moving cycles out of `unconverged` would move the published rate as a side
+    # effect of binding a field. So the fact is published and the rate is left
+    # alone; the split is one query away for whoever decides it deliberately.
+    #
+    # `is False` and never falsy: NULL is every round recorded before the field
+    # existed, and counting those would report the whole archive as unattested.
+    unattested = 0
     for c in cycles:
         ending = _cycle_ending(c.stopped, c.converged)
+        if c.attested is False:
+            unattested += 1
         size, kind = _pr_size(c.changed_lines), _pr_kind(c.pr_title)
         overall[ending] += 1
         for table, key in ((by_repo, c.repo), (by_size, size), (by_kind, kind),
@@ -7405,6 +7704,21 @@ async def review_convergence(
             "dial_runs": int(dials or 0),
         })
 
+    # #771's two sums, reduced to integers here. `SUM` over an all-NULL window is
+    # NULL rather than 0 in Postgres, so both come through the `or 0` every other
+    # tally in this handler uses — and the zero is only ever published beside
+    # `runs`, which is what says whether anything measured at all.
+    only_locality = int(only_locality_sum or 0)
+    by_key = int(by_key_sum or 0)
+    repeats_seen = only_locality + by_key
+    # #770's population and its elevated half. Counted off `lane_counts` rather
+    # than by a fourth `count(...).filter(isnot(None))`, so the total and the
+    # distribution cannot disagree about the same rows — and `medium` is in the
+    # elevated half because the axis's question is "did the repair reach past the
+    # line it named", which a dependency bump and an API change both do.
+    measured_blast = sum(lane_counts.values())
+    elevated = measured_blast - lane_counts["low"]
+
     return {
         "window": {
             "since": cutoff.isoformat() if cutoff else None,
@@ -7420,6 +7734,73 @@ async def review_convergence(
         },
         # The headline. `rate` is null, not 0.0, where `decided` is 0.
         "overall": _rate(overall),
+        # #771's fleet-wide ratio, published BESIDE the buckets and touching none
+        # of them — `unattested_cycles` directly below makes the same undertaking
+        # and for the same reason: `CYCLE_ENDINGS` is what `_rate` divides and
+        # #637's recalibration is measured against exactly that number, so nothing
+        # here may move it as a side effect of storing a field.
+        #
+        # What it answers: of every repeat this window recognised, what share did
+        # only the LOCALITY matcher catch — the ones a hash of the reviewing
+        # model's own wording missed. #771 is a bet that the share is not small,
+        # and this is where it is settled. A `share` that sits near zero over a few
+        # dozen cycles is the case for taking the matcher back out.
+        #
+        # Per RUN, not per cycle, and that departure from this endpoint's grain is
+        # deliberate: a repeat is round N against round N-1, so a cycle's terminal
+        # round holds one round's worth of the evidence and the rounds before it
+        # hold the rest. `runs` is the population that answered — never `window.runs`
+        # — so a window of rounds too old to measure reports `runs: 0` rather than a
+        # share of zero, which is the reading that would delete the feature.
+        #
+        # `share` is null and not 0.0 where nothing repeated at all, on `rate`'s
+        # rule one line up: no repeats is not a matcher that caught none of them.
+        "locality_repeats": {
+            "runs": measured_repeats,
+            "only_locality": only_locality,
+            "by_key": by_key,
+            "share": round(only_locality / repeats_seen, 4) if repeats_seen else None,
+        },
+        # #770's lane distribution, published beside the buckets and touching none
+        # of them — `locality_repeats` directly above and `unattested_cycles` below
+        # make the same undertaking, and this one repeats it: `CYCLE_ENDINGS` is
+        # what `_rate` divides, and nothing here moves a rate as a side effect of
+        # storing a field.
+        #
+        # What it answers: over this window, how dangerous were the repairs. On its
+        # own that is a description of the fleet's fix passes; against #770 it is
+        # the denominator the `fix_risk` axis gets calibrated on, because the
+        # correlation being sought — do `high` repairs write more of the NEXT
+        # round's findings — needs a population per lane before it needs anything
+        # else.
+        #
+        # Per RUN, on `locality_repeats`' departure from this endpoint's cycle
+        # grain and for a sharper reason: a converged cycle's terminal round
+        # usually ran no fix pass, so cycle grain would sample the safest rounds
+        # and report them as the distribution.
+        #
+        # `runs` is the three counts summed, by construction — the column is one of
+        # three words or NULL, and `ck_review_runs_fix_blast_lane` is what makes
+        # that true. It is published anyway, as every block on this response
+        # publishes its own population marker: a reader must be able to see that
+        # nothing measured without adding three numbers to find out.
+        #
+        # `elevated_share` is null and not 0.0 where nothing measured, on `rate`'s
+        # rule: no measured repair is not a fleet whose repairs were all safe.
+        "fix_blast": {
+            "runs": measured_blast,
+            **lane_counts,
+            "elevated_share": (round(elevated / measured_blast, 4)
+                               if measured_blast else None),
+        },
+        # How many of those cycles ended having attested to nothing (#782) — a
+        # subset of `overall.unconverged`, published as its own number rather than
+        # netted out of it. "This cycle did not converge because a P1 was still
+        # outstanding" and "because the panel raised nothing at all" are different
+        # facts with different repairs, and pooled they make the rate say neither.
+        # Counted over cycles whose terminal round ANSWERED the question: NULL is
+        # every round from before the field existed and is not a denial.
+        "unattested_cycles": unattested,
         "by_repo": [{"repo": k, **_rate(v)} for k, v in sorted(by_repo.items())],
         "by_size": [{"size": k, **_rate(v)}
                     for k, v in sorted(by_size.items(), key=_size_order)],
@@ -7963,6 +8344,12 @@ async def pr_finding_history(
         # had it dropped, so a long-lived PR can be summarisable and still have
         # nothing to say here.
         "converged": last.converged if summarisable else None,
+        # #782 beside it, gated identically and three-state for the same reason.
+        # The pair is what makes an unconverged cycle readable: `converged: false`
+        # with `attested: false` is a cycle that raised nothing anywhere, which is
+        # a different fact from one that ended holding a P1 and argues for a
+        # different repair.
+        "attested": last.attested if summarisable else None,
         # WHY the stop was unearned, in the panel's words. "not convergence" with
         # no reasons attached is the question this feature exists to answer left
         # unanswered.
@@ -8042,6 +8429,31 @@ async def pr_finding_history(
              # newest round of the newest cycle and says nothing about which round
              # of it was the clean finish.
              "converged": r.converged,
+             # ...and its fifth conjunct per round (#782), on the same promise the
+             # four above carry: unaltered at any window size, so a caller whose
+             # summary came back unattributable can still read each round's answer.
+             "attested": r.attested,
+             # #771's two counts per round, and this is the endpoint where they
+             # mean the most: a repeat is a claim that ROUND N restates something
+             # ROUND N-1 raised, and this is the only response that lays a cycle's
+             # rounds out in order beside the findings themselves. The summary
+             # above carries no total for them deliberately — these are per-round
+             # facts and there is no terminal round that speaks for the cycle.
+             #
+             # Three-state, like the two fields above: NULL is a producer that did
+             # not measure, 0 is one that measured and found nothing extra.
+             "repeats_only_locality": r.repeats_only_locality,
+             "repeats_by_key": r.repeats_by_key,
+             # #770's blast lane per round, and this is the endpoint where it means
+             # the most: the lane is a claim about ROUND N's repair, the findings it
+             # is read against are ROUND N+1's, and this is the only response that
+             # lays a cycle's rounds out in order beside the findings themselves.
+             # The summary above carries no lane for the same reason it carries no
+             # repeat total — there is no terminal round that speaks for the cycle.
+             #
+             # Three-state on the columns above's terms: NULL is a round whose fix
+             # surface was not measured, and it is not `low`.
+             "fix_blast_lane": r.fix_blast_lane,
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,
              # over confirmed findings only. None = no round followed it in this

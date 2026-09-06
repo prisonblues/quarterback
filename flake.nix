@@ -486,6 +486,10 @@
           install -Dm644 ${./.github/workflows/tests.yml}                    repo/.github/workflows/tests.yml
           install -Dm644 ${./app/api/reviews.py}                             repo/app/api/reviews.py
           install -Dm644 ${./app/models/review.py}                           repo/app/models/review.py
+          # The outcome vocabulary's declaration since #772: `app/api/reviews.py` binds
+          # `OUTCOMES` to it rather than spelling the words, so the suite that checks the docs
+          # against the vocabulary follows the import here.
+          install -Dm644 ${./app/finding_lifecycle.py}                       repo/app/finding_lifecycle.py
           install -Dm644 ${./flake.nix}                                      repo/flake.nix
           chmod -R u+w repo/harness/loops repo/harness/commands
           cd repo/harness

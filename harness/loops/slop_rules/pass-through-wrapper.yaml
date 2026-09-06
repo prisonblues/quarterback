@@ -1,0 +1,13 @@
+# What "extract this into a helper" turns into when the fixer has nothing to
+# extract. The function forwards its own parameters, positionally and unchanged,
+# to exactly one other call — so it adds a name, a stack frame and a second
+# place to read, and no behaviour. It lands as a fix and comes back as a finding
+# about unnecessary indirection, which is one round's remedy becoming the next
+# round's defect in a single hop.
+id: slop/pass-through-wrapper
+severity: P3
+languages: [python]
+message: Function only forwards its own parameters to one other call and adds no behaviour
+remediation: Call the inner function directly at the call sites, or give the wrapper the behaviour it was supposed to add.
+match:
+  kind: python_pass_through_wrapper

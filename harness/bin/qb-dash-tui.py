@@ -97,7 +97,7 @@ import time
 from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.coordinate import Coordinate
 from textual.events import Click, Resize
 from textual.screen import ModalScreen
@@ -371,13 +371,35 @@ class DialEdit(ModalScreen[dict | None]):
     #: The list and the spec line then take turns — four rows of names while a name
     #: is being chosen, three of description once one has been — so the tall state
     #: is the only one either of them is in.
-    #: `overflow-y` is the backstop for a pane shorter still — a modal that clips
-    #: silently loses whichever control is last, and here that was the scope.
+    #:
+    #: AND WHEN IT STILL DOES NOT FIT, WHAT GIVES IS THE FIELDS, NEVER THE FRAME.
+    #: Budgeting rows against a fixed pane works right up until the sentence that
+    #: goes in one of them gets longer, and this table gains dials faster than it
+    #: loses words — 41 of them one day and 49 the next. So the arrangement is
+    #: three parts and only the middle one moves: `#title`, docked to the top
+    #: because it carries the scope; `#form`, which holds every field and scrolls;
+    #: and `#foot`, docked to the bottom, which is the refusal and the key line.
+    #: The whole box scrolled before, which sounds like the same thing and is not —
+    #: the key line was simply last on a column that overflowed downwards, so it
+    #: went off the bottom, and it went off exactly when a refusal had made the
+    #: form tall, which is the one moment somebody is reading for the key that
+    #: dismisses it.
+    #:
+    #: `max-height: 1fr` and not `height: 1fr`: `1fr` alone would stretch the box
+    #: to the full pane whatever was in it, and a four-field form floating in the
+    #: middle of forty rows is a different bug. `auto` keeps the box the size of
+    #: what it holds; the cap only bites once that is more than there is room for.
     CSS = """
     DialEdit { align: center middle; }
     #box { width: 90%; max-width: 76; height: auto; max-height: 100%;
-           overflow-y: auto; padding: 1 2;
+           overflow: hidden; padding: 1 2;
            background: $panel; border: thick $accent; }
+    /* A one-column scrollbar and not the default two: it is only ever drawn in
+       the states where rows are already short, and the second column comes out of
+       the width of every field beside it. */
+    #form { height: auto; max-height: 1fr; scrollbar-size-vertical: 1; }
+    #title { dock: top; }
+    #foot { dock: bottom; height: auto; }
     #hint { color: $text-muted; }
     /* ALIGNED WITH THE TEXT IN THE BOXES, not with the box edge. An `Input` draws
        a border and pads inside it, so its text starts three columns in; a bare
@@ -441,31 +463,48 @@ class DialEdit(ModalScreen[dict | None]):
                          f"dial · {self.row.get('dial')}", style="bold")
             title.append(f"  ·  {self.scope_label or 'fleet (every repo)'}",
                          style="bold yellow")
-            yield Static(title)
-            if not existing:
-                yield Input(placeholder="review_panel.fix_severity_floor", id="f_dial")
-                # Populated in `on_mount` rather than here: the whole list is the
-                # right first answer to "which dials are there", and it is the
-                # same call every keystroke makes afterwards.
-                yield OptionList(id="names")
-            yield Input(value=self._value_text(), placeholder=self._value_hint(),
-                        id="f_value")
-            yield Static(self._spec(self._dial_name()), id="spec")
-            yield Input(placeholder="why is this value in force?", id="f_reason")
-            yield Input(placeholder="30m · 4h · 7d — empty for no end", id="f_expiry")
-            # Not drawn at all until something is actually wrong: a refusal line
-            # that is always there is one a person stops reading, and an empty one
-            # would spend a row of a modal that has none to spare.
-            err = Static("", id="err")
-            err.display = False
-            yield err
-            # The keys, and only the ones that do something here. `ctrl+x` clears a
-            # dial that is ON the board, so on a new one it is a key that can only
-            # bell — and `↓` is where the list of names went when the line under the
-            # value box started describing them instead of counting them.
-            keys = ("ctrl+s save · ctrl+x clear this dial · esc cancel" if existing
-                    else "↓ names · ctrl+s save · esc cancel")
-            yield Static(Text(keys, style="bold $accent"), id="hint")
+            yield Static(title, id="title")
+            # THE FIELDS, AND ONLY THE FIELDS, GO IN THE SCROLLING PART. What sits
+            # outside it is the frame — the title above, the refusal and the keys
+            # below — and a frame that scrolls away is a form that can hide both
+            # what it is objecting to and how to leave it. Everything in here stays
+            # reachable at any pane height; what a short pane costs is a scroll.
+            with VerticalScroll(id="form"):
+                if not existing:
+                    yield Input(placeholder="review_panel.fix_severity_floor",
+                                id="f_dial")
+                    # Populated in `on_mount` rather than here: the whole list is
+                    # the right first answer to "which dials are there", and it is
+                    # the same call every keystroke makes afterwards.
+                    yield OptionList(id="names")
+                yield Input(value=self._value_text(), placeholder=self._value_hint(),
+                            id="f_value")
+                yield Static(self._spec(self._dial_name()), id="spec")
+                yield Input(placeholder="why is this value in force?", id="f_reason")
+                yield Input(placeholder="30m · 4h · 7d — empty for no end",
+                            id="f_expiry")
+            with Vertical(id="foot"):
+                # Not drawn at all until something is actually wrong: a refusal line
+                # that is always there is one a person stops reading, and an empty
+                # one would spend a row of a modal that has none to spare.
+                #
+                # DOWN HERE WITH THE KEYS RATHER THAN UP WITH THE FIELDS, because a
+                # refusal is the tallest thing this form can grow and it is the one
+                # a person is reading when it does. In the scrolling part it would
+                # be the row most likely to land below the fold — a bell with
+                # nothing to read. It names the field it is about, so it does not
+                # need to sit next to it.
+                err = Static("", id="err")
+                err.display = False
+                yield err
+                # The keys, and only the ones that do something here. `ctrl+x`
+                # clears a dial that is ON the board, so on a new one it is a key
+                # that can only bell — and `↓` is where the list of names went when
+                # the line under the value box started describing them instead of
+                # counting them.
+                keys = ("ctrl+s save · ctrl+x clear this dial · esc cancel" if existing
+                        else "↓ names · ctrl+s save · esc cancel")
+                yield Static(Text(keys, style="bold $accent"), id="hint")
 
     # -- what the chosen dial is, and what it takes ----------------------------
 

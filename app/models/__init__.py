@@ -16,6 +16,7 @@ from app.models.post import Post
 from app.models.resource_lease import ResourceLease
 from app.models.review import (
     ReviewFinding,
+    ReviewFindingLedger,
     ReviewFindingOutcome,
     ReviewFindingReport,
     ReviewReviewer,
@@ -45,6 +46,7 @@ __all__ = [
     "Post",
     "ResourceLease",
     "ReviewFinding",
+    "ReviewFindingLedger",
     "ReviewFindingOutcome",
     "ReviewFindingReport",
     "ReviewReviewer",

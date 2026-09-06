@@ -1,0 +1,17 @@
+# Talking a checker out of a finding, in its literal form. Narrowed to the BARE
+# suppression — no rule code, so no way to tell what was silenced — because this
+# repo suppresses deliberately and often: 326 `# noqa: E402` in harness/ alone,
+# and a convention of `# noqa: BLE001 — the claim is what must survive` that
+# pyproject.toml defends at length. A rule that fired on those would be noise on
+# every round and would be switched off, taking the case that matters with it.
+# What is left is exactly the shape a fixer reaches for under review pressure: a
+# suppression that names nothing, silences everything on the line, and outlives
+# the code that tripped it.
+id: slop/bare-lint-suppression
+severity: P3
+languages: [python]
+message: Lint or type suppression names no rule code, so it silences more than the problem and nobody can tell what
+remediation: 'Give the suppression its rule code — # noqa: E501, # type: ignore[arg-type] — and a few words on why, or fix what tripped it.'
+match:
+  kind: line_regex
+  pattern: '#\s*(?:noqa(?!\s*:)|type:\s*ignore(?!\s*\[))'

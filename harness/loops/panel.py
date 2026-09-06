@@ -116,12 +116,83 @@ import panel_rounds  # noqa: F401
 import panel_scope  # noqa: F401
 import panel_seats  # noqa: F401
 
+# #771's locality matcher, and the ONE import in this file that is allowed to
+# fail. Everything it is used for is a second opinion beside an answer this file
+# already has — a key that matched, a repeat the baseline's own keys recognised, a
+# provenance bucket — so the fail-safe direction exists and is cheap: the module is
+# missing or raises on import, the round behaves exactly as it did before #771, and
+# the round SAYS so rather than degrading in silence. A hard import would trade
+# that for a panel that cannot run at all because a matcher nothing gates on would
+# not load, and #771's own argument is that a matcher must never cost a round.
+#
+# The reason is kept and the traceback is not: a config note is read by an operator
+# deciding whether to believe a coverage answer, and "panel_locality is not
+# installed" is the whole of what they can act on.
+try:
+    import panel_locality  # noqa: F401
+except Exception as exc:  # noqa: BLE001 — see above
+    panel_locality = None  # type: ignore[assignment]
+    LOCALITY_UNAVAILABLE = f"{type(exc).__name__}: {exc}".strip() or "import failed"
+else:
+    LOCALITY_UNAVAILABLE = ""
+
+# #770's blast lane, and the SECOND import in this file allowed to fail, on exactly
+# the terms above. Everything it produces is a second opinion beside answers this file
+# already has — which files the last fix pass touched, and how much of that was
+# refereed — and it gates nothing at all: no rung reads the lane, no dial arms it, and
+# #67's instrument-before-gate rule is why. So the fail-safe direction exists and is
+# free: the module is missing or raises on import, the round behaves exactly as it did
+# before #770, and the round SAYS so rather than degrading in silence.
+try:
+    import panel_blast  # noqa: F401
+except Exception as exc:  # noqa: BLE001 — see above
+    panel_blast = None  # type: ignore[assignment]
+    BLAST_UNAVAILABLE = f"{type(exc).__name__}: {exc}".strip() or "import failed"
+else:
+    BLAST_UNAVAILABLE = ""
+
+# #780's deterministic seat, and the THIRD import here allowed to fail, on the same
+# terms — with one more reason of its own. This one is not only a module: it reads
+# ten checked-in rule files at `load_rules()`, and that reader is strict on purpose
+# (an unknown key, a bad match kind and a duplicate id are all fatal, so a seat can
+# never report clean because half of it was misspelt). Strictness is right inside
+# the seat and wrong at the round's expense: a typo in a YAML file nobody edited
+# this week must not be able to stop a panel that has four vendors waiting on it.
+# So both the import AND the rule load are caught, and the seat that cannot load
+# costs the round a line rather than the round.
+#
+# The reason is kept and the traceback is not, exactly as above: an operator
+# reading a config note can act on "SlopRuleError: slop_rules/x.yaml: unknown key",
+# and cannot act on a stack.
+try:
+    import panel_slop  # noqa: F401
+except Exception as exc:  # noqa: BLE001 — see above
+    panel_slop = None  # type: ignore[assignment]
+    SLOP_UNAVAILABLE = f"{type(exc).__name__}: {exc}".strip() or "import failed"
+else:
+    SLOP_UNAVAILABLE = ""
+
 # Where the round's wall clock went (#192). Its own module, and deliberately NOT
 # star-imported: nothing here calls it as a bare global, so an explicit import
 # keeps `panel_timing.` on every call site and makes the instrumentation greppable
 # as one thing — this file is edited by several changes at once and a timing call
 # that reads like a panel helper is the kind of line a merge loses.
 import panel_timing  # noqa: F401
+
+# The three policy readers this file may not re-derive (#779, #776), taken BY NAME
+# rather than reached through the star imports below. Each has a fallback chain that
+# is load-bearing and invisible at the call site: `escalate_mode` merges three layers,
+# and reading a rung `DEFAULTS` names as `shadow` because this repo's mapping did not
+# mention it would disarm five brakes nobody named; `round_multiplier` reads a curve
+# that may be malformed, and the honest fallback is the flat budget the repo had
+# before it wrote the key; `tapered` is where "no ceiling stays no ceiling" is
+# written down once. A second spelling of any of them in this file is a policy with
+# two answers.
+from harness_rules import (  # noqa: E402
+    escalate_mode,
+    round_multiplier,
+    tapered,
+)
 
 # #274's one door, and #279's escalation list read back through it.
 from needs_human import announce  # noqa: E402
@@ -683,6 +754,332 @@ def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
     return seen, read
 
 
+#: #774's per-finding provenance label — one marker and one word per
+#: :data:`panel_scope.PROVENANCE` bucket, for the finding rows in the report.
+#:
+#: A DICT and not a formatting branch, so the report cannot render a bucket the
+#: attribution does not have: a bucket added to `PROVENANCE` and not to this simply
+#: does not print, which is the declining direction. `unknown` is deliberately absent
+#: rather than mapped to a word — see :func:`whence`, which says why a mark on an
+#: unattributable finding is a false claim about the fix pass.
+#:
+#: Short on purpose. The block above the list already prints the sentence that says
+#: what the buckets mean; this is the per-row reminder of which one this finding is
+#: in, and a clause repeated on every row costs more width than the titles do.
+def injection_share(kind: str, row: object) -> str:
+    """One kind's share of the injection rate, as the line prints it — or `""`.
+
+    Reads what was published and prints nothing it cannot read. The split is
+    computed and published elsewhere (`round_stop.injection.by_kind`), and this file
+    renders it: a renderer that INSISTED on one shape would turn a publisher's change
+    into a crash in the report, on a measurement nothing gates on. #67's rule with
+    the blame the other way round — an instrument that can take a round down has
+    stopped being report-only.
+
+    So both shapes a counter is plausibly written in are accepted: an object with
+    `introduced` beside its denominator, and a bare count. Anything else is silence,
+    which reads exactly as "this kind was not measured" — and that is true.
+    """
+    if isinstance(row, dict):
+        got = row.get("introduced")
+        total = row.get("new", row.get("total"))
+        if not isinstance(got, int) or isinstance(got, bool):
+            return ""
+        if isinstance(total, int) and not isinstance(total, bool) and total:
+            return f"{got} of {total} {kind}"
+        return f"{got} {kind}"
+    if isinstance(row, int) and not isinstance(row, bool):
+        return f"{row} {kind}"
+    return ""
+
+
+PROVENANCE_MARK = {"introduced": " 🔧 _fix-written_",
+                   "missed": " 🔍 _first-pass miss_",
+                   "missed-unread": " 🔍 _unread last round_"}
+
+
+def earlier_round_registers(paths: list[str], gh_repo: str, pr_number: int,
+                            round_no: int, cycle: str | None
+                            ) -> tuple[dict[str, str], dict[str, str]]:
+    """`(ca- key -> the declaration's own words, uc- key -> the claim's)` out of the
+    `--baseline` payloads themselves (#750).
+
+    Read here rather than off :class:`panel_rounds.Baseline`, on
+    :func:`earlier_round_files`' precedent and for its exact reason: that class
+    carries what earlier rounds FOUND and what a human has since said about it —
+    `assessed` is a key to an :class:`panel_rounds.Assessment`, and `acknowledged` a
+    key to a round — and neither carries the SENTENCE the key was minted from. The
+    payloads are read a second time for it, which is the cheap half of the trade: the
+    alternative is a new field on a class two other modules construct, for one
+    consumer.
+
+    That sentence is the whole of what #771's fallback has to work with. A key is a
+    hash of the seat's words, so an answer whose key names nothing this round raised
+    can only be re-aimed by comparing what it was answering against what this round
+    asked — and the first of those exists nowhere but in the payload that carried it.
+
+    Every identity check is :func:`earlier_round_files`', unchanged and for the same
+    reason: a declaration from another cycle re-addressed into this one would honour
+    an answer against a question nobody in this cycle asked. First spelling wins on a
+    collision, which cannot arise in practice — a key is content-addressed over the
+    text, so two payloads carrying one key carry one sentence — and costs nothing to
+    state. A payload that fails a check is skipped in silence: `load_baseline` has
+    already reported it, in the same round, out of the same files.
+    """
+    declared: dict[str, str] = {}
+    claimed: dict[str, str] = {}
+    for path in paths:
+        try:
+            payload = json.loads(Path(path).read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("github") != gh_repo or payload.get("pr") != pr_number:
+            continue
+        try:
+            was = int(payload.get("round"))
+        except (TypeError, ValueError):
+            continue
+        if not 1 <= was < round_no:
+            continue
+        if cycle and payload.get("cycle") and payload.get("cycle") != cycle:
+            continue
+        for row in payload.get("coverage_declarations") or []:
+            if isinstance(row, dict) and row.get("key") and row.get("declaration"):
+                declared.setdefault(str(row["key"]).strip().lower(),
+                                    str(row["declaration"]))
+        for row in payload.get("unresolved_claims") or []:
+            if isinstance(row, dict) and row.get("key") and row.get("claim"):
+                claimed.setdefault(str(row["key"]).strip().lower(), str(row["claim"]))
+    return declared, claimed
+
+
+#: What #771's fallback reads a coverage declaration's PLACE out of: a path as a
+#: seat spells one in prose, with the `:LINE` or `:START-END` some of them carry.
+#:
+#: Two alternatives and no third. A token with a SLASH in it is a path and nothing
+#: else; a bare token is one only where it ends in a short extension and its stem
+#: runs to three characters, which is what keeps `e.g`, `i.e` and a sentence's final
+#: `etc.` out of a match. Anchored at both ends against word characters so that a
+#: path inside a longer token is not half-read.
+_PROSE_PATH = re.compile(
+    r"(?<![\w/.\-])"
+    r"((?:[\w.\-]+/)+[\w.\-]*\w|[\w\-]{3,}\.[A-Za-z][A-Za-z0-9]{0,4})"
+    r"(?::(\d+)(?:\s*[-–]\s*(\d+))?)?"
+    r"(?![\w])")
+
+
+def register_localities(text: object) -> list[dict]:
+    """Every place a coverage declaration or an unverifiable claim NAMES, as the
+    finding-shaped dicts :mod:`panel_locality` matches (#771).
+
+    **This reads a fact back out of a sentence written for a human, which is the one
+    thing `panel_scope`'s own header rule forbids** — so the exception is stated
+    rather than smuggled. A finding carries `file` and `line` as fields and needs no
+    such reading; a :class:`panel_rounds.Declaration` carries a key, a sentence and
+    the seats that said it, and nothing else. There is no structured locality on
+    those registers to match on, and #771's whole complaint is that the key they DO
+    carry is a hash of the sentence. So either the fallback reads the sentence or
+    there is no fallback.
+
+    What makes it safe is where it is allowed to be used, not how well it reads
+    prose. It runs only where an answer has ALREADY failed to match by key, it
+    refuses on ambiguity (:func:`readdress_by_locality`), and every honouring it
+    produces is named in `config_notes` as a locality match — so the operator who
+    passed the answer can check it against the two sentences, which is the judgement
+    this cannot make and they can.
+
+    Backticks are not required and not stripped: a seat writes ``` `apps/config.py`
+    ``` about as often as it writes the bare path, and the pattern excludes the
+    backtick from the token either way. A declaration naming no path at all returns
+    `[]`, which is the decline — no locality, no match, today's behaviour.
+    """
+    out: list[dict] = []
+    seen: set[tuple] = set()
+    for path, start, end in _PROSE_PATH.findall(str(text or "")):
+        one, two = (int(start) if start else None), (int(end) if end else None)
+        row = (path, one, two if two is not None else one)
+        if row in seen:
+            continue
+        seen.add(row)
+        # Both spellings of each field. `panel_locality` reads a finding the way
+        # `evals/convergence.py` does — `path`, and line bounds off whatever the
+        # record calls them — and this file's records spell the file `file` while
+        # the payload's rows spell it `path`. Writing both costs a dict entry and
+        # removes a class of silent no-match that would look exactly like "the
+        # declarations are not in the same place".
+        out.append({"path": path, "file": path,
+                    "line": row[1], "start_line": row[1], "end_line": row[2]})
+    return out
+
+
+def shared_place(one: object, two: object) -> tuple[str, str]:
+    """`(the path two register entries share, why nothing was compared)` (#771).
+
+    Empty path and empty reason is the ordinary decline — the two sentences name no
+    common place — and is not a failure. A reason means the matcher itself was
+    unavailable or threw, which the caller reports: a fallback that quietly does
+    nothing is indistinguishable from a fallback that ran and found nothing, and the
+    operator deciding whether to re-answer a question needs to know which.
+
+    **The file alone is a match here, where :func:`panel_locality.same_finding`
+    refuses it, and the divergence is deliberate.** That function refuses path
+    equality because its population is FINDINGS: on `panel_rounds.py` — 8,500 lines
+    and the file most rounds raise something in — every unlocated finding would match
+    every other one, and an answer would carry forward onto a defect nobody asked
+    about. A register is not that population. A round raises a handful of coverage
+    declarations, most of them name a file and no line because a seat declaring "I
+    could not measure this" is declaring something about the file rather than about a
+    span, and :func:`readdress_by_locality` REFUSES the moment two of them land in one
+    place. So the collision that argument is about is not silently resolved here — it
+    is the case this declines on.
+
+    Where both sentences do name a line, the module's own rule applies unchanged,
+    slack and all: `same_finding` is the comparison, and a declaration about line 12
+    does not answer one about line 400 of the same file.
+    """
+    if panel_locality is None:
+        return "", LOCALITY_UNAVAILABLE or "panel_locality is not installed"
+    here, there = register_localities(one), register_localities(two)
+    if not here or not there:
+        return "", ""
+    try:
+        for a in here:
+            for b in there:
+                if (panel_locality.normalize_path(a["path"])
+                        != panel_locality.normalize_path(b["path"])):
+                    continue
+                if (a["line"] is not None and b["line"] is not None
+                        and not panel_locality.same_finding(a, b)):
+                    continue
+                return str(a["path"]), ""
+    except Exception as exc:  # noqa: BLE001 — a matcher must never cost a round
+        return "", f"{type(exc).__name__}: {exc}"
+    return "", ""
+
+
+def carried_assessment(note: str, old: str, where: str) -> str:
+    """The assessor's own sentence with the re-addressing on the end of it (#771).
+
+    #40's rule, applied to a register whose entries carry a claimed assessor's name.
+    An answer honoured by locality lands under a key its author never typed, and a
+    ledger row reading "answered, by NAME" beside a declaration they were never shown
+    attributes a person's measurement to a question they did not see. The clause says
+    which key they DID answer and what the two shared, so the row is checkable from
+    the row.
+
+    Appended rather than substituted: the sentence is the whole value of the register
+    (#718), and a harness that edited an assessor's words would be the actor
+    rewriting the evidence it is judged on. An answer recorded with no note keeps
+    that fact too — the clause stands alone and does not invent one.
+    """
+    said = " ".join(str(note or "").split())
+    tail = (f"[carried from {old} by locality, not by key: the two declarations both "
+            f"land in `{where}` (#771)]")
+    return f"{said} {tail}" if said else tail
+
+
+def readdress_by_locality(unmatched: list[str], raised: dict[str, str],
+                          earlier: dict[str, str], already: set[str],
+                          ) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, ...]], str]:
+    """#750's fallback: which of this round's register entries an answer that names
+    nothing was in fact aimed at.
+
+    `(honoured, ambiguous, problem)` — `honoured` maps the key the caller passed to
+    `(the key this round raised, the path they share)`, `ambiguous` maps it to every
+    key it could equally have meant, and `problem` is set where the matcher could not
+    be run at all.
+
+    **The exact-key path always wins.** `already` is every key an answer has landed
+    on under its own name, and a re-addressing may not take one of those or one
+    another re-addressing has taken: an answer is aimed at one question, and letting
+    two answers land on one declaration would discharge a veto nobody answered.
+
+    **Ambiguity is refused, not resolved.** :func:`panel_rounds._coverage_ruling`
+    settles the same question the same way and states the reason: resolving by
+    position would let the ORDER of a model's array decide whether a gap vetoes.
+    Here it is sharper, because the failure is fail-OPEN — a wrongly honoured answer
+    lifts a veto that should stand — and this file's rule is that a model's wording
+    may never be the thing that takes a line out of the veto list. Two of this
+    round's declarations about one file is a question the operator answers by reading
+    them; it is not one a path comparison can answer.
+
+    Deterministic: the caller's keys are walked sorted and this round's are too, so
+    two runs over one round re-address the same pairs and the payload's bytes do not
+    move with the order of the flags.
+    """
+    honoured: dict[str, tuple[str, str]] = {}
+    ambiguous: dict[str, tuple[str, ...]] = {}
+    taken = set(already)
+    problem = ""
+    for old in sorted(unmatched):
+        was = earlier.get(old)
+        if not was:
+            continue
+        hits: list[tuple[str, str]] = []
+        for new in sorted(raised):
+            if new in taken:
+                continue
+            where, why = shared_place(was, raised[new])
+            problem = problem or why
+            if where:
+                hits.append((new, where))
+        if len(hits) == 1:
+            honoured[old] = hits[0]
+            taken.add(hits[0][0])
+        elif hits:
+            ambiguous[old] = tuple(k for k, _ in hits)
+    return honoured, ambiguous, problem
+
+
+def repeats_by_locality(current: list, before: list[tuple]
+                        ) -> tuple[set[str], str]:
+    """`(the keys of this round's findings an earlier round already raised IN THE
+    SAME PLACE, why nothing was compared)` — #771's second matcher.
+
+    Beside the key comparison rather than instead of it. `Baseline.raised_before`
+    answers the same question off the finding's own key and off a title fallback
+    that is deliberately hard to trigger; this answers it off the LINES, which is
+    the half neither of those can reach — a seat that rewords its own finding mints
+    a new key and can defeat the title comparison too, and the finding is still the
+    same finding standing in the same place.
+
+    `before` is :attr:`panel_rounds.Baseline.fixed_findings` — `(key, severity, file,
+    line, title)` from the anchor round, which is the round whose fix commits this
+    one is reading. A record with no file is dropped: a finding nothing can place is
+    no evidence about where anything landed.
+
+    **Nothing here can make a round easier.** The set this returns is unioned into
+    `repeated`, and `round_stop`'s rule 3 counts repeats towards going AGAIN. So a
+    wrong match here costs a cycle a round it did not need, and a missed one leaves
+    the count exactly where it was before #771 — which is the direction a matcher
+    over a model's own output has to fail in.
+    """
+    if panel_locality is None:
+        return set(), LOCALITY_UNAVAILABLE or "panel_locality is not installed"
+    was = [{"key": str(k), "path": str(f), "file": str(f), "line": ln,
+            "start_line": ln, "end_line": ln, "title": str(t)}
+           for k, _sev, f, ln, t in before if f]
+    now = [{"key": c.key, "path": c.file or "", "file": c.file or "", "line": c.line,
+            "start_line": c.line, "end_line": c.line, "title": c.synthesis}
+           for c in current if c.file]
+    if not was or not now:
+        return set(), ""
+    try:
+        paired = panel_locality.match_across_rounds(was, now) or {}
+    except Exception as exc:  # noqa: BLE001 — a matcher must never cost a round
+        return set(), f"{type(exc).__name__}: {exc}"
+    # `match_across_rounds` maps the EARLIER round's key to this round's, and a prior
+    # finding that matched nothing is absent rather than present with an empty value.
+    # So the answer this function wants is the value side, filtered to keys this round
+    # actually carries — a pair naming a finding not in `outstanding` is dropped
+    # rather than counted, because `repeated` is a statement about the findings the
+    # round has to clear and nothing else.
+    here = {c.key for c in current}
+    return {new for new in paired.values() if new in here}, ""
+
+
 def fix_surface(fix_diff: str | None, prior_files: set[str],
                 prior_read: bool) -> dict | None:
     """What SURFACE the last fix pass opened: the files it touched, and which of
@@ -1105,6 +1502,15 @@ def _payload_defaults() -> dict:
         # round to attribute against. All-zero is a different statement: a round
         # that could have attributed and had nothing to attribute.
         "provenance_counts": {},
+        # #771's matcher, present on every exit for the reason `provenance_counts`
+        # above and `fix_pass` below are: this function exists so a consumer never has
+        # to tell "this run never got that far" from "this payload predates the key",
+        # and a block added to the reviewed literal and not to this one puts that
+        # distinction straight back. Null counts and not zeros, on `fix_pass`'s rule —
+        # a skipped round matched nothing because it read nothing, and a `0` here would
+        # say the matcher ran and found none. `why` is null because nothing was tried.
+        "locality_repeats": {"only_locality": None, "by_key": None,
+                             "keys": [], "why": None},
         "fix_range_source": None,
         "fix_range_rebuilt": None,
         # #559: nothing was attributed, so nothing was filtered out of the
@@ -1585,6 +1991,81 @@ def post_summary(gh_repo: str, pr_number: int, report: str) -> bool:
     return False
 
 
+def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
+    """The deterministic seat (#780), as the round's executor calls it.
+
+    :func:`panel_slop.review_fix_pass` is pure — rules in, diff in, findings out —
+    and everything impure the seat needs is here: the rule load, the post-image
+    read, and the clock. That split is the module's own rule and it is what makes
+    its fixtures a complete statement of its behaviour, so the impurity does not
+    leak back across it.
+
+    **`diff` is the FIX RANGE, never the PR's diff.** The caller passes `fix_diff`,
+    the one range this round resolved for provenance and the surface measurement,
+    and a caller with no range must not call this at all — see the dispatch, which
+    skips the seat and says why. Handing it `gh pr diff` would still "work" and
+    would report the whole branch's placeholder stubs as though the last fix pass
+    had just written them, which inverts the one claim the seat makes.
+
+    **The rule load is caught, and the seat is the only thing that dies.**
+    :func:`panel_slop.load_rules` is strict on purpose — an unknown key, an unknown
+    match kind and a duplicate id are all fatal, because a rule set that skips what
+    it cannot read reports clean for the wrong reason. That is right inside the
+    seat and wrong at the round's expense: ten checked-in YAML files must not be
+    able to take down a panel with four vendors waiting on it. A load that fails
+    comes back as a `skip`, which vetoes a confident stop the way any other seat's
+    failure does — this one IS about the round, it is somebody's typo, and it is
+    fixable in a minute.
+
+    **The post-image is read from the local checkout at the round's head**, through
+    :func:`panel_scope._blobs` — the panel's existing object-store reader, already
+    used by #559's restored-line filter, one `ls-tree` plus one `show` per file. Not
+    the `code_tree`: that is downloaded only when an LLM seat can read code, is
+    stripped of files this seat would want to see whole, and is pinned to
+    `meta["headRefOid"]` rather than to the head this round actually attributed
+    against. A checkout that cannot answer costs the five ast rules and nothing
+    else — they are declared per file in `could_not_assess`, which is the seat's own
+    contract, and the run comes back `code_blind` so those declarations are reported
+    without vetoing. `code_blind` is exactly true there: with no sources this seat's
+    evidence is the hunks and nothing more, which is the flag's definition.
+
+    A file the checkout HAD and could not be read is a different thing and is left
+    to speak for itself: the ast rules for it declare a gap, the run is not
+    code_blind because other files were read, and that gap vetoes. Which is right —
+    it is about this round.
+    """
+    started = time.monotonic()
+
+    def elapsed() -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    try:
+        rules = panel_slop.load_rules()
+    except Exception as exc:  # noqa: BLE001 — the round outlives a bad rule file
+        return ReviewerRun(
+            skip=f"slop: its rule files would not load ({type(exc).__name__}: {exc})",
+            duration_ms=elapsed())
+    try:
+        changed = panel_slop.parse_diff(diff)
+    except Exception as exc:  # noqa: BLE001 — same terms as the load above
+        return ReviewerRun(
+            skip=f"slop: the fix range would not parse ({type(exc).__name__}: {exc})",
+            duration_ms=elapsed())
+    files = sorted({c.path for c in changed if c.added})
+    sources: dict[str, str] = {}
+    if files and repo_path and head_sha:
+        sources, _holes = _blobs(repo_path, head_sha, files)
+    got = panel_slop.review_fix_pass(diff=diff, sources=sources, rules=rules)
+    return ReviewerRun(findings=got.findings,
+                       could_not_assess=got.could_not_assess,
+                       # The five ast rules had nothing to read AT ALL. Reported,
+                       # not vetoed — see the docstring, and `coverage_veto`, which
+                       # is the one consumer that treats this differently from every
+                       # other way of coming up short.
+                       code_blind=not sources,
+                       duration_ms=elapsed())
+
+
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
@@ -1700,7 +2181,44 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `None` is exactly today's behaviour — which is what lets this land on a fleet
     # that has set no dial and change nothing at all.
     round_cap_ceiling, _ceiling_said = panel_caps.round_ceiling(cfg)
-    dials = resolve_dials(panel, max_rounds, notes, round_cap_ceiling)
+    # #776's per-round budget multiplier, resolved BEFORE the dials because it is an
+    # INPUT to one of them, the same relationship `round_cap_ceiling` has to
+    # `max_rounds` above. One policy read in one place: it scales exactly four ceilings
+    # — the diff budget, the low-severity fix budget on `dials`, the per-round token
+    # allowance in `panel_caps` and (had it been clean to do) the seat set — on one
+    # rule: A MULTIPLIER SCALES WHAT A ROUND MAY SPEND AND NEVER WHAT A ROUND MAY
+    # CONCLUDE. So no floor, no `escalate_on` threshold, no growth ceiling, and nothing
+    # counted over a window or a whole PR is touched by it, because each of those is a
+    # verdict about the CHANGE rather than an allowance for the round reading it.
+    #
+    # `1.0` on the shipped `[1.0]`, which is every repo on the fleet today, and
+    # `harness_rules.tapered` is the identity at 1.0 for every ceiling that is not
+    # `None` — so a run under the shipped config computes the same numbers it computed
+    # before the key existed.
+    round_mult = round_multiplier(cfg, round_no)
+    # The curve said something other than "flat", so every tapered ceiling below is a
+    # number this round chose rather than the one the repo wrote — and a reader
+    # comparing two rounds' budgets has no other way to see that the policy, not the
+    # PR, moved. Silent at 1.0 for `_report`'s reason: a diagnostic that fires on the
+    # shipped default is noise in front of the ones that matter.
+    if round_mult != 1.0:
+        notes.append(
+            f"`round_budgets.multipliers` puts round {round_no} at x{round_mult:g} — "
+            "the diff budget, the per-seat and judge budgets that inherit it, "
+            "`low_severity_fix_lines` and the released token allowance are scaled by "
+            "it. Floors, thresholds, growth ceilings and anything counted over a "
+            "window or the whole PR are NOT: a multiplier scales what a round may "
+            "spend, never what it may conclude. Nor is the SEAT SET — there is no "
+            "order to take the first N of, so scaling it would drop seats by "
+            "alphabet and bank their silence as coverage (#776)")
+    dials = resolve_dials(panel, max_rounds, notes, round_cap_ceiling,
+                          # #776. The multiplier reaches the `Dials` constructor rather
+                          # than being applied to `dials.low_severity_fix_lines`
+                          # afterwards, because that field has five readers — the
+                          # prompt, the report, the brief, the stop rule and the
+                          # payload — and a value scaled at four of them is the
+                          # disagreement `resolve_dials` exists to prevent.
+                          round_mult=round_mult)
     cap = dials.max_rounds
     # #84's futility brake, from the round's side. Resolved beside the dials and for
     # the same reason: a rules file with a bad `escalate_on` has to say so whether or
@@ -1733,6 +2251,41 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # an instrument with one cycle behind it — a repo may set a number to watch it
     # without arming a stop on it.
     guard_lines_armed = guard_lines_brake(panel, notes)
+    # #779's mode per rung, read here beside the arming flags above because it is the
+    # other half of the same policy and belongs to the same moment: the round's stop is
+    # computed under one policy resolved in one place, and a malformed mode says so
+    # before a seat is dispatched rather than after a whole panel has been paid for.
+    #
+    # **Read from `cfg` and NOT from `panel`, which is the one difference from the six
+    # reads above it and is not an oversight.** `harness_rules.escalate_mode` is the
+    # only place the three-layer fallback may be applied — this repo's mapping, then
+    # `DEFAULTS`, then `shadow` for a rung `DEFAULTS` does not name — and it takes the
+    # resolved config because the middle layer is what stops one repo naming one rung
+    # from disarming the other five: `review_panel` merges one level deep, so a repo
+    # writing `escalate_modes: {"fix_injection": "shadow"}` leaves the other five
+    # ABSENT from `panel["escalate_modes"]`, and a reader taking absence for `shadow`
+    # would run the next cycle with five armed brakes recording and none stopping.
+    #
+    # Built over `panel_rounds.BRAKED_RUNGS` rather than over a list written here, so
+    # a rung wired into `round_stop` cannot arrive with no mode read for it — the two
+    # places would otherwise be a mapping and a literal that agree until somebody adds
+    # the seventh rung.
+    brake_modes = {rung: escalate_mode(cfg, rung)
+                   for rung in sorted(set(BRAKED_RUNGS.values()))}
+    # Said only where a rung is NOT enforcing, which is no repo today. #779's whole
+    # claim is that a brake in shadow records and acts on nothing, and a reader of a
+    # round whose `reason` names no rung has no other way to learn that one of its
+    # brakes was disarmed on purpose — `round_stop`'s payload carries the mode per
+    # rung, and `config_notes` is what a human reads.
+    in_shadow = sorted(r for r, m in brake_modes.items() if m != BRAKE_ENFORCE)
+    if in_shadow:
+        notes.append(
+            f"`escalate_modes` puts {', '.join(f'`{r}`' for r in in_shadow)} in "
+            f"{BRAKE_SHADOW} — {'that rung reaches its' if len(in_shadow) == 1 else 'those rungs reach their'} "
+            "verdict on every round and ends nothing. The verdict is recorded at "
+            "`round_stop.<rung>.would_fire` beside `fired`, which is the calibration "
+            "population #67 asks for before a gate binds; put the word back to "
+            f"`{BRAKE_ENFORCE}` to arm it again (#779)")
     # Said out loud rather than left to be discovered, on `max_fix_growth: null`'s
     # precedent one function up: a repo that armed the flag and wrote no ceiling has a
     # rung that can never fire, and a rung that ships unwired is the failure #169 names.
@@ -2867,7 +3420,29 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         notes.append(f"the tip of base branch '{base}' could not be read, so this round "
                      "records what its diff was built from and not what the PR would be "
                      "merged into — a later staleness check has one end of the range only")
-    panel_budget = diff_budget(panel, "max_diff_chars", DEFAULT_DIFF_BUDGET, notes)
+    # #776's taper on the one budget every seat inherits. ONE LINE COVERS THE
+    # INHERITANCE, and that is why it is applied here rather than to each seat: the
+    # per-seat budgets below and the judge's both take `panel_budget` as their
+    # FALLBACK, so a repo that wrote nothing per seat gets the tapered figure
+    # everywhere without this file scaling it four times. A seat or judge that names
+    # its own `max_diff_chars` keeps that number untapered, deliberately — a per-model
+    # budget states what THAT MODEL can read, which is a fact about a context window
+    # and not an allowance a later round should be spending less of.
+    #
+    # `diff_budget` answers `None` for "the whole diff, uncut" and never 0 or less (it
+    # refuses those and falls back, saying so), so `tapered` has exactly the two cases
+    # it documents: no ceiling stays no ceiling, and a written ceiling is floored to a
+    # whole number of chars. At the shipped x1.0 it returns the number `diff_budget`
+    # returned.
+    #
+    # The base is KEPT beside the tapered figure rather than discarded, because the
+    # veto a cut round earns has to name the taper and not just the ceiling: #776's
+    # rule is that the reason says what BOUND the round, and "60,000 of 177,872 chars"
+    # with no mention of the curve sends whoever tunes it to `.harness-rules`, where
+    # the number is not.
+    panel_budget_written = diff_budget(panel, "max_diff_chars",
+                                       DEFAULT_DIFF_BUDGET, notes)
+    panel_budget = tapered(panel_budget_written, round_mult)
     # Only for the reviewers actually running: a budget warning about a model
     # this run never asked for is noise, and a "truncated for antigravity" footnote
     # under a claude-only panel is a lie.
@@ -2891,6 +3466,36 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `claude`, which is a separate seat with a separate record, and its own gate
     # refuses it the same way.
     installed = {name for name in LLM_REVIEWERS if seat_installed(name)}
+    # ---- #776 CONSIDERED THE SEAT SET HERE AND DELIBERATELY DID NOT SCALE IT.
+    #
+    # `selected ∩ installed` is finalised on the line below, and it is the fourth
+    # ceiling #776 names: a later round is meant to be cheaper by reading LESS as well
+    # as by thinking less, and dropping a seat is the largest saving available. The
+    # rule the issue sets for it is "scale the SIZE, floor at 1, never choose which
+    # seats" — and that rule cannot be satisfied here, so this is what it costs and why
+    # it is not done.
+    #
+    # **There is no order to take the first N of.** `selected` is a set and
+    # `LLM_REVIEWERS` is a name-ordered tuple; nothing in this file ranks a seat above
+    # another for coverage, and nothing measures which seat's absence a round would
+    # miss least. Scaling the size therefore means choosing by alphabet, which IS
+    # choosing which seats, and it is choosing them by the one property that has no
+    # relationship to what they find. The complement-routing work is where a
+    # principled order would come from, and it is not built.
+    #
+    # **And a dropped seat is not a cheaper round, it is a narrower one, counted as
+    # coverage.** A seat that never ran is exempt from `coverage_veto` only where it is
+    # ABSENT from the box (`seat_installed`, #222); one dropped by a budget is an
+    # installed seat with no record, and the round after it inherits the quiet as
+    # though four seats had read the diff. That is exactly the "never a dropped seat
+    # counted as coverage" #776 forbids, and getting it right means teaching
+    # `coverage_veto`, `load_baseline` and the payload's `reviewers_selected` about a
+    # fifth reason a seat has no row — three files this taper has no business moving.
+    #
+    # What is left of the intent is real and is already applied: every seat's DIFF
+    # budget is tapered through `panel_budget` on the line below, so a later round is
+    # cheaper by reading less of the PR rather than by reading none of it through one
+    # seat's eyes.
     budgets = {name: diff_budget(rev.get(name, {}), "max_diff_chars", panel_budget, notes)
                for name in LLM_REVIEWERS if name in selected and name in installed}
     # The judge is a seat on this box too: `adjudicate` runs it through the
@@ -3767,6 +4372,123 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"reviewers' checkout: {', '.join(stripped[:8])}"
                      + (f" and {len(stripped) - 8} more" if len(stripped) > 8 else ""))
 
+    # ---- The fix pass's own range, read ONCE, here (#780).
+    #
+    # This block used to sit beside the attribution that consumes it, some nine
+    # hundred lines down, and it moved for one reason: the deterministic seat
+    # dispatched below reviews the FIX PASS rather than the PR, so the range has to
+    # exist before the seats are dispatched or the seat cannot be a seat. Moving the
+    # READ up is the only shape that keeps one answer to "what did the last pass
+    # write" — computing a second range for the seat would put two `compare` calls
+    # on every round and let the seat and the provenance numbers describe different
+    # spans, which is precisely the drift #512 spent itself closing between scope
+    # and attribution.
+    #
+    # Nothing else moved. `fix_added`, the `provenance unavailable` note, #559's
+    # restored-line subtraction and every consumer stay exactly where they were and
+    # read the variables this block binds; what is here is the compare read, the
+    # #504 reconstruction and the choice between them, none of which appends a note
+    # or touches the report, so the round's `config_notes` come out in the order
+    # they always did.
+    #
+    # It is in the SETUP phase and that is where it belongs: a `compare` read is
+    # the same kind of thing as the CI read and the code-tree download beside it,
+    # and no vendor has been paid yet. No path between here and its old home
+    # returns, so this is the same one call on the same rounds — earlier in the
+    # wall clock, and charged to the phase that was already doing the GitHub reads.
+    # Attribution needs both ends of the fix range, and `_fix_range_diff` says why
+    # when it has none: a baseline written before `head_sha` was recorded, a
+    # head that never moved, a branch rewritten between rounds, an API refusal.
+    # All of them degrade to "unknown" rather than to a wrong answer.
+    #
+    # `cycle_run` is `in_cycle or prior_rounds`, so `cycle_run and prior_rounds`
+    # only ever meant `prior_rounds`: round 1 has no earlier round to attribute
+    # against whether it is in a cycle or not.
+    #
+    # `prior.rounds` rather than the `prior_rounds` local, which is the same number
+    # bound five hundred lines below this now that the read has moved up
+    # (`prior_keys, prior_rounds = prior.keys, len(prior.rounds)`). One source, read
+    # early — not a second copy: the local is still what everything after it uses.
+    attributable = bool(prior.rounds)
+    # ---- ONE anchor, and the round's own lines where they are safe to use (#512).
+    #
+    # Two defects, one of them nearly introduced by the first cut of this change.
+    #
+    # **The anchor.** Scope anchors on `since or prior.head_sha`; this used to anchor
+    # on `prior.head_sha` outright. `--since` is documented and legitimate — "pass it
+    # to review a specific range, or when the baseline predates that field" — and
+    # passing it pointed the two at different spans with nothing reporting the
+    # mismatch, so the provenance numbers described a range nobody looked at. Both
+    # now read `anchor`, so they cannot drift.
+    #
+    # **The status guard, which is why the compare call STAYS.** It is tempting to
+    # drop it and attribute straight off `review.increment` — the round reviewed
+    # that diff, so it is the fix pass by construction. It is not, after a rewrite.
+    # `fetch_increment` uses the three-dot form and says what that costs: "when the
+    # branch was force-pushed or rebased between rounds the merge base moves back
+    # and the increment WIDENS toward the whole PR. That is the safe failure: the
+    # round re-reads more than it needed to." Safe for a review; catastrophic for an
+    # attribution, because every line the PR ever added is then inside the "fix
+    # range" and every finding on one reads `introduced`. `panel_scope` only falls
+    # back at `len(increment) >= len(diff)`, so a rebase that widens the increment to
+    # most of the PR passes every guard and becomes the target.
+    #
+    # `_fix_range_diff` is the only thing that sees `status`, refuses `diverged` and
+    # `behind`, and drives #509's veto. So it keeps running, and what changes is
+    # WHICH LINES are attributed once it has said the range is sound.
+    #
+    # **And then the increment's lines, because they are the better ones.** It is
+    # `_diff_subset`'d to files also in the PR diff, which drops a base-branch
+    # merge's own files — the over-count `_fix_range_diff`'s docstring names and
+    # cannot fix, since main's commits legitimately sit inside its range.
+    # `anchor`, not `review.since`: the two agree while the increment holds, and
+    # `review.since` is EMPTY on every round whose scope fell back to `pr` — so
+    # reading it there would silently revert to `prior.head_sha` and drop an explicit
+    # `--since`, which is the mismatch this is here to close. `anchor` is bound
+    # before scope is decided, carries `--since`'s own validation, and is what the
+    # round would have reviewed from.
+    if attributable:
+        _range_diff, no_range_why, range_kind = _fix_range_diff(
+            gh_repo, anchor, head_sha)
+    else:
+        _range_diff, no_range_why, range_kind = None, None, FIX_RANGE_OK
+    # ---- #504: a REWRITTEN range is a wrong range, not a lost fix pass.
+    #
+    # #509 made a rebased round honest and #512 gave it one range to be honest
+    # about; neither keeps the instruments ARMED, so a rebase between rounds still
+    # ends with every finding `unknown` and `escalate_on.fix_injection` unable to
+    # fire on the shape it is worth most on — the fixer working against a base that
+    # moved. #500's own observation is what makes the repair possible: the old SHAs
+    # still resolve, so the range is wrong and the history is not.
+    #
+    # Tried ONLY on `rewritten`, and only on an attributable round. Every other
+    # verdict already has a sound range in hand — `ok` has this reader's, `blind`
+    # usually has the round's own increment — and spending local git on those would
+    # buy a second answer to a question already answered, which is the duplication
+    # #512 has just finished removing.
+    rebuilt = (reconstruct_fix_range(cfg.get("path") or "", gh_repo, base,
+                                     anchor, head_sha)
+               if attributable and range_kind == FIX_RANGE_REWRITTEN else None)
+    # The increment is usable whenever the range is not REWRITTEN — including when
+    # this reader came back blind. `blind` means "I could not get the range" (too
+    # large to hold, an API refusal), which says nothing about the copy the round
+    # already reviewed; discarding a sound increment there is a false blindness, and
+    # it would fire on exactly the big base-branch merge this feature is for.
+    # `rewritten` is the one that forbids it, because then no diff of that span is
+    # the fix pass — the round's included.
+    have_increment = review.scope == "increment" and bool(review.increment)
+    # `reconstructed` is checked FIRST and it is the only source a rewritten round
+    # may use. The increment is barred there for the reason above it and stays
+    # barred — the reconstruction does not make the round's own diff trustworthy,
+    # it supplies a different one — and `_range_diff` is None on that road anyway.
+    if rebuilt and rebuilt["diff"]:
+        fix_diff, fix_range_source = rebuilt["diff"], "reconstructed"
+    elif attributable and range_kind != FIX_RANGE_REWRITTEN and have_increment:
+        fix_diff, fix_range_source = review.increment, "increment"
+    else:
+        fix_diff = _range_diff
+        fix_range_source = ("compare" if _range_diff else None) if attributable else None
+
     # Everything above — the PR read, the diff fetch, the scope decision, the
     # pre-flight verdict, the CI read and the code-tree download — closes here as
     # one phase. It is the part of a round that costs no vendor call and was
@@ -3837,16 +4559,51 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 {"number": pr_number, "base": base,
                  "head": meta["headRefName"], "head_sha": meta["headRefOid"]},
                 changed_lines, cfg["path"])
+        # ---- #780's deterministic seat, on sonarqube's terms: selectable, in
+        # ALL_REVIEWERS and not in LLM_REVIEWERS, dispatched into the same executor
+        # and never sent to a CLI. It costs no vendor call and no token, so it is
+        # submitted rather than run inline for one reason only — the join and the
+        # `watch` below are what attribute a round's wall clock, and a seat outside
+        # them is time charged to whichever seat happened to be slowest.
+        slop_future = None
+        slop_filed = False
+        #: Why the seat did not run, when it was asked for and could not. Reported
+        #: through `result.skipped` like any other skip and DELIBERATELY not written
+        #: into `reviewer_meta` — see the collection below.
+        slop_skip = ""
+        if "slop" in selected:
+            if panel_slop is None:
+                slop_skip = ("slop: the seat is not installed "
+                             f"({SLOP_UNAVAILABLE or 'import failed'}) — the round ran "
+                             "without it")
+            elif not fix_diff:
+                # THE distinction the seat exists for, enforced at the door. Its
+                # population is what the last fix pass wrote, and on a round with no
+                # readable range there is no such population — so it does not run.
+                # The tempting fallback is the PR's diff, which is always to hand and
+                # is the one thing that would make the seat wrong: it would report
+                # every placeholder body on the branch as this round's slop, most
+                # loudly on round 1, where the "fix pass" is the change under review.
+                slop_skip = ("slop: no fix-pass range this round, so there is nothing "
+                             "for it to read — " + (no_range_why or
+                             ("round 1 has no earlier round to compare against"
+                              if not attributable else "the range came back empty")))
+            else:
+                slop_future = ex.submit(review_slop, fix_diff, cfg.get("path") or "",
+                                        head_sha)
 
         # Observe the seats landing before collecting them in submission order
         # (#192). Sonar is watched with the rest: it is dispatched into the same
         # executor and its finish is part of the same join, so leaving it out
         # would attribute a round Sonar held to whichever LLM seat was slowest.
         # `watch` never reads a result, so the loop below still raises, skips and
-        # records exactly as it did — see its docstring.
+        # records exactly as it did — see its docstring. Slop is watched on the same
+        # argument; it is expected to be the cheapest thing in the executor, and an
+        # instrument that only measures what it expects measures nothing.
         panel_timing.watch(clock,
-                           {**tasks, **({"sonarqube": sonar_future} if sonar_future
-                                        else {})},
+                           {**tasks,
+                            **({"sonarqube": sonar_future} if sonar_future else {}),
+                            **({"slop": slop_future} if slop_future else {})},
                            echo=chatter)
 
         llm_findings: list[Finding] = []
@@ -3962,6 +4719,59 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # anything into the population the judge clusters, and only this
                 # branch can. See `filers`.
                 sonar_filed = bool(soft)
+        if slop_skip:
+            # Reported, and NOT recorded in `reviewer_meta`. `coverage_veto` walks
+            # that dict and turns every `ran: False` into a line, and the two ways
+            # this seat does not run are both facts about something other than the
+            # round's quality: round 1 has no fix pass BY CONSTRUCTION, so a veto
+            # there is a standing veto on the first round of every cycle, and a seat
+            # this box could not import is `absent`'s case exactly. Both are the
+            # constants `coverage_veto`'s docstring rules out at length — a signal
+            # that is never positive carries no information. What the round loses by
+            # not reading a fix pass it does not have is already said twice: here,
+            # and in the `provenance unavailable` note the same missing range
+            # produces. sonarqube's precedent is the same shape: it writes its row
+            # only on the rounds it was dispatched.
+            result.skipped.append(slop_skip)
+        if slop_future:
+            slop_run = slop_future.result()
+            reviewer_meta["slop"] = {
+                "ran": slop_run.skip is None,
+                "skip": slop_run.skip,
+                "duration_ms": slop_run.duration_ms,
+                "could_not_assess": slop_run.could_not_assess,
+                # Reported and not counted where the checkout gave the seat nothing
+                # to parse — the flag's own contract, and the reason the five ast
+                # rules' declarations cannot become a standing veto on a box whose
+                # checkout does not carry the PR's head.
+                "code_blind": slop_run.code_blind,
+                # Never absent: there is no CLI to be missing. A seat that could not
+                # be imported never reaches this branch at all.
+                "absent": False,
+                # No brain, no budget, no truncation, and no usage. Spelled out
+                # rather than left to `.get` defaults because the payload is read
+                # months later and a missing key and a false one are different
+                # claims — #222's rule, applied to a seat that has never had a model.
+                "model": None,
+                "effort": None,
+                "max_diff_chars": None,
+                "truncated": False,
+                "argv_capped": False,
+                "unstructured": False,
+                "model_unavailable": None,
+                "effort_unsupported": None,
+            }
+            if slop_run.skip:
+                result.skipped.append(slop_run.skip)
+            else:
+                # Into the SAME population the judge clusters, on sonarqube's soft
+                # terms: a deterministic finding is still a finding, and a defect two
+                # seats raise should merge on its title rather than appear twice. The
+                # judge can dismiss it like any other — which is the answer to "what
+                # if a rule is wrong on this diff", and it is a cheaper answer than a
+                # confidence field the seat declares about itself.
+                llm_findings.extend(slop_run.findings)
+                slop_filed = bool(slop_run.findings)
 
     # The executor has joined, so every seat has finished copying out of the tree
     # and nothing reads it again. Removed HERE rather than at the end of `run`
@@ -4182,7 +4992,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # this round could ever have produced, so a threshold above that count stands down
     # its whole band — which is a config nobody meant to write, and is invisible in a
     # report that only ever shows what the round did stand down.
-    threshold_filers = len(ran_llm) + (1 if sonar_filed else 0)
+    # `slop_filed` joins on sonarqube's argument and for its reason: its findings go
+    # into `llm_findings`, so a canonical finding's `reviewers` can legitimately read
+    # ["claude", "slop"], and a band whose threshold this count cannot reach must say
+    # so against everything that can actually FILE. Keyed on whether it filed, never
+    # on whether it ran — a seat that ran and found nothing adds no member to any
+    # cluster, which is the same distinction `sonar_filed` draws against the gate
+    # status one line up.
+    threshold_filers = len(ran_llm) + (1 if sonar_filed else 0) + (1 if slop_filed else 0)
     # `> 1` first, and it is load-bearing rather than a tidy-up: a round where no
     # member filed at all has `threshold_filers == 0`, and every band's threshold is
     # at least 1, so a bare comparison against the count would put this note on every
@@ -4459,11 +5276,66 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # than a list would hand out the exemption by substring, which is the fail-OPEN
     # direction on the one setting here that can buy a confident stop.
     ci_declared_absent = isinstance(_off, list) and "ci" in _off
+    # The two ledgers, built BEFORE the registers that answer them. That ordering is
+    # the one structural change #750 needs: an answer whose own key names nothing can
+    # only be re-aimed at a question this round actually asked, so the round has to
+    # know what it raised before it can decide what the answers landed on.
+    obligations = reached_obligations(reviewer_meta, ruled)
+    declarations = reached_declarations(reviewer_meta, ruled)
+    raised_now = {d.key: d.declaration for d in declarations}
+    raised = {ob.key: ob.claim for ob in obligations}
+
+    # ---- #750/#771: an answer that names nothing, re-aimed at the same PLACE.
+    #
+    # Measured on lexray#1611: an operator closed five coverage declarations with
+    # real measurements — a live `git grep`, an inspection of an installed package,
+    # twelve live fetches — passed all five back with `--assessed`, and got five
+    # "names no coverage declaration this round raised" notes. The seats had reworded
+    # their declarations, a key is a hash of the seat's own sentence, and so five
+    # answers retired nothing and the round was exactly as unconfident as if nobody
+    # had looked. #748 is the same fault from the other side: under `increment` scope
+    # no answer can ever carry, so `confident: true` is unreachable by construction.
+    #
+    # THE EXACT-KEY PATH IS UNTOUCHED AND RUNS FIRST. This is a fallback over what it
+    # leaves behind — `stray_*` is precisely the set that produced a note before —
+    # and it can only ever move a key from "named nothing" to "named this". An answer
+    # that matched by key never reaches here.
+    #
+    # What it matches on is the PLACE the two sentences name, which is #771's whole
+    # argument: mergeCraft's own doctrine admits a fingerprint cannot survive a
+    # paraphrase and their convergence eval matches on locality overlap instead. The
+    # register carries no locality of its own, so `register_localities` reads one out
+    # of the prose and says at length why that is allowed here and nowhere else.
+    #
+    # It refuses far more than it honours, on purpose. No path in either sentence, no
+    # match. Two candidates in one place, no match. Matcher missing or throwing, no
+    # match. Every one of those declines to today's behaviour, which is the direction
+    # a fail-OPEN change has to fail in: a wrongly honoured answer lifts a veto that
+    # should have stood, and this file's standing rule is that a model's wording may
+    # never be the thing that takes a line out of the veto list.
+    was_declared, was_claimed = earlier_round_registers(
+        baseline or [], gh_repo, pr_number, round_no, prior.cycle)
+    stray_assessed = [k for k in answered if k not in raised_now]
+    stray_ack = [k for k in accepted if k not in raised]
+    #
+    # `already` carries the INHERITED registers as well as this round's flags. A
+    # declaration an earlier round already answered is exempt at `coverage_veto`
+    # whatever happens here, so re-aiming a second answer at it would buy nothing and
+    # would put a note in front of an operator claiming a match that changed no
+    # verdict.
+    moved_assessed, blurred_assessed, assessed_problem = readdress_by_locality(
+        stray_assessed, raised_now, was_declared, set(answered) | set(prior.assessed))
+    moved_ack, blurred_ack, ack_problem = readdress_by_locality(
+        stray_ack, raised, was_claimed, set(accepted) | set(prior.acknowledged))
     # Declared this round plus every key an earlier round of the cycle accepted.
     # `prior` wins a collision for the same reason it does on `escalated`: the
     # earliest round that recorded the act owns its date, and re-passing a key you
-    # inherited must not re-date the acknowledgement to now.
+    # inherited must not re-date the acknowledgement to now. A re-addressed key sits
+    # with this round's own, because the re-addressing IS an act of this round: the
+    # human acted earlier, and the decision that their act reaches this key was taken
+    # here and has to be dated here to be checkable.
     ack_held = dict(sorted({**{k: round_no for k in accepted},
+                            **{new: round_no for new, _ in moved_ack.values()},
                             **prior.acknowledged}.items()))
     # #718's register, built on `ack_held`'s exact terms: declared this round plus
     # every key an earlier round of the cycle recorded, `prior` winning a collision so
@@ -4471,17 +5343,73 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # it, which is the sharper version of the same rule here, since the entry carries a
     # name. Sorted, because it is serialised straight into the payload and a diff
     # between two payloads has to mean something changed.
+    #
+    # A re-addressed entry carries `carried_assessment`'s clause in its note, and that
+    # is #40's rule rather than decoration: `set_by` is a claimed assessor, and an
+    # entry saying they answered `ca-45c9…` when what they answered was `ca-1eeb…`
+    # attributes a person's measurement to a question they were never shown. The
+    # clause rides in the ledger row so a reader of `coverage_declarations` sees it
+    # without having to hold `config_notes` beside it.
     assessed_held = dict(sorted(
         {**{k: Assessment(round_no, note, assessor) for k, note in answered.items()},
+         **{new: Assessment(round_no,
+                            carried_assessment(answered[old], old, where), assessor)
+            for old, (new, where) in moved_assessed.items()},
          **prior.assessed}.items()))
-    obligations = reached_obligations(reviewer_meta, ruled)
-    declarations = reached_declarations(reviewer_meta, ruled)
     veto = (coverage_veto(reviewer_meta, judge_skip, flagged, len(review.target),
                           ci_status=ci_status,
                           ci_declared_absent=ci_declared_absent,
                           coverage=ruled, acknowledged=ack_held,
                           assessed=assessed_held)
             + manifest_veto + moved_head_veto + judge_gaps + inherited + prior.problems)
+    # ---- #776: A TAPERED CEILING THAT BOUND IS A NAMED STOP, NEVER A SILENT CUT.
+    #
+    # `coverage_veto` above already vetoes a truncated seat, so a round the curve cut
+    # short cannot read as a clean finish — that half is not new. What IS new is that
+    # the number in its sentence ("claude saw 30,000 of 177,872 diff chars") is one
+    # THIS ROUND chose and not one anybody wrote down, and a reader taking it to
+    # `.harness-rules` finds a different figure and concludes the report is wrong. So
+    # the curve says so itself, in the same list, naming the ceiling, the multiplier
+    # and the base it scaled: without those three the taper is invisible to the person
+    # tuning it, which is the one thing #776 asks of every ceiling it touches.
+    #
+    # Gated on a seat having ACTUALLY been cut (`truncated_for`), not merely on the
+    # taper being in force: a round whose diff fits inside the smaller budget lost
+    # nothing, and a veto there would be the alert fatigue `coverage_veto` is careful
+    # about — every round of every tapered cycle carrying a standing veto teaches the
+    # reader to skip the list where the real gaps are.
+    if round_mult != 1.0 and truncated_for and panel_budget_written:
+        veto = [*veto, (
+            f"the diff budget that cut {', '.join(sorted(truncated_for))} is "
+            f"{panel_budget:,} chars and NOT the {panel_budget_written:,} in this "
+            f"repo's rules: round {round_no} runs at x{round_mult:g} on "
+            f"`round_budgets.multipliers`, so the TAPER bound this round and not the "
+            "ceiling anybody wrote. What those seats did not read was not reviewed by "
+            "them, and this round's quiet over it is a budget this cycle chose rather "
+            "than evidence about the code (#776)")]
+    # An answer HONOURED BY LOCALITY, said out loud and in those words. It is the one
+    # note here that reports a veto lifted rather than a veto standing, and an
+    # operator has to be able to tell the two apart: the harness has decided that two
+    # sentences written by a model in two rounds are the same question, which is a
+    # judgement only the person who did the measuring can check. So the note names
+    # both keys and the place they share, and says what it costs if the harness is
+    # wrong.
+    for old, (new, where) in sorted(moved_assessed.items()):
+        notes.append(
+            f"--assessed {old} names no coverage declaration this round raised, but "
+            f"the declaration it answered and this round's {new} both land in "
+            f"`{where}` — the answer was honoured BY LOCALITY rather than by key, "
+            "because the seat reworded its declaration (#771). Read both in the "
+            "report's Coverage declared block: if they are not the same question, "
+            "this round has spent a veto it should have kept")
+    for old, (new, where) in sorted(moved_ack.items()):
+        notes.append(
+            f"--acknowledge {old} names no unverifiable claim this round raised, but "
+            f"the claim it accepted and this round's {new} both land in `{where}` — "
+            "the acknowledgement was honoured BY LOCALITY rather than by key, because "
+            "the judge reworded the claim (#771). Read both in the report's "
+            "Unverifiable claims list: if they are not the same claim, this round has "
+            "spent a veto it should have kept")
     # An assessment naming no declaration this round raised, said out loud for the
     # reason its `--acknowledge` twin below is: the likeliest explanation is a seat
     # that reworded its own declaration, which `_claim_norm` says plainly it cannot
@@ -4494,24 +5422,50 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # ordinary case where it worked — the seat stopped declaring the gap because
     # somebody answered it — so reporting that every round would be the alert fatigue
     # these notes are careful not to become.
-    raised_now = {d.key for d in declarations}
-    for key in sorted(k for k in answered if k not in raised_now):
+    #
+    # An ambiguous fallback is reported here rather than under its own heading,
+    # because from the caller's side it is the same news with one more fact attached:
+    # the key still names nothing, and now they know the round found more than one
+    # place it could have meant and would not choose. That is the pair of sentences
+    # `_coverage_ruling` refuses to resolve by position, put to the reader instead.
+    for key in sorted(stray_assessed):
+        if key in moved_assessed:
+            continue
+        blurred = blurred_assessed.get(key) or ()
         notes.append(f"--assessed {key} names no coverage declaration this round "
                      "raised — check the key against the report's Coverage declared "
                      "block, and expect a new one if the seat reworded its "
-                     "declaration")
+                     "declaration"
+                     + (f". The locality fallback (#771) found {len(blurred)} "
+                        f"declarations in the same place ({', '.join(blurred)}) and "
+                        "will not choose between them — re-assess under the right one"
+                        if blurred else ""))
     # An acknowledgement naming no obligation this round raised is almost always a
     # re-worded claim under a new key, which `_claim_norm` says plainly it cannot
     # absorb — so it is SAID rather than corrected. The alternative readings are a
     # typo and a claim genuinely settled since, and this cannot tell the three apart;
     # what it can do is stop the caller reading the cycle's silence as the
     # acknowledgement having landed.
-    raised = {ob.key for ob in obligations}
-    dangling = sorted(k for k in accepted if k not in raised)
+    dangling = sorted(k for k in stray_ack if k not in moved_ack)
     for key in dangling:
+        blurred = blurred_ack.get(key) or ()
         notes.append(f"--acknowledge {key} names no unverifiable claim this round "
                      "raised — check the key against the report's Unverifiable claims "
-                     "list, and expect a new one if the judge reworded the claim")
+                     "list, and expect a new one if the judge reworded the claim"
+                     + (f". The locality fallback (#771) found {len(blurred)} claims "
+                        f"in the same place ({', '.join(blurred)}) and will not choose "
+                        "between them — re-acknowledge under the right one"
+                        if blurred else ""))
+    # The fallback could not be RUN, which is a different fact from its having run and
+    # found nothing, and only the first is worth a line: an operator reading "names no
+    # coverage declaration" needs to know whether the round tried the second matcher
+    # or never had one. Emitted once for both registers and only where there was
+    # something to fall back on — a round with no stray answers has nothing to say.
+    if (stray_assessed or stray_ack) and (assessed_problem or ack_problem):
+        notes.append(
+            "the locality fallback for --assessed/--acknowledge (#771) could not run: "
+            f"{assessed_problem or ack_problem} — every answer above was matched by "
+            "key alone, exactly as it was before #771")
     # The two halves of a re-worded claim, PAIRED (#663). Both halves were already
     # emitted and were reported apart: the note above went into `config_notes` while
     # the claim it was meant to discharge sat in the ledger under a key the caller
@@ -4539,6 +5493,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # every round for the rest of the cycle. That is the alert fatigue the vetoes
     # above are careful not to become. Re-passing the key on the command line is a
     # live act about THIS round, and it is the half worth pairing.
+    #
+    # #771's locality fallback runs AHEAD of this and takes out of both sides every
+    # pair it could settle mechanically. What reaches here is what no path comparison
+    # could aim — two sentences naming no file, or naming one file between several
+    # claims — which is the population this question was always for.
     #
     # The durable fix is not this: key the obligation on the capability limit that
     # could not be checked rather than on the judge's sentence about it, so that a
@@ -4734,93 +5693,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # already promises ("left out of the record rather than silently emptying
         # it"), and the note is what tells the operator coverage is unrecorded.
         unread_files = []
-    # Attribution needs both ends of the fix range, and `_fix_range_diff` says why
-    # when it has none: a baseline written before `head_sha` was recorded, a
-    # head that never moved, a branch rewritten between rounds, an API refusal.
-    # All of them degrade to "unknown" rather than to a wrong answer.
-    #
-    # `cycle_run` is `in_cycle or prior_rounds`, so `cycle_run and prior_rounds`
-    # only ever meant `prior_rounds`: round 1 has no earlier round to attribute
-    # against whether it is in a cycle or not.
-    attributable = bool(prior_rounds)
-    # ---- ONE anchor, and the round's own lines where they are safe to use (#512).
-    #
-    # Two defects, one of them nearly introduced by the first cut of this change.
-    #
-    # **The anchor.** Scope anchors on `since or prior.head_sha`; this used to anchor
-    # on `prior.head_sha` outright. `--since` is documented and legitimate — "pass it
-    # to review a specific range, or when the baseline predates that field" — and
-    # passing it pointed the two at different spans with nothing reporting the
-    # mismatch, so the provenance numbers described a range nobody looked at. Both
-    # now read `anchor`, so they cannot drift.
-    #
-    # **The status guard, which is why the compare call STAYS.** It is tempting to
-    # drop it and attribute straight off `review.increment` — the round reviewed
-    # that diff, so it is the fix pass by construction. It is not, after a rewrite.
-    # `fetch_increment` uses the three-dot form and says what that costs: "when the
-    # branch was force-pushed or rebased between rounds the merge base moves back
-    # and the increment WIDENS toward the whole PR. That is the safe failure: the
-    # round re-reads more than it needed to." Safe for a review; catastrophic for an
-    # attribution, because every line the PR ever added is then inside the "fix
-    # range" and every finding on one reads `introduced`. `panel_scope` only falls
-    # back at `len(increment) >= len(diff)`, so a rebase that widens the increment to
-    # most of the PR passes every guard and becomes the target.
-    #
-    # `_fix_range_diff` is the only thing that sees `status`, refuses `diverged` and
-    # `behind`, and drives #509's veto. So it keeps running, and what changes is
-    # WHICH LINES are attributed once it has said the range is sound.
-    #
-    # **And then the increment's lines, because they are the better ones.** It is
-    # `_diff_subset`'d to files also in the PR diff, which drops a base-branch
-    # merge's own files — the over-count `_fix_range_diff`'s docstring names and
-    # cannot fix, since main's commits legitimately sit inside its range.
-    # `anchor`, not `review.since`: the two agree while the increment holds, and
-    # `review.since` is EMPTY on every round whose scope fell back to `pr` — so
-    # reading it there would silently revert to `prior.head_sha` and drop an explicit
-    # `--since`, which is the mismatch this is here to close. `anchor` is bound
-    # before scope is decided, carries `--since`'s own validation, and is what the
-    # round would have reviewed from.
-    if attributable:
-        _range_diff, no_range_why, range_kind = _fix_range_diff(
-            gh_repo, anchor, head_sha)
-    else:
-        _range_diff, no_range_why, range_kind = None, None, FIX_RANGE_OK
-    # ---- #504: a REWRITTEN range is a wrong range, not a lost fix pass.
-    #
-    # #509 made a rebased round honest and #512 gave it one range to be honest
-    # about; neither keeps the instruments ARMED, so a rebase between rounds still
-    # ends with every finding `unknown` and `escalate_on.fix_injection` unable to
-    # fire on the shape it is worth most on — the fixer working against a base that
-    # moved. #500's own observation is what makes the repair possible: the old SHAs
-    # still resolve, so the range is wrong and the history is not.
-    #
-    # Tried ONLY on `rewritten`, and only on an attributable round. Every other
-    # verdict already has a sound range in hand — `ok` has this reader's, `blind`
-    # usually has the round's own increment — and spending local git on those would
-    # buy a second answer to a question already answered, which is the duplication
-    # #512 has just finished removing.
-    rebuilt = (reconstruct_fix_range(cfg.get("path") or "", gh_repo, base,
-                                     anchor, head_sha)
-               if attributable and range_kind == FIX_RANGE_REWRITTEN else None)
-    # The increment is usable whenever the range is not REWRITTEN — including when
-    # this reader came back blind. `blind` means "I could not get the range" (too
-    # large to hold, an API refusal), which says nothing about the copy the round
-    # already reviewed; discarding a sound increment there is a false blindness, and
-    # it would fire on exactly the big base-branch merge this feature is for.
-    # `rewritten` is the one that forbids it, because then no diff of that span is
-    # the fix pass — the round's included.
-    have_increment = review.scope == "increment" and bool(review.increment)
-    # `reconstructed` is checked FIRST and it is the only source a rewritten round
-    # may use. The increment is barred there for the reason above it and stays
-    # barred — the reconstruction does not make the round's own diff trustworthy,
-    # it supplies a different one — and `_range_diff` is None on that road anyway.
-    if rebuilt and rebuilt["diff"]:
-        fix_diff, fix_range_source = rebuilt["diff"], "reconstructed"
-    elif attributable and range_kind != FIX_RANGE_REWRITTEN and have_increment:
-        fix_diff, fix_range_source = review.increment, "increment"
-    else:
-        fix_diff = _range_diff
-        fix_range_source = ("compare" if _range_diff else None) if attributable else None
+    # ---- The fix range itself is read up in the setup phase (#780), because the
+    # deterministic seat below the dispatch reviews it. `_range_diff`,
+    # `no_range_why`, `range_kind`, `attributable`, `rebuilt` and `fix_diff` are
+    # bound there; everything from here down is unchanged and reads them.
     # ONE predicate for "is there a range", used by the added lines, by the note
     # and by the attribution itself. Two of them disagreed over an EMPTY compare:
     # truthiness called it no range, `fix_diff is not None` called it a readable
@@ -5240,7 +6116,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # ONE injection state, built here and passed to `round_stop` below rather than
     # computed twice: `over` is also the precondition for the extra API call under it,
     # and two `injection_state` calls could disagree about whether to make it.
-    injecting = injection_state(provenance_counts, injection_limit)
+    # #774's population, handed to the same call that already pools it. `placed` is
+    # the per-finding answer `provenance_counts` was tallied FROM, so the split and
+    # the pooled rate cannot come to describe different findings — which is why it is
+    # passed here rather than derived a second time beside the report.
+    #
+    # Filtered to the findings with a verdict, which is exactly the population the
+    # tally counted: `provenance_of` returns None outside a cycle and for a defect an
+    # earlier round already raised, and those Nones fall out of `provenance_counts`
+    # too. `None` and not `[]` where nothing was attributable, so the payload's
+    # `by_kind` reads as "not measured" rather than as three empty buckets — the same
+    # distinction `provenance_counts` itself makes by being `{}`.
+    injecting = injection_state(
+        provenance_counts, injection_limit,
+        placed=([(c.key, c.file or "", bucket) for c, bucket in placed if bucket]
+                if attributable else None))
     # #619's measurement, over the SAME fix range `injecting` and `refereeing` were
     # taken against, so the three cannot end up describing different passes. It is
     # one set difference over payloads this round has already been handed: the files
@@ -5459,13 +6349,88 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         cycle=prior.cycle, source=fix_range_source,
         narrowed=told, declined=declined_held, escalated=held)
 
+    # ---- #771: the same question asked a second way, and the union of the answers.
+    #
+    # `is_new` answers "did an earlier round raise this" off the finding's own KEY,
+    # with `Baseline.raised_before`'s title fallback behind it. Both read the
+    # reporters' WORDS: the key is a hash of them and the fallback is a sequence
+    # comparison over them, so a seat that rewords its own finding between rounds can
+    # defeat the pair of them and land a persistent defect in `new_findings`. This
+    # asks the question off the LINES instead — the anchor round's findings against
+    # this round's, within `panel_locality`'s slack — which is the half neither of
+    # those can reach.
+    #
+    # THE UNION, and never the intersection. The two matchers fail in opposite
+    # directions and neither is authoritative: a key match is proof and a locality
+    # match is evidence, so a finding either of them recognises is a finding an
+    # earlier round raised. Taking the union is also the only safe direction —
+    # `repeated` counts towards going AGAIN at `round_stop`'s rule 3, so a wrong
+    # match here buys a round nobody needed and a missed one leaves the count exactly
+    # where it was before #771.
+    #
+    # It changes which findings are RECOGNISED and not which ones buy a round: rule 3
+    # is bounded by the trigger floor and applies that filter itself. And the count
+    # only locality caught is recorded, because that number is the whole evidence for
+    # whether this was worth doing — if it stays at zero across a few dozen cycles,
+    # the matcher is costing a comparison and answering nothing.
+    repeated_by_key = {c.key for c in outstanding if not is_new(c)}
+    repeated_nearby, repeat_problem = repeats_by_locality(outstanding,
+                                                          prior.fixed_findings)
+    only_nearby = sorted(repeated_nearby - repeated_by_key)
+    if only_nearby:
+        notes.append(
+            f"{len(only_nearby)} finding(s) this round restate an earlier round's in "
+            f"the same place under a new key ({', '.join(only_nearby)}) — matched by "
+            "locality rather than by key (#771), and REPORTED rather than counted as "
+            "repeats. A key is a hash of the reporter's own words, so a reworded "
+            "restatement mints a new one and reads here as a fresh discovery; the "
+            "count is at `locality_repeats.only_locality` and gates nothing")
+    # Said only where there was something to match against, for the reason the
+    # `--assessed` fallback's twin is said: a matcher that could not run and a matcher
+    # that ran and found nothing are different facts, and the counts below are read
+    # differently depending on which happened.
+    if repeat_problem and prior.fixed_findings:
+        notes.append(f"the locality repeat matcher (#771) could not run: "
+                     f"{repeat_problem} — repeats were counted by key alone, exactly "
+                     "as they were before #771")
+
     # The repeat KEYS, not a count of them: `round_stop` subtracts the escalated
     # ones itself, so the rule lives in one place instead of depending on every
     # caller to filter first. It takes keys and nothing else — the count overload
     # it used to accept could not obey the escalation rule, and a caller passing
     # one put the #221 jam straight back with nothing said.
+    # ---- #771 IS REPORTED HERE AND FEEDS NO RULE, AND THAT IS #67 APPLIED TO OUR OWN
+    # CHANGE. `repeated_by_key` and nothing else, exactly as it was before this branch.
+    #
+    # **What the union did, measured.** `round_stop`'s `going_again` is
+    # `not stop and triggering and not held_over and not repeats`, and SIX things gate
+    # on it: #489's `injected`, #505's `flat`, #618's `overguarded`, #622's
+    # `overspent`, #554's `unchecked` and #506's `revert.offered`. One locality match
+    # takes `repeats` from 0 to 1 and switches all six off at once — proved by stubbing
+    # `repeats_by_locality` to an empty set and nothing else, which puts
+    # `test_panel_provenance.py::test_a_round_whose_findings_are_mostly_its_own_damage_
+    # ends_the_cycle` back to passing.
+    #
+    # **And it is ANTI-CORRELATED with the brake it disabled**, which is why this is a
+    # defect rather than a trade. A fix pass that injects defects writes them on the
+    # lines the previous round complained about, so the fix-injection signature IS the
+    # locality-repeat signature: round 1 finds `app/sync.py:9`, round 2 finds `:11`, a
+    # 3-line slack pairs them, and #489's brake is off in precisely the case it exists
+    # for. The same match also double-counts — the key arrives as a locality repeat AND
+    # as a finding no earlier round raised, in the To fix list.
+    #
+    # **The question underneath, named rather than settled.** A 3-line slack cannot
+    # tell "the same finding restated" from "a new finding on an adjacent line". #750's
+    # register re-addressing refuses that ambiguity outright rather than guessing; for
+    # findings it silently resolved to "repeat", which is the guess in the direction
+    # that ends cycles. Which of the two is right is a question a population answers,
+    # and `locality_repeats.only_locality` is that population: it is published on every
+    # round, it gates nothing, and if it stays at zero across a few dozen cycles the
+    # matcher is costing a comparison and answering nothing. `--assessed` and
+    # `--acknowledge` re-addressing are untouched by this and stay as built — that path
+    # refuses ambiguity rather than resolving it.
     stop = round_stop(round_no, cap, new_keys, outstanding, veto, not prior.problems,
-                      repeated={c.key for c in outstanding if not is_new(c)},
+                      repeated=repeated_by_key,
                       escalated=held,
                       # #615, and it sits next to `escalated` because that is the only
                       # place its argument shape belongs — the two are keys read out of
@@ -5489,6 +6454,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # declined in round 2 is still unmade in round 4, and under
                       # `increment` scope round 4 never re-reads the file to notice.
                       declined=sorted(live_declined),
+                      # #782, and the one population `round_stop` cannot see from its
+                      # own arguments. A finding the judge DISMISSED reaches neither
+                      # `new_keys` nor `outstanding`, so a round 1 whose seats all
+                      # filed and whose judge threw the lot out is indistinguishable
+                      # there from a round 1 where no seat spoke — and the second is
+                      # what `unattested` is for. This round CAN tell them apart,
+                      # because it is holding the dismissed bucket.
+                      #
+                      # `True` or `None`, never `False`. `None` is "you have not been
+                      # asked" and derives exactly as it did before, so an empty
+                      # dismissed bucket leaves every existing answer untouched; a
+                      # non-empty one is attested structural evidence the review ran,
+                      # which is the whole of the claim the field makes. Asserting
+                      # `False` here would be this file overriding a derivation that
+                      # reads three registers it does not.
+                      attested=True if dismissed else None,
                       # #165. The trigger floor bounds which NEW findings buy a round;
                       # the fix floor bounds rules 2 and 3, because a finding no fix
                       # round was asked to clear is outstanding every round by
@@ -5589,7 +6570,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                       # empty set, because "the pass opened nothing" and "nobody
                       # counted" must never render alike, and here the second would
                       # otherwise read as the first.
-                      surface=surface)
+                      surface=surface,
+                      # #779. Resolved beside the arming flags, one per rung, through
+                      # the one reader allowed to apply the three-layer fallback. A
+                      # rung in `shadow` reaches the same verdict and applies none of
+                      # it: `stop`, `reason`, `veto` and `confident` come back exactly
+                      # as they would have with that rung absent, and the verdict is
+                      # published at `<rung>.would_fire` beside `fired` so the
+                      # calibration population exists before the gate binds.
+                      modes=brake_modes,
+                      # #770's lane reads the same range the surface above was
+                      # measured off. The empty string is the honest value where the
+                      # range could not be read — the lane's diff heuristics fail
+                      # toward the LOWER lane, so a missing diff loses evidence and
+                      # can never manufacture a `high`.
+                      fix_diff=fix_diff or "")
     # Said in `config_notes` as well as in `round_stop`, because these two are read
     # by different people at different moments: the payload's `round_stop` is what
     # the orchestrator's `jq` reads to decide whether to go again, and `config_notes`
@@ -6431,6 +7426,23 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # three files and a resolution order.
         "rules": rules_record(cfg),
         "provenance_counts": provenance_counts,
+        # #771's own evidence, and the only reason this field exists. The issue is a
+        # bet — that matching a finding by where it LANDS catches restatements a hash
+        # of the reporter's words cannot — and the way to settle a bet is to publish
+        # the number it turns on. `only_locality` is how many of this round's
+        # findings ONLY the locality matcher recognised as repeats; `by_key` is the
+        # population the old comparison already had. A fleet where the first stays at
+        # zero over a few dozen cycles is a fleet where the matcher is answering
+        # nothing and should come out.
+        #
+        # It gates nothing and no dial reads it — #67's instrument-before-gate rule,
+        # which is why `guard_ratio` ships report-only too. `keys` is carried beside
+        # the counts so a reader can go and look at the findings rather than take the
+        # count, exactly as `round_stop` publishes its rate beside its limit.
+        "locality_repeats": {"only_locality": len(only_nearby),
+                             "by_key": len(repeated_by_key),
+                             "keys": only_nearby,
+                             "why": repeat_problem or None},
         # #624's artifact. Top level and NOT under `round_stop`, which is the block
         # that records a decision this record takes no part in: it gates nothing,
         # `round_stop` is not passed it, and filing it there would put a diagnostic
@@ -6618,7 +7630,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # sole-reviewer note, on findings nobody could corroborate) and under-counted
     # at the other ("ERROR" can still return hard findings, so the report could
     # claim nobody reviewed while Sonar issues were displayed beneath it).
-    filers = seats_filled + (1 if sonar_filed else 0)
+    #
+    # `slop_filed` (#780) is here on exactly that argument, one seat over: its
+    # findings go into `llm_findings` too, so ["claude", "slop"] is a legitimate
+    # `reviewers` list and leaving it out would let the header declare consensus
+    # impossible over a finding the report has just marked ⋆consensus. Keyed on
+    # having FILED, not on having run, for `sonar_filed`'s reason: a seat that read
+    # the fix pass and found it clean joins no cluster and corroborates nobody.
+    filers = seats_filled + (1 if sonar_filed else 0) + (1 if slop_filed else 0)
     consensus_possible = filers > 1
 
     def conf(c: Canonical) -> str:
@@ -6657,6 +7676,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         d = live_declined.get(c.key)
         return (f" 🧾 _declared unfixable in round {d.round} ({d.reason}) — a "
                 "known-unfixed defect, not a fresh finding_" if d else "")
+
+    def whence(c: Canonical) -> str:
+        """#774's mark: did the last fix pass WRITE the lines this finding lands on?
+
+        The answer already exists per finding — `provenance_of` computes it for every
+        outstanding finding and the round then pools it into one `fix_injection`
+        rate, which either ends the cycle or does not. The per-finding fact was
+        computed and discarded, and #751 is what that costs: six of thirteen findings
+        on lexray#1611 round 2 were about text the previous round had made stale, and
+        pooled into a single 69% rate they read as the loop circling.
+
+        So the fixer in front of the list can now see which of these are about its own
+        last pass and which are things the round before it missed. A marker and a
+        word, deliberately — the sentence explaining what the buckets mean is already
+        printed once above the list, and repeating it on every row would cost more
+        width than the finding's own title.
+
+        `unknown` and a `None` get NOTHING, on the round-summary block's own rule: a
+        mark on a finding nothing could attribute reads as a claim about the fix pass,
+        and a false one. Silence here means the question did not arise or could not be
+        answered, which is what its absence has always meant."""
+        return PROVENANCE_MARK.get(provenance_of(c) or "", "")
 
     def accounts(c: Canonical) -> list[str]:
         """What each reviewer actually said, under a MERGED finding.
@@ -6737,7 +7778,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             detail = [t.format(n=pc[b]) for b, t in phrasing.items() if pc.get(b)]
             lines.append("  - of those: " + ", ".join(detail)
                          + ". A signal, not a verdict — a fix can break something at a "
-                           "distance, so `missed` is evidence rather than proof.")
+                           "distance, so `missed` is evidence rather than proof. "
+                           # #774. The legend goes here, once, so the per-row marks
+                           # below can be a marker and a word: a fixer reading its
+                           # brief needs to see which findings are about its own last
+                           # pass, and a clause saying so on every row would cost more
+                           # width than the titles.
+                           "Each finding below carries its own mark — 🔧 the last pass "
+                           "wrote those lines, 🔍 they were already there and the last "
+                           "round did not catch it (#774).")
         # #67, and printed on the same rule and for the same reason: the operator
         # deciding whether to go again is the one the distinction is FOR.
         #
@@ -6793,6 +7842,46 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # gates on it, no threshold is crossed, no stop. A ceiling here would be a number
     # invented today with its argument written afterwards, and this repo's rule is
     # that an instrument earns a gate over a few dozen cycles or not at all.
+    # ---- #774's second half, and it sits in this register rather than beside the
+    # provenance line above because of what it is: `fix_injection` is the rung that
+    # ENDS cycles, this is a second reading of the same measurement, and a second
+    # reading printed next to the verdict reads as part of it.
+    #
+    # #751 is the case. Six of thirteen findings on lexray#1611 round 2 were about
+    # TEXT — a stale comment, a doc table, message strings — and four said in their
+    # own words that the previous round had made them stale. Pooled into one 69% rate
+    # they read as a fix pass generating its own next round, and the cycle stopped. A
+    # repo that states one fact in five places produces N findings from one edit, and
+    # that is not the loop circling; the pooled rate cannot tell the two apart and
+    # this split can.
+    #
+    # It gates nothing and no dial reads it. The threshold stays on the pooled rate
+    # until somebody has the cycles to recalibrate it (#637), which is #67's rule —
+    # an instrument earns a gate over a few dozen cycles or not at all. Printed
+    # BESIDE the pooled rate rather than instead of it, so a reader can check one
+    # against the other rather than take either.
+    #
+    # Read back off the payload and not off a local, on the rule this whole block
+    # follows: the line a human reads and the object a consumer reads have to be one
+    # measurement. Nothing prints where the split was not published — an absent
+    # breakdown is not a round of zeros.
+    inj = (payload.get("round_stop") or {}).get("fix_injection") or {}
+    by_kind = inj.get("by_kind") or {}
+    # `INJECTION_KINDS` and not a list written here: the order is fixed so the columns
+    # do not move between rounds, and taking it from the module that COMPUTES the
+    # split is what stops the report naming a bucket the measurement does not have.
+    split = [s for s in (injection_share(k, by_kind.get(k)) for k in INJECTION_KINDS) if s]
+    if split:
+        pooled = ("" if inj.get("rate") is None else
+                  f" Pooled: **{inj['rate']:.0%}** "
+                  f"({inj.get('introduced')} of {inj.get('new')}).")
+        lines.append("**Fix injection by kind:** " + ", ".join(split)
+                     + " introduced by the last fix pass." + pooled
+                     + " Reported, not a threshold — `escalate_on.fix_injection` "
+                       "still gates on the pooled rate (#637), and nothing stops on "
+                       "this split (#67). A repo that states one fact in five places "
+                       "answers one edit with five prose findings, which is not a "
+                       "cycle circling (#751).")
     gr = payload["guard_ratio"]
     if gr:
         # The split is printed beside the ratio because `guard` alone cannot say
@@ -7382,8 +8471,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
                      if c.needs_rereview else "")
             paid = "💸 " if budgeted(c) else ""
-            lines.append(f"- {paid}**{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
-                         f"{c.synthesis}"
+            lines.append(f"- {paid}**{c.severity}**{fresh}{whence(c)} `{loc(c)}` "
+                         f"[{c.id}] — {c.synthesis}"
                          f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}"
                          f"{declination(c)}")
             lines += accounts(c)
@@ -7489,7 +8578,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      f"`{dials.file_deferral_issues}`, so {goes}._")
         for c in under_floor:
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
-            lines.append(f"- 🔽 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+            lines.append(f"- 🔽 **{c.severity}**{fresh}{whence(c)} `{loc(c)}` "
+                         f"[{c.id}] — "
                          f"{c.synthesis}{conf(c)}{escalation(c)}{declination(c)}")
 
     # #78's half of the same idea, and a section of its own rather than a subheading
@@ -7520,7 +8610,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "to be real._")
         for c in under_threshold:
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
-            lines.append(f"- 👥 **{c.severity}**{fresh} `{loc(c)}` [{c.id}] — "
+            lines.append(f"- 👥 **{c.severity}**{fresh}{whence(c)} `{loc(c)}` "
+                         f"[{c.id}] — "
                          f"{c.synthesis}{conf(c)} — _{len(c.reviewers)} of "
                          f"{dials.threshold_for(c.severity)} seats_"
                          f"{escalation(c)}{declination(c)}")
@@ -7531,7 +8622,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # Same 🆕 rule as the judged findings: these count towards the round
             # diff too, because the gate has to end up clear either way.
             fresh = " 🆕" if prior_rounds and is_new(c) else ""
-            lines.append(f"- {c.severity}{fresh} `{loc(c)}` — {c.synthesis}"
+            lines.append(f"- {c.severity}{fresh}{whence(c)} `{loc(c)}` — "
+                         f"{c.synthesis}"
                          f"{escalation(c)}{declination(c)}")
 
     if dismissed:
