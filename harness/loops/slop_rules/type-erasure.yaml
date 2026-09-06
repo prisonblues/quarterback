@@ -1,0 +1,14 @@
+# The annotation a type finding gets closed with when modelling the real type
+# would cost more than the round has left. `Any` in a fresh annotation is not a
+# type, it is the absence of one written where a reader will mistake it for a
+# decision — and the checker that would have caught the next defect on that
+# value now cannot. Anchored to the annotation and cast positions only:
+# `dict[str, Any]` at a JSON boundary is honest and does not fire.
+id: slop/type-erasure
+severity: P3
+languages: [python]
+message: Annotation or cast erases the type to Any instead of modelling it
+remediation: Name the real type, or narrow it with a TypedDict, a protocol, or an isinstance check the checker can follow.
+match:
+  kind: line_regex
+  pattern: '(?:->|:)\s*(?:typing\.)?Any\b|\bcast\(\s*(?:typing\.)?Any\b'

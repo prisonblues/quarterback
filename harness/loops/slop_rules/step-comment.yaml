@@ -1,0 +1,18 @@
+# The narrator comment's other form, and worth its own rule because the
+# remediation differs: numbered narration is not deleted line by line, it is
+# deleted by giving the steps names — which is the change the review actually
+# wanted. It appears when a fixer is asked to make a long function readable and
+# answers by captioning it, so the function stays long and now claims to be
+# organised.
+#
+# The `\s+` after the hash is not decoration. Without it the rule matched 32
+# lines across this repo, most of them a comment CONTINUATION opening on an
+# issue reference — `#647. See :func:...` — which is a citation, not a step.
+id: slop/step-comment
+severity: P3
+languages: [python]
+message: Numbered step comment captions a long function instead of breaking it up
+remediation: Delete the numbering and let named helpers carry the sequence, or keep one comment saying why the order matters.
+match:
+  kind: comment_regex
+  pattern: '(?i)^#+\s+(?:step\s+\d+\s*[:.)-]|\d+[.)]\s+\S)'

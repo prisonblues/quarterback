@@ -527,12 +527,20 @@ def test_the_measurement_rides_in_the_payload_whether_it_fired_or_not():
     off = panel_rounds.round_stop(2, 5, [], [], [])
     assert off["new_findings_not_falling"] == {
         "limit": None, "rounds": [], "counts": [], "count": None, "was": None,
-        "streak": 0, "min_new": 17, "over": False, "fired": False}
+        "streak": 0, "min_new": 17, "over": False,
+        # #779's two, and the exact comparison stays exact: this test's claim is about
+        # the block's WHOLE shape on a round with nothing to compare, so a new field
+        # belongs in the literal. `enforce` is what a caller passing no `modes=` gets
+        # — `panel_rounds.brake_mode` argues why an absent ARGUMENT and an unnamed
+        # RUNG default opposite ways — and `would_fire` is the verdict minus the mode.
+        "mode": "enforce", "would_fire": False, "fired": False}
     on = panel_rounds.round_stop(2, 5, ["k1"], [], [],
                                  not_falling=_flat((44, 38)))
     assert on["new_findings_not_falling"] == {
         "limit": 1, "rounds": [1, 2], "counts": [44, 38], "count": 38, "was": 44,
-        "streak": 0, "min_new": 17, "over": False, "fired": False}
+        # The count FELL, so there is no streak and no verdict for a mode to apply.
+        "streak": 0, "min_new": 17, "over": False,
+        "mode": "enforce", "would_fire": False, "fired": False}
 
 
 # ------------------------------------------------------------------------ the reach

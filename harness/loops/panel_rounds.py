@@ -34,10 +34,39 @@ from collections.abc import Callable, Iterable, Mapping  # noqa: E402
 from types import MappingProxyType  # noqa: E402
 from typing import NamedTuple  # noqa: E402
 
+import panel_blast  # noqa: F401
 import panel_core  # noqa: F401
+import panel_locality  # noqa: F401
 import panel_scope  # noqa: F401
 import panel_seats  # noqa: F401
+
+# #779's two-value vocabulary, taken BY NAME from the one module that defines it
+# rather than spelled again here. A third spelling of `"shadow"` in this file would
+# be a rung that reports one thing and does another the first time somebody renamed
+# a mode: `harness_rules._dial_body` validates a written value against `BRAKE_MODES`,
+# `harness_rules.escalate_mode` resolves it against the same tuple, and this file
+# COMPARES against it — three readers, one tuple, or the comparison below silently
+# stops matching. ABOVE the star imports and not below them, unlike `finding_kind`:
+# nothing re-exported here carries these three names, so there is no "last import
+# wins" guarantee to keep, and `isort`'s order is then the only argument left.
+# The import direction is already fixed by `panel_core`.
+from harness_rules import BRAKE_ENFORCE, BRAKE_MODES, BRAKE_SHADOW  # noqa: E402
+
+# #770's first input, taken by NAME on `finding_kind`'s rule below: this file needs
+# exactly one thing from that module — which risk lane the last fix pass's paths fall
+# in — and a star import would put its whole surface into `panel`'s namespace through
+# this file's own re-export, which is how a helper becomes an accidental contract.
+from panel_blast import fix_blast_radius  # noqa: E402
 from panel_core import *  # noqa: F401,F403
+
+# ONE NAME, taken by name and not through a fourth star import (#774). This file
+# needs exactly one thing from that module — what a finding is ABOUT — and the answer
+# has to be spelled in the same three words :data:`panel_seats.REFEREE_KINDS` already
+# counts a fix PASS's churn in, because one payload carrying two vocabularies for "is
+# this a test file" is two things that can disagree about one path. A star import
+# would also put that module's whole surface into `panel`'s namespace through this
+# file's own re-export, which is how a helper becomes an accidental contract.
+from panel_locality import finding_kind  # noqa: E402
 from panel_scope import *  # noqa: F401,F403  — re-exported for callers
 from panel_seats import *  # noqa: F401,F403
 
@@ -3600,6 +3629,57 @@ ESCALATE_ON_DEFAULTS = harness_rules.DEFAULTS["review_panel"]["escalate_on"]
 #: look governed.
 ESCALATE_ON_UNBUILT = ("quorum_failed", "judge_absent")
 
+#: #779, and it is a mapping rather than a list because the two names differ: the
+#: PAYLOAD block a round publishes and the `escalate_modes` RUNG that decides whether
+#: it acts are spelled differently for one rung out of four (`guard_churn` is
+#: published under the measurement's name and armed under `escalate_on.guard_lines`),
+#: and a reader holding a payload has to be able to get from one to the other without
+#: knowing that. `{payload key: rung name}`.
+#:
+#: Four and not six. `premise_repeated` and `premise_undecidable` are rungs of
+#: `escalate_on` and are named in `harness_rules.DEFAULTS["review_panel"]
+#: ["escalate_modes"]`, but their stop is applied further down :func:`round_stop`
+#: off a LIST rather than off an `over`/`armed` state block, and nothing here reads
+#: their mode yet — see the comment at `circling` for what that costs and what it
+#: does not. Named here would be worse than absent: this mapping is what
+#: :func:`round_stop` iterates to publish `mode`, and a rung in it whose stop is not
+#: gated on that mode is the exact failure #779 was filed over — a payload saying
+#: `shadow` beside a cycle the rung ended.
+BRAKED_RUNGS: Mapping[str, str] = MappingProxyType({
+    "new_findings_not_falling": "new_findings_not_falling",
+    "fix_injection": "fix_injection",
+    "unrefereed_fix": "unrefereed_fix",
+    "guard_churn": "guard_lines",
+})
+
+
+def brake_mode(modes: Mapping[str, str] | None, rung: str) -> str:
+    """This rung's mode, from what the caller resolved — :data:`BRAKE_MODES`, #779.
+
+    NOT a second copy of `harness_rules.escalate_mode`, and the difference is the
+    question each answers. That one resolves three CONFIG layers — this repo's
+    mapping, then `DEFAULTS`, then `shadow` for a rung nobody has named — and it is
+    the only place that fallback chain may be written down, because a resolver that
+    read a missing rung as `shadow` would let one repo naming one rung disarm the
+    other five. This one answers a different question: what a CALLER handed in. A
+    caller that handed in nothing — every test that calls :func:`round_stop`
+    directly, and every consumer written before #779 — is not a repo that declined
+    to name a rung; it is a caller that has not been asked, and the answer for it is
+    the behaviour it already had, which is `enforce` on all four.
+
+    That asymmetry is deliberate and is the reverse of `escalate_mode`'s last layer.
+    Defaulting an ABSENT ARGUMENT to `shadow` here would disarm four armed brakes on
+    every caller that had not yet learned the parameter — the upgrade in which
+    nothing on the round looks different and five brakes have quietly stopped
+    stopping anything, which is the one outcome `DEFAULTS` spends a paragraph
+    refusing. An unreadable word takes the same answer for the same reason: a typo
+    may cost a calibration and may not cost a brake.
+    """
+    said = (modes or {}).get(rung)
+    if isinstance(said, str) and said.strip().lower() in BRAKE_MODES:
+        return said.strip().lower()
+    return BRAKE_ENFORCE
+
 #: Exit code for "a premise was declared for the Nth time and N reached the dial".
 #: Its own code, not 1: the caller has to be able to tell the brake FIRING from the
 #: command failing to run, and both are non-zero. 2 is argparse's usage error and 3
@@ -4590,7 +4670,36 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
             "undeclared_rounds": undeclared_passes(reg, round_no)}
 
 
-def injection_state(counts: dict | None, limit: float | None) -> dict:
+#: #774's split, and it is deliberately :data:`panel_seats.REFEREE_KINDS` rather than
+#: a fourth list of the same three words. That tuple already classifies the LINES a
+#: fix pass wrote; this classifies the FINDINGS a round raised about them, and a
+#: reader comparing "the pass wrote 380 prose lines" against "six of thirteen findings
+#: were about prose" is reading one vocabulary or two, depending only on this line.
+INJECTION_KINDS = panel_seats.REFEREE_KINDS
+
+
+def _kind_rate(rows: list[dict]) -> dict:
+    """One bucket of #774's by-kind split: `introduced` over that kind's own news.
+
+    The same arithmetic and the same rounding as the pooled rate above it, because
+    the two numbers are read side by side and a reader has to be able to check the
+    pooled one against the parts. `rate` is `None` — never `0.0` — where the kind has
+    no findings at all, on :func:`injection_state`'s own rule: zero is a claim about a
+    fix pass and an empty bucket is the absence of one.
+
+    No `over` and no `limit`. `escalate_on.fix_injection` compares against the POOLED
+    rate and nothing here changes that (#637 is recalibrating that threshold against
+    the pooled denominator and a split one would invalidate the measurement it is
+    waiting for), so a per-kind verdict would be a threshold nobody set, sitting in
+    the payload beside four rungs that do gate, inviting exactly one reading."""
+    introduced = sum(1 for r in rows if r["provenance"] == "introduced")
+    total = len(rows)
+    return {"introduced": introduced, "new": total,
+            "rate": None if not total else round(introduced / total, 4)}
+
+
+def injection_state(counts: dict | None, limit: float | None, *,
+                    placed: Iterable[tuple[str, str, str]] | None = None) -> dict:
     """#489's measurement as this round read it, for `round_stop` and the payload.
 
     `counts` is `panel.py`'s `provenance_counts` and nothing else: it is
@@ -4622,7 +4731,40 @@ def injection_state(counts: dict | None, limit: float | None) -> dict:
     `over` is the RULE and it is decided here rather than in `round_stop`, on
     `premise_state`'s precedent: what the stop rule receives is a verdict about a
     measurement it has no other way to make, and keeping the arithmetic beside the
-    thing it measures is what lets the stop rule stay a rule about findings."""
+    thing it measures is what lets the stop rule stay a rule about findings.
+
+    **`placed` IS #774, AND IT IS THE PER-FINDING ANSWER THIS FUNCTION WAS THROWING
+    AWAY.** :func:`panel_scope._provenance` decides, one finding at a time, whether
+    the previous fix pass wrote the lines it lands on; `counts` is that answer already
+    pooled into four integers, and the pooling is lossy in the two directions #751
+    measured. So the caller may pass the population as well — one
+    ``(key, file, verdict)`` per NEW outstanding finding, the SAME findings `counts`
+    was tallied over — and this publishes two things it could not publish before:
+
+    - **`findings`**, the verdict on each one, in `_provenance`'s own vocabulary
+      (:data:`panel_scope.PROVENANCE`) and not a second one. A fixer reading the
+      report can then see which of the findings in front of it are about its own last
+      pass, which is the whole of #774's first half; a rate cannot tell it that about
+      any particular row.
+    - **`by_kind`**, the same rate computed separately over production code, tests and
+      prose. The evidence is `lexray#1611` round 2 (#751): 13 new findings, 9
+      attributed, 69%, cycle stopped — and SIX of the thirteen were about text, four
+      of them stale precisely because that round had rewritten the thing they
+      described. One edit plus a repo that states one fact in five places arrives as N
+      findings, and pooled it reads to the brake as the loop circling.
+
+    **The pooled rate and `over` are untouched, and that is a constraint rather than
+    an omission.** `escalate_on.fix_injection`'s threshold is being recalibrated
+    against the pooled denominator (#637); moving the denominator under it would
+    invalidate the measurement that recalibration is waiting for. So the split is
+    published BESIDE the number that gates, and nothing reads it.
+
+    `placed` is `None` — not `[]` — where the caller did not supply the population,
+    and `findings` and `by_kind` are then null for the reason `rate` is: a payload
+    written before the field and a round with no new finding to place are different
+    claims, and a consumer that had to tell them apart would be reading the payload's
+    age rather than the cycle's state. It is keyword-only and optional so that every
+    caller on the old contract keeps the block it has, key for key, plus two nulls."""
     counts = counts or {}
     introduced = int(counts.get("introduced") or 0)
     total = sum(int(counts.get(b) or 0) for b in PROVENANCE)
@@ -4636,8 +4778,30 @@ def injection_state(counts: dict | None, limit: float | None) -> dict:
     rate = None if not total else round(introduced / total, 4)
     over = bool(limit is not None and rate is not None
                 and total >= FIX_INJECTION_MIN_NEW and rate > limit)
+    # SORTED BY KEY, for `escalated_outstanding`'s reason: a round that places the
+    # same findings twice has to write the same bytes, or a diff of two payloads means
+    # nothing. The file spelling rides along beside the kind because the kind is a
+    # JUDGEMENT about a path and a reader has to be able to check it — a row saying
+    # `prose` over `docs/x.md` is checkable and one saying `prose` over nothing is a
+    # classification taken on trust.
+    rows = None if placed is None else sorted(
+        ({"key": str(key or ""), "file": str(path or ""),
+          "kind": finding_kind(str(path or "")),
+          "provenance": str(verdict or "")}
+         for key, path, verdict in placed),
+        key=lambda r: (r["key"], r["file"]))
+    # Every kind on every round, `premise_state`'s rule: a bucket that is absent and a
+    # bucket with no findings in it are different claims, and a consumer joining the
+    # three against the pooled `new` must be able to see that they add up.
+    by_kind = None if rows is None else {
+        kind: _kind_rate([r for r in rows if r["kind"] == kind])
+        for kind in INJECTION_KINDS}
     return {"limit": limit, "introduced": introduced, "new": total, "rate": rate,
-            "min_new": FIX_INJECTION_MIN_NEW, "over": over}
+            "min_new": FIX_INJECTION_MIN_NEW, "over": over,
+            # #774. Beside the pooled rate and never instead of it: the rate is what
+            # `escalate_on.fix_injection` compares against and these two are what a
+            # human reads to decide whether the number meant what it said.
+            "findings": rows, "by_kind": by_kind}
 
 
 def unrefereed_fix_brake(panel: dict, notes: list[str]) -> bool:
@@ -6572,7 +6736,10 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
                unrefereed: dict | None = None,
                guard_churn: dict | None = None,
                fix_budget: dict | None = None,
-               surface: dict | None = None) -> dict:
+               surface: dict | None = None,
+               attested: bool | None = None,
+               modes: Mapping[str, str] | None = None,
+               fix_diff: str = "") -> dict:
     """Whether the panel/fix cycle should go again, and what decided it.
 
     ``outstanding`` is every finding the cycle still has to clear, which is wider
@@ -6934,6 +7101,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     ``premises``' precedent, so this function applies a rule rather than computing a
     rate over a diff it has no business seeing.
 
+    **The block now carries two things the rule does not read (#774), and the fact
+    that the rule does not read them is the point.** ``fix_injection.findings`` is the
+    per-finding verdict :func:`panel_scope._provenance` computes and this block used
+    to pool away, so a fixer can see which of the findings in front of it are about
+    its own last pass; ``fix_injection.by_kind`` is the same rate split over
+    production code, tests and prose, on `lexray#1611` round 2's evidence — 13 new
+    findings, 9 attributed, 69%, cycle stopped, and six of the thirteen were about
+    text, four of them stale because that round had rewritten the thing they
+    described. ``rate``, ``over`` and therefore this rung are computed over the pooled
+    denominator exactly as before: #637 is recalibrating that threshold against it,
+    and a split denominator would invalidate the measurement it is waiting for.
+
     **It may only take away the round RULE 1 was buying.** The justification is
     about rule 1 and nothing else, so the rule is bounded to it: a round going again
     under rule 2 (a P1/P2 or a Sonar gate issue still outstanding) or rule 3 (a
@@ -7286,6 +7465,55 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     asymmetry is deliberate: a false negative costs such a round nothing it had, and a
     false positive is the one reading this field exists to make impossible.
 
+    **``attested`` (#782), and the rule it applies, which recurs in this file often
+    enough to be worth stating once: AN ABSENCE WITH TWO CAUSES MUST NEVER BE REPORTED
+    AS THE BENIGN ONE.** "No finding" has two causes — nothing was wrong, and nothing
+    ran — and until this field the dry branch reported the first without being able to
+    tell them apart. That is the same rule ``fix_surface`` keeps when it publishes null
+    rather than zero for a round with no pass to read, the same rule the CI gate's
+    ``none`` handling keeps (#628), and the same rule
+    :func:`panel_scope._provenance` keeps when it answers ``unknown`` instead of
+    guessing. mergeCraft states it as a property of a finding list: its approval gate
+    returns ``neutral`` and not ``success`` on an empty one, because a finding is
+    *"attested structural evidence the review ran"* and an empty list is the absence
+    of that evidence rather than a pass.
+
+    So a stop whose whole CYCLE raised nothing — no new finding, nothing outstanding,
+    no repeat, no escalation, no narrowing, no declination — is reported as
+    ``unattested`` in its own ``reason`` and is not converged.
+
+    **It is answered from this function's own arguments, and it is a CYCLE question
+    rather than a round one.** The distinction is the whole of why the field is
+    reachable at all: the round that ends a converging cycle raises nothing BY
+    CONSTRUCTION, so a rule reading only this round would make ``converged``
+    unreachable and turn the number the epic is judged on into a constant zero.
+    A round after the first is proof that an earlier round of the cycle produced a
+    finding, because every route to ``stop: False`` runs through rule 1, rule 2 or
+    rule 3 and each of the three needs one. What is left is a round 1 that raised
+    nothing anywhere — a cycle whose panel never demonstrated it could see the diff at
+    all. The honest limit, since the caller asserts its own round number: a cycle
+    resumed by hand at ``--round N`` inherits that claim along with ``--baseline``,
+    on the same trust the baseline itself is read under.
+
+    ``attested`` overrides the derivation, and exists because this function is shown
+    a narrower population than the panel produced: findings the judge DISMISSED reach
+    neither ``new_keys`` nor ``outstanding``, so a round 1 whose seats all filed and
+    whose judge threw everything out is indistinguishable here from a round 1 where no
+    seat spoke. It is `None` where the caller has not answered — every existing caller
+    — and `None` means "derive it", not "no".
+
+    **It costs ``converged`` and NOT ``confident``, and the direction is the
+    judgement.** #165's below-floor stop is the precedent: a policy stop keeps its
+    confidence and loses the word. ``confident: False`` is a LANDING HOLD two files
+    away (``preland``'s ``--require-earned-stop``), so charging it here would hold
+    every trivial pull request whose panel honestly found nothing — and vetoing is
+    also not what the rule asks for. Whether anything READ the diff is
+    :func:`coverage_veto`'s question, it has a floor under it for exactly the
+    nothing-ran case ("no reviewer ran — nothing read this diff"), and this function
+    receives that answer as ``veto``. What is left for this field is the narrower
+    claim: the review may well have run, and it attested to nothing, so the cycle is
+    ``neutral`` and not ``success``.
+
     Two honest caveats, recorded here because they are properties of the design
     and not of the code, and because this docstring is where they are KEPT — the
     READMEs and ``panel-review-pr.md`` point at it rather than restating it, since
@@ -7309,7 +7537,66 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
       no retraction — so once a human ANSWERS a premise the answer ends the cycle:
       the key would otherwise go on subtracting its finding from the work a fix
       round can clear, and go on rendering ⛔, for every round that inherits the
-      baseline."""
+      baseline.
+
+    **``modes`` (#779) is `{rung: shadow|enforce}` for the four rungs
+    :data:`BRAKED_RUNGS` names, already resolved by the caller through
+    ``harness_rules.escalate_mode`` — the only place the three-layer config fallback
+    may be applied. Absent, every rung enforces, which is what this function did
+    before the parameter existed; :func:`brake_mode` argues why an absent ARGUMENT
+    and an unnamed RUNG take opposite defaults.**
+
+    It splits ``fired`` where the split was always latent, because that word has been
+    carrying two claims at once — the rung reached a stop-worthy verdict, AND the stop
+    was applied. One vocabulary and not two:
+
+    - ``over`` — the MEASUREMENT crossed. Decided in the state builder, unchanged;
+    - ``would_fire`` — the rung reached the VERDICT: over, armed, the rule's own
+      bounds cleared (``going_again``), everything except the mode;
+    - ``fired`` — the verdict was APPLIED: ``would_fire and mode == enforce``.
+
+    So ``fired`` keeps its exact present meaning, and every consumer of it is correct
+    the day this lands without an edit — ``panel_propose.escalations_fired`` in
+    particular, whose rule is that a shadow rung stopped nothing, is not why the cycle
+    stopped, and buys no fan-out. Under ``enforce`` the two are equal and the record
+    reads exactly as it did before.
+
+    **WHAT A SHADOW RUNG MAY NOT TOUCH, which is the constraint that makes shadow
+    mean shadow.** ``stop``, ``reason``, ``veto`` and ``confident`` are what they
+    would have been WITH THAT RUNG ABSENT. A shadow verdict that vetoed a confident
+    stop would be enforcement by another route, and a lost ``confident`` is a landing
+    hold two files away (``preland``'s ``--require-earned-stop``) — so a brake shipped
+    in shadow to be calibrated would hold pull requests while calibrating.
+
+    **And it is still VISIBLE, in the one field a human reads.** The ``reason``
+    carries a trailing clause naming each shadow rung that would have fired and what
+    it would have said, in the word ``shadow`` — appended after the cap wraps the
+    reason, so the sentence a stop already had is byte-for-byte what it was and the
+    shadow verdicts are additional rather than substituted. A ``reason`` naming
+    ``fix_injection`` without naming the mode is the misread #779 was filed over: a
+    rung that would have fired is not a rung that fired, and reading the first as the
+    second is how a confident round gets described as divergence.
+
+    ``fix_budget`` (#622) has no mode and is not in :data:`BRAKED_RUNGS`, because it
+    is not an ``escalate_on`` rung — it fires on a proof rather than on a threshold
+    anybody chose, and #621's "not a 29th dial" is the argument for it having no
+    switch. ``fix_surface`` (#619) and ``fix_blast`` (#770) have no mode for the
+    opposite reason: they gate nothing at all, so there is no verdict for a mode to
+    apply or withhold.
+
+    **``fix_blast`` (#770) is REPORTED and gates nothing**, in ``fix_surface``'s
+    register and beside it. It is :func:`panel_blast.fix_blast_radius` over the files
+    that pass touched — a `low`/`medium`/`high` lane with the categories that fired
+    and a sentence — and it is the first input to the fix-risk axis, not the axis.
+    #67's rule is why: an instrument earns a gate over a few dozen cycles or not at
+    all, and what the gate should be is #770's decision and carries
+    ``needs-human/decision``. It is **null and never ``low``** where
+    :func:`fix_surface_state` returned nothing: "the pass touched no risky path" and
+    "nobody measured the pass" are different claims, the sibling field states that
+    rule already, and a ``low`` manufactured out of an absent measurement is exactly
+    what the null exists to prevent. ``fix_diff`` is the range's own text where a
+    caller had it — the lane's diff heuristics fail toward the LOWER lane, so the
+    empty string a caller passes by default can never manufacture a ``high``."""
     # Both key collections are checked at the door, the way every other shape in
     # this file is, because both wrong shapes fail SILENTLY and both failures are
     # the #221 jam this function exists to close.
@@ -7521,6 +7808,34 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     #: already taken. They are named because the alternative is silence, and silence
     #: about them is what lets a below-floor stop read as a dry one.
     below_floor = sorted(k for k in work if not above(k, cleared_floor))
+    # ---- #782: DID THE PANEL ATTEST TO ANYTHING? An empty finding list has two
+    # causes — nothing was wrong, and nothing ran — and the dry branch below reported
+    # the first for both. The rule this applies is the one the docstring states once:
+    # an absence with two causes must never be reported as the benign one.
+    #
+    # Read off the sets the rules were already applied to, and off NOTHING ELSE.
+    # `work` is the one universe #42 built for the disposal, so a key that reached
+    # only one of the three parameters is counted here exactly as it is counted there;
+    # `cleared_out` is what the two filters subtracted BEFORE the rules ran, and an
+    # escalated or narrowed key is a finding a seat raised whatever the rules then did
+    # with it; `unfixed` is a correction an earlier pass wrote down. Recomputing any
+    # of them from the parameters would be a second reading of one quantity, and the
+    # `repeated` parameter in particular is an `Iterable` this function has already
+    # walked twice — a generator would answer this question `True` by existing.
+    raised = bool(work or cleared_out or unfixed)
+    # A CYCLE question, not a round one, and that is what makes the field reachable:
+    # the round that ENDS a converging cycle raises nothing by construction, so a rule
+    # reading only this round would make `converged` a constant false. `round_no > 1`
+    # is proof that an earlier round raised something, because the only routes to
+    # `stop: False` are rules 1, 2 and 3 and every one of them needs a finding. What
+    # this leaves is the case #782 names: a first round that raised nothing at all.
+    #
+    # `attested` OVERRIDES it rather than being folded in, because the caller can see
+    # a population this function cannot: a finding the judge DISMISSED is in neither
+    # `new_keys` nor `outstanding`, so a round 1 whose seats all filed and whose judge
+    # threw the lot out looks identical here to one where no seat spoke. `None` is
+    # "you have not been asked", which is every caller today, and it derives.
+    attesting = bool(raised or round_no > 1) if attested is None else bool(attested)
     if triggering:
         stop, reason = False, (f"{len(triggering)} finding(s) no earlier round raised")
     elif blockers:
@@ -7609,6 +7924,34 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"{len(unfixed)} correction(s) an earlier fix pass declared it could not "
             "make, so it did not converge: it ran out of corrections anybody was "
             "willing to make, which is not the same as running out of defects")
+    elif not attesting:
+        # #782, and it is the dry branch split in two rather than a new rule: nothing
+        # went again, nothing is outstanding, and the round is stopping either way.
+        # What it may not do is borrow the word — "dry" is a claim that the panel
+        # looked and there was nothing, and this is a cycle in which the panel never
+        # produced anything to look at. mergeCraft's gate calls the same list
+        # `neutral` rather than `success`, on the ground that a finding is attested
+        # structural evidence the review ran.
+        #
+        # LAST but one, above the dry branch and below every branch that names work:
+        # the chain's own rule that the most specific TRUE thing wins, and each branch
+        # above says something happened. It cannot in fact be reached past any of them
+        # — `attesting` is false only when they are all empty — and it is written in
+        # its place in the chain anyway, so that a branch added later between them
+        # inherits the ordering rather than the accident.
+        #
+        # NO VETO LINE, deliberately, on #165's below-floor precedent: a veto is
+        # `confident: False` and `confident: False` is a landing hold two files away
+        # (`preland --require-earned-stop`), which would hold every trivial PR whose
+        # panel honestly found nothing. Whether anything READ the diff is
+        # `coverage_veto`'s question and it has its own floor for the nothing-ran case;
+        # what this branch claims is only that the cycle attested to nothing, and the
+        # cost of that claim is the word `converged` and nothing else.
+        stop, reason = True, (
+            "unattested — nothing was raised anywhere in this cycle, so this round's "
+            "quiet is the absence of a finding rather than evidence of a clean "
+            "change: an empty finding list is not a pass, it is the panel not having "
+            "attested to anything (#782)")
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
@@ -7703,13 +8046,32 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # goes again exactly as it would have without one, which is what "the cycle
     # continues" asks for.
     excising = (excision_state(REVERT_NOT_ASKED) if excision is None else excision)
+    # #619's surface, resolved HERE rather than inline in the payload because #770's
+    # lane below is computed FROM it and the two must not be two separate reads of one
+    # measurement: `fix_blast` is null exactly where `fix_surface` is, and a second
+    # call could not be shown to agree with the first. It decides nothing either — no
+    # rung reads it, and none reads the lane.
+    surfacing = fix_surface_state(surface)
     # `going_again` below, and NOT #506's original `not stop and triggering`:
     # #505 named the corrected rule-1 bound after codex found the old form
     # let either rung end a cycle that was going again for a P1 an earlier
     # round raised. The stricter definition wins this merge; taking #506's
     # line would have quietly reverted that fix while both features looked
     # like they had landed intact.
-    injected = bool(injecting["over"] and going_again)
+    #
+    # #779's split, and the shape every rung on this chain now takes. `*_would` is the
+    # VERDICT — this rung's own rule, its bounds and nothing else — and the name the
+    # stop is applied under carries the MODE as well, so a `shadow` rung reaches the
+    # same verdict and applies none of it. Written as two locals rather than as an
+    # `if` inside each stop because the payload publishes both and the veto list, the
+    # disposal (`futile`) and the reason all read the applied one: a rung whose verdict
+    # and application were the same expression could not be shadowed without four
+    # separate edits that could disagree.
+    modes = modes or {}
+    injecting_would = bool(injecting["over"] and going_again)
+    injected = bool(injecting_would
+                    and brake_mode(modes, BRAKED_RUNGS["fix_injection"])
+                    == BRAKE_ENFORCE)
     # #505, applied BEFORE `injected` so that `injected` owns the `reason` when both
     # fire — `circling`'s ordering rule, one level down. A rate that names the fix pass
     # as the author of this round's work is the more specific truth than a count saying
@@ -7722,7 +8084,10 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # may only take away the round rule 1 was buying, and may not cancel the repair
     # round for a P1 an earlier round raised that this fix pass did not clear.
     flattening = (not_falling_state([], None) if not_falling is None else not_falling)
-    flat = bool(flattening["over"] and going_again)
+    flattening_would = bool(flattening["over"] and going_again)
+    flat = bool(flattening_would
+                and brake_mode(modes, BRAKED_RUNGS["new_findings_not_falling"])
+                == BRAKE_ENFORCE)
     if flat:
         stop, reason = True, (
             f"{flattening['count']} new finding(s) this round against "
@@ -7755,7 +8120,10 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # one has a single PR, so it takes the narrower of the two available shapes.
     guarding = (guard_churn_state(None, None, False) if guard_churn is None
                 else guard_churn)
-    overguarded = bool(guarding["over"] and guarding["armed"] and going_again)
+    guarding_would = bool(guarding["over"] and guarding["armed"] and going_again)
+    overguarded = bool(guarding_would
+                       and brake_mode(modes, BRAKED_RUNGS["guard_churn"])
+                       == BRAKE_ENFORCE)
     if overguarded:
         stop, reason = True, (
             f"the fix pass before this round churned {guarding['lines']} line(s) of "
@@ -7848,7 +8216,10 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # the argument is about rule 1's input, so it may not cancel the repair round for
     # a P1 an earlier round raised and this fix pass did not clear.
     refereeing = (referee_state(None, False) if unrefereed is None else unrefereed)
-    unchecked = bool(refereeing["over"] and going_again)
+    refereeing_would = bool(refereeing["over"] and going_again)
+    unchecked = bool(refereeing_would
+                     and brake_mode(modes, BRAKED_RUNGS["unrefereed_fix"])
+                     == BRAKE_ENFORCE)
     if unchecked:
         stop, reason = True, (
             f"the fix pass before this round churned {refereeing['churn']} line(s) "
@@ -7895,6 +8266,45 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     if not stop and round_no >= max_rounds:
         stop, capped = True, True
         reason = f"round cap ({max_rounds}) reached — {reason}, unreviewed"
+    # ---- #779: THE SHADOW VERDICTS, SAID OUT LOUD AND ACTING ON NOTHING.
+    #
+    # A rung in `shadow` reached its verdict above and applied none of it: `stop`,
+    # `veto` and `confident` are already what they would have been with that rung
+    # absent, because every one of them reads the APPLIED local and this block writes
+    # to none of them. What is left is that the verdict has to be READABLE, and the
+    # `reason` is the one field a human reads on a round they did not run.
+    #
+    # APPENDED, and appended HERE, after the cap has wrapped the reason. Substituting
+    # or prefixing would make a shadow rung change the sentence a stop already had —
+    # which is `reason` no longer being "what it would have been with that rung
+    # absent" — and appending before the cap would bury the clause inside
+    # `round cap (6) reached — …, unreviewed`, where it would read as part of the
+    # reason the cap was reached.
+    #
+    # The word `shadow` is in every clause, and the rung's own name beside it, because
+    # the misread #779 was filed over is a `reason` naming `fix_injection` without
+    # naming the mode: a rung that would have fired is not a rung that fired, and
+    # reading the first as the second is how a confident round gets described as
+    # divergence. `would have ended` is deliberately the counterfactual tense — this
+    # round did not end on it and may not have ended at all.
+    #
+    # Fires on a `go again` round as well as on a stop, and that is the point rather
+    # than an oversight: the calibration population #779 exists to create is every
+    # round the rung would have acted on, and the rounds it would have TURNED are
+    # precisely the ones that went again.
+    shadowed = [rung for rung, would in (
+        (BRAKED_RUNGS["fix_injection"], injecting_would),
+        (BRAKED_RUNGS["new_findings_not_falling"], flattening_would),
+        (BRAKED_RUNGS["guard_churn"], guarding_would),
+        (BRAKED_RUNGS["unrefereed_fix"], refereeing_would),
+    ) if would and brake_mode(modes, rung) == BRAKE_SHADOW]
+    if shadowed:
+        reason += (
+            f" [{BRAKE_SHADOW}: `escalate_on.{'`, `escalate_on.'.join(shadowed)}` "
+            f"reached {'its verdict' if len(shadowed) == 1 else 'their verdicts'} "
+            f"and would have ended this cycle — recorded, not applied, so nothing "
+            f"above this clause was decided by "
+            f"{'it' if len(shadowed) == 1 else 'them'}]")
     # Only on a STOP. The veto list is printed under "why this round's quiet is
     # not evidence of a quiet PR", and on a `go again` round the repeat IS the
     # reason — printing it there told a reader that a round which was not quiet
@@ -8281,7 +8691,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # what the epic is judged on, and a reader checking it against the payload
         # must be able to see every conjunct rather than reconstruct one from a veto
         # string. The two cannot disagree — both read the same local.
-        "converged": bool(confident and not fixable and not below_floor
+        # #782, and it is `converged`'s fifth conjunct rather than a note beside it —
+        # named in the payload for `blocking`'s reason: this flag is what the epic is
+        # judged on, and a reader checking it must be able to see every conjunct
+        # instead of reconstructing one from a `reason` string. True on every round
+        # this function has ever been able to call converged, so the field costs a
+        # healthy cycle nothing; false exactly where the cycle produced no finding
+        # anywhere and the dry branch would have said so in the benign words.
+        #
+        # ALWAYS present and always a bool, its siblings' rule: an absent key and "the
+        # cycle attested to nothing" are different claims.
+        "attested": attesting,
+        "converged": bool(confident and attesting and not fixable and not below_floor
                           and not blocking and not unfixed),
         "veto": veto,
         "round": round_no,
@@ -8358,7 +8779,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # stopped. A consumer that gated a "the cycle ended on divergence" sentence on
         # `over` would attach it to a confident, converged round, which is exactly the
         # misreporting the rest of this function is organised against.
-        "fix_injection": {**injecting, "fired": injected},
+        # #779 adds `mode` and `would_fire` beside them, and every existing key stays.
+        # `would_fire` is `over` plus this rung's own bounds — the whole verdict except
+        # the mode — so the three read as one vocabulary down one axis: the number
+        # crossed, the rung reached its verdict, the verdict was applied. `mode` is
+        # published rather than left to be joined against the repo's config, because
+        # the payload is what a calibration query reads and the config it ran under is
+        # not in it.
+        "fix_injection": {**injecting,
+                          "mode": brake_mode(modes, BRAKED_RUNGS["fix_injection"]),
+                          "would_fire": injecting_would, "fired": injected},
         # #506's remedy for the rule above, and ALWAYS present for the reason
         # `fix_injection` and `premises` are: an absent key and "there was nothing to
         # propose" are different claims. `kind` says which of those it is, in
@@ -8396,7 +8826,11 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # escalation, a round going again for a P1 under rule 2. `fired` is the
         # property of the VERDICT. A consumer that read the first as the second would
         # attach "the cycle ended without converging" to a confident, converged round.
-        "new_findings_not_falling": {**flattening, "fired": flat},
+        # `mode` and `would_fire` on `fix_injection`'s terms (#779).
+        "new_findings_not_falling": {
+            **flattening,
+            "mode": brake_mode(modes, BRAKED_RUNGS["new_findings_not_falling"]),
+            "would_fire": flattening_would, "fired": flat},
         # #554's measurement, ALWAYS present for the reason its three siblings are: a
         # payload with no key and a round with no fix pass to read are different
         # claims, and a consumer forced to tell them apart would be reading the
@@ -8411,7 +8845,16 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # deliberately does not touch — a below-floor policy stop, a round holding an
         # escalation, a round going again for a P1 under rule 2. `fired` is the
         # property of the VERDICT.
-        "unrefereed_fix": {**refereeing, "fired": unchecked},
+        # `mode` and `would_fire` on `fix_injection`'s terms (#779). `armed` and `mode`
+        # are two questions and stay two: `escalate_on.unrefereed_fix` says whether
+        # this is a rung at all, and the mode says whether an armed rung's verdict is
+        # applied — so `armed: false` and `armed: true, mode: shadow` are different
+        # records rather than two spellings of one. The first measures and reaches no
+        # verdict; the second reaches the verdict and declines to act, which IS the
+        # calibration population.
+        "unrefereed_fix": {**refereeing,
+                           "mode": brake_mode(modes, BRAKED_RUNGS["unrefereed_fix"]),
+                           "would_fire": refereeing_would, "fired": unchecked},
         # #618's measurement, ALWAYS present for the reason its siblings are: a payload
         # with no key and a round that measured no guard churn are different claims.
         # `limit` is null on every repo that has not written one, which is every repo
@@ -8419,7 +8862,14 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # "there was no ceiling". `over` is the measurement and `armed` is the policy,
         # kept apart on `referee_state`'s terms; `fired` is the verdict, kept apart from
         # both on `fix_injection`'s.
-        "guard_churn": {**guarding, "fired": overguarded},
+        # `mode` and `would_fire` on `fix_injection`'s terms (#779), and this is the
+        # one block whose key and whose rung are spelled differently: the measurement
+        # is published as `guard_churn` and the rung that acts on it is
+        # `escalate_on.guard_lines`. :data:`BRAKED_RUNGS` is the mapping, so the
+        # translation is written down once rather than inferred by a reader.
+        "guard_churn": {**guarding,
+                        "mode": brake_mode(modes, BRAKED_RUNGS["guard_churn"]),
+                        "would_fire": guarding_would, "fired": overguarded},
         # #622's measurement, ALWAYS present for the reason its siblings are, and it
         # carries TWO verdicts about one number because they are two different claims.
         #
@@ -8451,7 +8901,32 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # fix range), never a zero: `fix_surface_state` has the argument, and the short
         # of it is that "no pass opened a new file" and "nobody looked" are different
         # claims and only one of them is ever true of round 1.
-        "fix_surface": fix_surface_state(surface),
+        "fix_surface": surfacing,
+        # #770's first input, in `fix_surface`'s register and off `fix_surface`'s own
+        # answer: which risk lane the last fix pass's paths fall in — `low`, `medium`
+        # or `high` — with the categories that fired and a sentence saying why.
+        # REPORTED AND GATING NOTHING, which is #67's rule on an instrument with no
+        # calibration behind it: nothing above reads this, it moves no `stop`, no
+        # `reason`, no veto and no `confident`, and there is deliberately no dial to
+        # arm it. What the gate should be is #770's decision and carries
+        # `needs-human/decision`.
+        #
+        # **NULL AND NEVER `low` WHERE NOTHING WAS MEASURED**, which is the one rule
+        # here that must not be got wrong. `fix_surface_state` returns `None` for a
+        # round with no pass to read — round 1, a rewritten range — and "the pass
+        # touched no risky path" and "nobody looked at the pass" are different claims.
+        # `fix_blast_radius([])` answers `low` on an empty list, correctly, for a pass
+        # that genuinely touched nothing; manufacturing that same `low` out of an
+        # absent measurement would be the flattering direction on the axis that exists
+        # to say a change is dangerous, and it is the failure the sibling field's null
+        # already exists to prevent.
+        #
+        # `fix_diff` is passed as the caller had it. The lane's diff heuristics fail
+        # toward the LOWER lane by construction, so the empty default can never
+        # manufacture a `high` — a caller with no range in hand loses evidence and
+        # cannot gain a verdict.
+        "fix_blast": None if surfacing is None else fix_blast_radius(
+            surfacing.get("files") or [], diff=fix_diff or "").as_dict(),
         # #42, and it is the only block here that is not about whether to go again.
         # Every other field answers "should another PANEL run"; this one answers the
         # second question `stop` was being read as answering and was never computed
@@ -8530,8 +9005,22 @@ __all__ = [
     "assessment_or_none", "ASSESSED_COST", "_inherit_assessed",
     "reached_declarations",
     "ESCALATE_ON_DEFAULTS", "ESCALATE_ON_UNBUILT", "PREMISE_REPEATED_EXIT",
+    # #779. The three names are re-exported rather than re-spelled for the reason
+    # the import at the top gives: `panel.py` resolves the modes and this file
+    # compares against them, and two spellings of `"shadow"` is a rung that reports
+    # one thing and does another.
+    "BRAKE_SHADOW", "BRAKE_ENFORCE", "BRAKE_MODES", "BRAKED_RUNGS", "brake_mode",
     "DECIDABILITY", "premise_undecidable_brake",
     "FIX_INJECTION_MIN_NEW", "fix_injection_limit", "injection_state",
+    # #774. `finding_kind` is re-exported because `panel.py` renders the by-kind
+    # split this file computes, and a report reaching for a second spelling of "is
+    # this a test file" is the disagreement the named import above exists to prevent.
+    "panel_locality", "finding_kind", "INJECTION_KINDS", "_kind_rate",
+    # #770's blast lane, re-exported for `finding_kind`'s reason: `panel.py` renders
+    # what this file computes, and a report reaching for a second spelling of "how
+    # risky were the paths that pass touched" is the disagreement the named import
+    # above exists to prevent.
+    "panel_blast", "fix_blast_radius",
     "REVERT_NOT_ASKED", "fix_pass_outcome", "revert_state", "_by_severity",
     "sub_floor_brief", "_names_finding", "excision_seams", "_read_once",
     "excision_state",

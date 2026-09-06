@@ -192,3 +192,80 @@ def test_the_field_is_always_present_including_on_a_go_again():
     for d in (panel.round_stop(1, 5, ["k1"], [_finding("P1")], []),
               panel.round_stop(2, 5, [], [], [])):
         assert isinstance(d["converged"], bool)
+
+
+# ------------------------------------------------ #782: the absence with two causes
+
+def test_a_first_round_that_raised_nothing_at_all_does_not_converge():
+    """The path the audit found. Round 1, no new finding, nothing outstanding, no
+    repeat, no escalation, no veto — every conjunct `converged` had was satisfied, and
+    the round reported a clean finish over a cycle in which the panel produced no
+    evidence it had read anything. "No finding" has two causes and this branch was
+    reporting the benign one for both."""
+    d = panel.round_stop(1, 5, [], [], [])
+    assert d["stop"] is True
+    assert d["attested"] is False
+    assert d["reason"].startswith("unattested")
+    assert d["converged"] is False
+
+
+def test_the_unattested_stop_keeps_its_confidence_and_takes_no_veto():
+    """#165's below-floor precedent, and the direction is the judgement. `confident:
+    False` is a landing hold two files away (`preland --require-earned-stop`), so
+    charging it here would hold every trivial PR whose panel honestly found nothing —
+    and whether anything READ the diff is `coverage_veto`'s question, which has its own
+    floor for the nothing-ran case. What this stop claims is only that the cycle
+    attested to nothing, and that claim costs the word and nothing else."""
+    d = panel.round_stop(1, 5, [], [], [])
+    assert d["veto"] == []
+    assert d["confident"] is True and d["converged"] is False
+
+
+def test_a_later_dry_round_converges_because_an_earlier_one_raised_something():
+    """The property that makes the field reachable at all. The round that ENDS a
+    converging cycle raises nothing by construction, so a rule reading only this round
+    would make `converged` a constant false. A round after the first is proof that an
+    earlier round raised a finding: the only routes to `stop: False` are rules 1, 2 and
+    3, and every one of them needs one."""
+    d = panel.round_stop(2, 5, [], [], [])
+    assert d["attested"] is True
+    assert d["reason"].startswith("dry")
+    assert d["converged"] is True
+
+
+def test_a_first_round_that_raised_anything_at_all_has_attested():
+    """Read off the sets the rules were applied to, not off `new_keys` alone. A finding
+    the fixer answered narrowly is subtracted before every rule and is in none of the
+    disposal's lists — and a seat still raised it, so the round has attested and the
+    stop is #615's, not this one's."""
+    c = _finding("P2")
+    d = panel.round_stop(1, 5, [], [c], [], repeated=[c.key], narrowed=[c.key])
+    assert d["attested"] is True
+    assert "answered at the point they were raised" in d["reason"]
+    assert d["converged"] is True
+
+
+def test_a_caller_that_watched_the_judge_dismiss_everything_can_say_so():
+    """The population this function is never shown. A finding the judge DISMISSED
+    reaches neither `new_keys` nor `outstanding`, so a round 1 whose seats all filed
+    and whose judge threw the lot out is indistinguishable here from one where no seat
+    spoke. `attested` is the caller's answer to that and it overrides the derivation;
+    `None` means "you have not been asked", which is every caller on the old
+    contract."""
+    told = panel.round_stop(1, 5, [], [], [], attested=True)
+    assert told["attested"] is True
+    assert told["reason"] == "dry — no findings to fix"
+    assert told["converged"] is True
+    # And in the other direction, for a caller that looked and found no seat had
+    # spoken on a round this function would otherwise have credited.
+    denied = panel.round_stop(2, 5, [], [], [], attested=False)
+    assert denied["attested"] is False and denied["converged"] is False
+
+
+def test_the_attestation_is_always_present_and_always_a_bool():
+    """An absent key and "the cycle attested to nothing" are different claims — the
+    rule every measurement in this payload keeps."""
+    for d in (panel.round_stop(1, 5, [], [], []),
+              panel.round_stop(1, 5, ["k1"], [_finding("P1")], []),
+              panel.round_stop(2, 5, [], [], [])):
+        assert isinstance(d["attested"], bool)

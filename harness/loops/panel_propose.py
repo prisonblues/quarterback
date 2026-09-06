@@ -156,6 +156,51 @@ def escalations_fired(stop: dict | None) -> list[str]:
     return [name for name in PROPOSE_ESCALATIONS if name in fired]
 
 
+def escalations_shadowed(stop: dict | None) -> list[str]:
+    """Which rungs REACHED the verdict and were not allowed to apply it — #779.
+
+    :func:`escalations_fired`'s sibling, derived the same way off the same blocks and
+    for the same reason: `round_stop` publishes each rung's own answer and a second
+    list beside them is a second thing that can disagree with the first.
+
+    **`would_fire and not fired`, and the `and not fired` is load-bearing.** Under
+    `enforce` the two flags are equal, so a rung that ended the cycle would otherwise
+    appear in BOTH lists — and the one caller that matters here bills a fan-out off the
+    first. The subtraction is what makes these two lists a partition rather than an
+    overlap, so "which rungs stopped this cycle" and "which rungs would have" can be
+    read side by side and add up.
+
+    **NOTHING IS BILLED FOR WHAT IS IN THIS LIST, and that is the whole of #779's
+    constraint applied one file down.** A shadow rung stopped nothing, so it is not why
+    the cycle stopped, so it buys no fan-out: :func:`escalations_fired` is what
+    `panel.py` gates the constructive pass on and it reads `fired`, which keeps its
+    exact present meaning. This list exists so the calibration population is READABLE —
+    the rounds a rung would have acted on are the measurement #67 asks for before a
+    gate binds — and a consumer that spent on it would have turned an instrument back
+    into a gate by another route.
+
+    The four measured rungs only. `premise_repeated` and `premise_undecidable` have
+    modes in `escalate_modes` and their stop is not yet gated on one (see
+    `panel_rounds.BRAKED_RUNGS`), so they publish no `would_fire` and cannot appear
+    here — an absent name is the honest answer for a rung whose verdict is still
+    always applied, and inventing one from `fired` would report a shadow that no round
+    ever ran in.
+    """
+    if not isinstance(stop, dict):
+        return []
+    shadowed = []
+    for key, rung in (("new_findings_not_falling", "new_findings_not_falling"),
+                      ("unrefereed_fix", "unrefereed_fix"),
+                      # The measurement's key and the DIAL's name, kept apart here for
+                      # the reason `escalations_fired` keeps them apart above.
+                      ("guard_churn", "guard_lines"),
+                      ("fix_injection", "fix_injection")):
+        block = stop.get(key) or {}
+        if block.get("would_fire") and not block.get("fired"):
+            shadowed.append(rung)
+    return [name for name in PROPOSE_ESCALATIONS if name in shadowed]
+
+
 # ----------------------------------------------------------------------- the question
 
 #: What a seat may answer. Three, on :data:`panel_core.ASK_VERDICTS`' rule that the
@@ -437,10 +482,21 @@ def seat_findings(outstanding: list, held: Iterable[str] = ()) -> dict[str, list
     says whose the answer is. `round_stop`'s subtraction is untouched: nothing here
     reaches it.
 
-    **SONAR is not a seat.** `sonarqube` scans code against a rule set and has no
-    reply to give — `panel_ask` says so about the identical case — so its gate
+    **A RULE SET is not a seat.** `sonarqube` scans code against a rule set and has
+    no reply to give — `panel_ask` says so about the identical case — so its gate
     issues appear in no seat's list. They also do not go unrepresented, because a
     gate issue keeps the PR unmergeable whatever anyone proposes.
+
+    `slop` (#780) is the same case and is excluded by the same line. It is a
+    deterministic matcher over the fix pass's diff: there is no prose channel into
+    it and none out of it, which is the property that makes it worth having — a
+    fixer cannot talk it out of a finding — and the same property that makes "what
+    would you do instead?" a question it cannot be asked. Its findings DO reach a
+    fix pass, through `to_fix` like any other confirmed finding; what it has no
+    answer to is the constructive round. The exclusion is structural rather than
+    named: `name in LLM_REVIEWERS` is the one predicate, so a seat with no brain is
+    left out of this fan-out on the day it is registered, and no second list of
+    which seats can be spoken to exists to disagree with the first.
     """
     marked = frozenset(k for k in held if k)
     by_seat: dict[str, list] = {}
@@ -758,7 +814,7 @@ def propose_lines(block: dict) -> list[str]:
 #: silently.
 __all__ = [
     "panel_core", "panel_seats", "panel_rounds",
-    "PROPOSE_ESCALATIONS", "escalations_fired",
+    "PROPOSE_ESCALATIONS", "escalations_fired", "escalations_shadowed",
     "PROPOSE_VERDICTS", "_PROPOSE_ALIASES", "PROPOSE_CHARS",
     "PROPOSE_MAX_FINDINGS", "PROPOSE_FINDING_CHARS",
     "PROPOSE_PROMPT", "Proposal", "_propose_verdict", "parse_proposal",

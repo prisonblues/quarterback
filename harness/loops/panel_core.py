@@ -481,8 +481,24 @@ ROUNDS_HEADING = "**Rounds:**"
 # The panel's possible members. LLM reviewers are interchangeable in everything
 # except how their CLI is invoked; sonarqube is a different shape (an API, and a
 # hard gate), so it is selectable but not iterable with the others.
+#
+# `slop` (#780) is the second member of that second shape, and it is in
+# ALL_REVIEWERS and deliberately NOT in LLM_REVIEWERS. Membership of LLM_REVIEWERS
+# is what earns a seat a model pin, a reasoning effort, a `max_diff_chars` budget,
+# a composed prompt and a vendor CLI to send it to (`budgets`, `models`, `efforts`
+# and the dispatch loop in panel.py are all built off this tuple, not off
+# `selected`). This seat has none of those: it is `panel_slop.review_fix_pass`,
+# a pure function of the fix pass's diff and the rule files beside it, costing no
+# vendor call and no token. Putting it in LLM_REVIEWERS would hand it a diff
+# budget it cannot spend, an argv clamp it cannot hit and a `model` field naming a
+# brain that never ran — the contradictory pairing #222 exists to remove.
+#
+# ALL_REVIEWERS is what `select_reviewers` resolves against and what `--reviewers`
+# validates against, so this is also the line that makes `--reviewers slop` a
+# legal ask rather than a hard error, and `reviewers.slop.enabled` a key with a
+# reader.
 LLM_REVIEWERS = ("claude", "codex", "antigravity", "pi", "grok")
-ALL_REVIEWERS = LLM_REVIEWERS + ("sonarqube",)
+ALL_REVIEWERS = LLM_REVIEWERS + ("sonarqube", "slop")
 
 # Reviewer name -> the executable to look for on PATH, where the two differ.
 # They differ for exactly one member: Google ships the Antigravity CLI as `agy`.
@@ -678,6 +694,53 @@ citation, and it is worse than a missed defect: it survives review.
 
 """
 
+#: **The one thing a reviewer prompt can do that no later control can.** Every
+#: other lever this loop owns acts on the FIXER at the moment it writes — the fix
+#: severity floor, the line budgets, the surface rule, the re-review gate. All of
+#: them are downstream of a finding that has already been raised, judged, and
+#: briefed. 63.7% of this loop's next-round findings came out of the fix pass
+#: (#165: 128 of 201 across seven PRs), and no cycle on record has ever converged.
+#: A finding never raised costs nothing to fix, nothing to judge, and cannot write
+#: the next round's findings — so the cheapest place to stop the churn is here, in
+#: what a seat is asked to RETURN.
+#:
+#: Hence the drop paragraph below the severity scale, and the two things about it
+#: worth writing down because the wording will look over-strong to the next person
+#: to edit it:
+#:
+#: **It is a drop, not a downgrade, and that is deliberate.** The obvious softer
+#: version — "report bloat-shaped findings at P4" — buys nothing. Whether a P4
+#: reaches a fixer at all depends on `fix_severity_floor`, which is a dial and not
+#: a rule; below the floor it is still a verdict the judge spends, still a row in
+#: the payload, and still an outstanding item returned to the board unfixed
+#: (`panel_rounds`, "P4 returning to the board unfixed"). A finding raised at any
+#: severity has already cost most of what raising it costs.
+#:
+#: **It narrows reporting and NOT reading, and the paragraph says so in its own
+#: words** because it sits under an opening that says "Report EVERYTHING you spot"
+#: and "do NOT self-censor a finding because it seems minor". Left to resolve that
+#: itself a model resolves it whichever way it likes — the failure
+#: :data:`RELATED_CODE_SLOT` is split in two to avoid — and the way that hurts is
+#: a seat quietly dropping real P3 craft defects as "bloat". So the drop is stated
+#: as being about the PROPOSAL TO ADD, the "however minor" instruction is restated
+#: rather than left implied, and no dimension or severity line above is touched.
+#:
+#: The escape hatch is `could_not_assess` and not a new key: giving observations a
+#: channel of their own is #165's work, not this one's. It is not free — every
+#: declaration is a `coverage_veto` line, so a seat that reaches for it costs the
+#: round its confidence — which is why the sentence offering it also calls it rare.
+#: That is the same trade the `diff` scope brief already took for "outside the
+#: change:", and it errs towards a round that does not claim convergence.
+#:
+#: NOT added to :data:`MOVE_MANIFEST_PROMPT`. That prompt asks four structural
+#: questions — what was lost, what is genuinely new, what is duplicated, what the
+#: manifest cannot answer — and its severity ladder has no craft tier for an
+#: additive recommendation to land in, so the class is largely out of scope there
+#: already. The reason not to add it anyway is sharper: question 1 asks the seat to
+#: report a dropped guard clause or `except` arm as a P1, and a drop list whose
+#: third item is "just-in-case guards" sitting under that question is exactly the
+#: contradiction above, in a prompt whose entire design is to keep a seat on four
+#: questions and off the moved text.
 REVIEW_PROMPT = """You are reviewing a pull request diff to the same exhaustive standard as a
 senior reviewer whose bar is "nothing left to improve". Report EVERYTHING you spot, across every
 dimension below — do NOT self-censor a finding because it seems "minor" or "just style". A later
@@ -715,6 +778,24 @@ Severity: P1 blocks merge (correctness/security) · P2 important (error handling
 logic flaws, a false comment claim the correctness argument rests on) · P3 should fix (style,
 naming, simplifications, a false comment claim nothing rests on) · P4 polish (minor consistency).
 Report all of them.
+
+WHAT NOT TO REPORT. One class of finding is dropped rather than downgraded: a finding whose
+fix would ADD bloat. A defensive check for a case that cannot happen, an abstraction used once, a
+comment restating the code beside it, a test asserting a tautology, a "just-in-case" guard, an
+error handler for a case the types already rule out. Not at a lower severity, not "for
+consideration" — not raised at all.
+
+You are fallible and you BIAS TOWARDS RECOMMENDING CHANGES, and the cheapest recommendation to
+write is one that asks for more code. The bar for reporting is sound AND correct AND elegant. A
+change that improves one of the three and not the others — or that degrades elegance to nominally
+improve correctness — leaves the codebase worse than it found it, and two out of three is a reason
+to look harder for the fix that gets all three, not a reason to report the two.
+
+This narrows what is worth REPORTING, never what is worth READING. Every dimension above is still
+read to the same standard, and a defect you FOUND is still reported however minor — "do not
+self-censor" stands. What is dropped is the PROPOSAL TO ADD. If a dropped one is still worth
+somebody knowing, it is one `could_not_assess` phrase beginning "bloat:" and nothing more, and
+that is rarer than it sounds.
 
 """ + _FINDINGS_ENVELOPE
 

@@ -287,10 +287,30 @@ def test_the_measurement_rides_in_the_payload_whether_it_fired_or_not():
     off = panel_rounds.round_stop(2, 5, [], [], [])
     assert off["fix_injection"] == {"limit": None, "introduced": 0, "new": 0,
                                     "rate": None, "min_new": 4, "over": False,
+                                    # #774's two fields, null rather than absent and
+                                    # null rather than empty: the caller passed no
+                                    # population, which is a different claim from a
+                                    # round that placed no finding.
+                                    "findings": None, "by_kind": None,
+                                    # #779's two. The exact comparison stays exact:
+                                    # this test's claim is about the block's WHOLE
+                                    # shape, so a new field belongs in the literal
+                                    # rather than being excused by a subset check.
+                                    # `enforce` with no `modes=` argument, which is
+                                    # what every caller on the old contract gets —
+                                    # `panel_rounds.brake_mode` argues why an absent
+                                    # ARGUMENT and an unnamed RUNG default opposite
+                                    # ways. `would_fire` is the verdict minus the
+                                    # mode, and there is no rate here to reach one.
+                                    "mode": "enforce", "would_fire": False,
                                     "fired": False}
     on = panel_rounds.round_stop(2, 5, ["k1"], [], [], injection=_state(1, 3))
     assert on["fix_injection"] == {"limit": 0.5, "introduced": 1, "new": 4,
                                    "rate": 0.25, "min_new": 4, "over": False,
+                                   "findings": None, "by_kind": None,
+                                   # Under the threshold, so no verdict was reached
+                                   # and the mode had nothing to withhold.
+                                   "mode": "enforce", "would_fire": False,
                                    "fired": False}
 
 
@@ -505,3 +525,110 @@ def test_the_block_does_not_claim_the_growth_ceilings_blind_spot():
     block = _fix_injection_block()
     assert "#702" in block
     assert "Do not \"fix\" it here." in block
+
+
+# ------------------------------------ #774: the per-finding answer, and what it is ABOUT
+
+def _placed(*rows):
+    """`(key, file, verdict)` per new outstanding finding — the population `counts`
+    is tallied over, in `panel_scope._provenance`'s own vocabulary."""
+    return list(rows)
+
+
+def test_the_per_finding_verdict_is_published_and_not_only_pooled():
+    """#774's first half. `_provenance` answers this one finding at a time and the
+    block used to keep only the ratio, so a fixer reading the report could not tell
+    which of the findings in front of it were about its own last pass."""
+    got = panel_rounds.injection_state(
+        _counts(introduced=1, missed=1), 0.5,
+        placed=_placed(("k2", "a.py", "introduced"), ("k1", "b.py", "missed")))
+    assert got["findings"] == [
+        {"key": "k1", "file": "b.py", "kind": "production", "provenance": "missed"},
+        {"key": "k2", "file": "a.py", "kind": "production",
+         "provenance": "introduced"}]
+
+
+def test_the_findings_are_sorted_so_two_identical_rounds_write_the_same_bytes():
+    """`escalated_outstanding`'s rule: a payload whose bytes move with the order the
+    caller happened to walk its findings in is a diff that means nothing."""
+    rows = [("k3", "c.py", "missed"), ("k1", "a.py", "introduced"),
+            ("k2", "b.py", "unknown")]
+    first = panel_rounds.injection_state(_counts(1, 2), 0.5, placed=_placed(*rows))
+    again = panel_rounds.injection_state(_counts(1, 2), 0.5,
+                                         placed=_placed(*reversed(rows)))
+    assert first["findings"] == again["findings"]
+    assert [r["key"] for r in first["findings"]] == ["k1", "k2", "k3"]
+
+
+def test_the_rate_is_split_by_what_the_finding_is_ABOUT():
+    """#751's evidence, and the reason the pooled number misled. `lexray#1611` round 2:
+    13 new findings, 9 attributed, 69% — and six of the thirteen were about text, four
+    of them stale precisely because that round had rewritten the thing they described.
+    One edit plus a repo stating one fact in five places arrives as N findings, and
+    pooled it reads to the brake as the loop circling."""
+    rows = ([(f"p{i}", "harness/loops/panel.py", "introduced") for i in range(3)]
+            + [(f"q{i}", "harness/loops/panel.py", "missed") for i in range(4)]
+            + [(f"m{i}", "docs/panel.md", "introduced") for i in range(6)])
+    got = panel_rounds.injection_state(_counts(introduced=9, missed=4), 0.5,
+                                       placed=_placed(*rows))
+    assert got["by_kind"]["prose"] == {"introduced": 6, "new": 6, "rate": 1.0}
+    assert got["by_kind"]["production"] == {"introduced": 3, "new": 7,
+                                            "rate": round(3 / 7, 4)}
+    assert got["by_kind"]["test"] == {"introduced": 0, "new": 0, "rate": None}
+
+
+def test_the_split_is_published_BESIDE_the_pooled_rate_and_never_instead_of_it():
+    """The constraint #774 states in as many words. `escalate_on.fix_injection` is
+    being recalibrated against the POOLED denominator (#637), so moving the denominator
+    under it would invalidate the measurement that recalibration is waiting for. The
+    same round with and without the population reaches the same rate and the same
+    verdict."""
+    rows = [(f"m{i}", "docs/x.md", "introduced") for i in range(6)] + [
+        (f"p{i}", "a.py", "missed") for i in range(4)]
+    pooled = panel_rounds.injection_state(_counts(introduced=6, missed=4), 0.5)
+    split = panel_rounds.injection_state(_counts(introduced=6, missed=4), 0.5,
+                                         placed=_placed(*rows))
+    assert (pooled["rate"], pooled["over"]) == (split["rate"], split["over"])
+    assert split["over"] is True
+    # And no per-kind verdict to gate on: a threshold nobody set, sitting beside four
+    # rungs that do gate, is read as one.
+    for cell in split["by_kind"].values():
+        assert set(cell) == {"introduced", "new", "rate"}
+
+
+def test_every_kind_is_present_on_every_round_even_where_it_has_no_findings():
+    """`premise_state`'s rule one level down: a bucket that is absent and a bucket with
+    nothing in it are different claims, and a consumer joining the three against the
+    pooled `new` has to be able to see that they add up."""
+    got = panel_rounds.injection_state(_counts(1, 0), 0.5,
+                                       placed=_placed(("k", "a.py", "introduced")))
+    assert list(got["by_kind"]) == list(panel_rounds.INJECTION_KINDS)
+    assert sum(c["new"] for c in got["by_kind"].values()) == len(got["findings"])
+
+
+def test_no_population_is_null_and_an_empty_population_is_not():
+    """`rate`'s own distinction, applied to the two new fields. A caller that did not
+    pass the population and a round that placed no finding are different claims, and a
+    consumer forced to tell them apart would be reading the payload's age."""
+    silent = panel_rounds.injection_state({}, 0.5)
+    assert silent["findings"] is None and silent["by_kind"] is None
+    empty = panel_rounds.injection_state({}, 0.5, placed=[])
+    assert empty["findings"] == []
+    assert empty["by_kind"]["prose"] == {"introduced": 0, "new": 0, "rate": None}
+
+
+def test_the_split_rides_into_the_stop_payload_with_the_rest_of_the_block():
+    """`round_stop` publishes the measurement it was handed, so the fields reach the
+    artifact a report is rendered from without that function knowing what they are."""
+    got = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [],
+        injection=panel_rounds.injection_state(
+            _counts(1, 3), 0.5,
+            placed=_placed(("k1", "docs/x.md", "introduced"),
+                           ("k2", "a.py", "missed"), ("k3", "a.py", "missed"),
+                           ("k4", "tests/test_a.py", "missed"))))
+    assert got["fix_injection"]["by_kind"]["prose"]["rate"] == 1.0
+    assert got["fix_injection"]["by_kind"]["test"] == {"introduced": 0, "new": 1,
+                                                       "rate": 0.0}
+    assert [r["kind"] for r in got["fix_injection"]["findings"]] == [
+        "prose", "production", "production", "test"]

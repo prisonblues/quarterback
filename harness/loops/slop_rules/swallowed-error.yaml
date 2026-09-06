@@ -1,0 +1,14 @@
+# The cheapest way to make "this can raise" go away. A broad `except: pass`
+# converts a visible defect into an invisible one: the round that asked for
+# error handling reads the diff, sees a handler, and moves on, while the failure
+# it was worried about now happens silently. Narrowed to BROAD catches on
+# purpose — `except KeyError: pass` after a dict lookup is ordinary Python, and
+# a rule that fires on it is a rule an operator turns off within a week, taking
+# the broad case with it.
+id: slop/swallowed-error
+severity: P2
+languages: [python]
+message: Broad except handler discards the exception without logging, re-raising, or recovering
+remediation: Log the exception with its context, re-raise it, or narrow the clause to the one error you can actually recover from.
+match:
+  kind: python_swallowed_error

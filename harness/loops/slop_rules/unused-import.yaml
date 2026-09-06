@@ -1,0 +1,15 @@
+# This one earns its place because the linter that would say it is muzzled here:
+# F401 sits in pyproject.toml's ignore list until #697 lands, and it was put
+# there because `ruff --fix` twice deleted an import that exists for its side
+# effect. So nothing checks dead imports, and a fix pass is exactly where they
+# appear — a fixer rewrites a function, drops the call, and leaves the import at
+# the top of a file where the diff barely shows it. Imports carrying a `# noqa`
+# are skipped: in this codebase that comment marks a deliberate re-export or a
+# side-effecting import, with the argument written beside it.
+id: slop/unused-import
+severity: P3
+languages: [python]
+message: Imported name is never used anywhere in the module
+remediation: Delete the import, or keep it with a noqa comment naming the side effect or re-export it is there for.
+match:
+  kind: python_unused_import

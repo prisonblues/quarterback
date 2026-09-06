@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import ast
 import textwrap
+from functools import cache
 from pathlib import Path
 from typing import get_args
 
@@ -100,6 +101,12 @@ PANEL = REPO_ROOT / "harness" / "loops" / "panel.py"
 #: scan of ``panel.py`` alone would find only the five the refusal path writes by
 #: hand — which are all bound, so the check would have passed and covered nothing.
 PANEL_ROUNDS = REPO_ROOT / "harness" / "loops" / "panel_rounds.py"
+#: ...and where ``fix_blast`` does (#770). Same shape one tier further in:
+#: ``round_stop`` returns the key with a CALL as its value
+#: (``fix_blast_radius(...).as_dict()``), so neither of the two files above holds
+#: a dict display for it and a scan of them alone would see the key and nothing
+#: under it. The keys are in this module's ``BlastRadius.as_dict``.
+PANEL_BLAST = REPO_ROOT / "harness" / "loops" / "panel_blast.py"
 
 #: Keys the panel sends at the top level of a run payload and this board does not
 #: store. Every one of them was checked against ``ReviewRun.__table__.columns``
@@ -495,10 +502,20 @@ def test_the_harness_identity_is_bound_and_no_longer_dropped(panel_source):
 #: live drops were measured and is the block this issue is about; starting with
 #: the measured one is the answer #732 asks for and this comment is the record of
 #: what it leaves.
+#: ``fix_blast`` is the one entry that is NOT a top-level payload key, and it is
+#: here rather than in a register of its own on purpose. It is nested inside
+#: ``round_stop``, which ``StopIn`` binds with :class:`FixBlastIn` — a third tier —
+#: and the machinery this section is made of does not care how deep a block sits:
+#: it needs a name, a model, and a reader that can find the producer's keys.
+#: Splitting the registers by depth would mean a second copy of the drift
+#: assertion, the stale-entry assertion and the orphan checks, which is how the
+#: second tier came to be unchecked in the first place.
 NESTED_BLOCKS = {
     "round_stop": reviews.StopIn,
     "code_access": reviews.CodeAccessIn,
     "pr_claim": reviews.PrClaimIn,
+    "locality_repeats": reviews.LocalityRepeatsIn,
+    "fix_blast": reviews.FixBlastIn,
 }
 
 #: The nested blocks this file does NOT scan, and why — one written reason each.
@@ -575,12 +592,88 @@ NESTED_DROPPED_BY_DESIGN = {
         "max_rounds",
         "trigger_floor",
     }),
+    "locality_repeats": frozenset({
+        # ---- #771's per-round WORKING, beside the two counts that are bound and
+        # stored (`repeats_only_locality`, `repeats_by_key`).
+        #
+        # The counts earned columns because the question they answer is fleet-wide
+        # and archival: over hundreds of rounds, what share of a round's repeats
+        # did only the locality matcher recognise — the ones a hash of the
+        # reviewing model's own wording missed. That ratio is the entire argument
+        # for whether #771 earned its place, the payload it is computed in lives in
+        # a temp directory on whichever host ran the panel, and nothing else on
+        # this board can reconstruct it.
+        #
+        # These two answer a question about ONE round, and a reader who has that
+        # question has the round: the payload is published, `GET /review/findings`
+        # lays the cycle's rounds out in order, and the round's own findings carry
+        # the keys already. Storing them buys nothing the counts do not, and costs
+        # an unbounded list per run — `unread_files`' shape exactly, which is kept
+        # off the list views for that reason. `len(keys) == only_locality` by
+        # construction, so a column here would also be one number in two places
+        # with two chances to drift, which is what the three `outstanding` aliases
+        # above are exempted for.
+        #
+        # This is a decision and not a deferral. Re-litigate it if a reader turns
+        # up who needs a repeat's IDENTITY across a population rather than its
+        # count; nothing else changes the answer.
+        "keys",  # the finding names behind `only_locality`, per round
+        "why",   # the round's own prose where the comparison could not be made
+    }),
+    "fix_blast": frozenset({
+        # ---- #770's per-round WORKING, beside the one field that is bound and
+        # stored (`fix_blast_lane`).
+        #
+        # `lane` earned a column because the question it answers is fleet-wide and
+        # archival: across hundreds of rounds, do fix passes that land in dangerous
+        # code — migrations, auth, secrets, irreversible infrastructure — write more
+        # of the NEXT round's findings than passes that touch a docstring. That
+        # correlation is what #770's `fix_risk` axis gets calibrated against, and it
+        # cannot be computed from payloads that live in a temp directory on
+        # whichever host ran the panel.
+        #
+        # These three are the round's own working, and a reader with a question
+        # about ONE round has that round: the payload is published and
+        # `GET /review/findings` lays a cycle's rounds out in order. `categories` is
+        # the lane's derivation — the lane IS the worst of them, so a column would
+        # be one value in two places with two chances to drift, which is what the
+        # three `outstanding` aliases above are exempted for. `evidence` is a list
+        # of paths per category, unbounded per run — `unread_files`' shape exactly,
+        # which is kept off the list views for that reason. `reason` is those two
+        # rendered into a sentence, and a sentence assembled from dropped inputs is
+        # the one thing here that could not even be recomputed.
+        #
+        # This is a decision and not a deferral. Re-litigate it if a reader turns up
+        # who needs the CATEGORY DISTRIBUTION across a population — "which rule
+        # fires most, and which of them actually predicts the next round's findings"
+        # — in order to calibrate #770, rather than the lane. That is a real
+        # possibility and it is the only thing that changes the answer: the lane
+        # cannot be decomposed after the fact, and the payloads it was computed from
+        # will be gone.
+        "categories",  # the rules that fired; the lane is the worst of them
+        "evidence",    # per category, the paths and diff markers that fired it
+        "reason",      # the two above rendered into one sentence for a fixer
+    }),
 }
 
 
 @pytest.fixture(scope="module")
 def panel_rounds_source() -> ast.Module:
     return ast.parse(PANEL_ROUNDS.read_text(encoding="utf-8"))
+
+
+@cache
+def panel_blast_source() -> ast.Module:
+    """``panel_blast.py``, parsed.
+
+    A cached loader and not a fixture, where the two files above are fixtures,
+    because it has exactly one reader: :func:`block_keys` reaches for it on one
+    block, and threading a third source through eleven call sites and seven test
+    signatures would put the dependency in front of every test that does not have
+    it. Cached rather than re-read for the same reason ``scope="module"`` is on
+    the two fixtures.
+    """
+    return ast.parse(PANEL_BLAST.read_text(encoding="utf-8"))
 
 
 def _round_stop_return_keys(module: ast.Module) -> set[str]:
@@ -640,12 +733,45 @@ def nested_block_keys(module: ast.Module, block: str) -> set[str]:
     return keys
 
 
+def _blast_radius_dict_keys(module: ast.Module) -> set[str]:
+    """The keys ``panel_blast.BlastRadius.as_dict`` puts on the wire (#770).
+
+    Its own reader for :func:`_round_stop_return_keys`' reason, one tier further
+    in. ``round_stop`` returns ``"fix_blast": ... fix_blast_radius(...).as_dict()``
+    — a CALL, not a dict display — so the reader above sees the key ``fix_blast``
+    and nothing under it, and a check that stopped there would have reported the
+    block as fully bound while three keys went on the floor.
+
+    Anchored on the class rather than on a bare ``def as_dict``, so a second
+    serialiser added to this module cannot be read as this one's. The
+    single-return assertion is this scan's own failure mode written down, exactly
+    as it is above: two returns would be two shapes of one block, and a reader
+    taking the first would check half of it while reading as though it had checked
+    all of it.
+    """
+    for node in ast.walk(module):
+        if isinstance(node, ast.ClassDef) and node.name == "BlastRadius":
+            for fn in node.body:
+                if isinstance(fn, ast.FunctionDef) and fn.name == "as_dict":
+                    returns = [n for n in ast.walk(fn)
+                               if isinstance(n, ast.Return)
+                               and isinstance(n.value, ast.Dict)]
+                    assert len(returns) == 1, (
+                        f"BlastRadius.as_dict has {len(returns)} dict returns; "
+                        f"this scan reads one")
+                    return _dict_keys_closed(returns[0].value,
+                                             "BlastRadius.as_dict's return")
+    raise AssertionError(f"no BlastRadius.as_dict in {PANEL_BLAST}")
+
+
 def block_keys(block: str, panel: ast.Module, panel_rounds: ast.Module) -> set[str]:
     """Every key the panel puts inside one nested payload block, from every
     producer of it."""
     keys = nested_block_keys(panel, block)
     if block == "round_stop":
         keys |= _round_stop_return_keys(panel_rounds)
+    if block == "fix_blast":
+        keys |= _blast_radius_dict_keys(panel_blast_source())
     return keys
 
 
@@ -678,6 +804,14 @@ def test_the_nested_scan_actually_found_the_blocks(panel_source, panel_rounds_so
         "code_access", panel_source, panel_rounds_source)
     assert {"setting", "sent"} <= block_keys(
         "pr_claim", panel_source, panel_rounds_source)
+    # One bound key and one exempt one, so this spot-check would fail on a scan
+    # that found the block and read only half of it.
+    assert {"only_locality", "keys"} <= block_keys(
+        "locality_repeats", panel_source, panel_rounds_source)
+    # ...and the same pairing for the third-tier block, whose keys come from a
+    # third file again: one bound, one exempt.
+    assert {"lane", "evidence"} <= block_keys(
+        "fix_blast", panel_source, panel_rounds_source)
 
 
 @pytest.mark.parametrize("block", sorted(NESTED_BLOCKS))
@@ -829,6 +963,34 @@ def test_the_scanner_finds_a_key_added_to_the_producers_source(panel_rounds_sour
     # live assertion is made of: a mutation test that passed against a reader
     # returning nothing at all would be worthless.
     assert len(_round_stop_return_keys(panel_rounds_source)) >= 20
+
+
+def test_the_scanner_finds_a_key_added_to_the_blast_blocks_own_serialiser():
+    """The same red/green, done to #770's reader in the third file.
+
+    This one is worth its own test rather than trusting the shape above, because
+    the reader it exercises is the only thing standing between ``fix_blast``'s
+    keys and the state the whole file is about: ``round_stop`` returns the block as
+    a CALL, so the tier-two reader sees the key and nothing under it, and a
+    `fix_blast` scan that quietly returned the empty set would report "nothing
+    dropped" for a block with three unbound keys in it — while the exemption list
+    for those three sat in this file reading like coverage.
+    """
+    source = textwrap.dedent(
+        """
+        class BlastRadius:
+            def as_dict(self):
+                return {"lane": self.lane, "a_key_nobody_bound": 1}
+        """)
+    keys = _blast_radius_dict_keys(ast.parse(source))
+    assert "a_key_nobody_bound" in keys, (
+        "the reader did not find a key added to BlastRadius.as_dict — the scan, "
+        "not the comparison, is where this check would go blind")
+    assert nested_dropped_keys("fix_blast", keys) == {"a_key_nobody_bound"}
+    # ...and the real serialiser, read by that same reader, still carries the four
+    # keys the live assertion is made of.
+    assert _blast_radius_dict_keys(panel_blast_source()) == {
+        "lane", "categories", "evidence", "reason"}
 
 
 def test_a_producer_shape_the_scanner_cannot_read_fails_it():
@@ -986,3 +1148,47 @@ def test_the_stop_rungs_are_bound_and_land_in_one_column(
     # would be bound, checked and never written.
     assert set(reviews.STOP_RUNGS) <= accepted
     assert set(reviews.StopIn().rungs()) == set(reviews.STOP_RUNGS)
+
+
+#: #771's two counts: the payload key they are nested under, and the columns they
+#: land in. Written out here as well as bound on the model, for
+#: :data:`STOP_FLOORS`' reason exactly — removing an entry from an exemption list
+#: says "no longer exempt", and this says "BOUND AND STORED", which is a different
+#: claim and the one that goes wrong quietly.
+LOCALITY_COUNTS = {"only_locality": "repeats_only_locality",
+                   "by_key": "repeats_by_key"}
+
+
+def test_the_locality_repeat_counts_are_bound_and_stored(panel_source,
+                                                         panel_rounds_source):
+    """#771's evidence reaches a column, and the working beside it does not.
+
+    The counts are the entire argument for the locality matcher. It replaced a
+    hash of the reviewing model's own wording with a comparison of where a finding
+    LANDS, the panel passes the union of the two matchers on, and every downstream
+    number is computed off that union — so a matcher that caught nothing and a
+    matcher that caught half this cycle's repeats produce an identical row. What
+    tells them apart is ``only_locality`` summed over a population, and a payload
+    that lives in a temp directory on whichever host ran the panel cannot be summed
+    over anything.
+
+    Four assertions per count, on ``test_the_stop_floors_are_bound_and_no_longer_dropped``'s
+    argument: the halves fail differently. A field on the model with no column
+    stores nothing; a column with no field is #626's shape exactly; and an entry
+    left on the exemption list would swallow the key again if the field were ever
+    removed.
+    """
+    sent = block_keys("locality_repeats", panel_source, panel_rounds_source)
+    accepted = model_accepts(reviews.LocalityRepeatsIn)
+    columns = {c.name for c in ReviewRun.__table__.columns}
+    for key, column in LOCALITY_COUNTS.items():
+        assert key in sent, f"the panel no longer nests {key} in locality_repeats"
+        assert key in accepted, f"LocalityRepeatsIn does not bind {key}"
+        assert column in columns, f"review_runs has no column {column}"
+        assert key not in NESTED_DROPPED_BY_DESIGN["locality_repeats"], (
+            f"{key} is exempted rather than stored")
+    # ...and the other half of the decision, asserted rather than left to the
+    # exemption list's own prose: `keys` and `why` are dropped ON PURPOSE, so a
+    # later pass that quietly binds one has to come through this line.
+    assert NESTED_DROPPED_BY_DESIGN["locality_repeats"] == {"keys", "why"}
+    assert not set(LOCALITY_COUNTS) & NESTED_DROPPED_BY_DESIGN["locality_repeats"]

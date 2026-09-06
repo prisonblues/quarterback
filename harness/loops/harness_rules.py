@@ -160,6 +160,35 @@ GROK_EFFORTS = ("low", "medium", "high", "xhigh")
 EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS,
            "grok": GROK_EFFORTS}
 
+# ------------------------------------------------------ SHADOW AND ENFORCE (#779)
+#
+# The two words a brake's MODE may take, and the only place either is spelled. A
+# CLOSED VOCABULARY of exactly two, on `MODE_AXES`' precedent below: `"mode":
+# "shadwo"` in a rules file would otherwise leave a rung at its default with
+# nothing on stderr, which is the silent-typo failure `unknown_keys` catches in a
+# KEY and cannot catch in a VALUE.
+#
+#   `shadow`   the rung's decision runs and its verdict is RECORDED. It applies
+#              nothing: no stop, no veto line, no `confident: false`.
+#   `enforce`  the same decision, applied — what every armed rung has done since
+#              it shipped.
+#
+# **THE DECISION FUNCTION IS THE SAME FUNCTION IN BOTH**, and that is the whole
+# property #779 buys rather than an implementation note. Only APPLICATION differs,
+# so a shadow rung produces the same record an enforcing one would, the population
+# that calibrates a threshold exists before the threshold binds, and arming a rung
+# is a config change rather than a release. #67's rule — instrument before you
+# gate — stops being a convention somebody has to remember and becomes a value a
+# repo can read back.
+#
+# Public and imported rather than restated: `panel_rounds` writes the mode into
+# each rung's payload block and `panel_propose` reads it to decide whether a
+# fan-out was bought. A third spelling of `"shadow"` in either of them is a rung
+# that reports one thing and does another.
+BRAKE_SHADOW = "shadow"
+BRAKE_ENFORCE = "enforce"
+BRAKE_MODES = (BRAKE_SHADOW, BRAKE_ENFORCE)
+
 # What the untracked overlay is allowed to say, and it is deliberately narrow.
 # An untracked file is reviewed by nobody — it never appears in a PR, so branch
 # protection cannot see it — which is precisely what makes it right for machine
@@ -321,6 +350,34 @@ DEFAULTS: dict = {
         # CLI validates it locally, so a typo costs a startup rather than a turn.
         "grok": {"enabled": False, "model": "", "effort": ""},
         "sonarqube": {"enabled": False},
+        # #780's deterministic seat, and the second block here carrying `enabled`
+        # and nothing else — which is the shape a seat with no brain takes.
+        # sonarqube is the precedent and the reason the shape exists: a member of
+        # ALL_REVIEWERS that is not in LLM_REVIEWERS has no model to pin, no
+        # reasoning effort to set and no diff budget to spend, so every other key a
+        # reviewer block carries would be schema nothing reads. `max_diff_chars` is
+        # still accepted by _SHARED_REVIEWER_FIELDS and still means nothing here;
+        # that is a fact about the sweep, not an invitation.
+        #
+        # Off, 2026-09-06, and NOT because the seat is speculative. It was
+        # calibrated on this repo's own 252 Python files — 383 raw hits down to 90
+        # after the false-positive work, every rule shipping a positive and a
+        # false-positive fixture — so on THIS repo the number is measured.
+        # `DEFAULTS` is not this repo, it is every repo the fleet reviews, and none
+        # of the others has had a single rule run against it. A rule set tuned on
+        # one codebase and switched on everywhere is how a seat earns an operator's
+        # `enabled: false` on its first bad morning and takes the nine working
+        # rules with it. So the fleet default is the conservative one and the repo
+        # that measured it turns it on in its own `.harness-rules` — the same order
+        # antigravity, pi and grok are in, for the same reason: the box that can
+        # answer for a seat is the box that asks for it.
+        #
+        # The way back is one key, in both directions: `"slop": {"enabled": true}`
+        # in a repo's `.harness-rules` turns it on, and a per-box overlay can take
+        # it off again. Nothing else is a dial — the rules themselves are checked-in
+        # files under `harness/loops/slop_rules/`, reviewed as code, and there is
+        # deliberately no threshold, score or severity floor to tune.
+        "slop": {"enabled": False},
     },
     "review_panel": {
         "skip_title_patterns": [
@@ -2061,6 +2118,118 @@ DEFAULTS: dict = {
         "escalate_on": {"premise_repeated": 2, "premise_undecidable": True,
                          "fix_injection": 0.5, "new_findings_not_falling": 1,
                          "unrefereed_fix": True, "guard_lines": False},
+        # #779's MODE for each rung above, added 2026-09-06, and the block's answer
+        # to its own most-repeated sentence. Every rung here ships either off or
+        # armed, so the only way to learn what one would have done is to arm it and
+        # let live cycles pay for the answer. `fix_injection`'s 0.5 is what that
+        # costs: load-bearing since 2026-08-30, re-measured on 2026-09-02, and STILL
+        # uncalibrated — not for want of a number but for want of a POPULATION, since
+        # there was no mode in which the rung could record its verdict without acting
+        # on it. `GET /review/convergence` reports 0 of 27 attributable cycles
+        # converged, so the false-positive rate that default rests on has no
+        # denominator at all. This is the key that lets one accumulate.
+        #
+        # **A SIBLING MAPPING AND NOT A `mode` INSIDE EACH RUNG**, which is the shape
+        # #779 describes and the shape this file cannot carry. Three reasons; the
+        # third decides it:
+        #   - every rung above is a SCALAR and the board stores one JSON value per
+        #     dial — `app/api/dials.py` is explicit that the name is opaque text and
+        #     the value opaque JSON, and the vocabulary belongs to the client.
+        #     `escalate_on.fix_injection` is a `number` dial; making its value
+        #     `{"threshold": 0.5, "mode": "shadow"}` is a new value shape at the
+        #     board, in `_dial_problem`, in `apply_dials` and in every consumer that
+        #     has read the rung as the number it has always been;
+        #   - `dial_layers` answers "which layer set this" per LEAF, and these are two
+        #     decisions two layers may legitimately answer — the repo's file stating a
+        #     threshold while the board puts the rung in shadow for an afternoon is
+        #     exactly the split #305 built the dial layer for, and one leaf cannot
+        #     report it;
+        #   - **and `_validated` descends TWO levels, not three.** `review_panel.
+        #     escalate_on` gets its allowlist from DEFAULTS; a mapping one level below
+        #     that gets none, so `escalate_on: {"fix_injection": {"mdoe": "shadow"}}`
+        #     would be an unchecked typo in the block that decides when cycles stop.
+        #     That is the exact silence `unknown_keys` exists to end, reintroduced in
+        #     the worst place in the file.
+        # `max_fix_guard_lines` and `escalate_on.guard_lines` are the precedent, and
+        # the argument is theirs word for word: the measurement and the verdict are
+        # separable decisions, and a repo may reasonably want one without the other.
+        #
+        # **EVERY BUILT RUNG IS `enforce`, AND THAT IS THE RULE RATHER THAN A HEDGE.**
+        # #779's default is `shadow` for anything NEW, and none of these six is new.
+        # A key that shipped `shadow` across the board would silently disarm five
+        # brakes that are armed today: the first cycle after the upgrade would run
+        # with `premise_repeated`, `premise_undecidable`, `fix_injection`,
+        # `new_findings_not_falling` and `unrefereed_fix` all recording and none of
+        # them stopping anything, and nothing on the round would look different. A
+        # brake believed to be on and quietly off is the `require_failing_test`
+        # failure with the honesty removed, and this block already says so once.
+        #
+        # **HOW A NEW RUNG GETS `shadow`, given it is not written here.** A rung
+        # resolves through `escalate_mode()`: this repo's mapping, then this one,
+        # then `shadow`. So a rung added to `escalate_on` and NOT added below is in
+        # shadow by ARRIVING, without anybody remembering the rule — the duplication
+        # of names between the two mappings is the mechanism and not a hazard. The
+        # day a rung has been measured, it is named here as `enforce`, in one line,
+        # and the block above says what the measurement was.
+        #
+        # **THE FALLBACK IS PER KEY, for `escalate_on`'s own reason and with a worse
+        # failure behind it.** `review_panel` is merged one level deep, so a repo
+        # writing `escalate_modes` REPLACES this object — and a resolver that read a
+        # missing rung as `shadow` would let `{"fix_injection": "shadow"}` disarm the
+        # other five without naming one of them. Hence the middle step. `null`
+        # against a rung is read as ABSENT and therefore as this default, unlike the
+        # flag rungs above where `null` is off: there a null switches off the brake
+        # the key is about, here it would switch off brakes the key does not mention.
+        #
+        # **`armed` AND `mode` ARE TWO QUESTIONS AND STAY TWO.** `escalate_on` says
+        # whether a rung is a rung at all; this says whether an armed rung's verdict
+        # is APPLIED. So `guard_lines: false` and `guard_lines: true` in `shadow` are
+        # different records rather than two spellings of one: the first measures the
+        # ceiling and reaches no verdict, the second reaches the verdict and declines
+        # to act on it — which IS the calibration population, and what a repo watching
+        # `max_fix_guard_lines` for a few dozen cycles actually wants. `guard_lines`
+        # is not made redundant by this key and must not be folded into it: it is the
+        # older, coarser half of the same idea, and keeping the pair is what makes the
+        # finer half readable.
+        #
+        # **`over`, `would_fire`, `fired` — ONE VOCABULARY AND NOT TWO.** The rungs
+        # above already split `over` (the MEASUREMENT crossed) from `fired` (this rung
+        # is why the cycle stopped); that is `panel_propose.escalations_fired`'s rule,
+        # and the reason a round going again under rule 2 for a P1 buys no fan-out.
+        # This mode adds no second axis. It splits `fired` where the split was always
+        # latent, because `fired` has been carrying two claims at once — the rung
+        # reached a stop-worthy verdict, AND the stop was applied:
+        #     over        the number crossed the threshold. Unchanged.
+        #     would_fire  the rung reached the VERDICT: over, armed, floors cleared —
+        #                 everything except the mode.
+        #     fired       the verdict was applied. `would_fire and mode == enforce`.
+        # `fired` therefore keeps its exact present meaning and `escalations_fired` is
+        # correct the day this lands without an edit: a shadow rung stopped nothing,
+        # so it is not why the cycle stopped, so it buys no fan-out. Under `enforce`
+        # the two are equal and the record reads exactly as it does today.
+        #
+        # **WHAT A SHADOW RUNG MAY NOT TOUCH — a constraint on whoever wires this.**
+        # It records and does nothing else: `stop`, `reason`, `veto` and `confident`
+        # are what they would have been with the rung absent. A shadow verdict that
+        # vetoed a confident stop would be enforcement by another route, and a `reason`
+        # naming `fix_injection` without naming the mode is the misread #779 was filed
+        # over — a rung that would have fired is not a rung that fired, and reading
+        # the first as the second is how a confident round gets described as
+        # divergence. Where a shadow verdict is worth a line at all, it is worth the
+        # word beside it.
+        #
+        # **The way back is one word per rung, and it is not a release.**
+        # `"fix_injection": "shadow"` runs the number over live cycles and records
+        # every verdict it would have reached while changing nothing about what stops;
+        # the measurement #637 could not take is then a query over rounds that ran.
+        # Putting it back to `enforce` is the same one line, and the rung it disarms
+        # is named in the value that disarmed it.
+        "escalate_modes": {"premise_repeated": BRAKE_ENFORCE,
+                           "premise_undecidable": BRAKE_ENFORCE,
+                           "fix_injection": BRAKE_ENFORCE,
+                           "new_findings_not_falling": BRAKE_ENFORCE,
+                           "unrefereed_fix": BRAKE_ENFORCE,
+                           "guard_lines": BRAKE_ENFORCE},
         # #507, and it is NOT a fifth rung — which is why it is here and not inside
         # the block above. Every key in `escalate_on` answers one question: does this
         # end the cycle? This one ends nothing, extends nothing and cannot move a
@@ -2291,6 +2460,134 @@ DEFAULTS: dict = {
         # ceiling — and a fleet that could set only one of them would be setting a
         # number whose meaning it could not see.
         "budget_window_hours": 24,
+        # #776's TAPER, added 2026-09-06, and the only key in `review_panel` whose
+        # value is a CURVE rather than a number: one multiplier per round, indexed
+        # 1-based, the last entry reused for every round past the end of the list,
+        # applied to what a round may SPEND.
+        #
+        # **THE ARGUMENT.** `max_rounds` is 6 and round 6 has exactly as much room to
+        # generate work as round 1 did, which is backwards. From round 2 onward what
+        # a round reads IS the previous round's fix, and the later the round, the more
+        # of its input is the loop's own output. `escalate_on.fix_injection`'s block
+        # above is that measured in findings — 128 of 201 new findings across seven
+        # PRs created by the fix pass immediately before them, 39 of 53 after round 1
+        # on PR #299, 17 of 17 in its round 2 — and the same sentence read as a budget
+        # says a late round should be allowed to read less and think less, not the
+        # same. `round_stop`'s rule 1 buys another round with new findings; a flat
+        # budget pays full price for news the loop wrote itself.
+        #
+        # **`[1.0]` IS FLAT, SO NOTHING CHANGES UNTIL A REPO OPTS IN.** One entry
+        # reused past the end is every round at 1.0, which is the identity: this key
+        # costs a fleet that ignores it exactly nothing. `[1.5, 1.0, 0.75, 0.5]` is
+        # the shape #776 pins — spend big on round 1, shrink each round after, round 4
+        # and later at 0.5 — and it is an EXAMPLE here rather than the default,
+        # because nobody has measured it. A curve shipped at a number nobody chose
+        # would be the mistake `_55_budget` names: a ceiling arriving switched on.
+        #
+        # **WHICH CEILINGS IT SCALES. Exactly four, and this list is the contract:**
+        #   - `budget.tokens_per_round` — #483's per-round allowance, as released at a
+        #     round boundary by `panel_caps`. The allowance, not the running total:
+        #     that check compares `tokens_per_round x rounds already bought` against
+        #     `pr_total.tokens`, so the taper scales each round's own contribution and
+        #     a cheap late round leaves the earlier rounds' allowance where it was;
+        #   - `max_diff_chars` — the ROUND's diff ceiling, scaled before it is handed
+        #     out, so that a seat with no ceiling of its own and the judge inheriting
+        #     the same number both read a tapered diff from one wiring point. A
+        #     ceiling a repo wrote for one seat (`reviewers.<seat>.max_diff_chars`) or
+        #     for the judge (`judge_max_diff_chars`) STANDS, and that is the rule
+        #     rather than an omission: those exist because a model you run genuinely
+        #     cannot take the change, so they are statements about a model's capacity
+        #     and not about a round's budget, and tapering one would hand a model less
+        #     than it needs for a reason that has nothing to do with the model. The
+        #     taper narrows what the round spends; it does not renegotiate what a seat
+        #     can physically read;
+        #   - `low_severity_fix_lines` — the churned lines a round may spend on the
+        #     band between the two floors. Its proportional half,
+        #     `low_severity_fix_full_chars`, is a SIZE and not a ceiling: it says what
+        #     a whole budget is worth, the round already spends the smaller of the
+        #     two, and scaling both would apply the taper twice to one budget;
+        #   - the SEAT SET, if #775's complement routing lands — how many seats a
+        #     round dispatches, FLOORED AT 1. Never which seats: that is #775's
+        #     routing decision and a budget has no view on it. Floored at 1 because a
+        #     round with no seats reviewed nothing, and `panel.py` already counts a
+        #     seat that never ran as coverage it did not get. A budget able to
+        #     manufacture a clean round is the one thing this key must never be.
+        #
+        # **AND WHAT IT MUST NOT SCALE — from a rule rather than from a list. A
+        # multiplier scales what a round may SPEND and never what a round may
+        # CONCLUDE.** Taper a threshold and the same defect is a finding in round 1
+        # and not in round 5, so the cycle's verdict becomes a function of its round
+        # number: that is a different review, not a cheaper one. So not
+        # `fix_severity_floor`, not `round_trigger_floor`, not
+        # `threshold_by_severity`, not any rung of `escalate_on`, not `max_fix_growth`
+        # or `max_fix_growth_chars` or `min_fix_growth_chars` or `max_fix_guard_lines`
+        # or `distant_merge_lines` or `next_door_days`, and not
+        # `unrefereed_line_weight`, which is a PRICE rather than a ceiling. Not
+        # `max_rounds`: how many rounds there are is said in one key, and a per-round
+        # budget that could shorten a cycle would be the second place that says when
+        # one ends. And not the #55 ceilings counted over a WINDOW or a whole PR —
+        # `tokens_per_day`, `runs_per_day`, `tokens_per_pr`, `runs_per_pr`,
+        # `fleet_tokens_per_day`, `budget_window_hours` — where "round 4's multiplier"
+        # names nothing: a rolling 24 hours spans rounds of several cycles in several
+        # repos, and there is no round whose multiplier a window could take.
+        #
+        # **NO CEILING STAYS NO CEILING.** `None` means "no ceiling" everywhere in
+        # this block, and a multiplier over `None` is still `None`: the taper may
+        # tighten a ceiling somebody wrote and may never CREATE one. Which is also the
+        # honest statement of what this key does on a stock fleet — of the four,
+        # `budget.tokens_per_round` and `max_diff_chars` are both `None` by default,
+        # so a repo that opts in today gets the taper on its low-severity budget and
+        # its seat set, and gets it on tokens and diff chars the day somebody writes
+        # those two numbers.
+        #
+        # **RUNNING OUT IS A NAMED, NON-CONFIDENT STOP AND NEVER A PARTIAL PASS.**
+        # This is the half that makes the key safe rather than a quiet truncation, and
+        # it is written here as a constraint on whoever wires it: a round that cannot
+        # fit inside a tapered ceiling ENDS THE CYCLE with `confident: false` and a
+        # `reason` naming the ceiling, this round's multiplier and the base it scaled.
+        # It does not drop findings to fit, does not drop a seat and count the round
+        # as covered, and does not return a dry round — a dry round is the outcome
+        # this epic is judged on, and a budget that could produce one would make a
+        # review look cleaner the less of it ran. A tapered ceiling that floors below
+        # 1 is that same exhaustion and not a ceiling of zero. The reason must also
+        # say that the TAPER bound rather than the base, or the curve is invisible in
+        # the record and the next person to tune it has nothing to read.
+        #
+        # **A BOARD-STATED CEILING IS STILL A CEILING (#55).** `panel_caps.ceiling_of`
+        # treats the layer that answered as part of the answer: a ceiling the board
+        # stated cannot be exceeded by the repo's own file, by `--max-rounds` or by
+        # `--force`. This key IS the repo's own file, so a multiplier above 1.0 over a
+        # board-stated ceiling is clamped back to it. That is why multipliers above
+        # 1.0 are accepted rather than refused — `1.5` on round 1 is the shape #776
+        # wants and is honest against a ceiling the repo set itself, and the one case
+        # where it would be a loophole is closed where every other ceiling question is
+        # closed rather than by a number in this list.
+        #
+        # **WHAT A MULTIPLIER MAY BE:** a finite number greater than 0, in a list with
+        # at least one entry. `0` is REFUSED rather than clamped — a round with a zero
+        # ceiling is a round that cannot run, which is `max_rounds` written in the
+        # wrong key — and `[]` is refused because it has no last entry to reuse, so it
+        # reads as configured and behaves as absent. There is no upper bound here:
+        # nobody has measured one, and the bound that matters is the board's.
+        #
+        # **THIS IS THE SHAPE OF #483'S ANSWER AND NOT THE WHOLE OF IT.** #483's
+        # complaint is that the token budget is per-PR while the work is per-round.
+        # The per-round MECHANISM has already landed — `budget.tokens_per_round` is
+        # the primary of the two per-PR ceilings and `tokens_per_pr` is derived from
+        # it — and this key shapes that allowance round by round. What is still owed
+        # is the NUMBER: `tokens_per_round` is `null`, and 1.5 times no ceiling is no
+        # ceiling, so the taper is inert on tokens across the whole fleet today. Two
+        # things stop a number being written here, both recorded in `budget` above:
+        # setting ANY key in that block wakes the budget for every repo on the fleet
+        # (which is what reverted `tokens_per_pr` on 2026-08-31), and the board's own
+        # history cannot state a per-round figure — over the 62 four-seat runs that
+        # measured three seats, median 729,755 tokens per round against a p90 of
+        # 4,506,368, a 54x spread inside one seat configuration. So #483 is answered
+        # in shape here and in substance by a person choosing that number.
+        #
+        # **The way back is one key**, and it is the value this ships with: `[1.0]`
+        # restores a flat budget for every round, whatever the curve said.
+        "round_budgets": {"multipliers": [1.0]},
         # THE REPO'S OWN SUITE, run once before the seats are dispatched, when
         # GitHub CI has nothing to say about this commit (#548). `null` is off and
         # off is what every repo gets until it writes this, because this is the one
@@ -3672,6 +3969,33 @@ BOARD_DIALS: dict[str, Dial] = {
     # number here would be that ceiling written down a second time.
     "review_panel.escalate_on.guard_lines": Dial("flag", True, "either",
         'whether crossing max_fix_guard_lines ends the cycle, or is only reported'),
+    # #779's modes, one dial per rung, filled in from DEFAULTS on the seat list's
+    # rule — a rung added there is settable without a second edit here, and a rung
+    # named in two places is a rung the two places can disagree about.
+    #
+    # PER RUNG AND NOT ONE MAPPING DIAL, which is where this parts company with
+    # `threshold_by_severity` above. That is one dial because it is one policy a repo
+    # answers once. This is six calibrations that move independently — the entire
+    # mechanism is that ONE rung records while the others enforce — and a single
+    # mapping would mean arming one rung requires rewriting the map, where an omitted
+    # name silently returns a brake to shadow. A board write that can disarm a brake
+    # it does not name is the failure this key exists to prevent.
+    #
+    # NOT nullable, on `unrefereed_line_weight`'s rule: the vocabulary is two words
+    # and `shadow` already spells "records and does not act", so a `null` would be a
+    # second spelling of one of them. Clearing the dial hands the answer back to the
+    # repo's file, which is the same answer with nothing left behind saying otherwise.
+    #
+    # `either`, and both directions are real: a fleet that has watched a rung for a
+    # few dozen cycles arms it, and a fleet whose rung is stopping cycles it should
+    # not puts it back in shadow for an afternoon without a release. Neither is the
+    # safe direction — but neither can make a review look CLEANER than it is either,
+    # because a rung in shadow only ever declines to stop a cycle, and a cycle that
+    # was not stopped is one that keeps reviewing.
+    **{f"review_panel.escalate_modes.{rung}": Dial(
+           "brake_mode", False, "either",
+           f"whether the {rung} rung STOPS a cycle or only records what it would have done")
+       for rung in DEFAULTS["review_panel"]["escalate_modes"]},
     # #507's constructive pass. `either`, because it is the one dial here whose two
     # directions cost different things and neither is a merge policy: switching it ON
     # spends a fan-out on cycles that escalate, switching it OFF sends a human to a
@@ -3707,6 +4031,23 @@ BOARD_DIALS: dict[str, Dial] = {
         'tokens every watched repo combined may spend in the rolling window'),
     "review_panel.budget_window_hours": Dial("number", False, "either",
         'how long the rolling window is that the per-day ceilings are counted over'),
+    # #776's taper, and the only dial here whose value is a LIST. ONE dial because it
+    # is one curve: rounds are read off its POSITIONS, and a channel that could write
+    # position 3 on its own would leave a repo running a curve nobody wrote. It needs
+    # no new value shape at either end — the board stores opaque JSON, and
+    # `qbdata.parse_dial_value` already names `["a","b"]` as a value dials take.
+    #
+    # NOT nullable, on `unrefereed_line_weight`'s rule: `[1.0]` already spells "no
+    # taper", so `null` would be one written value with two meanings — and clearing
+    # the dial is the same answer with nothing left behind saying otherwise.
+    #
+    # `either`, and the two directions are the usual pair: a steeper curve makes late
+    # rounds cheaper and thinner, a flatter one spends more and reads more, and
+    # neither is the safe one. What makes this safe is not a direction but the rule
+    # in DEFAULTS — exhaustion is a named, non-confident stop — so no curve any layer
+    # can write makes a review look cleaner than it is.
+    "review_panel.round_budgets.multipliers": Dial("multipliers", False, "either",
+        'per-round budget multipliers, 1-based, the last entry reused for later rounds'),
     # #55's fourth acceptance criterion: turning the watcher off for a repo takes
     # ONE setting and takes effect on the next resolution rather than the next
     # restart — which is what a dial is, since `resolve_repo` reads them on every
@@ -4100,6 +4441,48 @@ def _dial_problem(path: str, dial: Dial, value: Any) -> str:
                 return (f"`{path}[{band}]` must be a whole number of seats, 1 or "
                         f"more, not {count!r} — leave the band out for no threshold")
         return ""
+    if dial.kind == "brake_mode":
+        # #779's two words, judged the way `_SCOPES` is: stripped and lower-cased, so
+        # one written value does not mean two things depending on which layer carried
+        # it. There is no third word and a near miss is not one — `"shadowed"` would
+        # otherwise resolve past this check and be read by nothing, which for this
+        # dial means a brake nobody armed and nobody disarmed.
+        ok = isinstance(value, str) and value.strip().lower() in BRAKE_MODES
+        return "" if ok else (
+            f"`{path}` must be one of {', '.join(BRAKE_MODES)}, not {value!r} — "
+            f"`{BRAKE_SHADOW}` records the verdict without acting on it, "
+            f"`{BRAKE_ENFORCE}` applies it")
+    if dial.kind == "multipliers":
+        # #776's curve, judged where the value is TYPED rather than where a round is
+        # dispatched. A board able to write `[0]` would be writing a round that cannot
+        # run, into the key whose whole subject is what a round may spend — and it
+        # would not be discovered until a seat was refused in front of whoever was
+        # waiting for the review, which is #483's own complaint about invisible
+        # contradictions.
+        if not isinstance(value, list):
+            return (f"`{path}` must be a list of per-round multipliers, not "
+                    f"{value!r} — e.g. `[1.5, 1.0, 0.75, 0.5]`, or `[1.0]` for flat")
+        if not value:
+            return (f"`{path}` must have at least one entry: the last one is reused "
+                    f"for every later round and an empty list has none, so it reads "
+                    f"as configured and behaves as absent. `[1.0]` is the flat curve")
+        for position, mult in enumerate(value, 1):
+            if isinstance(mult, bool) or not isinstance(mult, (int, float)):
+                return (f"`{path}[{position}]` must be a number, not {mult!r} — the "
+                        f"positions are rounds, 1-based")
+            # NaN and the infinities, on `number`'s reason and in the same place:
+            # `json.loads` takes all three as bare literals and `NaN` compares false
+            # against every bound there is, so a ceiling multiplied by one is a
+            # ceiling nothing can check.
+            if not math.isfinite(mult):
+                return (f"`{path}[{position}]` must be a finite number, and is "
+                        f"{mult!r} — JSON's `NaN` and `Infinity` are values Postgres "
+                        f"will not store and nothing here can compare against")
+            if mult <= 0:
+                return (f"`{path}[{position}]` must be greater than 0, not {mult!r} "
+                        f"— a round with a zero ceiling is a round that cannot run, "
+                        f"which is `max_rounds` written in the wrong key")
+        return ""
     # "number": int or float, and bools are excluded explicitly because `True` is
     # an int in Python and `max_rounds: true` would otherwise resolve to one round.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -4140,6 +4523,14 @@ _KIND_HINTS = {
     "severity_counts": (f"an object keyed by severity band "
                         f"({', '.join(_SEVERITY_BANDS)}) with a whole number of "
                         f"seats, 1 or more — e.g. {{\"P3\": 2}}, or {{}} for none"),
+    # #779's two words, built from the tuple the validator judges by, so the box and
+    # the refusal cannot offer different vocabularies.
+    "brake_mode": " or ".join(BRAKE_MODES),
+    # #776's curve. Like `severity_counts` the value is not a word, so the hint has
+    # to carry an EXAMPLE: there is no closed set to offer, and "a list of numbers"
+    # leaves a person guessing at what the positions mean.
+    "multipliers": ("a list of per-round multipliers, 1-based, the last reused for "
+                    "later rounds — e.g. [1.5, 1.0, 0.75, 0.5], or [1.0] for flat"),
 }
 
 #: Said whenever a `narrow` dial is about to be typed into, because the direction
@@ -4184,6 +4575,13 @@ def dial_choices(path: str) -> tuple[str, ...]:
         return _SCOPES
     if dial.kind == "flag":
         return ("true", "false")
+    # #779's closed pair. Offered as words for `_SCOPES`' reason — they survive
+    # `parse_dial_value` unchanged, being neither JSON nor a number.
+    if dial.kind == "brake_mode":
+        return BRAKE_MODES
+    # `multipliers` is deliberately absent: a curve is not a list a form could
+    # enumerate, and offering one would be making the vocabulary up. The hint
+    # carries an example instead.
     return ()
 
 
@@ -4746,6 +5144,109 @@ def describe(cfg: dict) -> str:
     return (f"[{cfg['name']}] {cfg['github']} @ {cfg['default_branch']} — "
             f"rules: {cfg['_rules_from']}"
             + ("  (unattended)" if unattended() else ""))
+
+
+def escalate_mode(cfg: dict, rung: str) -> str:
+    """`shadow` or `enforce` for one `escalate_on` rung, from a resolved config — #779.
+
+    THE ONE PLACE THE FALLBACK IS APPLIED, on `resolve_mode`'s rule and for a
+    sharper reason. `review_panel` is merged one level deep, so a repo that wrote
+    `escalate_modes: {"fix_injection": "shadow"}` leaves the other five rungs
+    ABSENT from the resolved mapping — and a consumer reading a missing rung as
+    `shadow` would disarm five brakes nobody named. Three layers, in order: what
+    this repo said, what `DEFAULTS` says, then `shadow`. The last is #779's rule —
+    a rung nobody has calibrated records rather than acts — and it is reached only
+    by a rung `DEFAULTS` does not name, which is to say one added since.
+
+    `null` against a rung is read as ABSENT rather than as an off switch, unlike
+    the flag rungs in `escalate_on`: there a null switches off the brake the key is
+    about, here it would switch off brakes the key does not mention.
+
+    A WORD THIS MODULE DOES NOT KNOW WARNS AND FALLS BACK, which is the treatment
+    every value in this file gets bar `preland.disabled_checks` — and it falls back
+    to the DEFAULT and never to `shadow`, so a typo can cost a calibration and
+    cannot cost a brake.
+    """
+    block = (cfg.get("review_panel") or {}).get("escalate_modes")
+    fallback = DEFAULTS["review_panel"]["escalate_modes"].get(rung, BRAKE_SHADOW)
+    stated = block.get(rung) if isinstance(block, dict) else None
+    if stated is None:
+        return fallback
+    if isinstance(stated, str) and stated.strip().lower() in BRAKE_MODES:
+        return stated.strip().lower()
+    _report(cfg.get("_rules_from") or "harness rules",
+            [f"`review_panel.escalate_modes.{rung}: {stated!r}` is not one of "
+             f"{', '.join(BRAKE_MODES)} — ignored, and the rung stays {fallback}"],
+            cfg.get("github") or "")
+    return fallback
+
+
+def round_multiplier(cfg: dict, round_no: int) -> float:
+    """This round's budget multiplier — #776. 1-based, and the last entry is reused.
+
+    ONE READER, so that the four ceilings this scales cannot each index the curve
+    their own way. A round number below 1 takes position 1: a caller with no round
+    number is asking about the first one, and the alternative is an IndexError
+    inside a budget check, on the path that runs unattended.
+
+    A MALFORMED CURVE REPORTS AND READS AS FLAT, on `resolve_mode`'s rule. This is
+    a multiplier over a ceiling, so 1.0 is the budget the repo had before it wrote
+    the key — the honest fallback — and raising here would take a repo's whole
+    panel out over a typo in a cost dial. `_dial_problem` refuses the same values
+    at the layer where they are typed; this is the same judgement made where they
+    are read, because a rules file is not judged by that layer at all.
+    """
+    curve = ((cfg.get("review_panel") or {}).get("round_budgets") or {}).get("multipliers")
+    problem = ""
+    if curve is None:
+        # ABSENT IS NOT WRONG, on `escalate_mode`'s rule: a config assembled by hand
+        # — a test, a caller that built a `review_panel` of its own — has not made a
+        # mistake by leaving a curve out, and a diagnostic that fires on the shipped
+        # default is the noise `_report`'s dedupe exists to keep out of the way of
+        # the ones that matter.
+        return 1.0
+    if not isinstance(curve, list) or not curve:
+        problem = (f"`review_panel.round_budgets.multipliers: {curve!r}` is not a "
+                   f"non-empty list of numbers — ignored, every round runs flat")
+    else:
+        position = min(max(int(round_no or 1), 1), len(curve))
+        mult = curve[position - 1]
+        if isinstance(mult, bool) or not isinstance(mult, (int, float)) \
+                or not math.isfinite(mult) or mult <= 0:
+            problem = (f"`review_panel.round_budgets.multipliers[{position}]: "
+                       f"{mult!r}` is not a finite number above 0 — ignored, round "
+                       f"{position} runs flat")
+        else:
+            return float(mult)
+    _report(cfg.get("_rules_from") or "harness rules", [problem],
+            cfg.get("github") or "")
+    return 1.0
+
+
+def tapered(ceiling: int | float | None, multiplier: float,
+            *, minimum: int = 1) -> int | None:
+    """One ceiling scaled by one round's multiplier — #776.
+
+    NO CEILING STAYS NO CEILING. `None` means "no ceiling" everywhere in
+    `review_panel`, and a taper may tighten a ceiling somebody wrote and may never
+    CREATE one — which is the property that keeps `[1.5, ...]` from arming a budget
+    on a fleet that never set one.
+
+    FLOORED to a whole number, because every ceiling this scales is counted in
+    whole things — tokens, chars, lines, seats — and CLAMPED at `minimum` rather
+    than allowed to reach 0. A zero ceiling is not a budget; it is an exhaustion,
+    and naming it belongs to the caller that also gets to end the cycle with
+    `confident: false`. A caller that wants to know whether the clamp bit compares
+    this against the base it passed in.
+
+    IT DOES NOT CLAMP AGAINST A BOARD-STATED CEILING (#55). `panel_caps.ceiling_of`
+    owns that question because it knows which LAYER answered, which this function
+    cannot see: a caller scaling a ceiling the board stated takes the smaller of
+    the two, and that is the only place a multiplier above 1.0 has to be caught.
+    """
+    if ceiling is None:
+        return None
+    return max(int(minimum), int(float(ceiling) * float(multiplier)))
 
 
 def resolve_mode(cfg: dict) -> Mode:

@@ -145,12 +145,24 @@ ANCHOR_DOCS = ("harness/README.md",)
 RECORDS_OUTCOMES = tuple(
     sorted(name for name, loop in FIX_LOOPS.items() if loop.records_outcomes))
 
-#: Read from the source text rather than imported: `app.api.reviews` pulls in FastAPI, the ORM
-#: and the app's settings, and this suite's whole reason for living under `harness/` is that it
-#: needs none of them. Tolerant of the edits that do not change the value — an annotation
-#: (`OUTCOMES: tuple[str, ...] = (…)`) or a trailing comment — because every assertion below
-#: reads the set through it, so a pattern that misses turns the lot into a fixture error.
-_OUTCOMES_TUPLE = re.compile(r"^OUTCOMES(?:\s*:[^=]+)?\s*=\s*\(([^)]*)\)", re.MULTILINE)
+#: A module-level tuple of string literals, by name. Read from the source text rather than
+#: imported: `app.api.reviews` pulls in FastAPI, the ORM and the app's settings, and this
+#: suite's whole reason for living under `harness/` is that it needs none of them. Tolerant of
+#: the edits that do not change the value — an annotation (`OUTCOMES: tuple[str, ...] = (…)`)
+#: or a trailing comment — because every assertion below reads the set through it, so a pattern
+#: that misses turns the lot into a fixture error.
+_TUPLE_LITERAL = r"^{name}(?:\s*:[^=]+)?\s*=\s*\(([^)]*)\)"
+
+#: `OUTCOMES` bound to a name instead of to a literal, which is what #772 made it: the ledger's
+#: state vocabulary is a superset of the outcomes and the two must not become two lists, so
+#: `app/api/reviews.py` now says `OUTCOMES = OUTCOME_STATES` and the words live one module over.
+#: The binding is FOLLOWED rather than restated here — see the `outcomes` fixture.
+_OUTCOMES_BINDING = re.compile(r"^OUTCOMES(?:\s*:[^=]+)?\s*=\s*([A-Za-z_]\w*)\s*(?:#.*)?$",
+                               re.MULTILINE)
+
+#: `from <module> import <names>`, in both the one-line and the parenthesised spellings, so the
+#: module a bound name came from can be read back out of the importer.
+_IMPORT_STATEMENT = re.compile(r"^from\s+([\w.]+)\s+import\s+(\([^)]*\)|[^\n]+)", re.MULTILINE)
 
 #: The CHECK constraint the vocabulary is spelled in for a third time. `app/api/reviews.py`
 #: guards itself against it at import; this is the name the docs and this suite's own failure
@@ -208,6 +220,10 @@ READS = frozenset({
     "harness/loops/README.md",
     "app/api/reviews.py",
     "app/models/review.py",
+    # Where the outcome vocabulary is declared since #772 — `app/api/reviews.py` binds
+    # `OUTCOMES` to it rather than restating the words. Read through `_imported_from`, so this
+    # entry is the module that file actually imports from and not a path assumed here.
+    "app/finding_lifecycle.py",
 })
 
 
@@ -679,18 +695,54 @@ def test_the_pr_less_premise_check_is_shown_and_is_still_a_valid_invocation():
 # --------------------------------------------------- 3. an outcome the database will accept
 
 
-@pytest.fixture(scope="module")
-def outcomes() -> set[str]:
-    text = doc("app/api/reviews.py")
-    match = _OUTCOMES_TUPLE.search(text)
-    assert match, "app/api/reviews.py no longer declares OUTCOMES as a tuple — read it another way"
+def _string_tuple(text: str, name: str, where: str) -> set[str]:
+    """The string values of the module-level tuple `name`, read out of `where`'s source."""
+    match = re.search(_TUPLE_LITERAL.format(name=re.escape(name)), text, re.MULTILINE)
+    assert match, (
+        f"{where} no longer declares {name} as a tuple literal — follow it to wherever the "
+        "words are now written, rather than restating them here")
     literal = match.group(1)
     assert "(" not in literal, (
-        f"the OUTCOMES literal read as {literal!r}, which contains a nested tuple — the pattern "
-        "matched more than the one declaration")
+        f"the {name} literal in {where} read as {literal!r}, which contains a nested tuple — "
+        "the pattern matched more than the one declaration")
     values = set(re.findall(r'"([^"]+)"', literal))
-    assert values, f"no string values in the OUTCOMES literal {literal!r}"
+    assert values, f"no string values in {where}'s {name} literal {literal!r}"
     return values
+
+
+def _imported_from(text: str, name: str, where: str) -> str:
+    """The repo-relative path of the module `where` imports `name` from.
+
+    Read out of the importer rather than guessed, so the vocabulary moving to a different module
+    is a one-line change to `READS` (and to the check that installs it) with a failure message
+    that says so, rather than a silent read of a file that no longer owns the words."""
+    for module, imported in _IMPORT_STATEMENT.findall(text):
+        if re.search(rf"(?<![\w.]){re.escape(name)}\b", imported):
+            return module.replace(".", "/") + ".py"
+    raise AssertionError(
+        f"{where} binds OUTCOMES to {name!r} but imports no such name, so the vocabulary it "
+        f"enforces cannot be followed to a declaration. Either {name} is defined in {where} "
+        "itself — in which case it is not a tuple literal — or the import moved.")
+
+
+@pytest.fixture(scope="module")
+def outcomes() -> set[str]:
+    """The vocabulary the endpoint actually enforces, followed to wherever it is declared.
+
+    `app/api/reviews.py` no longer spells the words (#772): `OUTCOMES` is BOUND to the finding
+    ledger's state vocabulary, so that a sixth outcome becomes a sixth lifecycle state on the
+    commit that adds it rather than a second list meaning almost the same thing. So the binding
+    is followed rather than the five words restated here — a fixture holding its own copy would
+    pass while every assertion below checked the docs against a vocabulary this suite invented,
+    which is this suite's own drift arriving through this suite. The literal is still tried
+    first, so inlining the tuple back into `reviews.py` needs no change here either."""
+    api = doc("app/api/reviews.py")
+    bound = _OUTCOMES_BINDING.search(api)
+    if bound is None:  # declared in place, the shape this suite was written against
+        return _string_tuple(api, "OUTCOMES", "app/api/reviews.py")
+    name = bound.group(1)
+    where = _imported_from(api, name, "app/api/reviews.py")
+    return _string_tuple(doc(where), name, where)
 
 
 def test_the_vocabulary_is_the_one_this_suite_thinks_it_is(outcomes: set[str]):

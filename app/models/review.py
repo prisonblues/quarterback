@@ -21,6 +21,12 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
+from app.finding_lifecycle import (
+    LIFECYCLE_SOURCES,
+    LIFECYCLE_STATES,
+    REASON_REQUIRED_STATES,
+    sql_list,
+)
 from app.models.base import Base
 from app.needs_human import NEEDS_HUMAN_CLASSES
 
@@ -30,6 +36,14 @@ from app.needs_human import NEEDS_HUMAN_CLASSES
 #: classes after the vocabulary had grown to seven — the exact drift
 #: `app/models/blocker.py` avoids by composing its own list the same way.
 _NH_CLASS_LIST = ", ".join(f"'{c}'" for c in NEEDS_HUMAN_CLASSES)
+
+#: #772's three vocabularies, rendered for their CHECKs the same way and for the
+#: same reason: composed from the tuples in :mod:`app.finding_lifecycle`, never
+#: spelled out here, so a state added there reaches the constraint through the
+#: next migration instead of being remembered in a second place.
+_LIFECYCLE_STATE_LIST = sql_list(LIFECYCLE_STATES)
+_LIFECYCLE_SOURCE_LIST = sql_list(LIFECYCLE_SOURCES)
+_REASON_REQUIRED_LIST = sql_list(REASON_REQUIRED_STATES)
 
 
 class ReviewRun(Base):
@@ -616,6 +630,27 @@ class ReviewRun(Base):
     #: collapsing them would either block landings this repo's own policy allows
     #: or count them as clean finishes they are not.
     converged: Mapped[bool | None] = mapped_column(Boolean)
+    #: DID THE CYCLE ATTEST TO ANYTHING AT ALL (#782) — :attr:`converged`'s fifth
+    #: conjunct, stored beside it rather than folded into it.
+    #:
+    #: "No finding" has two causes — nothing was wrong, and nothing ran — and the
+    #: dry branch reported the first without being able to tell them apart. A round
+    #: 1 whose seats produced nothing anywhere stopped, was confident, had no
+    #: veto and nothing outstanding, and so read as a clean converged finish on the
+    #: strength of a panel that never demonstrated it could see the diff.
+    #:
+    #: Stored rather than left in ``stop_reason``'s prose because ``converged``
+    #: is what this epic is judged on and a reader has to be able to see every
+    #: conjunct: without this column the board can say a cycle did not converge and
+    #: cannot say why, and "a P1 was outstanding" and "nobody attested to anything"
+    #: are different facts that argue for different repairs. Pooled into one
+    #: ``unconverged`` count the rate is uninterpretable.
+    #:
+    #: Three states, :attr:`converged`'s exactly. NULL is "the panel did not say" —
+    #: every round recorded before the field existed — and is NOT ``False``: read
+    #: for truthiness it would report the whole archive as having attested to
+    #: nothing, which is the flattering-in-reverse direction and just as wrong.
+    attested: Mapped[bool | None] = mapped_column(Boolean)
     #: WHAT THE CYCLE LEFT BEHIND, counted (#717). ``round_stop.outstanding`` on
     #: the round payload, as ``{"fixable": n, "below_floor": n, "escalated": n,
     #: "narrowed": n, "declined": n}`` — the length of each list the panel
@@ -719,6 +754,86 @@ class ReviewRun(Base):
     #: repo with a different problem from one where it is all in the first, and a
     #: total says neither.
     repeated_below_trigger_floor: Mapped[int | None] = mapped_column(Integer)
+    #: HOW MANY REPEATS ONLY THE LOCALITY MATCHER RECOGNISED (#771) —
+    #: ``locality_repeats.only_locality`` on the round payload.
+    #:
+    #: #771 replaced cross-round finding identity. A repeat used to be a match on
+    #: ``finding_key``, a hash of the reviewing model's own wording, so the same
+    #: defect restated in different words on the next round was a NEW finding: it
+    #: bought a round it had already bought, it landed in
+    #: ``escalate_on.fix_injection`` as fresh damage, and it never aged. Findings
+    #: are now also matched by LOCALITY — the line range against the round's diff
+    #: hunks, within a slack — and this column is the count the change turns on:
+    #: repeats the locality matcher caught that a wording hash did not.
+    #:
+    #: **This is the whole evidence for the feature.** The panel computes both
+    #: matchers and passes the union on, so the bet is invisible from the outside;
+    #: what settles it is this number over a population. A fleet where it stays at
+    #: zero across a few dozen cycles is a fleet where the locality matcher is
+    #: answering nothing and should come out, and that verdict is a query over
+    #: hundreds of rounds — which is exactly what a column is for and what the
+    #: round's own published JSON, sitting in a temp directory on whichever host
+    #: ran the panel, can never be.
+    #:
+    #: Stored as SENT, never re-derived. The comparison is over diff hunks and a
+    #: slack this board does not hold, on :attr:`converged`'s rule: a board-side
+    #: derivation would be a second reading of a rule the producer already ran.
+    #:
+    #: NULL = the panel did not say — every round recorded before this column, and
+    #: every producer too old to send the block. **Never read as zero**: "the
+    #: locality matcher caught nothing extra" is the finding this column exists to
+    #: report, and "nobody measured" read as that finding is how a feature gets
+    #: deleted on evidence it never produced.
+    repeats_only_locality: Mapped[int | None] = mapped_column(Integer)
+    #: HOW MANY REPEATS THE WORDING KEY ALREADY CAUGHT (#771) —
+    #: ``locality_repeats.by_key`` on the round payload.
+    #:
+    #: The denominator's other half, and it is a separate column rather than a
+    #: total for :attr:`new_below_trigger_floor`'s reason: the two populations are
+    #: DISJOINT by construction (the panel subtracts the key matches out of the
+    #: locality matches before counting), so a sum is recoverable from the pair and
+    #: the pair is not recoverable from a sum. What the ratio of the two says is
+    #: whether the locality matcher is a rounding error on the old comparison or a
+    #: substantial share of it, and a stored total says neither.
+    #:
+    #: NULL on :attr:`repeats_only_locality`'s terms exactly, and the two are NULL
+    #: and non-NULL together: they come off one block the panel sends whole.
+    repeats_by_key: Mapped[int | None] = mapped_column(Integer)
+    #: HOW DANGEROUS THE REPAIR WAS (#770) — ``round_stop.fix_blast.lane`` on the
+    #: round payload: ``low``, ``medium`` or ``high``.
+    #:
+    #: A finding is graded on severity and nothing else, so a fixer is told how bad
+    #: the DEFECT is and never how far the REPAIR reaches. ``panel_blast``
+    #: classifies the fix pass's own changed paths — migrations, auth, secrets,
+    #: irreversible infrastructure, dependencies, public API surface, source with no
+    #: test beside it — and the lane is the worst category that fired.
+    #:
+    #: **This is the first input to #770's ``fix_risk`` axis, and this column is
+    #: what the axis gets calibrated against.** The question is fleet-wide and
+    #: archival: across hundreds of rounds, do fix passes that land in dangerous
+    #: code write more of the NEXT round's findings than ones that touch a
+    #: docstring? Nothing on this board could say so before. The payload the lane is
+    #: computed in lives in a temp directory on whichever host ran the panel, so a
+    #: correlation over a population is a query over this column or it is nobody's
+    #: answer — :attr:`repeats_only_locality`'s argument exactly.
+    #:
+    #: Stored AS SENT, never re-derived. The rule table is the producer's, it reads
+    #: a diff this board does not hold, and a board-side re-derivation would be a
+    #: second reading of the rule that produced the value stored beside it —
+    #: :attr:`converged`'s rule.
+    #:
+    #: The categories, the evidence and the reason sentence ride the same block and
+    #: get no column: they are one round's WORKING, already in the payload that
+    #: round published, and an unbounded structure per run.
+    #: ``tests/test_payload_key_drift.py`` holds that decision in writing.
+    #:
+    #: NULL = the fix surface could not be measured — the producer sends
+    #: ``fix_blast: null`` there — plus every row recorded before this column and
+    #: every producer too old to nest the key. **Never read as ``low``**: "the pass
+    #: opened no dangerous file" and "nobody measured" are different claims, and
+    #: folding the second into the first would build the axis's own baseline out of
+    #: rounds that never looked.
+    fix_blast_lane: Mapped[str | None] = mapped_column(Text)
     #: THE ESCALATION RUNGS AS THIS ROUND MEASURED THEM (#732), verbatim: the nine
     #: blocks ``round_stop`` publishes beside its verdict, keyed by the names the
     #: panel gives them (:data:`app.api.reviews.STOP_RUNGS`) — ``fix_injection``,
@@ -785,6 +900,41 @@ class ReviewRun(Base):
         CheckConstraint('"round" >= 1', name="ck_review_runs_round_positive"),
         CheckConstraint("new_findings >= 0",
                         name="ck_review_runs_new_findings_non_negative"),
+        # #771's two counts, on `new_findings`' rule one line up and for its
+        # reason: the API is not the only writer, and a negative repeat count is
+        # not a smaller measurement — it is a number that would net against a real
+        # one and make the ratio this feature is judged on read LOW, which is the
+        # direction that gets the locality matcher deleted.
+        #
+        # One constraint each rather than one over the pair, so a caller is told
+        # which of the two refused it — the argument
+        # `ck_review_runs_converged_implies_attested` makes for not widening a
+        # neighbouring rule. NULL passes on both: it is every row recorded before
+        # the columns and every producer too old to send the block.
+        CheckConstraint("repeats_only_locality >= 0",
+                        name="ck_review_runs_repeats_only_locality_non_negative"),
+        CheckConstraint("repeats_by_key >= 0",
+                        name="ck_review_runs_repeats_by_key_non_negative"),
+        # #770's lane, against a CLOSED vocabulary — where `cleared_floor` two
+        # columns over deliberately has none, and the two do not conflict. A
+        # severity floor is a repo dial whose spellings grow, and an unrecognised
+        # one stored verbatim gives a consumer an extra group it can SEE. These
+        # three are an ordered scale that consumers BRANCH on and that #770's axis
+        # will divide, so a fourth word would not appear as a fourth group: it
+        # would fall through every branch and be read as whichever the `else` is.
+        #
+        # Ingest already coerces an unrecognised lane to NULL
+        # (`FixBlastIn._lane`), which makes this constraint unreachable from the
+        # endpoint — the point of it, on the rule the constraints above give: the
+        # API is not the only writer, and a write path added later must not be
+        # able to introduce a fourth lane quietly.
+        #
+        # NULL passes: it is every row recorded before the column, every producer
+        # too old to nest the key, and every round whose fix surface could not be
+        # measured. A constraint that refused it would make the migration
+        # unrunnable rather than make the rows honest.
+        CheckConstraint("fix_blast_lane IN ('low', 'medium', 'high')",
+                        name="ck_review_runs_fix_blast_lane"),
         # A run that reviewed nothing cannot also have earned a confident stop
         # (#94). `stop_confident` is what `preland --require-earned-stop` reads
         # and what the review queue calls convergence, so the one combination
@@ -820,6 +970,20 @@ class ReviewRun(Base):
             "NOT (converged IS TRUE AND "
             "(stopped IS NOT TRUE OR stop_confident IS NOT TRUE))",
             name="ck_review_runs_converged_implies_earned_stop",
+        ),
+        # ...and the same rule for #782's fifth conjunct, as its own constraint
+        # rather than by widening the one above. Two reasons for the separate
+        # name: a caller is owed the rule that actually refused it, and the two
+        # are refused for different things — that one is "you did not stop", this
+        # one is "nothing was raised anywhere in this cycle, so there is no
+        # evidence a review happened at all".
+        #
+        # NULL passes on either side, on the argument directly above: `attested`
+        # is NULL on every round recorded before the field existed, and a
+        # constraint that read that as a denial would refuse the archive.
+        CheckConstraint(
+            "NOT (converged IS TRUE AND attested IS FALSE)",
+            name="ck_review_runs_converged_implies_attested",
         ),
         # One repository, one stored spelling — at the boundary, so that the API
         # is not the only thing that remembers (#326, migration 0033).
@@ -1534,6 +1698,211 @@ class ReviewFindingOutcome(Base):
             name="ck_review_finding_outcomes_superseded_by",
         ),
         CheckConstraint("revisions >= 0", name="ck_review_finding_outcomes_revisions"),
+    )
+
+
+class ReviewFindingLedger(Base):
+    """WHERE A DEFECT STOOD AT THE END OF A ROUND, and who put it there (#772).
+
+    The row this board has never had. A finding is raised inside a round, judged
+    inside that round, and then nothing carries its state into the next one — so a
+    finding deferred in round 2 comes back in round 3 looking like fresh damage,
+    which is counted as `fix_injection` and stops cycles that were converging. And
+    "did round 3's fix answer round 2's complaint" is a question only a human
+    reading two reports can answer.
+
+    **One row per (repo, pr, finding_key, round, source)** — each writer's word
+    about one defect in one round. Not one row per defect (that is
+    :class:`ReviewFindingOutcome`, and it is a different question — see
+    :mod:`app.finding_lifecycle`) and not one row per transition either: a
+    writer that says the same thing twice in one round is retrying, not changing
+    its mind, so the unique constraint makes the whole endpoint idempotent under
+    the retry every client here eventually performs. A writer that genuinely
+    changes its mind inside a round rewrites its own row, and ``revisions`` /
+    ``prior_state`` make that visible on ``ReviewFindingOutcome``'s terms.
+
+    The current state of a defect is the newest row for it by ``(round, ts, id)``.
+    Several sources may speak in one round — a promotion at the start, the panel
+    and the judge at the end — and their order is the order they were written,
+    which is the order they happened.
+
+    **The board stores the key; it never computes one.** ``finding_key`` is
+    whatever identity the producer sends, matched across rounds by
+    ``harness/loops/panel_locality.py`` (diff-hunk overlap, deliberately not a
+    hash of the model's wording, which moves every time a seat re-words its own
+    title). A board-side identity would be a second opinion about which two
+    findings are one, computed without the diff, and it would disagree with the
+    matcher exactly where the matcher is doing its job. What this table DOES
+    require is that the key names a finding some run of this pull request
+    recorded: a ledger row for a defect the board has no observation of is a
+    state with no evidence under it.
+    """
+
+    __tablename__ = "review_finding_ledger"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    #: Scoped exactly as :class:`ReviewFindingOutcome` is, and for its reason:
+    #: ``finding_key`` identifies a defect WITHIN a pull request, so the same key
+    #: in another repo is a different chain. Canonically folded, enforced by a
+    #: CHECK — the unique constraint below is only as good as the spelling it is
+    #: on, and `Acme/X` beside `acme/x` would give one defect two ledgers.
+    repo: Mapped[str] = mapped_column(Text, nullable=False)
+    pr: Mapped[int] = mapped_column(Integer, nullable=False)
+    finding_key: Mapped[str] = mapped_column(Text, nullable=False)
+
+    #: One of :data:`app.finding_lifecycle.LIFECYCLE_STATES`. Constrained in the
+    #: database as well as at ingest: this table is the substrate a convergence
+    #: metric is computed over, and an unknown value would silently leave every
+    #: numerator while still counting as coverage.
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    #: WHICH WRITER — one of :data:`app.finding_lifecycle.LIFECYCLE_SOURCES`. The
+    #: named-skip-reason half, and the reason this is a column rather than a
+    #: sentence in ``reason``: `(unpaid, budget)` and `(refuted, judge)` are
+    #: "nobody looked" and "somebody looked and said no", and a design that files
+    #: both under one `skipped` bucket makes a budget that is too small
+    #: indistinguishable from a reviewer being wrong. Only one of those two has a
+    #: fix, and pooled they are invisible.
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    #: WHY, in a line. Required by the API and by a CHECK for every state in
+    #: :data:`app.finding_lifecycle.REASON_REQUIRED_STATES` — everything but
+    #: ``raised`` and ``fixed``, which are the loop working. Every other state is a
+    #: claim that this finding is NOT being worked, and a bare one is the
+    #: confident assertion with nothing behind it that
+    #: ``ck_review_finding_outcomes_refuted_note`` refuses one table over.
+    reason: Mapped[str | None] = mapped_column(Text)
+    #: The ``finding_key`` that replaced this one, for ``superseded``. The same
+    #: field, the same rule and the same CHECK as the outcome table's, kept as its
+    #: own column rather than crammed into ``reason``: it is a pointer another
+    #: query follows, and a pointer stored inside prose is a pointer nothing can
+    #: follow. There is deliberately no ``deferred_to`` here — an issue ref is a
+    #: disposal outside this loop and already has its home on the outcome row,
+    #: and a second copy is two answers to "where did it go".
+    superseded_by: Mapped[str | None] = mapped_column(Text)
+
+    #: THE ROUND THIS TRANSITION HAPPENED IN. NOT NULL, and that is the whole
+    #: point of the table: a ledger row that cannot say which round it belongs to
+    #: answers none of the questions the ledger exists for. A producer with no
+    #: round has nothing to say to a record whose entire subject is cross-round
+    #: state.
+    round: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: THE ROUND THE DEFECT FIRST ENTERED THE LEDGER, carried forward unchanged by
+    #: every later row — a promotion included, which is the requirement mergeCraft
+    #: states as "``promote`` keeps the original round index".
+    #:
+    #: Two columns and not one, because mergeCraft's single ``round_index`` has to
+    #: choose: keep the original and lose "which round did it come back in", or
+    #: take the new one and lose the age of the complaint. Both facts are wanted —
+    #: the first says a finding is not new damage, the second says which round to
+    #: credit the promotion to — so both are stored.
+    #:
+    #: **Derived by the board from its own rows, and this is not identity.** The
+    #: value is copied from the earliest existing row for the key, or is ``round``
+    #: when there is none. A producer sending it could get it wrong on a retry, on
+    #: a resumed cycle, or by not having read the ledger first, and the failure
+    #: would be silent and in the flattering direction — a promoted finding
+    #: acquiring a fresh round is precisely the "looks like new damage" defect this
+    #: table was built to end.
+    origin_round: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: The panel cycle this transition belongs to, where the producer named one.
+    #:
+    #: Stored because a round NUMBER is ambiguous on its own: two agents can loop
+    #: one pull request concurrently, and `GET /review/findings`' ``followed_by``
+    #: already refuses to treat adjacency as succession for exactly this reason —
+    #: "A-r1, B-r2 recorded by two agents looping one PR". A ledger read without
+    #: the cycle beside it would make the same wrong join. NULL where the producer
+    #: has no cycle (a one-shot read, a hand-written entry).
+    cycle: Mapped[str | None] = mapped_column(Text)
+    #: The run that produced this transition, where there was one.
+    #:
+    #: ``SET NULL`` and never ``CASCADE``: deleting a run must not delete the
+    #: record of what happened to a defect — the outcome table refuses to be
+    #: foreign-keyed to a run at all for that reason, and this is the weaker form
+    #: of the same rule, keeping the join while refusing the lifetime. Nullable
+    #: because a person recording an escalation at a terminal is in no run.
+    run_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("review_runs.id", ondelete="SET NULL")
+    )
+
+    #: The board identity that wrote this, from the token. Proof, exactly as
+    #: ``ReviewFindingOutcome.set_by`` is — and there is deliberately no
+    #: ``attested_by`` here: this table records where a finding stood, not a claim
+    #: that a human agreed with it, and that claim already has one home.
+    set_by: Mapped[str] = mapped_column(Text, nullable=False)
+    session: Mapped[str | None] = mapped_column(Text)
+
+    #: How many times this writer's word about this finding in this round has been
+    #: REWRITTEN. ``ReviewFindingOutcome.revisions``' rule, one table over: a state
+    #: that moves is legitimate, a state that moves silently is not, and a reason
+    #: quietly rewritten under an unchanged state improves an after-the-fact
+    #: convergence figure by exactly the same route.
+    revisions: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                           server_default="0")
+    prior_state: Mapped[str | None] = mapped_column(Text)
+
+    ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        # One word per writer per round per defect. What it buys is idempotency:
+        # the commonest race on this board is not two agents, it is one agent
+        # whose request was accepted and whose client timed out — `qb` gives curl
+        # 15 seconds — so the retry arrives with the row already in. Under an
+        # append-only design that retry silently doubles a round's ledger and
+        # every count over it.
+        #
+        # Its B-tree is also the read path: hydration selects on (repo, pr), which
+        # the leftmost prefix serves, so there is no second index — the argument
+        # `ReviewFindingOutcome` and `ReviewRunFile` both record for theirs.
+        UniqueConstraint("repo", "pr", "finding_key", "round", "source",
+                         name="uq_review_finding_ledger_entry"),
+        # One repository, one stored spelling — `ck_review_finding_outcomes_repo_canonical`
+        # exactly, and load-bearing for the same reason: the unique constraint
+        # above is only as good as the spelling it is on, and a second spelling is
+        # a second ledger for one defect.
+        CheckConstraint(r"repo = lower(btrim(repo, E' \t\n\r\f\013'))",
+                        name="ck_review_finding_ledger_repo_canonical"),
+        CheckConstraint(f"state IN ({_LIFECYCLE_STATE_LIST})",
+                        name="ck_review_finding_ledger_state"),
+        CheckConstraint(f"source IN ({_LIFECYCLE_SOURCE_LIST})",
+                        name="ck_review_finding_ledger_source"),
+        # A skip must name itself, at the boundary and not only at ingest — for a
+        # backfill, an admin script, or the next write path. Four things this gets
+        # right, every one of them learned on
+        # `ck_review_finding_outcomes_refuted_note` and restated here because the
+        # traps are not visible in the expression:
+        #
+        # * the NOT NULL is not redundant beside the trim test. **A CHECK passes
+        #   when its expression evaluates to NULL**, so the trim alone would let a
+        #   null straight through — the exact row this refuses.
+        # * `btrim` with an explicit character set, because single-argument
+        #   `btrim` strips ORDINARY SPACES ONLY: a reason of one tab satisfied it.
+        # * vertical tab is `\013` and never `\v`. Postgres' escape strings do not
+        #   define `\v`, and an undefined escape drops the backslash and keeps the
+        #   character, so `E'\v'` is the LETTER v — the set would refuse a reason
+        #   of "v" as empty.
+        # * it mirrors the API's rule exactly, so a row this service would refuse
+        #   cannot arrive by another door.
+        CheckConstraint(
+            f"state NOT IN ({_REASON_REQUIRED_LIST}) OR (reason IS NOT NULL "
+            r"AND btrim(reason, E' \t\n\r\f\013') <> '')",
+            name="ck_review_finding_ledger_reason",
+        ),
+        CheckConstraint(
+            r"state <> 'superseded' OR (superseded_by IS NOT NULL "
+            r"AND btrim(superseded_by, E' \t\n\r\f\013') <> '')",
+            name="ck_review_finding_ledger_superseded_by",
+        ),
+        # Rounds are 1-based and a promotion never invents an earlier origin than
+        # the round it is promoting into. `origin_round <= round` is the invariant
+        # that makes "this finding is N rounds old" a subtraction rather than a
+        # guess, and it is what a wrong client-side origin would have broken
+        # silently.
+        CheckConstraint("round >= 1", name="ck_review_finding_ledger_round"),
+        CheckConstraint("origin_round >= 1 AND origin_round <= round",
+                        name="ck_review_finding_ledger_origin_round"),
+        CheckConstraint("revisions >= 0", name="ck_review_finding_ledger_revisions"),
     )
 
 

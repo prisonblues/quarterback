@@ -533,26 +533,61 @@ def test_a_dial_with_no_name_is_refused_whatever_the_table_says(tui):
 
 
 def visible(app_screen, selector):
-    """Is this widget drawn inside the screen, rather than off the bottom of it?
+    """Is this widget drawn where a person can read it, rather than off the pane?
 
     A Textual modal taller than its screen does not scroll into view or complain —
     it CLIPS, and what it clips is whatever was composed last. Which was the scope
     line, before #539 moved it into the title: the one control on this form whose
     mistake cannot be seen afterwards, hidden by the picker that was added above
-    it. So this asks about the region rather than about the widget's existence.
+    it. So this asks about what is on the screen rather than about the widget's
+    existence.
+
+    `can_view_entire` and not the region, since the fields were given a scroll of
+    their own: a widget that has scrolled off the TOP of the form still has a
+    region inside the pane, so the arithmetic that catches the off-the-bottom case
+    calls it visible and the two ways of being absent stop being one question. The
+    compositor decides which cells get painted; ask it.
     """
     widget = app_screen.query_one(selector)
-    return widget.region.bottom <= app_screen.size.height and widget.region.height > 0
+    return (widget.display and widget.region.height > 0
+            and app_screen.can_view_entire(widget))
+
+
+#: Everything on the form that a short pane could take away, in the order it is
+#: drawn. `#title` carries the scope, which is the mistake nobody can see once
+#: made; `#hint` says which key gets out.
+CONTROLS = ("#title", "#f_dial", "#names", "#f_value", "#spec", "#f_reason",
+            "#f_expiry", "#hint")
 
 
 def test_the_whole_form_fits_the_pane_it_opens_in(tui, vocabulary):
     """78x24 with the picker open, the reason, the expiry and the keys all drawn.
     The margins, the scope line's home and the refusal line's absence are all paid
-    for by this — it is one row from the edge either way."""
+    for by this — it is one row from the edge either way.
+
+    IN EVERY ROW OF THE PICKER, and not only the one drawn before anything is
+    touched. The line under the value box describes whatever the cursor is on, so
+    "the form fits while browsing" is a claim about the longest of forty-nine
+    descriptions; measuring it on the first row measures the state the form is in
+    for one keystroke. Nothing scrolls in this state and nothing is allowed to:
+    the picker is the tall arrangement the row budget was written for, and a
+    scrollbar appearing here is the budget having quietly gone.
+    """
+    from textual.widgets import OptionList
+
     async def steps(screen, pilot):
-        for selector in ("#f_dial", "#names", "#f_value", "#spec", "#f_reason",
-                         "#f_expiry", "#hint"):
+        form = screen.query_one("#form")
+        for selector in CONTROLS:
             assert visible(screen, selector), selector
+        screen.action_to_names()
+        await pilot.pause()
+        for index, name in enumerate(screen.matches):
+            screen.query_one("#names", OptionList).highlighted = index
+            await pilot.pause()
+            assert text_of(screen, "#spec") == vocabulary[name]["what"]
+            for selector in CONTROLS:
+                assert visible(screen, selector), f"{selector} while on {name}"
+            assert not form.show_vertical_scrollbar, f"the picker scrolls on {name}"
 
     drive(tui, modal(tui, vocabulary), steps)
 
@@ -694,7 +729,15 @@ def test_the_form_still_fits_with_the_list_up_and_a_wrapped_refusal(tui, vocabul
     the picker still showing (an unknown name that filters to several), a two-line
     description under the value box, and a refusal wrapped onto a second line. This
     form grows downward as it objects, and what a Textual modal does when it
-    outgrows its screen is clip whatever was composed last."""
+    outgrows its screen is clip whatever was composed last.
+
+    This asked for all eight controls at once and got them, which was never true:
+    the form is two rows over the pane in this state and always has been, and the
+    key line was sitting in the box's bottom border where a bottom-edge sum called
+    it visible and a person could not read a word of it. The eight-way assertion
+    was measuring the wrong thing rather than the wrong state, so it is the frame
+    that is asked for here now, and a scrollbar for the rest.
+    """
     async def steps(screen, pilot):
         field(screen, "#f_dial").value = "budget"
         field(screen, "#f_value").value = "x"
@@ -704,30 +747,62 @@ def test_the_form_still_fits_with_the_list_up_and_a_wrapped_refusal(tui, vocabul
         await pilot.pause()
         assert screen.query_one("#names").display, "the list is up in this state"
         assert screen.query_one("#err").region.height >= 2, "and the refusal wrapped"
-        for selector in ("#f_dial", "#names", "#f_value", "#spec", "#f_reason",
-                         "#f_expiry", "#err", "#hint"):
+        for selector in ("#title", "#f_dial", "#names", "#err", "#hint"):
             assert visible(screen, selector), selector
+        assert screen.query_one("#form").show_vertical_scrollbar, (
+            "the rest is below the fold and nothing says so")
 
     drive(tui, modal(tui, vocabulary), steps)
 
 
-def test_the_longest_refusal_a_known_dial_can_raise_also_fits(tui, vocabulary):
-    """The other tall state: no list, the full four-line block, and the harness's
-    own sentence about a value — which names the dial, so the longest dial name
-    makes the longest refusal."""
-    longest = max(vocabulary, key=len)
+def test_no_dial_can_raise_a_refusal_that_takes_the_keys_off_the_screen(tui,
+                                                                       vocabulary):
+    """The other tall state: no list, the full block, and the harness's own
+    sentence about a value.
 
+    EVERY DIAL, and not the one with the longest name. This used to type
+    `max(vocabulary, key=len)` on the reasoning that the refusal names the dial, so
+    the longest name makes the longest refusal — and the refusal is a whole
+    sentence about what the dial ACCEPTS, of which the name is the part that varies
+    least. `round_budgets.multipliers` is fourteen characters shorter than the
+    longest name in the table and drew a block a row taller than it did; four other
+    dials overflowed alongside them, and the sampling found none of the four. It
+    caught this at all only because the longest name happened to be one of the bad
+    ones, which is a thing to notice rather than to rely on. A worst-case assertion
+    has to go and find the worst case, and with a refusal there is no proxy for
+    reading it: ask all of them.
+
+    A `{...}` and not the string the earlier cut typed, because it is refused by
+    every dial in the table and a string is not: one dial takes any string, and a
+    save it accepts dismisses the modal and ends the sweep on whatever row it
+    reached.
+
+    WHAT IS PINNED IS THE FRAME. The scope on the title line, the refusal itself
+    and the key line are drawn whatever the sentence turns out to be; the fields
+    scroll. A refusal is allowed to push `#f_dial` out of view — somebody reading
+    "must be one of shadow, enforce" is not looking at the name box, and it comes
+    back the moment they reach for it — but it is never allowed to take the line
+    that says which key dismisses it, which is the one thing being asked for at
+    exactly that moment.
+    """
     async def steps(screen, pilot):
-        field(screen, "#f_dial").value = longest
-        field(screen, "#f_value").value = '"not a value"'
+        form = screen.query_one("#form")
         field(screen, "#f_reason").value = "an experiment"
-        await pilot.pause()
-        screen.action_save()
-        await pilot.pause()
-        assert longest in text_of(screen, "#err")
-        for selector in ("#f_dial", "#f_value", "#spec", "#f_reason", "#f_expiry",
-                         "#err", "#hint"):
-            assert visible(screen, selector), selector
+        for name in vocabulary:
+            field(screen, "#f_dial").value = name
+            field(screen, "#f_value").value = '{"not": "a value"}'
+            await pilot.pause()
+            screen.action_save()
+            await pilot.pause()
+            assert screen.query_one("#err").display, name
+            assert name in text_of(screen, "#err")
+            for selector in ("#title", "#err", "#hint"):
+                assert visible(screen, selector), f"{selector} refusing {name}"
+            # And what does not fit is scrolled, never dropped: a field out of view
+            # with no scrollbar beside it is the clip this test is named after.
+            fields = ("#f_dial", "#f_value", "#spec", "#f_reason", "#f_expiry")
+            assert (all(visible(screen, sel) for sel in fields)
+                    or form.show_vertical_scrollbar), f"clipped refusing {name}"
 
     drive(tui, modal(tui, vocabulary), steps)
 

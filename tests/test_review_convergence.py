@@ -1080,3 +1080,444 @@ async def test_an_empty_rules_record_is_not_coverage_for_a_threshold(client):
     assert row["rated_runs"] == 3
     assert row["dial_runs"] == 2, "`{}` is not coverage; `{'dials': {}}` is, and " \
         "that is the upper bound this marker is documented to be"
+
+
+# ---- #782: a cycle that attested to nothing ---------------------------------
+#
+# `converged`'s fifth conjunct, and the reason it is a stored column rather than
+# a sentence in `stop_reason`. "No finding" has two causes — nothing was wrong,
+# and nothing ran — and the dry branch reported the first without being able to
+# tell them apart: a round 1 whose seats produced nothing anywhere stopped, was
+# confident, had no veto and nothing outstanding, and so read as a clean
+# converged finish from a panel that never demonstrated it could see the diff.
+#
+# Bound rather than listed as dropped in `tests/test_payload_key_drift.py`,
+# because this endpoint is what the epic is judged on and without the field the
+# board can say a cycle did not converge and cannot say why.
+
+async def test_attested_survives_the_round_trip_and_is_three_state(client):
+    """Sent, it is stored and published; unsent, it is NULL and not False.
+
+    The NULL half is the load-bearing one, exactly as it is for `converged`: a
+    silence folded into a denial would report every round this board has ever
+    recorded as having attested to nothing, and would then have to strip
+    `converged` off the whole archive to satisfy
+    `ck_review_runs_converged_implies_attested`.
+    """
+    repo = "acme/c782-roundtrip"
+    said = await record(client, repo, 7821, cycle="cyc-1", round=1, to_fix=[],
+                        round_stop={**stop(), "attested": True})
+    silent = await record(client, repo, 7822, cycle="cyc-2", round=1, to_fix=[],
+                          round_stop=stop())
+    detail = (await client.get(f"/review/{said['id']}", headers=AGENT)).json()
+    assert detail["attested"] is True and detail["converged"] is True
+    detail = (await client.get(f"/review/{silent['id']}", headers=AGENT)).json()
+    assert detail["attested"] is None, "silence is not a denial"
+    assert detail["converged"] is True, "a producer too old to send it keeps its finish"
+
+
+async def test_a_clean_finish_that_attested_to_nothing_is_not_believed(client):
+    """The pair the panel cannot emit, coerced rather than 500'd.
+
+    `round_stop` computes `converged` with `attested` ANDed in, so
+    `converged: true, attested: false` was either not produced by the panel or
+    was edited on the way. It is coerced on
+    `test_converged_cannot_outrun_the_stop_it_was_built_from`'s terms — refusing
+    the payload would lose the findings and the scorecards with it — and left to
+    the CHECK it would have been a 500 that lost the same things.
+    """
+    repo = "acme/c782-unattested"
+    r = await client.post(
+        "/review",
+        json=payload(repo, 7823, cycle="cyc-1", round=1, to_fix=[],
+                     round_stop={**stop(), "attested": False}),
+        headers=AGENT,
+    )
+    assert r.status_code == 201, r.text
+    assert "converged_dropped" in r.json()
+    detail = (await client.get(f"/review/{r.json()['id']}", headers=AGENT)).json()
+    assert detail["attested"] is False
+    # False and not NULL: this payload's stopping rule DID answer, in a way its
+    # own evidence refuses.
+    assert detail["converged"] is False
+
+
+async def test_unattested_cycles_are_counted_beside_the_rate_and_not_inside_it(client):
+    """WHY a cycle failed to converge, published without moving the number.
+
+    A cycle that raised nothing anywhere is `unconverged` today because
+    `converged` is false, and whether it belongs in that denominator at all is a
+    real question this change deliberately does not settle: `CYCLE_ENDINGS` is
+    what `_rate` divides, #637's recalibration of `escalate_on.fix_injection` is
+    measured against exactly that number, and moving cycles out of `unconverged`
+    would move a published rate as a side effect of binding a field. So the fact
+    is published and the buckets are left alone.
+
+    Counted over cycles whose terminal round ANSWERED the question. A NULL is
+    every round from before the field existed and is not a denial — counting
+    those would report the whole archive as unattested.
+    """
+    repo = "acme/c782-agg"
+    # One cycle that raised nothing anywhere...
+    await record(client, repo, 7824, cycle="cyc-a", round=1, to_fix=[],
+                 round_stop={**stop(converged=False, reason="unattested"),
+                             "attested": False})
+    # ...one that ended holding a real finding...
+    await record(client, repo, 7825, cycle="cyc-b", round=1,
+                 round_stop={**stop(converged=False, reason="a stop, not convergence"),
+                             "attested": True})
+    # ...and one from a producer too old to say either way.
+    await record(client, repo, 7826, cycle="cyc-c", round=1, to_fix=[],
+                 round_stop=stop())
+
+    agg = await convergence(client, repo)
+    assert agg["unattested_cycles"] == 1
+    # The buckets are untouched: both failures are still `unconverged`, and the
+    # rate is still taken over `converged + unconverged`.
+    assert agg["overall"]["unconverged"] == 2
+    assert agg["overall"]["converged"] == 1
+    assert agg["overall"]["decided"] == 3
+
+
+# ---- #771: a repeat is where a finding landed -------------------------------
+#
+# Cross-round finding identity used to be `finding_key`, a hash of the reviewing
+# model's own WORDING, so the same defect restated in different words on the next
+# round was a new finding: it bought a round it had already bought, it landed in
+# `escalate_on.fix_injection` as fresh damage, and it never aged. #771 matches
+# findings by LOCALITY as well — the line range against the round's diff hunks,
+# within a slack — and the panel passes the UNION of the two matchers on.
+#
+# Which is why these counts exist and why they are stored. Every downstream number
+# is computed off the union, so a matcher that caught nothing and a matcher that
+# caught half this cycle's repeats produce an identical row; `only_locality`
+# summed over a population is the only thing that tells them apart, and the
+# payload it is computed in lives in a temp directory on whichever host ran the
+# panel. `keys` and `why` ride the same block and are deliberately dropped —
+# `tests/test_payload_key_drift.py` holds that decision in writing.
+
+
+def repeats(only_locality=3, by_key=9) -> dict:
+    """The block as the panel sends it, working included."""
+    return {"only_locality": only_locality, "by_key": by_key,
+            "keys": ["acme:x.py:1", "acme:x.py:2", "acme:y.py:9"][:only_locality],
+            "why": None}
+
+
+async def test_the_locality_counts_survive_the_round_trip_and_are_three_state(client):
+    """Sent, both reach every read path; unsent, both are NULL and neither is 0.
+
+    The NULL half is the load-bearing one and the direction is the opposite of
+    `attested`'s. "The locality matcher caught nothing extra" is the FINDING this
+    measurement exists to report, so a silence folded into a zero would fill the
+    population with rounds that never ran the matcher and build the case for
+    deleting it out of them.
+
+    Every view, because the reader is a query over a population rather than a
+    person opening one round: a field that rode `GET /review/{id}` alone could not
+    answer the question the columns were added for.
+    """
+    repo = "acme/c771-roundtrip"
+    said = await record(client, repo, 7711, cycle="cyc-1", round=2,
+                        round_stop=stop(), locality_repeats=repeats())
+    silent = await record(client, repo, 7712, cycle="cyc-2", round=2,
+                          round_stop=stop())
+
+    detail = (await client.get(f"/review/{said['id']}", headers=AGENT)).json()
+    assert detail["repeats_only_locality"] == 3
+    assert detail["repeats_by_key"] == 9
+
+    listed = (await client.get(f"/reviews?repo={repo}&pr=7711", headers=AGENT)).json()
+    assert listed[0]["repeats_only_locality"] == 3
+    assert listed[0]["repeats_by_key"] == 9
+
+    hist = (await client.get(f"/review/findings?repo={repo}&pr=7711",
+                             headers=AGENT)).json()
+    assert hist["runs"][0]["repeats_only_locality"] == 3
+    assert hist["runs"][0]["repeats_by_key"] == 9
+
+    quiet = (await client.get(f"/review/{silent['id']}", headers=AGENT)).json()
+    assert quiet["repeats_only_locality"] is None, "silence is not a measurement"
+    assert quiet["repeats_by_key"] is None
+
+
+async def test_the_working_beside_the_counts_is_dropped_and_stores_nothing(client):
+    """`keys` and `why` are accepted and go nowhere, by design.
+
+    A round's repeat KEYS are per-round detail already in the payload and on the
+    round's own findings, and `len(keys) == only_locality` by construction — a
+    column would be one number in two places with two chances to drift. The point
+    of asserting it here rather than leaving it to the drift check is that a later
+    pass binding them would make this test say so.
+    """
+    repo = "acme/c771-working"
+    run = await record(client, repo, 7713, cycle="cyc-1", round=2,
+                       round_stop=stop(),
+                       locality_repeats={**repeats(), "why": "no diff hunks"})
+    detail = (await client.get(f"/review/{run['id']}", headers=AGENT)).json()
+    assert detail["repeats_only_locality"] == 3
+    assert "keys" not in detail and "why" not in detail
+    assert "locality_repeats" not in detail
+
+
+async def test_a_repeat_count_that_cannot_be_believed_becomes_no_count(client):
+    """Coerced, not rejected — this module's standing rule.
+
+    A negative count is not a smaller measurement: it would net against a real one
+    and make the fleet-wide share read LOW, which is the direction that gets the
+    locality matcher deleted. It becomes "the producer did not say", which is a
+    state the column already has, rather than a 422 that would take the round's
+    findings, scorecards and accounts down with it.
+    """
+    repo = "acme/c771-unbelievable"
+    r = await client.post(
+        "/review",
+        json=payload(repo, 7714, cycle="cyc-1", round=2, round_stop=stop(),
+                     locality_repeats={"only_locality": -1, "by_key": "9"}),
+        headers=AGENT,
+    )
+    assert r.status_code == 201, r.text
+    detail = (await client.get(f"/review/{r.json()['id']}", headers=AGENT)).json()
+    assert detail["repeats_only_locality"] is None
+    # ...and a count spelled as a string is still a count, so one bad field does
+    # not cost the other one.
+    assert detail["repeats_by_key"] == 9
+
+
+async def test_the_fleet_wide_share_is_summed_over_rounds_and_moves_no_bucket(client):
+    """#771's verdict, published beside the rate and touching none of it.
+
+    Summed over RUNS and not over cycles, which is the one place this endpoint's
+    cycle grain would be the wrong answer: a repeat is round N against round N-1,
+    so a cycle's terminal round holds one round's worth of the evidence and the
+    rounds before it hold the rest. Reading the terminal round alone would report
+    a fraction of the measurement as the whole of it.
+
+    And the buckets are left exactly as they were, on `unattested_cycles`' promise:
+    `CYCLE_ENDINGS` is what `_rate` divides and #637's recalibration is measured
+    against that number, so nothing here may move it as a side effect of storing a
+    field.
+    """
+    repo = "acme/c771-agg"
+    # Two rounds of one cycle, both measured...
+    await record(client, repo, 7715, cycle="cyc-a", round=1,
+                 round_stop=stop(converged=False, reason="going again"),
+                 locality_repeats=repeats(only_locality=3, by_key=9))
+    await record(client, repo, 7715, cycle="cyc-a", round=2, to_fix=[],
+                 round_stop=stop(), locality_repeats=repeats(only_locality=2, by_key=6))
+    # ...and one round from a producer too old to send the block at all.
+    await record(client, repo, 7716, cycle="cyc-b", round=1, to_fix=[],
+                 round_stop=stop())
+
+    agg = await convergence(client, repo)
+    lr = agg["locality_repeats"]
+    assert lr["runs"] == 2, "the unmeasured round is not in the denominator"
+    assert lr["only_locality"] == 5, "both rounds of the cycle, not just the last"
+    assert lr["by_key"] == 15
+    assert lr["share"] == 0.25
+
+    # The buckets, untouched: one cycle converged, one converged, and the
+    # mid-cycle round is not an ending.
+    assert agg["overall"]["converged"] == 2
+    assert agg["overall"]["unconverged"] == 0
+    assert agg["overall"]["decided"] == 2
+
+
+async def test_a_window_that_measured_and_found_nothing_says_so(client):
+    """Zero repeats is `share: null`, and it is a different answer from `runs: 0`.
+
+    `share` is null and not 0.0 where nothing repeated at all, on `rate`'s rule:
+    no repeats is not a matcher that recognised none of them. `runs` is what
+    separates "measured, and there was nothing to catch" from "nobody measured" —
+    without it a window of rounds too old to send the block would look like a
+    matcher that had earned nothing.
+    """
+    repo = "acme/c771-quiet"
+    await record(client, repo, 7717, cycle="cyc-a", round=1, to_fix=[],
+                 round_stop=stop(), locality_repeats=repeats(only_locality=0, by_key=0))
+    agg = await convergence(client, repo)
+    assert agg["locality_repeats"] == {"runs": 1, "only_locality": 0, "by_key": 0,
+                                       "share": None}
+
+    unmeasured = "acme/c771-silent"
+    await record(client, unmeasured, 7718, cycle="cyc-a", round=1, to_fix=[],
+                 round_stop=stop())
+    agg = await convergence(client, unmeasured)
+    assert agg["locality_repeats"] == {"runs": 0, "only_locality": 0, "by_key": 0,
+                                       "share": None}
+
+
+# ---- #770: how dangerous the repair was -------------------------------------
+#
+# A finding is graded on severity and nothing else, so a fixer is told how bad the
+# DEFECT is and never how far the REPAIR reaches. `panel_blast` classifies the fix
+# pass's own changed paths — migrations, auth, secrets, irreversible
+# infrastructure, dependencies, public API surface, source with no test beside it —
+# and `round_stop` nests the worst lane that fired.
+#
+# The lane is stored because the question it exists for is a correlation over a
+# population: across hundreds of rounds, do fix passes that land in dangerous code
+# write more of the NEXT round's findings than ones that touch a docstring. That is
+# what #770's `fix_risk` axis gets calibrated against, and the payload the lane is
+# computed in lives in a temp directory on whichever host ran the panel.
+# `categories`, `evidence` and `reason` ride the same block and are deliberately
+# dropped — `tests/test_payload_key_drift.py` holds that decision in writing.
+
+
+def blast(lane="high") -> dict:
+    """The block as the panel sends it, working included."""
+    return {"lane": lane,
+            "categories": ["migrations", "auth_security_payment"],
+            "evidence": {"migrations": ["migrations/versions/m0fc6fd4c_x.py"],
+                         "auth_security_payment": ["app/api/auth.py"]},
+            "reason": "Fixing here is HIGH risk: a schema migration (…)."}
+
+
+async def test_the_blast_lane_survives_the_round_trip_and_is_three_state(client):
+    """Sent, the lane reaches every read path; unsent, it is NULL and not `low`.
+
+    The NULL half is the load-bearing one and it is `repeats_only_locality`'s
+    direction rather than `attested`'s: the producer nulls the whole block where it
+    could not measure the fix surface, and "the pass opened no dangerous file" and
+    "nobody measured" are different claims. Folded together, the axis this column
+    feeds would be calibrated with unmeasured rounds sitting in its safe half.
+
+    Every view, because the reader is a correlation over a population and not a
+    person opening one round — a field that rode `GET /review/{id}` alone could not
+    answer the question the column was added for.
+    """
+    repo = "acme/c770-roundtrip"
+    said = await record(client, repo, 7701, cycle="cyc-1", round=2,
+                        round_stop={**stop(), "fix_blast": blast()})
+    silent = await record(client, repo, 7702, cycle="cyc-2", round=2,
+                          round_stop=stop())
+    # ...and a round that ran a fix pass which opened nothing dangerous, which is
+    # the answer the silence above must never be confused with.
+    safe = await record(client, repo, 7703, cycle="cyc-3", round=2,
+                        round_stop={**stop(), "fix_blast": blast(lane="low")})
+
+    detail = (await client.get(f"/review/{said['id']}", headers=AGENT)).json()
+    assert detail["fix_blast_lane"] == "high"
+
+    listed = (await client.get(f"/reviews?repo={repo}&pr=7701", headers=AGENT)).json()
+    assert listed[0]["fix_blast_lane"] == "high"
+
+    hist = (await client.get(f"/review/findings?repo={repo}&pr=7701",
+                             headers=AGENT)).json()
+    assert hist["runs"][0]["fix_blast_lane"] == "high"
+
+    quiet = (await client.get(f"/review/{silent['id']}", headers=AGENT)).json()
+    assert quiet["fix_blast_lane"] is None, "an unmeasured surface is not `low`"
+    low = (await client.get(f"/review/{safe['id']}", headers=AGENT)).json()
+    assert low["fix_blast_lane"] == "low"
+
+
+async def test_the_working_beside_the_lane_is_dropped_and_stores_nothing(client):
+    """`categories`, `evidence` and `reason` are accepted and go nowhere.
+
+    They are one round's working: the categories are the lane's own derivation (the
+    lane IS the worst of them, so a column would be one value in two places), the
+    evidence is an unbounded list of paths per run, and the reason is those two
+    rendered into a sentence. A reader with a question about one round has the
+    round's own published payload. Asserted here rather than left to the drift
+    check so that a later pass binding them makes this test say so.
+    """
+    repo = "acme/c770-working"
+    run = await record(client, repo, 7704, cycle="cyc-1", round=2,
+                       round_stop={**stop(), "fix_blast": blast()})
+    detail = (await client.get(f"/review/{run['id']}", headers=AGENT)).json()
+    assert detail["fix_blast_lane"] == "high"
+    assert "categories" not in detail and "evidence" not in detail
+    assert "fix_blast" not in detail
+
+
+async def test_a_lane_this_board_does_not_know_becomes_no_lane(client):
+    """Coerced, not rejected, and not stored verbatim either.
+
+    Two rules meet here. A payload is never refused over one field — a 422 would
+    take the round's findings, scorecards and accounts with it — and the lane is a
+    CLOSED vocabulary its consumers branch on, unlike `cleared_floor` beside it: a
+    fourth word would not show up as a fourth group, it would fall through every
+    branch and be read as whichever the `else` is. So an unrecognised lane becomes
+    "the panel did not say", a state the column already has.
+
+    A block that is not an object at all takes the same route rather than 422ing,
+    which is the one way a nested model could have broken `StopIn`'s standing rule.
+    """
+    repo = "acme/c770-unbelievable"
+    r = await client.post(
+        "/review",
+        json=payload(repo, 7705, cycle="cyc-1", round=2,
+                     round_stop={**stop(), "fix_blast": {**blast(), "lane": "SEVERE"}}),
+        headers=AGENT,
+    )
+    assert r.status_code == 201, r.text
+    detail = (await client.get(f"/review/{r.json()['id']}", headers=AGENT)).json()
+    assert detail["fix_blast_lane"] is None
+
+    r = await client.post(
+        "/review",
+        json=payload(repo, 7706, cycle="cyc-2", round=2,
+                     round_stop={**stop(), "fix_blast": "high"}),
+        headers=AGENT,
+    )
+    assert r.status_code == 201, r.text
+    detail = (await client.get(f"/review/{r.json()['id']}", headers=AGENT)).json()
+    assert detail["fix_blast_lane"] is None
+    # ...and the verdict beside it is untouched: one unreadable block costs the
+    # round nothing else.
+    assert detail["converged"] is True
+
+
+async def test_the_lane_distribution_is_counted_over_rounds_and_moves_no_bucket(client):
+    """#770's population, published beside the rate and touching none of it.
+
+    Counted over RUNS and not over cycles, on `locality_repeats`' departure from
+    this endpoint's grain and for a sharper reason: a converged cycle's terminal
+    round usually ran no fix pass at all, so cycle grain would sample the safest
+    rounds and report them as the whole distribution.
+
+    And the buckets are left exactly as they were, on `unattested_cycles`' promise:
+    `CYCLE_ENDINGS` is what `_rate` divides and #637's recalibration is measured
+    against that number, so nothing here may move it as a side effect of storing a
+    field.
+    """
+    repo = "acme/c770-agg"
+    # Two rounds of one cycle, both measured...
+    await record(client, repo, 7707, cycle="cyc-a", round=1,
+                 round_stop={**stop(converged=False, reason="going again"),
+                             "fix_blast": blast(lane="high")})
+    await record(client, repo, 7707, cycle="cyc-a", round=2, to_fix=[],
+                 round_stop={**stop(), "fix_blast": blast(lane="medium")})
+    # ...one that measured and found nothing dangerous...
+    await record(client, repo, 7708, cycle="cyc-b", round=1, to_fix=[],
+                 round_stop={**stop(), "fix_blast": blast(lane="low")})
+    # ...and one from a producer too old to nest the block at all.
+    await record(client, repo, 7709, cycle="cyc-c", round=1, to_fix=[],
+                 round_stop=stop())
+
+    agg = await convergence(client, repo)
+    assert agg["fix_blast"] == {"runs": 3, "low": 1, "medium": 1, "high": 1,
+                                "elevated_share": 0.6667}
+
+    # The buckets, untouched: three cycles, each ending converged, and the
+    # mid-cycle round that carried the `high` lane is not an ending.
+    assert agg["overall"]["converged"] == 3
+    assert agg["overall"]["unconverged"] == 0
+    assert agg["overall"]["decided"] == 3
+
+
+async def test_a_window_where_nothing_measured_its_surface_says_so(client):
+    """`runs: 0` and `elevated_share: null`, never a fleet of safe repairs.
+
+    `share` is null and not 0.0 where nothing measured, on `rate`'s rule: no
+    measured repair is not a fleet whose repairs were all low-risk. Without the
+    population marker a window of rounds too old to nest the block would read as
+    exactly that, which is the flattering direction on the axis this column feeds.
+    """
+    repo = "acme/c770-silent"
+    await record(client, repo, 7710, cycle="cyc-a", round=1, to_fix=[],
+                 round_stop=stop())
+    agg = await convergence(client, repo)
+    assert agg["fix_blast"] == {"runs": 0, "low": 0, "medium": 0, "high": 0,
+                                "elevated_share": None}

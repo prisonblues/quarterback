@@ -1,0 +1,14 @@
+# The same pressure as slop/swallowed-error one step further along: the handler
+# returns a falsy value, so every caller reads "nothing found" where the truth
+# was "the lookup blew up". Worse than a bare `pass` for a review loop, because
+# the sentinel hands the fixer a story — "it degrades gracefully" — and a later
+# round has to reconstruct that the degradation was never designed. A separate
+# rule rather than a second matcher on swallowed-error because the remediation
+# is different: this one has a return type to widen, not a handler to fill in.
+id: slop/sentinel-catch
+severity: P2
+languages: [python]
+message: Broad except handler returns a falsy sentinel, so callers cannot tell a failure from an empty result
+remediation: Return a value that distinguishes the failure from an empty result, or let the exception reach a caller that can act on it.
+match:
+  kind: python_sentinel_catch

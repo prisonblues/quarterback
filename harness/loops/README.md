@@ -536,6 +536,19 @@ python3 appetite.py file --title "..." --run $SESSION --record   # I did
   apply to it.
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
+- `slop` — the deterministic seat (#780), and the only member with no brain, no
+  CLI and no cost. It carries `enabled` and nothing else: there is no model to
+  pin, no effort to set and no diff budget to spend. It reads the **fix pass's**
+  diff rather than the PR's — the same range provenance and the surface
+  measurement read — and applies the rules in `slop_rules/`, which are
+  checked-in files reviewed as code rather than dials. Off in `DEFAULTS` and
+  **on in this repo**, where the rules were calibrated; `.harness-rules.sample`
+  carries that argument. On a round with no readable fix range (round 1, a
+  rewritten branch, an API refusal) it does not run and the report says why —
+  falling back to the PR's diff would report the change under review as the
+  fixer's slop. It cannot be asked a question (`--ask`) and is not asked to
+  propose: it has no prose channel in either direction, which is the property
+  that makes it worth having.
 
 `review_panel.judge_model` (default: **`sonnet`**) — the model that adjudicates what
 the seats found. It is deliberately not `opus`, which is `reviewers.claude.model`: the

@@ -486,22 +486,44 @@ def test_there_is_no_FLAG_to_arm_one_either():
     # Every dial whose name mentions a budget, so a key added for this would show up
     # here rather than in whatever this list happens to contain. The `budget.*` block
     # is #191's spend ceiling and `budget_window_hours` is its window — neither is
-    # `low_severity_fix_lines`, and the one addition since is `tokens_per_round`
-    # (#483), which is that same spend ceiling denominated in the unit its work is
-    # dispatched in. This list is a canary and not a ledger: a member added here has
-    # to be a TOKEN-and-RUN ceiling measured against `GET /review/spend`, which is
-    # what makes it not a dial for the churned-line budget above.
+    # `low_severity_fix_lines` — and `tokens_per_round` (#483) is that same spend
+    # ceiling denominated in the unit its work is dispatched in.
+    #
+    # `round_budgets.multipliers` (#776) is the one member that is NOT a ceiling, and
+    # it is admitted here on a stated ground rather than because the set had to be
+    # made to match: it is a TAPER over what a round may spend, one multiplier per
+    # round, and it scales `low_severity_fix_lines` among the four things it is
+    # allowed to touch. That makes it a dial the fix budget's NUMBER passes through
+    # and still not the thing this test is about — it cannot arm anything, because
+    # the budget needs no arming: the strict half fires on a proved breach with no
+    # flag in front of it (see the test below) and the loose half gates nothing in
+    # either direction (the test above). What it does leave open is a separate
+    # question for #776 and not for this test: a multiplier over a limit a round can
+    # be STOPPED on makes that stop a function of the round number, and today the
+    # curve is declared in `harness_rules` and read by nothing in `panel*`.
+    #
+    # This list is a canary and not a ledger: a member added here is either a
+    # TOKEN-and-RUN ceiling measured against `GET /review/spend`, or it says here why
+    # it is not one — and neither kind may be a switch over the churned-line budget.
     assert {k for k in harness_rules.BOARD_DIALS if "budget" in k} == {
         "review_panel.budget.tokens_per_day", "review_panel.budget.runs_per_day",
         "review_panel.budget.tokens_per_round",
         "review_panel.budget.tokens_per_pr", "review_panel.budget.runs_per_pr",
         "review_panel.budget.fleet_tokens_per_day",
-        "review_panel.budget_window_hours"}
-    # And the canary's real claim, stated so it cannot be satisfied by editing a
-    # literal: every one of them is a ceiling `panel_caps` measures, so none of them
-    # is a dial for the fix budget whatever it is called.
+        "review_panel.budget_window_hours",
+        "review_panel.round_budgets.multipliers"}
+    # And the canary's real claim, stated twice so that neither half can be satisfied
+    # by editing a literal. First: every dial under `review_panel.budget.` is a
+    # ceiling `panel_caps` measures, so none of THOSE is a dial for the fix budget
+    # whatever it is called.
     assert {k.rsplit(".", 1)[-1] for k in harness_rules.BOARD_DIALS
             if k.startswith("review_panel.budget.")} == set(panel_caps.CEILINGS)
+    # Second, and this is the assertion the test's own name makes: none of them is a
+    # FLAG. `guard_churn`'s `escalate_on.guard_lines` is a switch one setting away
+    # from ending a cycle; nothing whose name mentions a budget may be that, whether
+    # it is a ceiling, a window or a curve.
+    assert not [k for k, dial in harness_rules.BOARD_DIALS.items()
+                if "budget" in k and dial.kind == "flag"]
 
 
 def test_a_PROVEN_breach_ends_the_round_and_names_the_premise():

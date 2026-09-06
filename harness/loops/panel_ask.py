@@ -634,15 +634,26 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     selected, override_note = select_reviewers(rev, reviewers)
 
     notes: list[str] = []
-    if "sonarqube" in selected and reviewers:
-        # Selectable for a review, and meaningless here: it is a scanner with a
-        # rule set, not a correspondent. Said rather than silently dropped —
-        # `--reviewers claude,sonarqube` otherwise looks like a two-seat ask.
-        # Only when it was ASKED for, though: firing on the resolved set put a
-        # permanent warning about a seat nobody tried to ask on every ask in
-        # every repo that merely enables sonarqube for its reviews.
-        notes.append("sonarqube cannot be asked a question — it scans code against a "
-                     "rule set and has no reply to give. Not a seat on this ask.")
+    # Selectable for a review, and meaningless here: both are rule sets, not
+    # correspondents. Said rather than silently dropped — `--reviewers claude,slop`
+    # otherwise looks like a two-seat ask. Only when they were ASKED for, though:
+    # firing on the resolved set put a permanent warning about a seat nobody tried to
+    # ask on every ask in every repo that merely enables one of them for its reviews.
+    #
+    # Driven off ALL_REVIEWERS minus LLM_REVIEWERS rather than off the two names, so
+    # the next seat with no brain is unaskable the day it is registered rather than
+    # the day somebody notices. That is the same rule `panel_propose.seat_findings`
+    # already keeps by filtering on `LLM_REVIEWERS`: membership of that tuple IS
+    # "has something to say", and a second list of which seats can be spoken to is a
+    # policy with two answers.
+    unaskable = sorted(n for n in selected
+                       if n in ALL_REVIEWERS and n not in LLM_REVIEWERS)
+    if unaskable and reviewers:
+        notes.append(f"{', '.join(unaskable)} cannot be asked a question — "
+                     f"{'they scan' if len(unaskable) > 1 else 'it scans'} code "
+                     f"against a rule set and "
+                     f"{'have' if len(unaskable) > 1 else 'has'} no reply to give. "
+                     f"Not {'seats' if len(unaskable) > 1 else 'a seat'} on this ask.")
     seats = [n for n in LLM_REVIEWERS if n in selected]
     quorum = _ask_rule(panel, "ask_quorum", notes)
     threshold = _ask_rule(panel, "ask_threshold", notes)

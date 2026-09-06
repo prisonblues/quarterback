@@ -1,0 +1,16 @@
+# What "add a comment explaining this" produces when the fixer has nothing to
+# explain: a restatement of the line below it. It costs a review round, it is
+# the first thing to go stale, and it actively displaces the comment that was
+# wanted. This repo's own convention is the opposite — comments carry the
+# argument and the failure prevented, never the code — so a narrator comment is
+# a defect against a written house rule and not a matter of taste. Matched only
+# on the openers that cannot be anything else; a comment beginning "This is not
+# value-weighting" is an argument and does not fire.
+id: slop/narrator-comment
+severity: P3
+languages: [python]
+message: Comment restates the code below it instead of carrying the argument for it
+remediation: Delete it, or replace it with the reason the code is this way and the failure that shape prevents.
+match:
+  kind: comment_regex
+  pattern: '^#+\s*(?:This (?:function|method|class|code|block|variable|loop|line|test)\b|(?:Now|Then|Next|First|Finally),?\s+we\b|(?:Loop|Iterate) (?:through|over)\b|Create (?:a|an|the)\b|Return the\b)'

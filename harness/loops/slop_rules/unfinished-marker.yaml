@@ -1,0 +1,14 @@
+# The fix pass recording the work instead of doing it. Every one of these is a
+# finding the next round will raise, already written down in the diff, and the
+# round that reads it has to spend a seat and a judge ruling to rediscover what
+# the fixer already knew. Narrowed to the unfinished-work verbs on purpose: a
+# `# TODO(#697): drop this once the ratchet reaches zero` is tracked work with a
+# home and is not this defect.
+id: slop/unfinished-marker
+severity: P3
+languages: [python]
+message: Comment records unfinished work in the same pass that was meant to finish it
+remediation: Do the work, or move it to an issue and reference that issue instead of leaving the marker in the source.
+match:
+  kind: comment_regex
+  pattern: '(?i)\b(?:todo|fixme|xxx|hack)\b\s*[:( -]*\s*(?:implement|add\b|finish|complete|later|fill in|wire up|properly)'
