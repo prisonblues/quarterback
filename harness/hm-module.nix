@@ -223,9 +223,9 @@ in
       default = true;
       description = ''
         Put create-worktree / remove-worktree / prune-worktrees / worktree-holder
-        on PATH by adding the package to home.packages. Turn this off to take the
-        loops and commands without the worktree tooling — the two halves are
-        independent.
+        / worktree-lock on PATH by adding the package to home.packages. Turn this
+        off to take the loops and commands without the worktree tooling — the two
+        halves are independent.
 
         The board wiring below does NOT depend on this: it invokes qb-claude-setup
         by store path and wires qb-hook by store path, so a host can have a working

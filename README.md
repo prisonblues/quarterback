@@ -2624,9 +2624,11 @@ harness/      step 2 of the install — the workflow the board coordinates
   commands/        Claude Code slash commands (/panel, /fix-issue, /wt, …)
   bin/             create-worktree, remove-worktree, prune-worktrees,
                    worktree-holder (who is live in a worktree — asked before
-                   anything destroys one), qb-stage, qb-seats (a screen of
-                   agent panes in a multiplexer, plus the board),
-                   qb-board (launcher for the terminal client in mcp/mcp_server/board/)
+                   anything destroys one), worktree-lock (the flock that keeps
+                   that answer true until the caller acts on it), qb-stage,
+                   qb-seats (a screen of agent panes in a multiplexer, plus
+                   the board), qb-board (launcher for the terminal client in
+                   mcp/mcp_server/board/)
   tests/           the worktree-tooling suite (pytest driving the bash)
   templates/       copyable .worktree.json starting points, dbtarget.py (the DB
                    guard) and test_migrations_self_contained.py (the migration

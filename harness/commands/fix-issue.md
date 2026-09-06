@@ -94,10 +94,10 @@ docs. The branch is `{prefix}issue-$ISSUE_NUMBER`.
   place — **keep it, do not run `create-worktree`** (that would nest a worktree
   and throw away the correct fork point). Set `WT_DIR` to the current worktree
   (`WT_DIR=$(git rev-parse --show-toplevel)`), write the session marker for it
-  (same `printf … | tee "$HOME/.cache/claude-code/session-cwd/$CLAUDE_CODE_SESSION_ID"`
-  as below), then go to **Isolation check** at the end of this step. Don't
-  provision a database — the epic setup did that — but do check it: "it was
-  provisioned" is the assumption the check exists to test, not a reason to skip.
+  (same `worktree-lock --enter "$WT_DIR"` as below), then go to **Isolation
+  check** at the end of this step. Don't provision a database — the epic setup
+  did that — but do check it: "it was provisioned" is the assumption the check
+  exists to test, not a reason to skip.
 
 - **Does the worktree already exist? Reuse is allowed; re-verifying is not
   optional.** `create-worktree` **refuses** an existing directory
@@ -148,13 +148,32 @@ the statusline can't otherwise tell it's in the worktree. Write a per-session
 marker so the statusline shows the worktree's branch + port, and `/drop-worktree`
 knows which worktree this session owns:
 ```bash
-mkdir -p "$HOME/.cache/claude-code/session-cwd"
-printf '%s' "$WT_DIR" | tee "$HOME/.cache/claude-code/session-cwd/$CLAUDE_CODE_SESSION_ID" >/dev/null
+worktree-lock --enter "$WT_DIR"
 ```
-**Write it with `tee`, not `>`.** A `>` redirect anywhere under `$HOME` is
-refused by the `dcg` pre-tool guard (`core.filesystem:redirect-truncate-root-home`),
-so the obvious `printf … > "$marker"` never runs and the bar spends the whole
-session showing the main checkout. `tee` is not a redirect and is allowed.
+**That is one command because it is one indivisible act (#743).** The marker is
+what makes this session visible to `worktree-holder`, and `worktree-holder` is
+what `remove-worktree` asks before it deletes a worktree, its docker stack, its
+database and its local branch. Until the marker exists, a teardown running on
+this box sees an empty tree and is right to. `worktree-lock` takes the worktree's
+lock, re-checks that the tree is still there, and writes the marker under it — so
+either this lands first and the teardown then sees a holder and refuses, or the
+teardown holds the lock and this waits and then tells you the tree is gone. There
+is no ordering in which you are left working in a directory being deleted.
+
+- **Exit 5** — something else is creating or tearing down that tree right now.
+  Do not force it: wait, then look again.
+- **Exit 2** — the tree is not there any more (or is not a worktree). Go back and
+  resolve `WT_DIR` again; do not carry on in a directory that has gone.
+- **`worktree-lock` not installed** (an older harness) — fall back to writing the
+  marker directly, and know that you have the race back:
+  ```bash
+  mkdir -p "$HOME/.cache/claude-code/session-cwd"
+  printf '%s' "$WT_DIR" | tee "$HOME/.cache/claude-code/session-cwd/$CLAUDE_CODE_SESSION_ID" >/dev/null
+  ```
+  **Write it with `tee`, not `>`.** A `>` redirect anywhere under `$HOME` is
+  refused by the `dcg` pre-tool guard (`core.filesystem:redirect-truncate-root-home`),
+  so the obvious `printf … > "$marker"` never runs and the bar spends the whole
+  session showing the main checkout. `tee` is not a redirect and is allowed.
 
 **Adopt the checkout's claim onto this session — one command, and it is not
 bookkeeping.** `create-worktree` claimed `$ISSUE_NUMBER` for the tree, held by the
