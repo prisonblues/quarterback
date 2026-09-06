@@ -527,6 +527,28 @@ def _no_next_door_fetch(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_refutation_fetch(monkeypatch):
+    """No test asks a real board what this PR has already refuted (#773).
+
+    Autouse and unconditional, on `_no_next_door_fetch`'s rule directly above and
+    for its exact failure mode: `board_refutations` runs on EVERY round, resolves
+    the board out of THIS host's site config, and on an enrolled machine would
+    therefore make a live HTTP call per round — while the header of this file says
+    in capitals that the suite does not talk to a board. In the nix sandbox there
+    is no board and nothing happens, which is why CI would never find it.
+
+    Stubbed at `board_refutations` rather than at `board_request` so that the
+    reason a round has no refutation memory is "nothing was asked", not "the board
+    said no" — the second puts a note in every report and changes what the e2e
+    tests assert about `config_notes`.
+
+    `test_panel_refuted.py` is the file this would blind, and it restores the real
+    function explicitly rather than opting out, for the reason given there.
+    """
+    monkeypatch.setattr(panel, "board_refutations", lambda *a, **k: ([], ""))
+
+
+@pytest.fixture(autouse=True)
 def recorded_runs(monkeypatch):
     """No test records a real run on a real board (#94), and here is the list of
     what it would have recorded.

@@ -564,6 +564,203 @@ def board_next_door(gh_repo: str, pr_number: int, days: int) -> tuple[list[dict]
     return [h for h in hints if isinstance(h, dict)], ""
 
 
+#: What `GET /review/refutations` calls the list (#773). Named for the reason
+#: :data:`NEXT_DOOR_KEY` is: two things read it, the fetch below and the note it
+#: writes when a board is too old to publish it.
+REFUTED_KEY = "refutations"
+
+#: What a board that does not serve #773 answers — **422, and NOT 404**, on
+#: :data:`NEXT_DOOR_ABSENT`'s reasoning exactly. `GET /review/{run_id}` is declared
+#: on the same prefix with an `int` path parameter, so on an older board the path
+#: falls through to it, `refutations` fails that validation, and FastAPI answers
+#: 422. It reads like "your request was malformed" and means "this board is older
+#: than the feature", and it is therefore silent: a round that cannot fetch the set
+#: reviews the way every round before #773 did, and a note on every round of every
+#: PR is a note that gets trained away.
+#:
+#: This endpoint raises no 404 of its own — a PR with nothing refuted is `200` with
+#: an empty list, which is a real answer rather than an absence — so unlike #508's
+#: fetch there is no second code to keep out of this tuple. The one parameter that
+#: could earn a genuine 422 is `limit`, and this file never sends one.
+REFUTED_ABSENT = (422,)
+
+
+def board_refutations(gh_repo: str, pr_number: int) -> tuple[list[dict], str]:
+    """`(what this PR has already disproved, why we could not find out)` (#773).
+
+    The read half of #773, and the whole of what makes a refutation binding. We
+    have recorded a `refuted` outcome since v2.37 and never once read it back, so a
+    seat that raised a false positive raised it again next round, the judge ruled on
+    it again, and the fixer either re-refuted it — which #616 measured as costing
+    MORE than complying — or complied with something that was wrong.
+
+    **Fetched ONCE and consulted TWICE**, which is why this returns the set rather
+    than an answer. `run()` renders it into the reviewer prompt before the seats
+    dispatch, and hands the same rows to :func:`suppress_refuted` before the judge
+    is called. A second fetch would be a second answer: the two reads are twenty
+    minutes apart, a peer can record an outcome in between, and a round that briefed
+    its seats against one set and filtered against another would be unexplainable
+    from its own payload.
+
+    **Fails OPEN, and says so.** An unreachable board leaves the round exactly as
+    correct as every round before this existed — nothing downstream is less right
+    for having no refutation memory, it is merely more expensive. So the failure is
+    reported and never gated on, on :func:`board_next_door`'s rule and for the same
+    reason: the operator who switched a board on and sees no suppression is owed the
+    sentence, and a memory that cannot be fetched must never cost a round.
+
+    A host on NO board is silent, and only that one — `board_request` reports an
+    unresolvable config as an ordinary error with no HTTP status, so without this
+    check a box that never had `QUARTERBACK_BASE_URL` set would get a `config_notes`
+    line on every round of every PR, published as a public comment under `--post`.
+    The same line `board_next_door` draws, on the same evidence.
+    """
+    if not board_config()[0]:
+        return [], ""
+    body, err, code = board_request("review/refutations",
+                                    {"repo": gh_repo, "pr": pr_number})
+    if code in REFUTED_ABSENT:
+        # Silent: a board older than the feature, which is the ordinary state of a
+        # fleet mid-rollout and not a fault anybody can act on.
+        return [], ""
+    if err:
+        return [], (f"refutation memory: {err} — this round's reviewers were not "
+                    "told what this PR has already disproved, and a finding "
+                    "somebody refuted can be raised again and cost a ruling")
+    if not isinstance(body, dict):
+        return [], ("refutation memory: the board answered /review/refutations "
+                    f"with a {type(body).__name__}, not an object")
+    rows = body.get(REFUTED_KEY)
+    if rows is None:
+        # NOT the capability case — that is the 422 above, already swallowed in
+        # silence. Reaching here means the endpoint answered and then omitted the
+        # field, which no shipped version does. Reported plainly rather than
+        # guessed at, exactly as `board_next_door` reports the same shape.
+        return [], ("refutation memory: the board answered /review/refutations "
+                    f"with no `{REFUTED_KEY}`")
+    if not isinstance(rows, list):
+        return [], (f"refutation memory: `{REFUTED_KEY}` came back as a "
+                    f"{type(rows).__name__}, not a list")
+    return [r for r in rows if isinstance(r, dict)], ""
+
+
+def suppress_refuted(clusters: list, rows: list[dict]
+                     ) -> tuple[list, list[dict], str]:
+    """`(the clusters the judge should rule on, what was dropped, why nothing was
+    compared)` — #773's second read, spent before a ruling is.
+
+    mergeCraft's verifier does this in the same place and states the ordering as
+    the point: severity, then the withdrawn memory, then the budget, *"so the cap
+    is spent on the worst findings that are still live rather than on ones already
+    known to be dead"*. Ours runs between the clustering and `adjudicate`, which is
+    the last moment before the round's most expensive seat is dispatched and the
+    listing budget is divided. A finding dropped here costs no ruling, no fix-pass
+    line, no payload row and no place in the next round's baseline.
+
+    **Keyed by LOCALITY, never by wording** (#771). A refutation stored against a
+    seat's phrasing misses the reworded restatement, which is the whole failure that
+    issue fixed — so the comparison is `panel_locality.same_finding`, the file plus
+    the line span within `DEFAULT_LINE_SLACK`, and nothing either party WROTE is
+    read. That also makes the memory survive the fixer: a refuted defect whose lines
+    moved two when the pass above it landed is still the same defect.
+
+    **A refutation that names no line binds nothing, and that is the honest
+    answer.** `same_finding` refuses an unlocated finding against everything,
+    including another unlocated one, because path equality on a 9,000-line file
+    would declare every unplaced finding in it to be every other one. So such a
+    refutation reaches the seats as prose (`panel_core.refuted_brief` renders it)
+    and can never suppress. The two halves of "binding" are not the same strength
+    and the round says which it had — see `panel_core.refuted_note`.
+
+    **Filtered per FINDING and not per cluster.** A cluster is `CLUSTER_WINDOW`
+    lines of one file and can hold two genuinely different defects; dropping the
+    whole group because one member matched would take a live finding out of the
+    round on a neighbour's refutation. A cluster that empties disappears; one that
+    loses a member is judged on the members that are left, which is also what keeps
+    every surviving reviewer's account intact.
+
+    Nothing here can raise. A matcher that threw would take a whole round's findings
+    with it, and #771's rule is that a matcher must never cost a round — so the
+    exception becomes a reported reason and the clusters pass through untouched,
+    which is the pre-#773 behaviour.
+    """
+    binding = [r for r in rows
+               if isinstance(r, dict) and r.get("locatable")
+               and " ".join(str(r.get("reason") or "").split())]
+    if not clusters or not binding:
+        return list(clusters), [], ""
+    if panel_locality is None:
+        return list(clusters), [], (LOCALITY_UNAVAILABLE
+                                    or "panel_locality is not installed")
+    # Both spellings of the file field on both sides, for `register_localities`'
+    # reason: `panel_locality` reads `file` or `path`, this file's records spell it
+    # `file` and the board's rows spell it `file` too — writing both costs a dict
+    # entry and removes a class of silent no-match that looks exactly like "nothing
+    # was refuted here".
+    was = [{"file": str(r.get("file") or ""), "path": str(r.get("file") or ""),
+            "line": r.get("line"), "start_line": r.get("line"),
+            "end_line": r.get("line"), "row": r}
+           for r in binding]
+    kept: list = []
+    dropped: list[dict] = []
+    try:
+        for group in clusters:
+            live = []
+            for f in group:
+                here = {"file": f.file or "", "path": f.file or "", "line": f.line,
+                        "start_line": f.line, "end_line": f.line}
+                hit = next((w for w in was
+                            if panel_locality.same_finding(w, here)), None)
+                if hit is None:
+                    live.append(f)
+                    continue
+                dropped.append({
+                    "reviewer": f.reviewer, "severity": f.severity,
+                    "file": f.file, "line": f.line, "title": f.title,
+                    # The refutation this matched, by its key and its reason — the
+                    # two things an operator needs to overturn it. A drop recorded
+                    # without them is a finding that vanished, which is the shape
+                    # this whole feature is supposed to be the opposite of.
+                    "refutation_key": hit["row"].get("key"),
+                    "refutation_reason": hit["row"].get("reason"),
+                    "refutation_source": hit["row"].get("source"),
+                })
+            if live:
+                kept.append(live)
+    except Exception as exc:  # noqa: BLE001 — a matcher must never cost a round
+        return list(clusters), [], f"{type(exc).__name__}: {exc}"
+    return kept, dropped, ""
+
+
+def suppression_note(dropped: list[dict]) -> str:
+    """The `config_notes` line for what a refutation actually stopped, or `""`.
+
+    Named rather than counted. This is the one place in the feature where a wrong
+    entry costs something — the risk mergeCraft's own brief states, *"a wrong entry
+    here silently suppresses a real finding later"* — and the only defence available
+    against it is that the suppression is not silent. So each drop is printed with
+    the place it stood and the key of the refutation that stopped it, which is
+    enough for an operator to go and read the reason and, if it is wrong, amend the
+    outcome that carries it.
+
+    The finding's own title is NOT printed and the refutation's reason is not
+    either: this lands in `config_notes`, which `--post` publishes as a public
+    pull-request comment, and both are free text off the wire. The payload's
+    `refuted.suppressed` carries all of it for a reader who is entitled to it.
+    """
+    if not dropped:
+        return ""
+    where = ", ".join(sorted({f"{d['file'] or '?'}:{d['line']}"
+                              if isinstance(d.get("line"), int)
+                              else str(d.get("file") or "?")
+                              for d in dropped}))
+    plural = "" if len(dropped) == 1 else "s"
+    return (f"refutation memory: {len(dropped)} finding{plural} dropped before the "
+            f"judge because this PR has already refuted a finding in the same place "
+            f"— {where}. See `refuted.suppressed` in the payload for the reason each "
+            f"rests on, and amend the outcome if one of them is wrong (#773)")
+
+
 def announce_escalations(payload: dict, cfg: dict) -> list[str]:
     """Tell the board about every finding this round says a human has to settle.
 
@@ -1653,6 +1850,12 @@ def _payload_defaults() -> dict:
         # in the rules file is still reported on those paths — it lands in
         # `config_notes`, which the skip payloads carry.
         "review_panel": None,
+        # #773's refutation memory, as this round used it. Null and not
+        # `{"read": 0, …}` for `code_access`' reason: a round that dispatched no
+        # seat did not consult an empty memory, it never asked — and `read: 0` on a
+        # skip payload would read as "this PR has refuted nothing", the flattering
+        # direction and one a later reader could not tell from the truth.
+        "refuted": None,
         # WHICH LAYER supplied each of them (#305) — and unlike `review_panel`
         # above, present on every payload including the ones that reviewed nothing.
         # A round that refused still resolved a policy, and "what rules did this
@@ -4139,6 +4342,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         if next_door:
             notes.append(next_door_note(hints))
 
+    # #773's refutation memory — the first of its two reads. Fetched ONCE for the
+    # round and consulted twice: rendered into the prompt here, and handed to
+    # `suppress_refuted` before `adjudicate` below. Two fetches would be two
+    # answers twenty minutes apart, and a round that briefed its seats against one
+    # set and filtered against another could not be explained from its own payload.
+    #
+    # **Fetched even on a MANIFEST round, unlike the block above, and the asymmetry
+    # is the point.** A next-door hint is prompt-side and nothing else, so a round
+    # that renders none needs none. This set has a second consumer: the suppression
+    # before the judge, which is the half that stops a ruling being spent. A manifest
+    # round raises findings like any other and can raise a refuted one, so it gets
+    # the memory even though `MOVE_MANIFEST_PROMPT` carries no `REFUTED_SLOT` to
+    # render it into — which is why only the BRIEF is conditional here.
+    refutations, refuted_why = board_refutations(gh_repo, pr_number)
+    if refuted_why:
+        notes.append(refuted_why)
+    refuted: str = "" if pre.verdict == "manifest" else refuted_brief(refutations)
+    if refuted:
+        notes.append(refuted_note(refutations))
+
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
         # `fit_argv_budget` takes this as a single-arg render, and antigravity is
@@ -4187,7 +4410,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             ci=ci_text,
                             diff=history + claim + review.material(budget)[0],
                             code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
-                        ).replace(NEXT_DOOR_SLOT, next_door, 1)
+                        ).replace(NEXT_DOOR_SLOT, next_door, 1
+                        # #773's block, swapped after the render and bounded to one
+                        # occurrence on exactly the argument above: it is built from
+                        # model-authored titles AND from refutation reasons a human
+                        # typed, so a brace in either would raise `KeyError` on an
+                        # unrelated round, and an unbounded replace would rewrite the
+                        # literal token where this repo's own diff quotes it. The
+                        # template carries it once, immediately after `NEXT_DOOR_SLOT`
+                        # and ahead of `{diff}`, so the first occurrence is the slot.
+                        ).replace(REFUTED_SLOT, refuted, 1)
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
@@ -4797,6 +5029,28 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # each issue in one step (no consensus gate). Dedup cannot happen upstream of
     # the judge without discarding what the other reviewers said — see adjudicate.
     clusters = cluster_findings(llm_findings)
+    # #773's second read, and the one that saves the money. The seats were briefed
+    # with the refutation set above and a seat that took the brief raised nothing to
+    # drop here; this is what happens when one did not, or when the refutation could
+    # not be shown because the block was capped. It runs BETWEEN the clustering and
+    # `adjudicate` on mergeCraft's stated ordering — severity, then the withdrawn
+    # memory, then the budget, "so the cap is spent on the worst findings that are
+    # still live rather than on ones already known to be dead" — which here means
+    # before the judge is dispatched and before `MAX_LISTING_CHARS` is divided among
+    # the findings competing for it.
+    #
+    # The drop is loud, not silent: every one is named in `config_notes` with the
+    # place it stood, and the payload carries the reason each rests on. A wrong
+    # refutation suppressing a real finding is the cost this feature has, and
+    # visibility is the only defence available against it.
+    clusters, refuted_out, refuted_match_why = suppress_refuted(clusters, refutations)
+    if refuted_match_why:
+        notes.append(
+            f"refutation memory: nothing was matched against what this PR has "
+            f"already refuted ({refuted_match_why}) — the round judged every "
+            f"finding, including any a previous round disproved")
+    if refuted_out:
+        notes.append(suppression_note(refuted_out))
     coverage = {n: m.get("could_not_assess") or [] for n, m in reviewer_meta.items()}
     # The judge reads the same material the reviewers did, composed the same way.
     # Handing it the whole PR while the panel reviewed an increment would put the
@@ -6634,12 +6888,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "pass the brake was an annotation, not a brake (#560). Where the "
             "orchestrator is also the fixer, declare the premise after reading "
             "`round_stop` and before the first edit")
-    for repeated in stop["premises"]["repeated"]:
-        notes.append(
-            f"premise {repeated['key']} was declared in rounds "
-            f"{', '.join(str(r) for r in repeated['rounds'])} — "
-            f"{repeated['text']!r}. A fix pass was written against it more than once, "
-            "so the cycle ends here and a human answers the premise (#67, #84)")
+    # `fired`, NOT the list — the same discipline the `fix_injection` note twenty
+    # lines below states, arriving here with #789. `premises.repeated` is the RECORD
+    # of what the register held and is populated whatever the rung's mode is; this
+    # sentence says the cycle ends here and a human answers the premise, and under
+    # `escalate_modes.premise_repeated: shadow` neither of those happened. A
+    # `config_notes` line contradicting the `reason` beside it is worse than no line,
+    # and this one is published as a public PR comment under `--post`.
+    if stop["premises"]["repeated_verdict"]["fired"]:
+        for repeated in stop["premises"]["repeated"]:
+            notes.append(
+                f"premise {repeated['key']} was declared in rounds "
+                f"{', '.join(str(r) for r in repeated['rounds'])} — "
+                f"{repeated['text']!r}. A fix pass was written against it more than "
+                "once, so the cycle ends here and a human answers the premise "
+                "(#67, #84)")
     # #491's late half, and it is the same shape as the repeat above for the same
     # reason: `panel.py --premise` refuses the fix when it is PROPOSED, and a caller
     # that ignored exit 4 wrote it anyway. The register is then the record that says
@@ -6649,14 +6912,21 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # either way — the payload reports what the cycle declared — but a repo that
     # switched the brake off asked for a fixer to be allowed to approximate, and
     # ending its cycle on the answer anyway would apply a policy it declined.
-    for undecidable in (stop["premises"]["undecidable"] if premise_undecidable else []):
-        notes.append(
-            f"premise {undecidable['key']} was declared in rounds "
-            f"{', '.join(str(r) for r in undecidable['rounds'])} — "
-            f"{undecidable['text']!r} — and answered `decidable: no`. A fix pass was "
-            "written against a property the runtime cannot observe, so every fix for "
-            "it is an approximation: the cycle ends here and a human answers it "
-            "(#491)")
+    # ...and gated on `fired` for the reason above, which subsumes the arming check
+    # this line used to make for itself: `undecidable_verdict.armed` IS
+    # `undecidable_brake`, so a repo that switched the brake off still reads
+    # `would_fire: false` and prints nothing, exactly as before — and a repo that
+    # armed it and shadowed the rung now reads `would_fire: true, fired: false` and
+    # prints nothing either, which is the case that was wrong.
+    if stop["premises"]["undecidable_verdict"]["fired"]:
+        for undecidable in stop["premises"]["undecidable"]:
+            notes.append(
+                f"premise {undecidable['key']} was declared in rounds "
+                f"{', '.join(str(r) for r in undecidable['rounds'])} — "
+                f"{undecidable['text']!r} — and answered `decidable: no`. A fix pass "
+                "was written against a property the runtime cannot observe, so every "
+                "fix for it is an approximation: the cycle ends here and a human "
+                "answers it (#491)")
     # #489, said in `config_notes` as well as in `round_stop` and for the reason the
     # premise notes above are: `jq .round_stop` is what an orchestrator reads to
     # decide whether to go again, and this is what a human reads off the PR comment
@@ -7132,6 +7402,25 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # key -> the round it was first acknowledged in, inherited by the next round
         # through --baseline exactly as `escalated` is.
         "acknowledged": ack_held,
+        # What this PR had already disproved, and what that stopped (#773). Three
+        # numbers and a list, because they answer three different questions and a
+        # reader that had only the last could not tell them apart: `read` is what the
+        # board served, `binding` is how much of it could be matched by locality at
+        # all (a refutation naming no line is prose to the seats and nothing to the
+        # matcher), `shown` is how much reached the reviewer prompt under
+        # `REFUTED_MAX`, and `suppressed` is what never reached the judge.
+        #
+        # `suppressed` carries the refutation's key and reason on every row, which is
+        # the whole of the safety valve: a wrong entry silently suppresses a real
+        # finding, so the drop is recorded with the argument it rests on and the key
+        # to amend. `config_notes` names the places for a human; this is the copy a
+        # tool can read.
+        "refuted": {
+            "read": len(refutations),
+            "binding": sum(1 for r in refutations if r.get("locatable")),
+            "shown": len(refuted_rows(refutations)) if refuted else 0,
+            "suppressed": refuted_out,
+        },
         # #718's ledger, beside #547's and on the same terms. Every coverage
         # declaration this round is vetoing on, under the key that retires it,
         # whether or not somebody has answered it — the answer is a separate field,

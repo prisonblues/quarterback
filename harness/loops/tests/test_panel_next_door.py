@@ -96,7 +96,13 @@ def rendered(next_door: str, scope: str = "diff") -> str:
     return (panel_core.reviewer_brief(scope)
             .format(n=1, repo="acme/app", base="main", ci="CI: green",
                     diff="DIFF", code="CODE")
-            .replace(panel_core.NEXT_DOOR_SLOT, next_door))
+            .replace(panel_core.NEXT_DOOR_SLOT, next_door)
+            # #773's slot sits immediately after this one and is swapped by the same
+            # closure. Emptied here rather than left standing: every assertion below
+            # is about what #508 does to the prompt, and a raw `<<<REFUTED>>>` in the
+            # rendering would fail them all for a reason that has nothing to do with
+            # next-door hints. The refutation block has its own file.
+            .replace(panel_core.REFUTED_SLOT, ""))
 
 
 # ---- the off path, and the byte-identical prompt ---------------------------

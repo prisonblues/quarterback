@@ -118,13 +118,22 @@ def escalations_fired(stop: dict | None) -> list[str]:
     converged is the same misreport `round_stop` keeps those two keys apart to
     prevent.
 
-    The premise rungs are read with their ARMING, exactly as `round_stop` reads
-    them. `premises.repeated` is populated only where the limit was reached and
-    always forces the stop, so it needs no flag; `premises.undecidable` is listed
-    whether or not the repo armed the brake — the payload records what the cycle
-    DECLARED — so `undecidable_brake` has to be checked here rather than inferred
-    from the list being non-empty, or a repo that switched #491 off would be billed
-    for a fan-out over a policy it declined.
+    The premise rungs are read off their VERDICT since #789, exactly as the four
+    above them are. Until then they were read off their lists with the arming
+    checked beside — which was the honest reading while their stop was the same list
+    membership, and stopped being one the moment those two rungs gained a mode:
+    `premises.repeated` is the RECORD of what the cycle declared and is published on
+    a shadowed round too, so a fan-out bought off it would be bought for a rung that
+    stopped nothing. That is the one thing #779 says a shadow rung may never do.
+
+    **The list is still what an older payload is read on**, and that is not a hedge.
+    Every round written before `repeated_verdict` existed applied its premise rungs
+    unconditionally — there was no mode to decline with — so for those payloads the
+    list IS the verdict, and reading a missing block as "did not fire" would rewrite
+    the history of every cycle #84 ever ended. `undecidable_brake` is checked on that
+    path for the reason it always was: `premises.undecidable` is listed whether or
+    not the repo armed the brake, so a repo that switched #491 off would otherwise be
+    billed for a fan-out over a policy it declined.
     """
     if not isinstance(stop, dict):
         return []
@@ -149,9 +158,11 @@ def escalations_fired(stop: dict | None) -> list[str]:
     if (stop.get("fix_injection") or {}).get("fired"):
         fired.append("fix_injection")
     premises = stop.get("premises") or {}
-    if premises.get("repeated"):
+    if _premise_fired(premises, "repeated_verdict", bool(premises.get("repeated"))):
         fired.append("premise_repeated")
-    if premises.get("undecidable") and premises.get("undecidable_brake"):
+    if _premise_fired(premises, "undecidable_verdict",
+                      bool(premises.get("undecidable")
+                           and premises.get("undecidable_brake"))):
         fired.append("premise_undecidable")
     return [name for name in PROPOSE_ESCALATIONS if name in fired]
 
@@ -179,26 +190,60 @@ def escalations_shadowed(stop: dict | None) -> list[str]:
     gate binds — and a consumer that spent on it would have turned an instrument back
     into a gate by another route.
 
-    The four measured rungs only. `premise_repeated` and `premise_undecidable` have
-    modes in `escalate_modes` and their stop is not yet gated on one (see
-    `panel_rounds.BRAKED_RUNGS`), so they publish no `would_fire` and cannot appear
-    here — an absent name is the honest answer for a rung whose verdict is still
-    always applied, and inventing one from `fired` would report a shadow that no round
-    ever ran in.
+    **All six since #789**, where this shipped reading four. The two premise rungs had
+    modes in `escalate_modes` and no enforcement of them — their stop was applied off
+    a list, so there was no verdict object to publish a `would_fire` from — and the
+    rungs a repo would most want to watch in shadow were the two it could not. They
+    publish `premises.repeated_verdict` and `premises.undecidable_verdict` now, in the
+    same two field names, and are read here on exactly the same pair.
+
+    A payload with no verdict block contributes nothing, and the asymmetry with
+    :func:`escalations_fired`'s fallback is the point rather than an inconsistency:
+    that one has to say what an older round DID and reads the list, while this one
+    says what a round declined to do, and no round before #789 ever declined. An
+    invented name here would report a shadow that no cycle ever ran in.
     """
     if not isinstance(stop, dict):
         return []
     shadowed = []
-    for key, rung in (("new_findings_not_falling", "new_findings_not_falling"),
-                      ("unrefereed_fix", "unrefereed_fix"),
-                      # The measurement's key and the DIAL's name, kept apart here for
-                      # the reason `escalations_fired` keeps them apart above.
-                      ("guard_churn", "guard_lines"),
-                      ("fix_injection", "fix_injection")):
-        block = stop.get(key) or {}
+    premises = stop.get("premises") or {}
+    for block, rung in ((stop.get("new_findings_not_falling"),
+                         "new_findings_not_falling"),
+                        (stop.get("unrefereed_fix"), "unrefereed_fix"),
+                        # The measurement's key and the DIAL's name, kept apart here
+                        # for the reason `escalations_fired` keeps them apart above.
+                        (stop.get("guard_churn"), "guard_lines"),
+                        (stop.get("fix_injection"), "fix_injection"),
+                        # #789's two, nested one tier in — `premises` is the premise
+                        # rungs' block on this payload and on the board, and the
+                        # verdicts ride inside it rather than beside their four
+                        # siblings so a stored round carries them from day one.
+                        (premises.get("undecidable_verdict"), "premise_undecidable"),
+                        (premises.get("repeated_verdict"), "premise_repeated")):
+        block = block or {}
         if block.get("would_fire") and not block.get("fired"):
             shadowed.append(rung)
     return [name for name in PROPOSE_ESCALATIONS if name in shadowed]
+
+
+def _premise_fired(premises: dict, key: str, legacy: bool) -> bool:
+    """Did this premise rung end the cycle — `fired` where the round said, else #789.
+
+    ONE reader for both rungs, because the fallback is the half that is easy to get
+    subtly wrong and two copies of it would be two chances to. A round that published
+    a verdict block is read on `fired` and on nothing else: that flag already carries
+    the arming and the mode, and re-deriving either beside it would be a second
+    answer to a question the producer settled.
+
+    `legacy` is what the caller works out from the lists for a payload with no block,
+    and it is a claim about ROUNDS THAT ARE ALREADY OVER — before #789 neither rung
+    could be shadowed, so a repeat that reached one of those rounds ended it. Reading
+    an absent block as `False` would be the flattering direction on a stored
+    population: every cycle #84 ever stopped would read back as a cycle that stopped
+    for something else.
+    """
+    block = premises.get(key)
+    return bool(block.get("fired")) if isinstance(block, dict) else legacy
 
 
 # ----------------------------------------------------------------------- the question
