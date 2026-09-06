@@ -40,6 +40,62 @@ Run `git branch --show-current` and `git status --short`.
   files that are part of this fix, never `git add -A`, so you don't sweep the
   user's in-progress work into your commit.
 
+## 0b. Claim the issue — on this path, nothing else will
+
+`/fix-issue` claims through `create-worktree`, which is the harness's only
+automatic pickup. This command's entire purpose is *no worktree, no branch*, so it
+misses that path **by construction**: every in-place fix has been invisible to the
+board from beginning to end, and the plan has gone on offering the issue while
+somebody was fixing it (#713). Measured on lexray on 2026-09-03 — three agents live
+in one repo, `claims(repo_path=…)` empty for the whole repo, and `lapsed_claims`
+empty too, so none had ever been taken.
+
+```bash
+qb-claim issue $ISSUE_NUMBER --ttl 28800 \
+  --note "fixing in place on $(git branch --show-current)"
+```
+
+- **Exit 0** — it is yours. The claim carries **this session** (`qb-claim` defaults
+  `--session` to `$CLAUDE_CODE_SESSION_ID`), so ending the session hands it back
+  even if you never reach §10.
+- **Exit 1** — somebody holds it, and `qb-claim` prints who and what they said they
+  were doing. **STOP and ask the user** before writing anything. Two agents fixing
+  one issue is exactly what the claim exists to prevent, and whether to do it
+  anyway is their call, not yours.
+- **Exit 2** — the board could not be reached, or there is no `qb-claim` on this
+  host. Say so in your final report and carry on. A coordination tool that cannot
+  be reached must not stop the work; that is the rule `create-worktree` follows on
+  the same failure and this path takes it unchanged.
+
+**Every exit after this line releases it, not only §10.** The release below is
+written as the last step of the happy path, and the paths that matter are the other
+ones: tests that will not go green and a user who says stop, the DB guard halting
+at §2, a self-review turning up something you cannot fix here. `POST /session/end`
+fires when the SESSION ends, not when a command stops, and the pane commonly lives
+for hours after a command has given up. So if you stop early for any reason, run
+`qb-release issue $ISSUE_NUMBER` as part of stopping, and say in your report that
+you did.
+
+**Eight hours — `create-worktree`'s own fuse — and a shorter one would be wrong
+here.** #715 gave a panel round three hours, on the argument that a released claim's
+TTL only has to outlast the slowest round. That argument holds *there* because
+`panel.py` is a program: `release_pr` runs at the end of the round whether or not
+anybody remembers it. Every release on THIS path is a step in a brief, executed by
+an agent that may stop before it reaches the step, so the TTL here is not backed by
+a mechanical release and must not be sized as though it were.
+
+Nothing renews a work claim while you hold it, either — `qb-hook`'s `_lease`
+heartbeats the session lease and never touches `POST /claim` — so a three-hour fuse
+on a fix that runs longer does not degrade, it inverts: at t+3h the board reports
+the issue free while you are demonstrably in it, and the next agent is told to take
+it. A claim that lingers delays somebody; a claim that expires under live work
+causes the collision the claim exists to prevent (#608, #135). Eight hours is what a
+fuse is for — the session that never ended — not a duration anybody waits out.
+
+**No `--no-plan-item` here.** That flag records a key without asserting a pickup,
+and it exists for a review round holding the PR it is reading (#722). This command
+is picking the work up, so it writes the plan item a pickup writes (#427).
+
 ## 1. Research
 
 Understand the problem before writing code:
@@ -192,6 +248,16 @@ Do not push automatically. Ask the user whether to push:
 
 ## 10. Coordinate + report
 
+- **Hand the claim back:**
+  ```bash
+  qb-release issue $ISSUE_NUMBER
+  ```
+  Run it whatever happened above — nothing to release is exit 0, so it is safe even
+  on the path where §0b could not reach the board and took nothing. Doing it here
+  rather than leaving
+  it to the TTL is #135: a claim that outlives its work makes the fleet's claim
+  count highest immediately after it has been most productive. Ending the session
+  releases it too, so this is the second of two chances and not the only one.
 - If the quarterback board tools are available, post a `landed` with the commit
   SHA and a one-line summary (and `report_git` so peers can find the commit) —
   that's the coordination substitute for the missing PR.
