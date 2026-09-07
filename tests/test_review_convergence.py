@@ -1521,3 +1521,197 @@ async def test_a_window_where_nothing_measured_its_surface_says_so(client):
     agg = await convergence(client, repo)
     assert agg["fix_blast"] == {"runs": 0, "low": 0, "medium": 0, "high": 0,
                                 "elevated_share": None}
+
+
+# ---- #775: how many seats the round actually asked --------------------------
+#
+# Every round used to dispatch the same panel, so `reviewers_selected` answered
+# two questions at once. `panel_seats.route_seats` separates them: round N's seats
+# are the set difference against round N-1's, spent within a per-round budget, on
+# the argument that a seat which read the diff in round 1 and reads the fix in
+# round 2 with its own round-1 findings in front of it produces more of the same
+# shape.
+#
+# The two counts are stored because the question they exist for is a correlation
+# over a population: across hundreds of rounds, does a round that asked fewer seats
+# find less? `round_budgets.multipliers` ships `[1.0]` precisely because nobody has
+# measured a curve, and the payload the counts are computed in lives in a temp
+# directory on whichever host ran the panel. `why`, `budget`, `prior_round` and
+# `prior_dispatched` ride the same block and are deliberately dropped —
+# `tests/test_payload_key_drift.py` holds that decision in writing.
+
+
+def routing(dispatched=("claude",), held=("codex", "gemini")) -> dict:
+    """The block as the panel sends it, working included."""
+    return {"dispatched": sorted(dispatched),
+            "held": sorted(held),
+            "why": {"claude": "floor-code", "codex": "held", "gemini": "held"},
+            "budget": 1,
+            "prior_round": 1,
+            "prior_dispatched": ["codex", "gemini"]}
+
+
+async def test_the_seat_counts_survive_the_round_trip_and_are_three_state(client):
+    """Sent, both counts reach every read path; unsent, they are NULL and not 0.
+
+    The NULL half is the load-bearing one and it is `repeats_only_locality`'s
+    direction: the panel nulls the whole block on every path that never got as far
+    as choosing — a title skip, a pre-flight refusal, a spend-ceiling refusal — and
+    "this round asked every seat it could" is a MEASUREMENT that happens to be
+    zero. Folded together, the baseline a curve gets tuned against would be built
+    out of rounds that never routed.
+
+    Every view, because the reader is a correlation over a population and not a
+    person opening one round — a pair that rode `GET /review/{id}` alone could not
+    answer the question the columns were added for.
+    """
+    repo = "acme/c775-roundtrip"
+    said = await record(client, repo, 7751, cycle="cyc-1", round=2,
+                        seat_routing=routing())
+    silent = await record(client, repo, 7752, cycle="cyc-2", round=2)
+    # ...and a round that routed and held nobody back, which is the answer the
+    # silence above must never be confused with. It is also every round on the
+    # shipped flat curve.
+    full = await record(client, repo, 7753, cycle="cyc-3", round=2,
+                        seat_routing=routing(dispatched=("claude", "codex"),
+                                             held=()))
+
+    detail = (await client.get(f"/review/{said['id']}", headers=AGENT)).json()
+    assert detail["seats_dispatched"] == 1
+    assert detail["seats_held"] == 2
+
+    listed = (await client.get(f"/reviews?repo={repo}&pr=7751", headers=AGENT)).json()
+    assert listed[0]["seats_dispatched"] == 1
+    assert listed[0]["seats_held"] == 2
+
+    hist = (await client.get(f"/review/findings?repo={repo}&pr=7751",
+                             headers=AGENT)).json()
+    assert hist["runs"][0]["seats_dispatched"] == 1
+    assert hist["runs"][0]["seats_held"] == 2
+
+    quiet = (await client.get(f"/review/{silent['id']}", headers=AGENT)).json()
+    assert quiet["seats_dispatched"] is None, "a round that never routed is not 0"
+    assert quiet["seats_held"] is None
+    asked = (await client.get(f"/review/{full['id']}", headers=AGENT)).json()
+    assert asked["seats_dispatched"] == 2
+    assert asked["seats_held"] == 0, "held nobody back is a measurement, not silence"
+
+
+async def test_the_working_beside_the_counts_is_dropped_and_stores_nothing(client):
+    """`why`, `budget`, `prior_round` and `prior_dispatched` are accepted and go
+    nowhere.
+
+    They are one round's working. `why` is the per-seat reason table — the panel's
+    own readers branch on it, but no query over a population needs a seat's
+    individual reason and it is an unbounded object per run. `budget` is the
+    round's arithmetic, derivable two ways and free to disagree with itself. The
+    other two say what the complement was taken AGAINST, which is this board's own
+    row one round earlier. Asserted here rather than left to the drift check so
+    that a later pass binding one makes this test say so.
+    """
+    repo = "acme/c775-working"
+    run = await record(client, repo, 7754, cycle="cyc-1", round=2,
+                       seat_routing=routing())
+    detail = (await client.get(f"/review/{run['id']}", headers=AGENT)).json()
+    assert detail["seats_dispatched"] == 1
+    assert "why" not in detail and "budget" not in detail
+    assert "prior_round" not in detail and "prior_dispatched" not in detail
+    assert "seat_routing" not in detail
+
+
+async def test_a_seat_list_this_board_cannot_read_becomes_no_count(client):
+    """Coerced, not rejected, and never guessed at.
+
+    A payload is never refused over one field — a 422 would take the round's
+    findings, scorecards and accounts with it — so a `dispatched` that is not a
+    list becomes "the panel did not say", a state the column already has. A block
+    that is not an object at all takes the same route rather than 422ing, which is
+    the one way a nested model could have broken this module's standing rule.
+    """
+    repo = "acme/c775-unbelievable"
+    r = await client.post(
+        "/review",
+        json=payload(repo, 7755, cycle="cyc-1", round=2,
+                     seat_routing={**routing(), "dispatched": "claude"}),
+        headers=AGENT,
+    )
+    assert r.status_code == 201, r.text
+    detail = (await client.get(f"/review/{r.json()['id']}", headers=AGENT)).json()
+    assert detail["seats_dispatched"] is None
+    # ...and the readable half of the block is untouched: one unreadable count
+    # costs the round nothing else.
+    assert detail["seats_held"] == 2
+
+    r = await client.post(
+        "/review",
+        json=payload(repo, 7756, cycle="cyc-2", round=2,
+                     seat_routing="claude,codex"),
+        headers=AGENT,
+    )
+    assert r.status_code == 201, r.text
+    detail = (await client.get(f"/review/{r.json()['id']}", headers=AGENT)).json()
+    assert detail["seats_dispatched"] is None and detail["seats_held"] is None
+
+
+async def test_the_routing_totals_are_counted_over_rounds_and_move_no_bucket(client):
+    """#775's population, published beside the rate and touching none of it.
+
+    Counted over RUNS and not over cycles, on `locality_repeats`' departure from
+    this endpoint's grain and for a sharper reason than either block beside it: a
+    cycle's terminal round is the one a routed cycle most wants to have asked
+    everybody, because a held seat vetoes a confident stop. Cycle grain would
+    sample exactly those rounds and report a fleet that never held anything back.
+
+    `rounds_holding` is beside the sums rather than derived from them: one round
+    that held four seats and four rounds that held one are the same `held`, and
+    only the second says a curve is binding across the window.
+
+    And the buckets are left exactly as they were, on `unattested_cycles`' promise:
+    `CYCLE_ENDINGS` is what `_rate` divides and #637's recalibration is measured
+    against that number, so nothing here may move it as a side effect of storing a
+    field.
+    """
+    repo = "acme/c775-agg"
+    # Two rounds of one cycle: the first held two seats back, the second asked
+    # everybody — which is what an earned stop costs.
+    await record(client, repo, 7757, cycle="cyc-a", round=1,
+                 round_stop=stop(converged=False, reason="going again"),
+                 seat_routing=routing())
+    await record(client, repo, 7757, cycle="cyc-a", round=2, to_fix=[],
+                 round_stop=stop(),
+                 seat_routing=routing(dispatched=("claude", "codex", "gemini"),
+                                      held=()))
+    # ...one round that routed and held nothing, on the shipped flat curve...
+    await record(client, repo, 7758, cycle="cyc-b", round=1, to_fix=[],
+                 round_stop=stop(),
+                 seat_routing=routing(dispatched=("claude",), held=()))
+    # ...and one from a producer too old to send the block at all.
+    await record(client, repo, 7759, cycle="cyc-c", round=1, to_fix=[],
+                 round_stop=stop())
+
+    agg = await convergence(client, repo)
+    assert agg["seat_routing"] == {"runs": 3, "dispatched": 5, "held": 2,
+                                   "rounds_holding": 1, "held_share": 0.2857}
+
+    # The buckets, untouched: three cycles, each ending converged, and the
+    # mid-cycle round that held two seats is not an ending.
+    assert agg["overall"]["converged"] == 3
+    assert agg["overall"]["unconverged"] == 0
+    assert agg["overall"]["decided"] == 3
+
+
+async def test_a_window_where_nothing_routed_says_so(client):
+    """`runs: 0` and `held_share: null`, never a fleet that asked every seat.
+
+    `share` is null and not 0.0 where nothing measured, on `rate`'s rule: no
+    measured round is not a fleet that held nothing back. Without the population
+    marker a window of rounds too old to send the block would read as exactly that,
+    which is the flattering direction for anybody deciding whether a curve is safe
+    to tighten.
+    """
+    repo = "acme/c775-silent"
+    await record(client, repo, 7760, cycle="cyc-a", round=1, to_fix=[],
+                 round_stop=stop())
+    agg = await convergence(client, repo)
+    assert agg["seat_routing"] == {"runs": 0, "dispatched": 0, "held": 0,
+                                   "rounds_holding": 0, "held_share": None}
