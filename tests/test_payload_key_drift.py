@@ -157,6 +157,27 @@ DROPPED_BY_DESIGN = frozenset({
     # panel publishes and nothing here aggregates; storing one is a decision about
     # what the /panel page reports, not a plumbing fix.
     "guard_ratio",          # #492, instrument-before-gate — #618 may still move this
+    # #773's refutation memory as this round used it: how many refutations the
+    # board served, how many could bind a matcher, how many reached the prompt, and
+    # every finding that was dropped before the judge because this PR had already
+    # disproved a finding in the same place.
+    #
+    # Dropped on the sibling feature's precedent and with one caveat stated rather
+    # than buried. The precedent: #508's next-door hints are the same shape — a
+    # memory fetched per round, rendered into a prompt, reported in `config_notes`
+    # — and nothing about them is stored on the run row either; storing a number
+    # here is a decision about what the /panel page reports, not a plumbing fix,
+    # and #67's rule is instrument before gate.
+    #
+    # The caveat: unlike most of this tier, `suppressed` is NOT reconstructible
+    # from anything the board keeps, and for the reason the feature exists — a
+    # suppressed finding never reaches the board at all. So "did the memory pay for
+    # itself" is answerable only from the payloads while they last, exactly as
+    # `provenance` was before it got a column. A `refuted_suppressed` count on
+    # `review_runs` is the obvious next commit; it is not this one, because nothing
+    # yet aggregates it and a column added ahead of a question is a column whose
+    # meaning gets decided later by whoever first queries it.
+    "refuted",              # #773: what this PR had already disproved, and what it stopped
     "context_chars",        # chars prepared ALONGSIDE the target under increment scope
     "pr_chars",             # the whole PR's size, whatever this round reviewed (#298)
     "timing",               # #192's wall-clock block

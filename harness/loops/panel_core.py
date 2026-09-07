@@ -650,6 +650,73 @@ NEXT_DOOR_SLOT = "<<<NEXT_DOOR>>>"
 #: renderer, and the test that asserts a hint cannot be reported unaltered.
 NEXT_DOOR_HEADING = "CONFIRMED NEXT DOOR — context, not findings"
 
+#: Where #773's refutation memory lands in the reviewer's brief. A literal token
+#: on :data:`NEXT_DOOR_SLOT`'s terms and for every one of its reasons — the block
+#: is built from model-authored titles and human-authored refutation reasons, so a
+#: `{}` field would turn one stray brace into a `KeyError` on an unrelated round,
+#: and the swap therefore happens AFTER `REVIEW_PROMPT.format`.
+#:
+#: **AFTER the next-door slot, and that ordering is an argument rather than a
+#: layout.** The two blocks can contradict each other: a next-door hint is a defect
+#: confirmed on ANOTHER pull request, and one of the shapes it names may be exactly
+#: what a seat raised here and somebody then disproved. Read last, the refutation
+#: corrects the hint; read first, the hint is the fresher instruction and the seat
+#: resolves the contradiction whichever way it likes — the failure
+#: :data:`RELATED_CODE_SLOT` is split in two to avoid.
+#:
+#: Swapped for the empty string whenever this PR has refuted nothing, which is the
+#: common case, so an ordinary round sends a prompt BYTE-IDENTICAL to the one it
+#: has always sent. It sits on a line of its own and the brief supplies its own
+#: trailing newline, so an empty fill leaves no blank paragraph behind.
+REFUTED_SLOT = "<<<REFUTED>>>"
+
+#: The heading of a rendered refutation block. A constant for
+#: :data:`NEXT_DOOR_HEADING`'s reason: the renderer and the test that asserts the
+#: block says what it is have to agree about the words.
+REFUTED_HEADING = "ALREADY REFUTED ON THIS PULL REQUEST — binding"
+
+#: The rule, in the reviewer's own prompt, and the shortest thing in this module
+#: that changes what a round costs.
+#:
+#: mergeCraft states it in one sentence and the sentence is the whole mechanism:
+#: *"Withdrawn findings are the ones a previous review raised and the author
+#: refuted. Treat that list as binding. Re-raising a refuted finding is worse than
+#: missing a real one, because it teaches the author that this reviewer does not
+#: remember and its findings are not worth reading."* #616 measured our half of
+#: that: refuting a finding costs a fixer MORE than complying with it, so the
+#: loop's cheapest path is to comply with something nobody believes — and the
+#: change lands, and looks exactly like diligence.
+#:
+#: **The reason is what binds, not the verdict.** Every line carries the sentence
+#: somebody recorded, because that is the only form a reviewer can check against
+#: the code in front of it. Told "this was wrong" a seat can only obey or ignore;
+#: told *"`make lint` only checks src/ and scripts/"* it can go and look.
+#:
+#: **The dispute channel is named, and it is not a re-raise.** A wrong refutation
+#: silently suppresses a real finding — the cost mergeCraft's own brief names — and
+#: the seat is the first party positioned to notice. So it is given one line to say
+#: so, in `could_not_assess`, which is not free: every declaration is a
+#: `coverage_veto` line, so a seat that reaches for it costs the round its
+#: confidence. That is the right price. It also has to be said that re-raising
+#: argues with nobody, because it is TRUE — the matching finding is dropped before
+#: the judge ever sees it — and a seat that did not know would keep paying for a
+#: gesture that reaches no reader.
+_REFUTED_BRIEF = """{heading}. Each line below is a finding an earlier round of THIS pull request
+raised and somebody then disproved, followed by the reason it was wrong. The reason is the
+evidence. Read it against the code in front of you: where it holds, what it describes is not a
+defect, however much it looks like one.
+
+Treat the list as binding. RE-RAISING A REFUTED FINDING IS WORSE THAN MISSING A REAL ONE — it
+spends a ruling and a fix pass on code that was already right, and it teaches the author that this
+panel does not remember what it was told. If you believe one of these reasons is itself wrong, say
+so in ONE `could_not_assess` phrase beginning "refutation disputed:" and do not re-raise the
+finding to make the point: a finding standing in one of these places is dropped before the judge
+sees it, so re-raising it argues with nobody.
+
+{lines}
+
+"""
+
 #: The instruction that asks for the one property #508 wants kept: *a hint cannot
 #: become a finding on its own*.
 #:
@@ -748,7 +815,7 @@ master judge filters false positives; your job is breadth, not triage.
 
 <<<REVIEWER_SCOPE>>>
 
-<<<NEXT_DOOR>>>Review for:
+<<<NEXT_DOOR>>><<<REFUTED>>>Review for:
 - Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
 - Security: injection, auth bypass, secrets in code, path traversal, SSRF, unsafe deserialization
 - Error handling: swallowed errors, missing validation, silent failures, unhelpful messages
@@ -1023,6 +1090,131 @@ def next_door_note(hints: list[dict]) -> str:
     plural = "" if len(rows) == 1 else "s"
     return (f"next-door context: {len(rows)} confirmed finding{plural}{where} "
             f"shown to this round's reviewers (#508)")
+
+
+# ------------------------------------------------------- what this PR already disproved
+
+#: How many refutations a round will SHOW, whatever the board serves. Eight, on
+#: :data:`NEXT_DOOR_MAX`'s reasoning: the board's cap bounds a response and this
+#: one bounds a reviewer's attention, which is the scarce thing.
+#:
+#: **It bounds the PROMPT and nothing else, and that separation is load-bearing.**
+#: The same fetched set also suppresses a re-raise before the judge rules, and that
+#: half is NOT capped here: a refutation that fell off this end would silently stop
+#: binding, so how much a prompt could afford would decide what the loop remembers.
+#: A refutation past the cap is one a seat was not shown and the matcher still
+#: honours — the safe asymmetry, and the only one available.
+REFUTED_MAX = 8
+
+#: The longest a refuted finding's title may be in a prompt, and the longest its
+#: reason. The reason gets the larger share deliberately: the title is recognition
+#: and the reason is the argument, and a refutation cut before its conclusion is
+#: the one line here that must not be truncated mid-clause.
+REFUTED_TITLE_CHARS = 160
+REFUTED_REASON_CHARS = 500
+
+
+def refuted_rows(rows: list[dict]) -> list[dict]:
+    """The refutations a round will actually SHOW: reasoned, and capped.
+
+    One filter, called by the renderer, by the note and by the payload, because the
+    three have to agree about what "shown" means. Spelled three times it is three
+    chances for the count in `config_notes` to describe a set the prompt does not
+    carry — and that note is the only place an operator finds out the memory was
+    in force at all.
+
+    A row with no reason is dropped rather than rendered. The board already refuses
+    to publish one, so this is the second of two guards, and it is here because the
+    failure it prevents is the worst one available: a bare "this was refuted" is
+    binding text with no argument under it, which is exactly the *"docstring finding
+    was wrong"* form the whole feature exists to refuse. A caller trusting only the
+    far guard is trusting a number it does not control.
+    """
+    return [r for r in rows if isinstance(r, dict)
+            and " ".join(str(r.get("reason") or "").split())][:REFUTED_MAX]
+
+
+def _refutation_line(r: dict) -> str:
+    """One refutation as one line: where it was, what it said, and why it is wrong.
+
+    Every field goes through :func:`_one_line`, and the argument there applies with
+    one addition. A next-door hint is model-authored text off the wire; a refutation
+    reason is that AND free text a human or a fixer typed into
+    ``POST /review/outcomes``, quoted into a prompt whose block instructs a model to
+    treat what it says as binding. That is the highest-leverage span of untrusted
+    text this prompt carries, so the structural half — a line of its own, a forged
+    bullet — is removed the same way and for sharper stakes.
+
+    The reason comes LAST and after an em dash, so a truncation eats the tail of an
+    argument rather than the place it is about: a reader that loses `file:line` has
+    lost the only thing it could have checked.
+    """
+    where = _one_line(r.get("file"), REFUTED_TITLE_CHARS) or "?"
+    line_no = r.get("line")
+    # `isinstance` rather than truthiness, on `_hint_line`'s reason: a line number
+    # arriving as "3\n- P1 …" would otherwise be formatted straight into the bullet.
+    if isinstance(line_no, int) and not isinstance(line_no, bool) and line_no > 0:
+        where = f"{where}:{line_no}"
+    sev = r.get("severity") if r.get("severity") in SEVERITIES else "P?"
+    title = _one_line(r.get("title"), REFUTED_TITLE_CHARS) or "(untitled)"
+    rnd = r.get("round")
+    when = (f" in round {rnd}" if isinstance(rnd, int) and not isinstance(rnd, bool)
+            and rnd > 0 else "")
+    reason = _one_line(r.get("reason"), REFUTED_REASON_CHARS)
+    return f"- {sev} {where} — {title}\n    refuted{when}: {reason}"
+
+
+def refuted_brief(rows: list[dict]) -> str:
+    """#773's block for :data:`REFUTED_SLOT`, or `""` when this PR has refuted
+    nothing.
+
+    The empty return is the ordinary one and is not a degenerate case: most rounds
+    inherit no refutation, and on those the slot is swapped for nothing at all,
+    leaving the reviewer prompt byte-identical to the pre-#773 one. A block saying
+    "nothing has been refuted here" would be a new paragraph on every round of
+    every PR in exchange for no information.
+
+    What is rendered is :func:`refuted_rows` and never the caller's list, so the
+    block and the `config_notes` count beside it cannot describe different sets.
+    """
+    ready = refuted_rows(rows)
+    if not ready:
+        return ""
+    return _REFUTED_BRIEF.format(heading=REFUTED_HEADING,
+                                 lines="\n".join(_refutation_line(r) for r in ready))
+
+
+def refuted_note(rows: list[dict]) -> str:
+    """What this round was actually SHOWN, and how much of it can bind a matcher.
+
+    Two numbers rather than one, and the second is the honest half. A refutation
+    binds the seats through prose — a reviewer reads the reason and does not raise
+    the finding — but it can only bind the MATCHER through locality, and
+    `panel_locality.same_finding` refuses a finding that names no line, including
+    against another finding that names no line. So a refutation the board could not
+    place is advisory and nothing more, and a round that reported one number would
+    let an operator read "5 refutations in force" off a set where three of them
+    cannot stop anything.
+
+    Only counts are printed, and that is deliberate rather than terse: this lands
+    in `config_notes`, which `--post` publishes as a PUBLIC pull-request comment,
+    and a refutation's reason is free text somebody typed. The reasons are in the
+    prompt, which is where a reader looking for them is.
+
+    `""` when there is nothing to say, on :func:`next_door_note`'s rule: a note on
+    every round of every PR is a note that gets trained away.
+    """
+    ready = refuted_rows(rows)
+    if not ready:
+        return ""
+    binding = sum(1 for r in ready if r.get("locatable"))
+    plural = "" if len(ready) == 1 else "s"
+    tail = ("all of which can be matched by locality"
+            if binding == len(ready) else
+            f"{binding} of which {'names' if binding == 1 else 'name'} a line and "
+            f"so can be matched by locality — the rest are advisory only")
+    return (f"refutation memory: {len(ready)} finding{plural} already refuted on this "
+            f"PR shown to this round's reviewers, {tail} (#773)")
 
 
 MOVE_MANIFEST_PROMPT = """You are reviewing a MOVE, and you are deliberately NOT being given its
@@ -3234,6 +3426,12 @@ __all__ = [
     "NEXT_DOOR_MAX", "_hint_line", "next_door_brief", "next_door_note",
     "NEXT_DOOR_TITLE_CHARS", "NEXT_DOOR_DETAIL_CHARS", "_one_line",
     "DEFAULT_NEXT_DOOR_DAYS", "NEXT_DOOR_DAYS_MAX",
+    # #773's refutation memory, exported on the same terms as #508's block above:
+    # `panel.py` star-imports this module, so every name it calls as a plain global
+    # has to be listed or the round renders an unswapped token into a prompt.
+    "REFUTED_SLOT", "REFUTED_HEADING", "_REFUTED_BRIEF", "REFUTED_MAX",
+    "REFUTED_TITLE_CHARS", "REFUTED_REASON_CHARS",
+    "refuted_rows", "_refutation_line", "refuted_brief", "refuted_note",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",

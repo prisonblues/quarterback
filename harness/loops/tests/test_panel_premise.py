@@ -40,6 +40,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import harness_rules  # noqa: E402
 import panel  # noqa: E402
+import panel_propose  # noqa: E402
 import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
 from test_panel_dials import PANEL_CFG, stub  # noqa: E402
@@ -885,10 +886,23 @@ def test_a_round_with_no_register_still_answers_the_question():
     """Always present, so a consumer never has to tell "nothing was declared" from "a
     payload written before the field" — that would be reading a payload's age."""
     got = panel_rounds.round_stop(3, 5, [], [], [])
-    assert got["premises"] == {"limit": None, "declared": 0, "repeated": [],
-                              "undecidable": [], "undecidable_brake": False,
-                              "wired": False, "stamped": 0, "retroactive": [],
-                              "undeclared_rounds": [1, 2]}
+    assert got["premises"] == {
+        "limit": None, "declared": 0, "repeated": [],
+        "undecidable": [], "undecidable_brake": False,
+        "wired": False, "stamped": 0, "retroactive": [],
+        "undeclared_rounds": [1, 2],
+        # #789's two verdicts, and the exact comparison is kept exact on purpose:
+        # this test's claim is about the block's WHOLE shape, and a round with no
+        # register has to answer for the rungs as well as for the declarations. Both
+        # are off — no limit is a rung that is not armed, and no declaration is a
+        # measurement that did not cross — and `enforce` is what a caller passing no
+        # `modes=` gets, on `brake_mode`'s rule that an absent argument is a caller
+        # nobody asked rather than a repo that declined to name a rung.
+        "repeated_verdict": {"count": 0, "armed": False, "over": False,
+                             "mode": "enforce", "would_fire": False, "fired": False},
+        "undecidable_verdict": {"count": 0, "armed": False, "over": False,
+                                "mode": "enforce", "would_fire": False,
+                                "fired": False}}
 
 
 def test_the_stop_records_which_premise_and_which_rounds():
@@ -896,6 +910,265 @@ def test_the_stop_records_which_premise_and_which_rounds():
     repeated, = got["premises"]["repeated"]
     assert repeated["rounds"] == [1, 2] and repeated["occurrences"] == 2
     assert repeated["findings"] == [KEY_A]
+
+
+# ------------------------------------- #789: the mode these two rungs did not have
+#
+# #779 gave every `escalate_on` rung a `shadow | enforce` mode so a brake can record
+# its verdict before it acts on it. The config surface covered all six rungs and the
+# enforcement covered four: these two applied their stop off a LIST — the same
+# expression was the measurement, the arming, the verdict and the action — so there
+# was no verdict object for a mode to gate, and `escalate_modes.premise_repeated` was
+# a value the config resolved and nothing read. Set it to `shadow` and the brake
+# still fired.
+#
+# What this section pins is the three things that make the mode real rather than
+# stored, and the first is the one a wiring commit gets wrong: a shadowed rung must
+# leave the round BYTE-IDENTICAL to a round the rung was never in, because a veto line
+# it wrote would cost `confident`, and `confident` is a landing hold two files away.
+
+#: A shadow verdict's one visible mark on a round: the trailing clause `round_stop`
+#: appends to the `reason` after the cap has wrapped it. Everything a comparison
+#: against a rung-absent round has to subtract starts here.
+SHADOW_CLAUSE = f" [{harness_rules.BRAKE_SHADOW}:"
+
+
+def _undecidable(brake=True, round_no=2, answered="no"):
+    reg = {"premises": [{"key": "p1", "text": LANDED, "norm": LANDED, "rounds": [1],
+                         "findings": [KEY_A], "decidable": answered}]}
+    return panel_rounds.premise_state(reg, round_no, 2, brake)
+
+
+def _blocker():
+    return panel.Canonical(id="34-F01", severity="P1", file="a.py", line=1,
+                           synthesis="boom", verdict="confirmed",
+                           reported_by=[panel.Finding("claude", "P1", "a.py", 1,
+                                                      "boom", "")])
+
+
+def _rung_absent(state, listed):
+    """The same round with this rung's STATE omitted, and nothing else touched.
+
+    `listed` is the key whose entries are the rung's evidence — empty it and the rung
+    has nothing to reach a verdict on, while `limit`, `declared`, the arming flag and
+    every #560 field stay exactly what they were. That is the counterfactual #779's
+    constraint is written against: not "the brake off" (which is `armed`, a different
+    record) but "this cycle declared nothing for it to fire on"."""
+    return {**state, listed: []}
+
+
+def _comparable(stop):
+    """One round's payload with everything a shadow verdict is ALLOWED to change
+    subtracted, serialised so the comparison is bytes rather than a dict `==` that
+    can pass on a key neither side has.
+
+    Three subtractions and no more. The two verdict blocks are the record #789 adds —
+    a rung that reached its verdict says so, and a rung with nothing to reach one on
+    says that — so they differ by construction and comparing them would be comparing
+    the feature against its own absence. The two lists are the evidence those verdicts
+    were reached on, published unchanged on a shadowed round because the payload
+    records what the cycle DECLARED. The `reason`'s trailing clause is the one field a
+    shadow verdict is meant to reach, appended after the sentence the stop already had
+    so that sentence stays byte-for-byte what it was — which is what the split leaves
+    testable.
+
+    Everything else is in the comparison, `stop`, `reason`, `veto`, `confident`,
+    `converged`, `handed_to` and the disposal included."""
+    premises = {k: v for k, v in stop["premises"].items()
+                if k not in ("repeated_verdict", "undecidable_verdict")}
+    payload = {**stop, "premises": {**premises, "repeated": [], "undecidable": []},
+               "reason": stop["reason"].split(SHADOW_CLAUSE)[0]}
+    return json.dumps(payload, sort_keys=True)
+
+
+def test_every_rung_with_a_mode_dial_is_a_rung_whose_stop_reads_the_mode():
+    """The whole of #789 as one assertion, and the test that would have caught it the
+    day #779 landed. `escalate_modes` is settable per rung; `BRAKED_RUNGS` is what
+    `round_stop` gates and what `panel.py` builds its `modes=` from. A rung in the
+    first and not the second is a dial that stores a value nothing reads — #169's
+    shape, on a dial about brakes — and a rung in the second and not the first is a
+    stop gated on a mode no repo can set."""
+    assert set(panel_rounds.BRAKED_RUNGS.values()) == set(
+        harness_rules.DEFAULTS["review_panel"]["escalate_modes"])
+    assert {"premise_repeated", "premise_undecidable"} <= set(
+        panel_rounds.BRAKED_RUNGS.values())
+
+
+@pytest.mark.parametrize("rung,state,listed", [
+    ("premise_repeated", _state([1, 2], round_no=2), "repeated"),
+    ("premise_undecidable", _undecidable(), "undecidable"),
+])
+def test_a_shadowed_premise_rung_leaves_the_round_byte_identical_to_one_without_it(
+        rung, state, listed):
+    """#779's constraint, checked mechanically rather than obeyed. `stop`, `reason`,
+    `veto` and `confident` are what they would have been WITH THE RUNG ABSENT — a
+    shadow verdict that vetoed a confident stop would be enforcement by another route,
+    and a lost `confident` is a landing hold in `preland`'s `--require-earned-stop`.
+
+    The round is one rule 1 is buying, so absent the brake it GOES AGAIN: the strongest
+    form of the comparison, because a shadowed rung that reached its verdict and did
+    anything at all would turn this round into a stop and the two payloads would part
+    company on the first field."""
+    shadowed = panel_rounds.round_stop(2, 5, ["k1"], [], [], premises=state,
+                                       modes={rung: harness_rules.BRAKE_SHADOW})
+    absent = panel_rounds.round_stop(2, 5, ["k1"], [], [],
+                                     premises=_rung_absent(state, listed))
+    assert _comparable(shadowed) == _comparable(absent)
+    assert shadowed["stop"] is False and shadowed["confident"] is False
+    assert shadowed["veto"] == absent["veto"]
+
+
+@pytest.mark.parametrize("rung,state,listed", [
+    ("premise_repeated", _state([1, 2], round_no=2), "repeated"),
+    ("premise_undecidable", _undecidable(), "undecidable"),
+])
+def test_the_shipped_config_ends_the_cycle_exactly_as_it_did_before(rung, state,
+                                                                    listed):
+    """`enforce` is the default for both, so a run with the shipped config is
+    byte-identical to the run this file pinned before #789 — checked against a caller
+    that passes no `modes=` at all, which is every consumer written before #779 and
+    every test that calls `round_stop` directly."""
+    unasked = panel_rounds.round_stop(2, 5, ["k1"], [], [], premises=state)
+    shipped = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=state,
+        modes={r: harness_rules.escalate_mode({}, r)
+               for r in panel_rounds.BRAKED_RUNGS.values()})
+    assert json.dumps(unasked, sort_keys=True) == json.dumps(shipped, sort_keys=True)
+    assert unasked["stop"] is True and unasked["confident"] is False
+    assert unasked["premises"][f"{listed}_verdict"]["fired"] is True
+    assert SHADOW_CLAUSE not in unasked["reason"]
+
+
+def test_the_verdict_object_is_the_shape_its_four_siblings_publish():
+    """One vocabulary down one axis and not a sixth spelling of it: the number
+    crossed, the rung reached its verdict, the verdict was applied. A consumer that
+    can read `fix_injection` reads these without learning anything new."""
+    fired = panel_rounds.round_stop(2, 5, ["k1"], [], [],
+                                    premises=_state([1, 2], round_no=2))
+    assert fired["premises"]["repeated_verdict"] == {
+        "count": 1, "armed": True, "over": True, "mode": "enforce",
+        "would_fire": True, "fired": True}
+    assert fired["premises"]["undecidable_verdict"] == {
+        "count": 0, "armed": False, "over": False, "mode": "enforce",
+        "would_fire": False, "fired": False}
+    shadow = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=_undecidable(),
+        modes={"premise_undecidable": harness_rules.BRAKE_SHADOW})
+    assert shadow["premises"]["undecidable_verdict"] == {
+        "count": 1, "armed": True, "over": True, "mode": "shadow",
+        "would_fire": True, "fired": False}
+
+
+def test_the_arming_and_the_mode_stay_two_questions():
+    """`escalate_on.premise_undecidable` says whether this is a rung at all; the mode
+    says whether an armed rung's verdict is applied. Two records rather than two
+    spellings of one — the first measures and reaches no verdict, the second reaches
+    the verdict and declines to act, and only the second is a calibration
+    population."""
+    off = panel_rounds.round_stop(2, 5, ["k1"], [], [],
+                                  premises=_undecidable(brake=False))
+    assert off["premises"]["undecidable_verdict"] == {
+        "count": 1, "armed": False, "over": True, "mode": "enforce",
+        "would_fire": False, "fired": False}
+    shadow = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=_undecidable(),
+        modes={"premise_undecidable": harness_rules.BRAKE_SHADOW})
+    assert shadow["premises"]["undecidable_verdict"]["would_fire"] is True
+    assert off["stop"] is False and shadow["stop"] is False
+
+
+@pytest.mark.parametrize("rung,state,names", [
+    ("premise_repeated", _state([1, 2], round_no=2), "`escalate_on.premise_repeated`"),
+    ("premise_undecidable", _undecidable(), "`escalate_on.premise_undecidable`"),
+])
+def test_the_shadow_verdict_is_said_out_loud_and_named_as_a_shadow(rung, state,
+                                                                   names):
+    """A rung that WOULD have fired is not a rung that fired, and reading the first as
+    the second is how a confident round gets described as divergence. The clause
+    carries the word `shadow`, the rung's own name, and the counterfactual tense."""
+    got = panel_rounds.round_stop(2, 5, ["k1"], [], [], premises=state,
+                                  modes={rung: harness_rules.BRAKE_SHADOW})
+    assert f"[shadow: {names} reached its verdict and would have ended this cycle" \
+        in got["reason"]
+    assert "recorded, not applied" in got["reason"]
+
+
+def test_both_premise_rungs_in_shadow_are_named_in_one_clause():
+    """A cycle circling a premise it also cannot observe is the case #491 was filed
+    from, and it is the round a calibration most wants: both verdicts reached, neither
+    applied, one sentence."""
+    reg = panel_rounds.new_premise_register("acme/board", 34)
+    for r in (1, 2):
+        panel_rounds.declare_premise(reg, LANDED, r, [KEY_A], 2, decidable="no")
+    got = panel_rounds.round_stop(
+        2, 5, ["k1"], [], [], premises=panel_rounds.premise_state(reg, 2, 2, True),
+        modes={"premise_repeated": harness_rules.BRAKE_SHADOW,
+               "premise_undecidable": harness_rules.BRAKE_SHADOW})
+    assert ("[shadow: `escalate_on.premise_undecidable`, "
+            "`escalate_on.premise_repeated` reached their verdicts") in got["reason"]
+    assert got["stop"] is False
+
+
+@pytest.mark.parametrize("rung,state", [
+    ("premise_repeated", _state([1, 2], round_no=2)),
+    ("premise_undecidable", _undecidable()),
+])
+def test_a_shadowed_rung_buys_no_fan_out_and_is_reported_shadowed_instead(rung,
+                                                                          state):
+    """`fired` keeps meaning "this rule is why the cycle stopped", which is what
+    `escalations_fired` bills a constructive pass off. A shadow rung stopped nothing,
+    so it buys nothing — and `escalations_shadowed` beside it is where the verdict
+    shows up, so the two lists partition rather than overlap."""
+    enforced = panel_rounds.round_stop(2, 5, ["k1"], [], [], premises=state)
+    assert panel_propose.escalations_fired(enforced) == [rung]
+    assert panel_propose.escalations_shadowed(enforced) == []
+    shadowed = panel_rounds.round_stop(2, 5, ["k1"], [], [], premises=state,
+                                       modes={rung: harness_rules.BRAKE_SHADOW})
+    assert panel_propose.escalations_fired(shadowed) == []
+    assert panel_propose.escalations_shadowed(shadowed) == [rung]
+
+
+def test_a_payload_written_before_the_verdict_block_still_reads_as_fired():
+    """The fallback, and it is a claim about rounds that are already over: before #789
+    neither rung could be shadowed, so a repeat that reached one of those rounds ended
+    it. Reading an absent block as "did not fire" would be the flattering direction on
+    a stored population — every cycle #84 ever stopped would read back as a cycle that
+    stopped for something else."""
+    old = {"premises": {"repeated": [{"key": "p1"}], "undecidable": [{"key": "p2"}],
+                        "undecidable_brake": True}}
+    assert panel_propose.escalations_fired(old) == ["premise_repeated",
+                                                    "premise_undecidable"]
+    # And the arming is still read on that path, so a repo that switched #491 off is
+    # not billed for a fan-out over a policy it declined.
+    declined = {"premises": {"repeated": [], "undecidable": [{"key": "p2"}],
+                             "undecidable_brake": False}}
+    assert panel_propose.escalations_fired(declined) == []
+    # Nothing is reported shadowed off an old payload: that list says what a round
+    # DECLINED to do, and no round before #789 ever declined.
+    assert panel_propose.escalations_shadowed(old) == []
+
+
+@pytest.mark.parametrize("rung,state", [
+    ("premise_repeated", _state([1, 2], round_no=5)),
+    ("premise_undecidable", _undecidable(round_no=5)),
+])
+def test_a_shadow_verdict_does_not_quietly_make_it_a_fixers_problem(rung, state):
+    """The stop these two produce is `handed_to: "human"`, with a reason saying a
+    person answers this rather than another fix pass — and the disposal has to agree
+    with the sentence the same payload is carrying (#42).
+
+    The other direction is the one a wiring commit gets wrong. On a round that stops
+    for something else entirely — here the cap, with a P1 the fix pass did not clear —
+    a shadowed rung must not drag the remainder to a human on the strength of a verdict
+    the round declined to act on. `futile` is read on `fired` for exactly this."""
+    enforced = panel_rounds.round_stop(5, 5, [], [_blocker()], [], premises=state)
+    assert enforced["outstanding"]["handed_to"] == "human"
+    assert "not another fix pass" in enforced["reason"] or \
+        "not a better approximation" in enforced["reason"]
+    shadowed = panel_rounds.round_stop(5, 5, [], [_blocker()], [], premises=state,
+                                       modes={rung: harness_rules.BRAKE_SHADOW})
+    assert shadowed["outstanding"]["handed_to"] == "fixer"
+    assert shadowed["reason"].startswith("round cap (5) reached")
 
 
 # ------------------------------------------------------------------- the register file

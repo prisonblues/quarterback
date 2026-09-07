@@ -3631,25 +3631,37 @@ ESCALATE_ON_UNBUILT = ("quorum_failed", "judge_absent")
 
 #: #779, and it is a mapping rather than a list because the two names differ: the
 #: PAYLOAD block a round publishes and the `escalate_modes` RUNG that decides whether
-#: it acts are spelled differently for one rung out of four (`guard_churn` is
+#: it acts are spelled differently for one rung out of six (`guard_churn` is
 #: published under the measurement's name and armed under `escalate_on.guard_lines`),
 #: and a reader holding a payload has to be able to get from one to the other without
 #: knowing that. `{payload key: rung name}`.
 #:
-#: Four and not six. `premise_repeated` and `premise_undecidable` are rungs of
-#: `escalate_on` and are named in `harness_rules.DEFAULTS["review_panel"]
-#: ["escalate_modes"]`, but their stop is applied further down :func:`round_stop`
-#: off a LIST rather than off an `over`/`armed` state block, and nothing here reads
-#: their mode yet — see the comment at `circling` for what that costs and what it
-#: does not. Named here would be worse than absent: this mapping is what
-#: :func:`round_stop` iterates to publish `mode`, and a rung in it whose stop is not
-#: gated on that mode is the exact failure #779 was filed over — a payload saying
-#: `shadow` beside a cycle the rung ended.
+#: **Six, and the last two arrived with #789 rather than with #779.** They were left
+#: out on purpose and the omission was argued where it was made: the premise rungs
+#: applied their stop off a LIST — `premises.repeated`, `premises.undecidable` —
+#: rather than off an `over`/`armed` state block, so there was no verdict object for a
+#: mode to gate and no `would_fire` to publish, and a rung named here whose stop
+#: ignored its mode would have been #779's own failure. What #789 changed is the thing
+#: that made them different: :func:`premise_repeated_state` and
+#: :func:`premise_undecidable_state` now reach the verdict, the list is left as the
+#: RECORD it always was, and the stop reads `fired`. The mapping is the same shape for
+#: all six because the rungs now are.
+#:
+#: Two of the keys are PATHS and not top-level payload keys, which is the one thing a
+#: reader holding a payload has to know. The premise verdicts are published INSIDE the
+#: `premises` block — `premises` is already the premise rungs' block on the board
+#: (`app/api/reviews.py`'s `STOP_RUNGS` stores it whole and says in as many words that
+#: it is "a rung's evidence under a different name"), so nesting them there gets the
+#: calibration population stored on the day it starts accumulating, where two new
+#: top-level keys would have been dropped unbound until the board grew a column for
+#: each.
 BRAKED_RUNGS: Mapping[str, str] = MappingProxyType({
     "new_findings_not_falling": "new_findings_not_falling",
     "fix_injection": "fix_injection",
     "unrefereed_fix": "unrefereed_fix",
     "guard_churn": "guard_lines",
+    "premises.repeated_verdict": "premise_repeated",
+    "premises.undecidable_verdict": "premise_undecidable",
 })
 
 
@@ -3665,10 +3677,10 @@ def brake_mode(modes: Mapping[str, str] | None, rung: str) -> str:
     caller that handed in nothing — every test that calls :func:`round_stop`
     directly, and every consumer written before #779 — is not a repo that declined
     to name a rung; it is a caller that has not been asked, and the answer for it is
-    the behaviour it already had, which is `enforce` on all four.
+    the behaviour it already had, which is `enforce` on all six.
 
     That asymmetry is deliberate and is the reverse of `escalate_mode`'s last layer.
-    Defaulting an ABSENT ARGUMENT to `shadow` here would disarm four armed brakes on
+    Defaulting an ABSENT ARGUMENT to `shadow` here would disarm six armed brakes on
     every caller that had not yet learned the parameter — the upgrade in which
     nothing on the round looks different and five brakes have quietly stopped
     stopping anything, which is the one outcome `DEFAULTS` spends a paragraph
@@ -4376,7 +4388,8 @@ def find_premise(reg: dict, text: str) -> dict | None:
 def declare_premise(reg: dict, text: str, round_no: int,
                     findings: Iterable[str] = (), limit: int | None = None,
                     decidable: str = "unknown",
-                    undecidable_brake: bool = False, head: str = "") -> dict:
+                    undecidable_brake: bool = False, head: str = "",
+                    modes: Mapping[str, str] | None = None) -> dict:
     """Record that a fix pass is about to be written against ``text``, and say
     whether it may be.
 
@@ -4431,7 +4444,25 @@ def declare_premise(reg: dict, text: str, round_no: int,
     ordering fails: the pass that was already COMMITTED when the premise was declared,
     which is the shape #560 reported and which :func:`retroactive_declarations` reads.
     The pass that was merely WRITTEN moves no head and is not settled here — see that
-    function for the three attempts at it and why the evidence does not carry it."""
+    function for the three attempts at it and why the evidence does not carry it.
+
+    ``modes`` is #779's per-rung mode, and reading it HERE is the half that matters
+    most (#789). Both brakes are evaluated twice: at the round, where a stop is one
+    whole fix pass and one whole panel too late, and here, where the fix is being
+    PROPOSED. Until this argument existed the second evaluation ignored the mode
+    entirely, so ``escalate_modes.premise_repeated: shadow`` shadowed the round's stop
+    and this function still refused the fix with
+    :data:`PREMISE_REPEATED_EXIT` — a brake half in shadow, which is worse than one
+    not in shadow at all, because the operator has been told it is recording.
+
+    So the vocabulary is the one its four siblings publish and the same
+    ``fired``-not-``over`` discipline applies: ``repeated`` and ``undecidable`` stay
+    the MEASUREMENTS and are unchanged, ``repeated_verdict``/``undecidable_verdict``
+    carry the mode and both halves of the verdict, ``would_escalate`` is what the
+    brake reached, and ``escalate`` — the field the exit code and the board
+    announcement are built on — is what it APPLIED. Absent ``modes`` is ``enforce``
+    on both, per :func:`brake_mode`: a caller that has not been asked gets the
+    behaviour it already had, never a silently disarmed brake."""
     text = " ".join(str(text).split())
     answer = str(decidable or "unknown").strip().lower()
     if answer not in DECIDABILITY:
@@ -4484,7 +4515,20 @@ def declare_premise(reg: dict, text: str, round_no: int,
     occurrence = len(entry["rounds"])
     repeated = limit is not None and occurrence >= limit
     undecidable = bool(undecidable_brake) and entry["decidable"] == "no"
-    escalate = repeated or undecidable
+    # `over and armed` is the flag itself on both rungs — `repeated` already requires
+    # a limit and `undecidable` already requires the brake — so `armed` is a conjunct
+    # of `over` here exactly as `premise_repeated_state` says it is at the round. It
+    # is published anyway, on that function's precedent: a fixer reading a
+    # declaration that did not stop it has to be able to tell "the rung is off" from
+    # "the rung is on and this premise has not repeated".
+    repeated_verdict = _premise_brake_state(
+        repeated, limit is not None, 1 if repeated else 0, modes,
+        BRAKED_RUNGS["premises.repeated_verdict"])
+    undecidable_verdict = _premise_brake_state(
+        undecidable, bool(undecidable_brake), 1 if undecidable else 0, modes,
+        BRAKED_RUNGS["premises.undecidable_verdict"])
+    would_escalate = repeated or undecidable
+    escalate = repeated_verdict["fired"] or undecidable_verdict["fired"]
     reasons = []
     if undecidable:
         reasons.append(
@@ -4498,7 +4542,15 @@ def declare_premise(reg: dict, text: str, round_no: int,
             f"premise declared {occurrence} time(s) — rounds "
             f"{', '.join(str(r) for r in entry['rounds'])} — and the brake is set "
             f"at {limit}: a human answers this premise, not another fix pass")
-    if reasons:
+    if reasons and not escalate:
+        # SHADOW. The verdict was reached and applied to nothing, and the sentence
+        # has to say both — a reason that reads exactly like the enforcing one under
+        # a command that exited 0 is how a fixer learns to ignore the block entirely.
+        reason = ("WOULD HAVE REFUSED THIS FIX, and did not: "
+                  + "; and ".join(reasons)
+                  + f". `escalate_modes` puts this rung in {BRAKE_SHADOW}, so the "
+                  "verdict is recorded and the fix is permitted (#779)")
+    elif reasons:
         reason = "; and ".join(reasons)
     elif limit is None:
         reason = (f"recorded (occurrence {occurrence}) — `escalate_on.premise_repeated` "
@@ -4512,6 +4564,12 @@ def declare_premise(reg: dict, text: str, round_no: int,
             "limit": limit, "escalate": escalate, "reason": reason,
             "decidable": entry["decidable"], "answered": answer,
             "repeated": repeated, "undecidable": undecidable,
+            # The verdict beside the measurement, in the four siblings' vocabulary.
+            # `escalate` above is `fired`; this is what would have happened, and the
+            # pair is the calibration population #67 asks for before a gate binds.
+            "would_escalate": would_escalate,
+            "repeated_verdict": repeated_verdict,
+            "undecidable_verdict": undecidable_verdict,
             "undecidable_brake": bool(undecidable_brake),
             "head": entry["heads"].get(round_no, ""),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
@@ -4668,6 +4726,83 @@ def premise_state(reg: dict, round_no: int, limit: int | None = None,
             "stamped": sum(len(e.get("heads") or {}) for e in entries),
             "retroactive": retroactive_declarations(reg, heads),
             "undeclared_rounds": undeclared_passes(reg, round_no)}
+
+
+def _premise_brake_state(over: bool, armed: bool, count: int,
+                         modes: Mapping[str, str] | None, rung: str) -> dict:
+    """One premise rung's verdict, in the vocabulary its four siblings publish (#789).
+
+    The shape is the whole point and is copied deliberately: `over` is the
+    MEASUREMENT, `armed` is the policy, `would_fire` is the verdict — over, armed,
+    and this rung's own bounds — and `fired` is the verdict APPLIED. A consumer that
+    can read `fix_injection` can read this without learning a second vocabulary, and
+    `panel_propose.escalations_shadowed` reads all six off one pair of field names.
+
+    **`would_fire` here is `over and armed` and takes no `going_again` bound, which is
+    the one place these two differ from the four above them and is not an omission.**
+    Those four may only turn a round that was going again into a stop — the argument
+    each of them makes is about rule 1's input, so none may cancel the repair round
+    for a P1 an earlier round raised. These two make no claim about this round's
+    findings at all: they say the CYCLE has stopped being about different things, and
+    a P1 outstanding is not evidence against that — it is the thing the next fix pass
+    would be circling. So they end the cycle from any of the four rules and always
+    have, and a bound added here under cover of #789 would be a behaviour change
+    smuggled in on a wiring commit.
+
+    The consequence for the caller is that there is nothing left for `round_stop` to
+    add: the verdict is complete where the measurement is, and `fired` can be settled
+    here. That is why this returns the block its siblings only get after `round_stop`
+    has merged the mode in."""
+    mode = brake_mode(modes, rung)
+    would = bool(over and armed)
+    return {"count": count, "armed": bool(armed), "over": bool(over), "mode": mode,
+            "would_fire": would, "fired": bool(would and mode == BRAKE_ENFORCE)}
+
+
+def premise_repeated_state(premises: dict | None,
+                           modes: Mapping[str, str] | None = None) -> dict:
+    """`escalate_on.premise_repeated`'s verdict on a round (#84, #789).
+
+    A READING of :func:`premise_state`'s block and never a second reading of the
+    register, which is `injection_state`'s rule with a sharper edge: the list this
+    counts is the one the payload publishes and the report prints, so a verdict
+    derived from a fresh pass over the entries could disagree with the evidence
+    printed beside it and nothing would say which was wrong.
+
+    `over` is "a premise reached the occurrence limit", `armed` is "`escalate_on.
+    premise_repeated` is a number and not `null`". `armed` is already a conjunct of
+    `over` — `premise_state` populates `repeated` only where a limit was set — and it
+    is published anyway, on :func:`referee_state`'s precedent: a repo reading a round
+    that did not fire has to be able to tell "the rung is off" from "the rung is on
+    and nothing repeated", and a block that reports only the second is the shape #169
+    names."""
+    listed = list((premises or {}).get("repeated") or [])
+    return _premise_brake_state(
+        bool(listed), (premises or {}).get("limit") is not None, len(listed), modes,
+        BRAKED_RUNGS["premises.repeated_verdict"])
+
+
+def premise_undecidable_state(premises: dict | None,
+                              modes: Mapping[str, str] | None = None) -> dict:
+    """`escalate_on.premise_undecidable`'s verdict on a round (#491, #789).
+
+    `over` is "a fix pass was written against a property the runtime cannot observe"
+    and `armed` is `undecidable_brake` — and here the two are genuinely independent,
+    which is why this rung needed the split more than the one beside it.
+    `premise_state` lists an undecidable declaration whether or not the brake is
+    armed, deliberately, because the payload records what a cycle DECLARED; the
+    arming used to be checked at the stop, where it read as one condition on a list
+    rather than as the policy half of a verdict.
+
+    So a repo that switched the brake off now reads `over: true, armed: false,
+    would_fire: false` — it declined the policy — and a repo that armed it and put the
+    rung in `shadow` reads `armed: true, would_fire: true, fired: false`. Those are
+    two different records and were one before #789: both showed up as a cycle that did
+    not end, with nothing saying whether the verdict had been reached."""
+    listed = list((premises or {}).get("undecidable") or [])
+    return _premise_brake_state(
+        bool(listed), bool((premises or {}).get("undecidable_brake")), len(listed),
+        modes, BRAKED_RUNGS["premises.undecidable_verdict"])
 
 
 #: #774's split, and it is deliberately :data:`panel_seats.REFEREE_KINDS` rather than
@@ -6423,6 +6558,27 @@ def premise_report(verdict: dict, register_path: str, notes: list[str],
     for line in (*problems, *notes):
         out.append(f"note     {line}")
     out.append("")
+    if verdict.get("would_escalate") and not verdict["escalate"]:
+        # SHADOW, said as loudly as the refusal it stands in for and never as a note
+        # (#789). The fixer is about to write the patch, so what it most needs to
+        # know is that the brake reached its verdict and was told to act on nothing —
+        # the calibration population #67 asks for is only worth having if somebody
+        # can see it being collected. Which rung is named, because the two mean
+        # different things and a repo shadowing one has usually armed the other.
+        shadowed = ", ".join(
+            f"`escalate_on.{BRAKED_RUNGS[key]}`"
+            for key, flag in (("premises.repeated_verdict", "repeated_verdict"),
+                              ("premises.undecidable_verdict", "undecidable_verdict"))
+            if (verdict.get(flag) or {}).get("would_fire"))
+        out += [
+            "SHADOW — this fix would have been REFUSED, and is permitted.",
+            verdict["reason"],
+            "",
+            f"{shadowed} is in {BRAKE_SHADOW}, so the verdict was recorded and "
+            "applied to nothing. Write the fix. If this rung is meant to stop a "
+            f"pass, put the word back to `{BRAKE_ENFORCE}` in "
+            "`review_panel.escalate_modes` (#779, #789).",
+        ]
     if verdict["escalate"]:
         keys = " ".join(f"--escalated {k}" for k in verdict["findings"])
         # Which brake fired changes what the fixer is being told NOT to do, so the
@@ -6660,7 +6816,17 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     The occurrence is recorded even when the brake fires, and the exit code is what
     carries the refusal. A caller that ignores it has written the fix anyway, and the
     register is then the record that says so — which `round_stop` reads on the round
-    that follows, ending the cycle late rather than not at all."""
+    that follows, ending the cycle late rather than not at all.
+
+    **And the mode decides whether there is a refusal at all** (#789). A rung in
+    `shadow` reaches its verdict, records it, prints it and exits **0** — the fix is
+    permitted — because a brake that shadows the round's stop and still refuses the
+    fix at declaration time is half-armed while the operator has been told it is
+    recording. The exit code is the whole interface here: a caller reads
+    :data:`PREMISE_REPEATED_EXIT` as *do not write this fix*, so a shadowed rung must
+    not produce it. Nor may it announce: the board write below is gated on the
+    APPLIED verdict, because a needs-human row parks the work as surely as an exit
+    code does."""
     cfg = load_repo_cfg(repo_name)
     repo_name = cfg.get("name") or repo_name
     notes: list[str] = []
@@ -6672,8 +6838,22 @@ def declare(repo_name: str | None, premise: str, register_path: str,
     # the fact — see :func:`working_head` for why it is not a flag, and
     # :func:`retroactive_declarations` for the one ordering failure it settles and the
     # one it does not.
+    # #789's modes, resolved from the config this function already loaded and beside
+    # the two policy reads above it. Resolved HERE rather than handed in by `main()`,
+    # which is the one deviation from `round_stop`'s arrangement and is deliberate:
+    # `round_stop` is given a config it never loads, while this function loads one —
+    # so a mode resolved in `panel.py` would mean a second `load_repo_cfg`, and two
+    # reads of one rules file are two answers to "is this rung armed" the first time
+    # somebody edits it mid-cycle. `escalate_mode` is still the only resolver; this is
+    # just the caller that hands it in.
+    #
+    # Built over `BRAKED_RUNGS` rather than over the two names, for the reason
+    # `panel.run` builds its own that way: a rung wired into a brake cannot arrive
+    # with no mode read for it.
+    modes = {rung: harness_rules.escalate_mode(cfg, rung)
+             for rung in sorted(set(BRAKED_RUNGS.values()))}
     verdict = declare_premise(reg, premise, round_no, findings or [], limit,
-                              decidable, undecidable_brake, working_head())
+                              decidable, undecidable_brake, working_head(), modes)
     if verdict["decidable"] == "no" and not undecidable_brake:
         # The repo switched it off, and the declaration still says the fix cannot be
         # verified where it runs. Recorded and reported rather than swallowed, on
@@ -7539,12 +7719,24 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
       round can clear, and go on rendering ⛔, for every round that inherits the
       baseline.
 
-    **``modes`` (#779) is `{rung: shadow|enforce}` for the four rungs
+    **``modes`` (#779, #789) is `{rung: shadow|enforce}` for the six rungs
     :data:`BRAKED_RUNGS` names, already resolved by the caller through
     ``harness_rules.escalate_mode`` — the only place the three-layer config fallback
     may be applied. Absent, every rung enforces, which is what this function did
     before the parameter existed; :func:`brake_mode` argues why an absent ARGUMENT
     and an unnamed RUNG take opposite defaults.**
+
+    **Six since #789, and the two that arrived last are the two the mechanism was
+    most needed for.** ``premise_repeated`` and ``premise_undecidable`` shipped with
+    #779's config surface and none of its enforcement: their stop was applied off a
+    LIST — the same expression was the measurement, the arming, the verdict and the
+    action — so ``escalate_modes.premise_repeated`` was settable, resolved, and read
+    by nothing. They end a cycle on an argument rather than on a count, which makes
+    their false-positive cost the highest of the six and makes them exactly the rungs
+    a repo would want to run in shadow while calibrating. See
+    :func:`premise_repeated_state` and :func:`premise_undecidable_state` for the
+    verdict object the mode now gates, and ``premises.repeated_verdict`` /
+    ``premises.undecidable_verdict`` in the payload for where it is published.
 
     It splits ``fired`` where the split was always latent, because that word has been
     carrying two claims at once — the rung reached a stop-worthy verdict, AND the stop
@@ -7552,7 +7744,9 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
 
     - ``over`` — the MEASUREMENT crossed. Decided in the state builder, unchanged;
     - ``would_fire`` — the rung reached the VERDICT: over, armed, the rule's own
-      bounds cleared (``going_again``), everything except the mode;
+      bounds cleared (``going_again`` for four of the six; the two premise rungs
+      take no such bound and :func:`_premise_brake_state` says why), everything except
+      the mode;
     - ``fired`` — the verdict was APPLIED: ``would_fire and mode == enforce``.
 
     So ``fired`` keeps its exact present meaning, and every consumer of it is correct
@@ -8234,19 +8428,34 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"round, past the `escalate_on.fix_injection` threshold of "
             f"{injecting['limit']:g} — the fix pass is generating this round's work, "
             "and a human answers that, not another fix pass")
-    circling = list((premises or {}).get("repeated") or [])
-    # #491's half, on exactly the same terms and gated on the same arming flag the
-    # declaration path reads. A repo that switched `escalate_on.premise_undecidable`
-    # off asked for its fixers to be allowed to approximate; ending its cycle on the
-    # answer anyway would enforce a policy it declined, which is the failure
-    # `ESCALATE_ON_UNBUILT` exists to keep on the other side.
+    # ---- #789: THE TWO FUTILITY RUNGS, WHICH DECIDE AND APPLY IN TWO STEPS NOW.
     #
-    # `premise_state` lists these regardless of the flag, deliberately — the payload
-    # records what a cycle DECLARED — so the arming check has to happen here rather
-    # than being assumed from the list being non-empty.
-    unobservable = (list((premises or {}).get("undecidable") or [])
-                    if (premises or {}).get("undecidable_brake") else [])
-    if unobservable:
+    # These lists used to BE the decision. `if circling:` was the measurement, the
+    # arming, the verdict and the stop in one expression, which is why #779 could not
+    # give either rung a mode without half-wiring it: there was no verdict object to
+    # gate and no `would_fire` to publish, so `escalate_modes.premise_repeated` was a
+    # value the config resolved and nothing read.
+    #
+    # Split, and the lists stay exactly what they were — the RECORD of what the cycle
+    # declared, published unchanged in the payload and printed unchanged in the
+    # report. What moved is the APPLICATION: the two blocks below carry the verdict
+    # and every stop, veto and disposal reads `fired`, so a rung in `shadow` reaches
+    # the same verdict and applies none of it. The lists are no longer gated on the
+    # arming flag either — `unobservable` used to be emptied when
+    # `escalate_on.premise_undecidable` was off, which made "the repo declined this
+    # policy" and "nothing was declared" the same local — and `armed` in the verdict
+    # is now where that question is answered, which is where its four siblings answer
+    # it.
+    #
+    # A repo that switched `escalate_on.premise_undecidable` off asked for its fixers
+    # to be allowed to approximate, and ending its cycle on the answer anyway would
+    # enforce a policy it declined — the failure `ESCALATE_ON_UNBUILT` exists to keep
+    # on the other side. That is `armed`, and it is unchanged in effect.
+    circling = list((premises or {}).get("repeated") or [])
+    unobservable = list((premises or {}).get("undecidable") or [])
+    repeating = premise_repeated_state(premises, modes)
+    unobserving = premise_undecidable_state(premises, modes)
+    if unobserving["fired"]:
         worded = "; ".join(
             f"{p['text']!r} (rounds {', '.join(str(r) for r in p['rounds'])})"
             for p in unobservable)
@@ -8255,7 +8464,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             f"property the runtime cannot observe — {worded} — so every fix for them "
             "is an approximation and the next round finds the gap: a human answers "
             "this, not a better approximation")
-    if circling:
+    if repeating["fired"]:
         worded = "; ".join(
             f"{p['text']!r} declared {p['occurrences']}x "
             f"(rounds {', '.join(str(r) for r in p['rounds'])})" for p in circling)
@@ -8292,11 +8501,22 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # than an oversight: the calibration population #779 exists to create is every
     # round the rung would have acted on, and the rounds it would have TURNED are
     # precisely the ones that went again.
+    #
+    # The two premise rungs (#789) are last, in the order they are APPLIED above, and
+    # they are the two this clause was most needed for: they end a cycle on an
+    # argument rather than on a count, so their false-positive cost is the highest of
+    # the six and a reader calibrating one is reading this sentence to find out what
+    # it would have cost. Their `would_fire` comes off the verdict block rather than
+    # off a local, because for these two the mode is the only thing between the
+    # verdict and the stop and a second expression here could disagree with the one
+    # the stop read.
     shadowed = [rung for rung, would in (
         (BRAKED_RUNGS["fix_injection"], injecting_would),
         (BRAKED_RUNGS["new_findings_not_falling"], flattening_would),
         (BRAKED_RUNGS["guard_churn"], guarding_would),
         (BRAKED_RUNGS["unrefereed_fix"], refereeing_would),
+        (BRAKED_RUNGS["premises.undecidable_verdict"], unobserving["would_fire"]),
+        (BRAKED_RUNGS["premises.repeated_verdict"], repeating["would_fire"]),
     ) if would and brake_mode(modes, rung) == BRAKE_SHADOW]
     if shadowed:
         reason += (
@@ -8534,20 +8754,32 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             "that would identify the offending pass is the range that is missing "
             "(#500), so there is no revert to propose here — what ships is a change "
             "this cycle can measure and cannot point at (#506)")]
-    # #84. Unconditional rather than "only on a STOP", because `circling` forces the
-    # stop a few lines above — there is no `go again` round this can fire on, and
+    # #84. Unconditional rather than "only on a STOP", because a FIRED repeat forces
+    # the stop a few lines above — there is no `go again` round this can fire on, and
     # writing the guard anyway would say there was.
-    if circling:
+    #
+    # On `fired` and not on the list (#789), which is what makes `shadow` mean shadow
+    # for this rung: a veto line is not a report, it is the reason `confident` is
+    # withheld, and `confident: false` is a landing hold two files away
+    # (`preland`'s `--require-earned-stop`). A shadowed rung that wrote one would hold
+    # pull requests while it was being calibrated — enforcement by another route, and
+    # the most expensive of the routes available.
+    if repeating["fired"]:
         veto = [*veto, f"{len(circling)} premise(s) were declared more than once in "
                        "this cycle — the rounds have stopped being about different "
                        "things, and the next fix pass would be the third patch on one "
                        "assumption (#67, #84)"]
-    # Unconditional for the same reason `circling`'s is: it forces the stop above, so
-    # there is no `go again` round this can fire on. Its own line rather than folded
-    # into the one above, because the two say different things to a human deciding
-    # what to do next — one asks whether to keep patching an assumption, the other
-    # asks whether the property can be checked here at all.
-    if unobservable:
+    # Unconditional for the same reason the repeat's is: a fired verdict forces the
+    # stop above, so there is no `go again` round this can fire on. Its own line
+    # rather than folded into the one above, because the two say different things to a
+    # human deciding what to do next — one asks whether to keep patching an
+    # assumption, the other asks whether the property can be checked here at all.
+    #
+    # On `fired` for the reason the line above it is, and it now carries the ARMING
+    # too: this used to read `if unobservable:` against a list that had already been
+    # emptied when the brake was off, so the arming was enforced by a local two
+    # hundred lines up. One flag, read in one place, published beside the verdict.
+    if unobserving["fired"]:
         veto = [*veto, f"{len(unobservable)} premise(s) in this cycle assert a property "
                        "nothing in the runtime can observe, so no fix for them can be "
                        "verified where it runs and each round patches the last "
@@ -8574,8 +8806,17 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # question, its wording is not identical, and quietly widening a second rung's
     # disposal under a #622 branch is the kind of drive-by this file's own rule about
     # surgical diffs exists to refuse.
-    futile = bool(flat or unchecked or injected or circling or unobservable
-                  or overspent)
+    #
+    # The two premise rungs are read on `fired` and not on their lists (#789), and
+    # this is the third of the three places `shadow` had to reach. `futile` is what
+    # sends a round's remainder to a HUMAN rather than to a fix pass, and the reason
+    # it does is that the stop's own sentence says a human answers this. A shadowed
+    # rung wrote no such sentence — the round stopped for whatever else was true of it
+    # — so a `futile` taken off the list would hand a fixer's round to a human on the
+    # strength of a verdict the round declined to act on, which is the same
+    # enforcement the veto lines above are kept off.
+    futile = bool(flat or unchecked or injected or repeating["fired"]
+                  or unobserving["fired"] or overspent)
     if not stop:
         # The cycle is going again, so there is no disposal to make: §5's ordinary
         # path hands this round's findings to the next fix pass and the round after
@@ -8736,33 +8977,64 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # to tell them apart would be reading a payload's age rather than a cycle's
         # state. `undeclared_rounds` is the honest half: those fix passes could not
         # have been braked, whatever this round's stop says.
-        "premises": premise_state({"premises": []}, round_no, None) if premises is None
-        else {"limit": premises.get("limit"),
-              "declared": premises.get("declared", 0),
-              "repeated": circling,
-              # The DECLARED list, not the armed one: a payload records what the
-              # cycle said, and `undecidable_brake` beside it says whether this run
-              # was going to act on it. Collapsing the two would make a repo that
-              # switched the brake off indistinguishable from one where no fixer ever
-              # answered the question.
-              "undecidable": list(premises.get("undecidable") or []),
-              "undecidable_brake": bool(premises.get("undecidable_brake")),
-              # #560. `wired` is whether this round was handed a register at all,
-              # kept apart from `undeclared_rounds` on exactly the terms
-              # `undecidable_brake` is kept apart from `undecidable`: one is what
-              # the cycle said and the other is whether it was ever in a position
-              # to say it. `retroactive` is the declarations this cycle's own
-              # records place after the pass they explain — evidence about the
-              # cycle, not a rung, and not a proof: each entry rests on a reading
-              # taken in the actor's environment. Nothing here stops anything,
-              # deliberately: the
-              # brake's whole claim is that it runs before the patch, and a stop
-              # taken on a round is the late half that `repeated` and
-              # `undecidable` already occupy.
-              "wired": bool(premises.get("wired")),
-              "stamped": int(premises.get("stamped") or 0),
-              "retroactive": list(premises.get("retroactive") or []),
-              "undeclared_rounds": list(premises.get("undeclared_rounds") or [])},
+        #
+        # #789's two verdict blocks ride INSIDE it, under `repeated_verdict` and
+        # `undecidable_verdict`, and every key that was here before is here unchanged.
+        # Inside rather than beside its four siblings at the payload's top level for
+        # the reason `STOP_RUNGS` gives for storing this block at all — `premises` IS
+        # the premise rungs' evidence under a different name — and with a consequence
+        # #779 was filed to get: the board stores this block whole and opaque, so the
+        # calibration population these two exist to create is queryable on the day it
+        # starts accumulating rather than after two columns are added for it.
+        #
+        # The lists beside them are the RECORD and stay the record: `repeated` and
+        # `undecidable` say what the cycle declared, `undecidable_brake` says whether
+        # the repo armed the rung, and the verdict blocks say what the rung made of
+        # that and whether it was allowed to act. A reader who had only the lists
+        # could not tell a shadowed verdict from a cycle that stopped for something
+        # else, which is the whole of what #789 reports as missing.
+        "premises": {
+            **(premise_state({"premises": []}, round_no, None) if premises is None
+               else {"limit": premises.get("limit"),
+                     "declared": premises.get("declared", 0),
+                     "repeated": circling,
+                     # The DECLARED list, not the armed one: a payload records what the
+                     # cycle said, and `undecidable_brake` beside it says whether this run
+                     # was going to act on it. Collapsing the two would make a repo that
+                     # switched the brake off indistinguishable from one where no fixer ever
+                     # answered the question.
+                     "undecidable": list(premises.get("undecidable") or []),
+                     "undecidable_brake": bool(premises.get("undecidable_brake")),
+                     # #560. `wired` is whether this round was handed a register at all,
+                     # kept apart from `undeclared_rounds` on exactly the terms
+                     # `undecidable_brake` is kept apart from `undecidable`: one is what
+                     # the cycle said and the other is whether it was ever in a position
+                     # to say it. `retroactive` is the declarations this cycle's own
+                     # records place after the pass they explain — evidence about the
+                     # cycle, not a rung, and not a proof: each entry rests on a reading
+                     # taken in the actor's environment. Nothing here stops anything,
+                     # deliberately: the
+                     # brake's whole claim is that it runs before the patch, and a stop
+                     # taken on a round is the late half that `repeated` and
+                     # `undecidable` already occupy.
+                     "wired": bool(premises.get("wired")),
+                     "stamped": int(premises.get("stamped") or 0),
+                     "retroactive": list(premises.get("retroactive") or []),
+                     "undeclared_rounds": list(premises.get("undeclared_rounds")
+                                               or [])}),
+            # #84's rung as a verdict rather than as a list membership (#789).
+            # `count` and not the entries: the entries are `repeated` one key up,
+            # and a second copy of them inside the verdict is one list in two
+            # places with two chances to disagree about which premises a cycle
+            # circled. `limit` is one key up for the same reason.
+            "repeated_verdict": repeating,
+            # #491's, on exactly the same terms — and this is the one whose `armed`
+            # a reader cannot get anywhere else in the same vocabulary:
+            # `undecidable_brake` above is the same flag and the same read, kept
+            # because consumers have read it since #491 and a payload does not
+            # rename a key to tidy a shape.
+            "undecidable_verdict": unobserving,
+        },
         # #489's measurement as this round read it, and ALWAYS present for the reason
         # `premises` is: a payload with no key and a round with nothing to attribute
         # are different claims, and a consumer forced to tell them apart would be
@@ -9033,6 +9305,7 @@ __all__ = [
     "PREMISE_REGISTER_VERSION", "premise_repeat_limit", "premise_key",
     "same_premise", "new_premise_register", "load_premises", "find_premise",
     "declare_premise", "undeclared_passes", "premise_state",
+    "premise_repeated_state", "premise_undecidable_state",
     "working_head", "retroactive_declarations",
     "premise_report", "declare", "announce_escalation",
 ]

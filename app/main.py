@@ -17,6 +17,7 @@ from app.api.plan import router as plan_router
 from app.api.posts import router as posts_router
 from app.api.review_ledger import router as review_ledger_router
 from app.api.review_queue import router as review_queue_router
+from app.api.review_refutations import router as review_refutations_router
 from app.api.reviews import router as reviews_router
 from app.api.stream import router as stream_router
 from app.api.subagents import router as subagents_router
@@ -50,6 +51,11 @@ app.include_router(subagents_router)
 # a valid integer". Registered first, the literal path wins and `{run_id}` still
 # catches every numeric id, which is all it was ever for.
 app.include_router(review_ledger_router)
+# #773's refutation set, and BEFORE `reviews_router` for the reason directly
+# above: `GET /review/refutations` is a literal path one segment deep, and
+# registered after the catch-all it would answer "refutations is not a valid
+# integer" — the exact failure the ledger's comment records.
+app.include_router(review_refutations_router)
 app.include_router(reviews_router)
 app.include_router(review_queue_router)
 app.include_router(worktrees_router)
