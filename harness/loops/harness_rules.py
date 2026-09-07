@@ -2506,12 +2506,24 @@ DEFAULTS: dict = {
         #     `low_severity_fix_full_chars`, is a SIZE and not a ceiling: it says what
         #     a whole budget is worth, the round already spends the smaller of the
         #     two, and scaling both would apply the taper twice to one budget;
-        #   - the SEAT SET, if #775's complement routing lands — how many seats a
+        #   - the SEAT SET, since #775's complement routing landed — how many seats a
         #     round dispatches, FLOORED AT 1. Never which seats: that is #775's
         #     routing decision and a budget has no view on it. Floored at 1 because a
         #     round with no seats reviewed nothing, and `panel.py` already counts a
         #     seat that never ran as coverage it did not get. A budget able to
         #     manufacture a clean round is the one thing this key must never be.
+        #
+        #     **AND IT ONLY BINDS WHERE THERE IS AN ORDER TO SPEND IT IN.**
+        #     `panel_seats.route_seats` spends this budget on the seats the PREVIOUS
+        #     round did not use, read back off that round's payload. A round with no
+        #     such record — round 1, a standalone `/panel`, a cycle whose baselines
+        #     predate the field — dispatches every selected seat whatever this curve
+        #     says, because the only order left would be the order the vendor names
+        #     happen to be written in, and #790 refused that in as many words. The
+        #     other half of #790 is answered too: a seat this curve does not ask
+        #     writes a row of its own, gets its own line in `coverage_veto` and blocks
+        #     a confident stop, so a cheaper round can never bank its saving as
+        #     coverage.
         #
         # **AND WHAT IT MUST NOT SCALE — from a rule rather than from a list. A
         # multiplier scales what a round may SPEND and never what a round may

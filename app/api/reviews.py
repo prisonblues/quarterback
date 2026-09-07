@@ -2624,6 +2624,20 @@ def _below_floor_count(v: object) -> int | None:
     readings of the same round, and only one of them argues for lowering the
     floor.
 
+    **Also #775's two seat lists**, and the name is now narrower than the function.
+    Kept rather than split, because the rule is the whole function and it is the
+    same rule twice over: the producer publishes names, the board stores how many,
+    and a list it could not read is a silence rather than a nought. Two coercers
+    differing in a docstring would be two places to tighten the member check the
+    paragraph below defers, which is exactly the split that argues against
+    tightening one of them. ``seat_routing.dispatched`` and ``.held`` read through
+    here, which makes four call sites under a name that describes two of them.
+    Renaming it to something like ``_list_len_or_none`` is the right change and it
+    is not this one: the name is read at four call sites and in
+    :attr:`StopIn.new_below_trigger_floor`'s docstring, and a rename riding on a
+    commit that adds a caller is how a reviewer ends up checking two things at
+    once.
+
     **What is NOT checked, said out loud.** The OUTER shape is checked and the
     MEMBERS are not: ``[None]``, ``[True]``, ``[{}]`` and ``["k", "k"]`` are
     stored as 1, 1, 1 and 2. So "the keys cannot disagree with their count" is a
@@ -2945,6 +2959,62 @@ class LocalityRepeatsIn(BaseModel):
     @classmethod
     def _count(cls, v: object) -> int | None:
         return _count_or_none(v)
+
+
+class SeatRoutingIn(BaseModel):
+    """Which seats the round ASKED, apart from which it was configured with (#775).
+
+    Every round used to dispatch every seat it selected, so "configured" and
+    "asked" had one answer and ``reviewers_selected`` held it.
+    ``panel_seats.route_seats`` separates them: round N's seats are the set
+    difference against round N-1's, spent within a per-round budget, on the
+    argument that a seat which read the diff in round 1 and reads the fix in round
+    2 with its own round-1 findings in front of it produces more of the same shape.
+
+    **Two of the six keys are bound and the other four are not**, on
+    :class:`LocalityRepeatsIn`'s and :class:`FixBlastIn`'s terms. :attr:`dispatched`
+    and :attr:`held` are the fleet-wide question — across hundreds of rounds, does a
+    round that asked fewer seats find less — and it is the one nobody can ask later:
+    the payload they are computed in lives in a temp directory on whichever host ran
+    the panel. Anybody tuning a ``round_budgets.multipliers`` curve on evidence
+    rather than on taste needs exactly this pair, and ``[1.0]`` ships today
+    precisely because nobody has measured a curve.
+
+    ``why``, ``budget``, ``prior_round`` and ``prior_dispatched`` are the round's
+    own working — the per-seat reason words, the arithmetic that produced the
+    budget, and the round the complement was taken against. A reader with a
+    question about ONE round has that round: the payload is published and
+    ``GET /review/findings`` lays a cycle's rounds out in order.
+    ``tests/test_payload_key_drift.py`` carries that decision in writing, which is
+    the only other way past the drift check.
+
+    A nested object rather than two flat fields because the panel sends it as one,
+    on :class:`PrClaimIn`'s precedent — and because the block is ``null`` as a whole
+    on every path that made no routing decision, which is what keeps the two counts
+    NULL together rather than one of them guessing.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    #: The seats this round put a question to, including the ones whose CLI turned
+    #: out to be missing: the round ASKED, and that is what the field says.
+    #:
+    #: Typed ``Any`` and not ``list``, on :attr:`StopIn.new_below_trigger_floor`'s
+    #: rule and for its reason — ``dispatched: 3`` from a hand-rolled caller would
+    #: be a 422 under a list annotation, taking the findings, the scorecards and the
+    #: accounts down with it. Stored as a LENGTH by :func:`_below_floor_count`,
+    #: which is where the "not a list is not a zero" rule is written out.
+    dispatched: Any = None
+    #: Selected, installed, and deliberately not asked — the fifth reason a seat has
+    #: no row, beside not installed, ran and failed, ran and was silent, and cut by
+    #: a ceiling.
+    #:
+    #: Stored as a length on :attr:`dispatched`'s terms, and the pair is the
+    #: measurement: three seats out of three and three out of six are the same
+    #: dispatched count, and only this field tells them apart. ``0`` is a round that
+    #: asked everybody it could — the answer every round on the shipped flat curve
+    #: gives — and NULL is a round that never made the decision.
+    held: Any = None
 
 
 class ReviewIn(BaseModel):
@@ -3775,6 +3845,14 @@ class ReviewIn(BaseModel):
     #: round that dispatched no seat compared nothing, and a guessed zero would put
     #: it in the population that measured and found nothing.
     locality_repeats: LocalityRepeatsIn | None = None
+    #: Which seats this round ASKED (#775), apart from which it was configured
+    #: with. Optional, and its absence is a statement: the panel nulls the whole
+    #: block on every path that made no routing decision — a title skip, a
+    #: pre-flight refusal, a spend-ceiling refusal — as well as on every producer
+    #: older than the block. A round that dispatched no seat did not decline to ask
+    #: anybody, it never got as far as choosing, and `{}` here would claim it held
+    #: nobody back.
+    seat_routing: SeatRoutingIn | None = None
 
     to_fix: list[FindingIn] = Field(default_factory=list)
     dismissed: list[FindingIn] = Field(default_factory=list)
@@ -3798,6 +3876,26 @@ class ReviewIn(BaseModel):
     @classmethod
     def _new_findings(cls, v: object) -> int | None:
         return _count_or_none(v)
+
+    @field_validator("seat_routing", mode="before")
+    @classmethod
+    def _seat_routing(cls, v: object) -> object:
+        """Anything that is not an object becomes no block at all —
+        :meth:`StopIn._fix_blast`'s guard, at the top level.
+
+        Both fields inside are typed ``Any`` so that one unreadable count cannot
+        422 a round, and a nested model is the one shape that can get past that:
+        ``seat_routing: "claude,codex"`` from a hand-rolled caller would be a
+        validation error, taking the findings, the scorecards and the accounts down
+        with it. This is this module's standing rule applied to the block itself.
+
+        ``code_access``, ``pr_claim`` and ``locality_repeats`` beside it have no
+        such guard and would 422 on the same input. That is a gap in three fields
+        rather than an argument for a fourth: widening it is a change to three
+        shipped contracts and wants its own review, and it is written down here so
+        the omission reads as noticed rather than as this block's own rule.
+        """
+        return v if isinstance(v, Mapping) else None
 
     @field_validator("skip_reason", mode="before")
     @classmethod
@@ -4467,6 +4565,31 @@ async def record_review(
         # response) while the value has to be computed where the row is built.
         stop_rungs=(_stop_rungs_or_none(body.round_stop.rungs())[0]
                     if body.round_stop else None),
+        # #775's two seat counts, flattened out of their nested block on
+        # `locality_repeats`' terms and stored as LENGTHS on
+        # `new_below_trigger_floor`'s: the panel publishes the seat names, `len()`
+        # of that list cannot disagree with it, and the dispatched seats already
+        # have a row each in `review_reviewers`.
+        #
+        # Both kept, because neither means anything alone. `dispatched` without
+        # `held` is a count with no denominator — three seats out of three and
+        # three out of six are the same integer — and `reviewers_selected` is not
+        # that denominator: the routing runs over the LLM seats and that column
+        # carries the whole panel, sonarqube included.
+        #
+        # NULL and never zero for a producer that sent no block — every round older
+        # than the routing, and every skip and refusal path, which the panel nulls
+        # deliberately. "This round asked every seat it could" is 0 and IS the
+        # measurement on the shipped flat curve; a guessed zero for a round that
+        # never chose would fill the baseline with rounds that never routed.
+        # `why`, `budget`, `prior_round` and `prior_dispatched` ride the same block
+        # and are deliberately not stored: they are one round's working, already in
+        # the payload a reader can fetch, and `tests/test_payload_key_drift.py`
+        # holds that decision in writing.
+        seats_dispatched=(_below_floor_count(body.seat_routing.dispatched)
+                          if body.seat_routing else None),
+        seats_held=(_below_floor_count(body.seat_routing.held)
+                    if body.seat_routing else None),
         sonar_gate=body.sonar_gate,
         ci_status=body.ci_status,
         reviewers_selected=body.reviewers_selected or None,
@@ -5732,6 +5855,21 @@ def _run_view(r: ReviewRun, unread_count: int | None) -> dict:
         # every producer too old to nest the key, and every round that nulled the
         # block — and it is not `low`.
         "fix_blast_lane": r.fix_blast_lane,
+        # #775: how many seats the round asked, and how many it held back. On every
+        # view for the three fields above's reason and with the same sharpening —
+        # the reader is a correlation over a population ("does a round that asked
+        # fewer seats find less"), not a person opening one round, and a pair that
+        # had to be fetched per round could not answer it. Two integers, so the
+        # `limit=500` size argument that keeps `stop_rungs` off this view does not
+        # arise.
+        #
+        # Unmasked, both, and read with an identity test. NULL is "this round made
+        # no routing decision" — every round predating the columns, every producer
+        # too old to send the block, and every skip and refusal payload — and it is
+        # not 0. `seats_held: 0` is the answer every round on the shipped `[1.0]`
+        # curve gives and it is a measurement: the round asked everybody it could.
+        "seats_dispatched": r.seats_dispatched,
+        "seats_held": r.seats_held,
         "sonar_gate": r.sonar_gate,
         "ci_status": r.ci_status,
         "reviewers_selected": r.reviewers_selected or [],
@@ -7479,19 +7617,45 @@ async def review_convergence(
                     ReviewRun.repeats_only_locality.isnot(None)),
                 func.sum(ReviewRun.repeats_only_locality),
                 func.sum(ReviewRun.repeats_by_key),
+                # ...and #775's two seat counts, on the same terms again: same
+                # rows, same predicate, one scan, and summed over RUNS because a
+                # dispatch decision is a fact about one round against the round
+                # before it. `rounds_holding` is counted rather than derived from
+                # the sums because they answer different questions — one round that
+                # held four seats and four rounds that held one are the same
+                # `held`, and only the second says a curve is binding across the
+                # window.
+                #
+                # `measured_routing` counts the runs whose producer ANSWERED, on
+                # `measured_repeats`' rule directly above: NULL is every round
+                # recorded before the columns and every skip payload, and a
+                # denominator that swept those in would report rounds that never
+                # routed as rounds that held nothing back.
+                func.count(ReviewRun.id).filter(
+                    ReviewRun.seats_dispatched.isnot(None)),
+                func.sum(ReviewRun.seats_dispatched),
+                func.sum(ReviewRun.seats_held),
+                func.count(ReviewRun.id).filter(ReviewRun.seats_held > 0),
+                # LAST, and it has to stay last: it is a splat of unknown length
+                # that the unpacking below reads as "everything after the named
+                # columns". A column added under it lands in that slice, where
+                # `strict=True` raises rather than transposing the distribution
+                # silently — loud, and the fix is still to put the new column above
+                # this line.
                 *(func.count(ReviewRun.id).filter(ReviewRun.fix_blast_lane == lane)
                   for lane in FIX_BLAST_LANES),
             ).where(*filters)
         )
     ).one()
     (runs_total, without_cycle, first_ts, last_ts,
-     measured_repeats, only_locality_sum, by_key_sum) = window_row[:7]
+     measured_repeats, only_locality_sum, by_key_sum,
+     measured_routing, dispatched_sum, held_sum, rounds_holding) = window_row[:11]
     # Zipped back against the vocabulary that built the filters rather than
     # unpacked into three names: the trailing columns ARE `FIX_BLAST_LANES` in
     # order, and three names would let a reordering of that tuple transpose the
     # distribution silently. `strict=True` is what says so.
     lane_counts = {lane: int(n or 0) for lane, n
-                   in zip(FIX_BLAST_LANES, window_row[7:], strict=True)}
+                   in zip(FIX_BLAST_LANES, window_row[11:], strict=True)}
 
     # One row per cycle: its terminal round, picked in SQL by a window function
     # rather than by `max(round)` and a second query to fetch that row, which
@@ -7718,6 +7882,13 @@ async def review_convergence(
     # line it named", which a dependency bump and an API change both do.
     measured_blast = sum(lane_counts.values())
     elevated = measured_blast - lane_counts["low"]
+    # #775's population. `seats_seen` is the panel this window could have asked —
+    # the seats it dispatched plus the ones it held — and it is the denominator
+    # because neither half is one on its own: three seats out of three and three
+    # out of six are the same `dispatched`.
+    dispatched = int(dispatched_sum or 0)
+    held = int(held_sum or 0)
+    seats_seen = dispatched + held
 
     return {
         "window": {
@@ -7792,6 +7963,45 @@ async def review_convergence(
             **lane_counts,
             "elevated_share": (round(elevated / measured_blast, 4)
                                if measured_blast else None),
+        },
+        # #775's seat routing over this window, published beside the two blocks
+        # above and making the same undertaking they do: `CYCLE_ENDINGS` is what
+        # `_rate` divides, #637's recalibration is measured against those numbers,
+        # and nothing here moves a rate as a side effect of storing a field.
+        #
+        # What it answers: how much of the panel this window actually asked. On its
+        # own that is a description of the fleet's rounds; against #775 it is the
+        # population a `round_budgets.multipliers` curve gets tuned on, because the
+        # correlation being sought — do rounds that asked fewer seats find less —
+        # needs a population per amount-held before it needs anything else. The
+        # correlation itself is a query over `seats_dispatched` beside
+        # `new_findings`, which every run view publishes; this block is the marker
+        # that says whether there is anything to correlate.
+        #
+        # Per RUN, on `locality_repeats`' departure from this endpoint's cycle
+        # grain and for a sharper reason than either block above: a cycle's
+        # TERMINAL round is the one a routed cycle most wants to have asked
+        # everybody — `coverage_veto` gives a held seat a veto, so a confident stop
+        # has to end on a full round — and cycle grain would sample exactly those
+        # and report a fleet that never held anything back.
+        #
+        # `rounds_holding` is beside the sums rather than derived from them: one
+        # round that held four seats and four rounds that held one are the same
+        # `held`, and only the second says a curve is binding across the window.
+        # `runs` is published for the reason `fix_blast.runs` is — a reader must be
+        # able to see that nothing measured without inferring it from a zero.
+        #
+        # `held_share` is null and not 0.0 where there were no seats to take a
+        # share of, on `rate`'s rule: no measured round is not a fleet that asked
+        # every seat, and neither is a window of panels configured with no LLM seat
+        # at all. Where rounds DID route seats, 0.0 is the true answer and the one
+        # every repo on the shipped `[1.0]` curve gives.
+        "seat_routing": {
+            "runs": measured_routing,
+            "dispatched": dispatched,
+            "held": held,
+            "rounds_holding": rounds_holding,
+            "held_share": round(held / seats_seen, 4) if seats_seen else None,
         },
         # How many of those cycles ended having attested to nothing (#782) — a
         # subset of `overall.unconverged`, published as its own number rather than
@@ -8454,6 +8664,22 @@ async def pr_finding_history(
              # Three-state on the columns above's terms: NULL is a round whose fix
              # surface was not measured, and it is not `low`.
              "fix_blast_lane": r.fix_blast_lane,
+             # #775's two seat counts per round, and this is the endpoint where
+             # they mean the most — more than the two above it, because the lane
+             # and the repeats are claims about a round read against the NEXT
+             # round's findings, while these two are read against the SAME round's:
+             # the question is whether a round that asked fewer seats found less,
+             # and this is the only response that lays a cycle's rounds out in
+             # order beside the findings themselves. The summary above carries no
+             # total for them for the reason it carries none for the lane — there
+             # is no terminal round that speaks for the cycle, and a cycle's last
+             # round is the one most likely to have held nothing back.
+             #
+             # Three-state on the columns above's terms: NULL is a round that made
+             # no routing decision, and `seats_held: 0` is a round that asked
+             # everybody it could.
+             "seats_dispatched": r.seats_dispatched,
+             "seats_held": r.seats_held,
              # Findings this round declared worth re-reading, and whether the
              # round that followed found anything where it pointed — file-grain,
              # over confirmed findings only. None = no round followed it in this

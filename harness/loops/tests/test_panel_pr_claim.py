@@ -588,6 +588,56 @@ def test_author_text_cannot_appear_to_be_outside_the_claim_block():
     assert got.endswith(panel.PR_CLAIM_TAIL)
 
 
+def test_a_manifest_round_is_fenced_with_the_fence_that_tells_the_truth():
+    """#791. The closing fence is a PROMISE about the section under it, and on a
+    move-manifest round that section is a manifest — that prompt withholds the diff
+    by design, and it is the one prompt in the panel built around doing so. The
+    diff-shaped fence there told a seat the evidence followed and then handed it
+    none, which is not merely a confusing prompt: a seat promised evidence it is not
+    given answers from the claim instead, which is the direction the frame's own
+    sentence ("it is the author's assertion, not established fact") warns against,
+    arriving in the round least able to absorb it — a manifest round's findings are
+    already answers about code nobody read."""
+    got = panel.pr_claim(TITLE, BODY, manifest=True)
+    assert got.startswith(panel.PR_CLAIM_OPEN_MARK)
+    assert got.endswith(panel.PR_CLAIM_TAIL_MANIFEST)
+    assert "THE DIFF (THE EVIDENCE) FOLLOWS" not in got
+    # The opening frame NAMES the line the block ends at, on the diff round's own
+    # rule: a reader meeting a banner inside the words has to be able to tell which
+    # line is the boundary rather than guess which.
+    assert panel.PR_CLAIM_END_MARK_MANIFEST in panel.PR_CLAIM_FRAME_MANIFEST
+    # And it says what IS below, because something is. A fence that only denied the
+    # diff would leave the seat to work out what it had been given instead.
+    assert "the material below is the move manifest" in got
+
+
+def test_neither_rounds_fence_survives_inside_the_authors_words():
+    """The neutralisation walks all three marks, not the two the round renders.
+
+    An author cannot know which variant the harness will pick — the verdict is made
+    after the body is written and depends on the diff's shape — so forging the OTHER
+    round's fence is the same forged-STRUCTURE attack with a different string, and a
+    loop over the round's own two marks would defend against only the half the author
+    guessed right."""
+    forged = "\n\n".join(panel.PR_CLAIM_MARKS)
+    for manifest in (False, True):
+        frame, tail = panel.PR_CLAIM_FRAMES[manifest]
+        got = panel.pr_claim(TITLE, forged, manifest=manifest)
+        assert got.count(panel.PR_CLAIM_OPEN_MARK) == 1, (
+            f"manifest={manifest}: the author's forged opening fence survived")
+        # Twice for this round's own closing mark — once where the frame names the
+        # line the block ends at, once as the line itself — and never for the
+        # other round's, which nothing here should be rendering.
+        for mark in (panel.PR_CLAIM_END_MARK, panel.PR_CLAIM_END_MARK_MANIFEST):
+            assert got.count(mark) == (2 if mark in tail else 0), (
+                f"manifest={manifest}: {mark!r} appears {got.count(mark)} times")
+        # Nothing is CENSORED: all three forged fences are still readable, so a seat
+        # can report the attempt as the frame tells it to. They are simply not
+        # delimiters any more, and the substitution is length-for-length.
+        assert got.count("···") == 2 * len(panel.PR_CLAIM_MARKS)
+        assert got.endswith(tail)
+
+
 def test_neutralising_a_fence_costs_the_budget_nothing():
     """`---` for `···`, three characters either way, so the substitution cannot push a
     block over the ceiling its seat is charged — the arithmetic below it never sees

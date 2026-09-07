@@ -880,6 +880,62 @@ class ReviewRun(Base):
     reviewers_selected: Mapped[list[str] | None] = mapped_column(JSONB)
     reviewers_override: Mapped[str | None] = mapped_column(Text)
     skipped: Mapped[list[str] | None] = mapped_column(JSONB)
+    #: HOW MANY SEATS THE ROUND ACTUALLY ASKED (#775) — the length of
+    #: ``seat_routing.dispatched`` on the round payload.
+    #:
+    #: :attr:`reviewers_selected` one line up is what ``.harness-rules`` and
+    #: ``--reviewers`` CONFIGURED. Every round used to dispatch all of them, so the
+    #: two questions had one answer and one column could hold it. ``route_seats``
+    #: separates them: round N's seats are the set difference against round N-1's,
+    #: spent within a per-round budget, so a round may now ask fewer seats than it
+    #: selected and this is the only place that says how many.
+    #:
+    #: **Stored as a LENGTH, on** :func:`app.api.reviews._below_floor_count`'s rule.
+    #: The panel publishes the names, ``len()`` of that list cannot disagree with
+    #: it, and the dispatched seats already have a row each in ``review_reviewers``.
+    #: A second copy of the names here would be an unbounded list per run for
+    #: nothing the count does not say.
+    #:
+    #: NULL = this round made no routing decision — the panel sends
+    #: ``seat_routing: null`` on every skip and refusal path, and it is every row
+    #: recorded before this column and every producer too old to send the block.
+    #: **Never read as 0**: a round that asked nobody and a round nobody asked about
+    #: are opposite facts, and only the first is evidence about the curve.
+    seats_dispatched: Mapped[int | None] = mapped_column(Integer)
+    #: HOW MANY IT HELD BACK — the length of ``seat_routing.held``.
+    #:
+    #: **The pair is the measurement and neither half is it.** The question that
+    #: earns these two columns is fleet-wide and archival, and it is the one nobody
+    #: can ask later: across hundreds of rounds, does a round that asked fewer seats
+    #: find less? A dispatched count alone cannot say whether the round asked
+    #: everybody it could have — three seats out of three and three out of six are
+    #: the same integer — so the denominator has to be stored beside it.
+    #: :attr:`reviewers_selected` is NOT that denominator: the panel routes over the
+    #: LLM seats and ``reviewers_selected`` carries the whole panel, sonarqube
+    #: included.
+    #:
+    #: The pair is also not reconstructible from the ``review_reviewers`` rows
+    #: beside it. A held seat lands there with ``ran = False``, and so does a seat
+    #: whose CLI is missing, a seat that crashed and a seat that was cut by a
+    #: ceiling; the word that tells them apart is ``seat_routing.why``, which is one
+    #: round's working and is deliberately dropped. Counting ``ran = False`` rows
+    #: would give the four causes one number.
+    #:
+    #: ``round_budgets.multipliers`` ships ``[1.0]``, so today every round holds
+    #: nothing and this column is 0 across the fleet — which is the point. A curve
+    #: is tuned on evidence or on taste, and ``[1.0]`` ships precisely because
+    #: nobody has measured one. A population of rounds at 0 is the baseline the
+    #: first repo to opt into a curve gets compared against.
+    #:
+    #: NULL on :attr:`seats_dispatched`'s terms exactly, and the two are NULL and
+    #: non-NULL together: they come off one block the panel sends whole. **0 is a
+    #: measurement** — this round asked every seat it could — and NULL is a round
+    #: that never made the decision. The budget, the per-seat reason words and the
+    #: round the complement was taken against ride the same block and get no
+    #: column: they are one round's working, already in the payload that round
+    #: published. ``tests/test_payload_key_drift.py`` holds that decision in
+    #: writing.
+    seats_held: Mapped[int | None] = mapped_column(Integer)
 
     # Denormalised run totals, so the run list renders without touching findings.
     n_confirmed: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -935,6 +991,28 @@ class ReviewRun(Base):
         # unrunnable rather than make the rows honest.
         CheckConstraint("fix_blast_lane IN ('low', 'medium', 'high')",
                         name="ck_review_runs_fix_blast_lane"),
+        # #775's two seat counts, on the `repeats_*` pair's rule above and for its
+        # reason: the API is not the only writer, and a negative count is not a
+        # smaller measurement. It would net against a real one, and the direction
+        # it moves the answer is the dangerous one — a negative `seats_held` makes
+        # a window of routed rounds report that nothing was ever held back, which
+        # is the reading that says a curve is safe to tighten.
+        #
+        # One constraint each rather than one over the pair, so a caller is told
+        # which of the two refused it — `ck_review_runs_repeats_*`'s argument.
+        #
+        # `>= 0` and not `seats_dispatched >= 1`, deliberately. `route_seats` keeps
+        # at least one seat whenever there is one to keep, but a panel configured
+        # with no LLM seat at all selects none, dispatches none and holds none, and
+        # `0 / 0` is that round's honest record rather than a fault. A floor of 1
+        # would refuse it at the boundary and cost the caller the round.
+        #
+        # NULL passes on both: it is every row recorded before the columns, every
+        # producer too old to send the block, and every skip and refusal payload.
+        CheckConstraint("seats_dispatched >= 0",
+                        name="ck_review_runs_seats_dispatched_non_negative"),
+        CheckConstraint("seats_held >= 0",
+                        name="ck_review_runs_seats_held_non_negative"),
         # A run that reviewed nothing cannot also have earned a confident stop
         # (#94). `stop_confident` is what `preland --require-earned-stop` reads
         # and what the review queue calls convergence, so the one combination

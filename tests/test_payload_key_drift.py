@@ -107,6 +107,13 @@ PANEL_ROUNDS = REPO_ROOT / "harness" / "loops" / "panel_rounds.py"
 #: a dict display for it and a scan of them alone would see the key and nothing
 #: under it. The keys are in this module's ``BlastRadius.as_dict``.
 PANEL_BLAST = REPO_ROOT / "harness" / "loops" / "panel_blast.py"
+#: ...and where ``seat_routing`` does (#775). ``fix_blast``'s shape one tier back
+#: out: ``panel.py`` writes ``"seat_routing": routing.as_dict()`` on the reviewed
+#: exit and ``"seat_routing": None`` in ``_payload_defaults``, so neither site
+#: holds a dict display, :func:`nested_block_keys` would find nothing under the key
+#: and the block would read as fully bound with four keys on the floor. The keys
+#: are in this module's ``SeatRouting.as_dict``.
+PANEL_SEATS = REPO_ROOT / "harness" / "loops" / "panel_seats.py"
 
 #: Keys the panel sends at the top level of a run payload and this board does not
 #: store. Every one of them was checked against ``ReviewRun.__table__.columns``
@@ -537,6 +544,7 @@ NESTED_BLOCKS = {
     "pr_claim": reviews.PrClaimIn,
     "locality_repeats": reviews.LocalityRepeatsIn,
     "fix_blast": reviews.FixBlastIn,
+    "seat_routing": reviews.SeatRoutingIn,
 }
 
 #: The nested blocks this file does NOT scan, and why — one written reason each.
@@ -675,6 +683,55 @@ NESTED_DROPPED_BY_DESIGN = {
         "evidence",    # per category, the paths and diff markers that fired it
         "reason",      # the two above rendered into one sentence for a fixer
     }),
+    "seat_routing": frozenset({
+        # ---- #775's per-round WORKING, beside the two counts that are bound and
+        # stored (`seats_dispatched`, `seats_held`).
+        #
+        # The counts earned columns on `locality_repeats`' and `fix_blast`'s
+        # argument directly above, and the question is the one nobody can ask
+        # later: across hundreds of rounds, does a round that asked fewer seats
+        # find less? `round_budgets.multipliers` ships `[1.0]` precisely because
+        # nobody has measured a curve, and the payload the answer would be computed
+        # from lives in a temp directory on whichever host ran the panel. Nothing
+        # else on this board can reconstruct the pair either — a held seat's
+        # `review_reviewers` row says `ran: false`, and so does a missing CLI, a
+        # crash and a ceiling cut.
+        #
+        # These four answer a question about ONE round, and a reader who has that
+        # question has the round: the payload is published and `GET /review/findings`
+        # lays the cycle's rounds out in order.
+        #
+        # `why` is the per-seat reason table — one word per selected seat from
+        # `panel_seats.SEAT_ROUTING_REASONS`. It is the record of the DECISION and
+        # the panel's own readers (`coverage_veto`, `load_baseline`) branch on it,
+        # but no query over a population needs a seat's individual reason, and it is
+        # an unbounded object per run — `unread_files`' shape exactly, which is kept
+        # off the list views for that reason.
+        #
+        # `budget` is the round's arithmetic: `tapered(len(routable_seats),
+        # multiplier)`. Storing it would be one number derivable two ways with two
+        # chances to drift, which is what the three `outstanding` aliases above are
+        # exempted for — and the fact it carries that `seats_held` does not (a flat
+        # curve versus a budget too loose to bind) is a question about the CONFIG,
+        # which `review_panel` has held verbatim since #643.
+        #
+        # `prior_round` and `prior_dispatched` say what the complement was taken
+        # AGAINST. They are this board's own rows one round earlier — the cycle's
+        # round N-1 has its own `seats_dispatched` — so a column would be a copy of
+        # a neighbouring row, free to disagree with it. They are on the payload
+        # because `load_baseline` reads a FILE and cannot see this table.
+        #
+        # This is a decision and not a deferral. Re-litigate it if a reader turns up
+        # who needs to know WHICH seat was held across a population — "does holding
+        # codex specifically cost a round its findings" — rather than how many. That
+        # is a real possibility and it is the only thing that changes the answer:
+        # the counts cannot be decomposed after the fact, and the payloads they were
+        # computed from will be gone.
+        "why",               # seat -> one word, the record of the decision
+        "budget",            # how many seats the round could ask; None on a flat curve
+        "prior_round",       # which round the complement was taken against
+        "prior_dispatched",  # ...and what it dispatched; null for "nothing recorded"
+    }),
 }
 
 
@@ -695,6 +752,15 @@ def panel_blast_source() -> ast.Module:
     the two fixtures.
     """
     return ast.parse(PANEL_BLAST.read_text(encoding="utf-8"))
+
+
+@cache
+def panel_seats_source() -> ast.Module:
+    """``panel_seats.py``, parsed. A cached loader rather than a fixture, on
+    :func:`panel_blast_source`'s argument exactly: it has one reader, and threading
+    a fourth source through every call site and test signature would put the
+    dependency in front of every test that does not have it."""
+    return ast.parse(PANEL_SEATS.read_text(encoding="utf-8"))
 
 
 def _round_stop_return_keys(module: ast.Module) -> set[str]:
@@ -754,35 +820,46 @@ def nested_block_keys(module: ast.Module, block: str) -> set[str]:
     return keys
 
 
-def _blast_radius_dict_keys(module: ast.Module) -> set[str]:
-    """The keys ``panel_blast.BlastRadius.as_dict`` puts on the wire (#770).
+def _serialiser_keys(module: ast.Module, cls: str, where: Path) -> set[str]:
+    """The keys one ``<cls>.as_dict`` puts on the wire — #770's reader, and #775's.
 
-    Its own reader for :func:`_round_stop_return_keys`' reason, one tier further
-    in. ``round_stop`` returns ``"fix_blast": ... fix_blast_radius(...).as_dict()``
-    — a CALL, not a dict display — so the reader above sees the key ``fix_blast``
-    and nothing under it, and a check that stopped there would have reported the
-    block as fully bound while three keys went on the floor.
+    Its own reader for :func:`_round_stop_return_keys`' reason, at whatever tier
+    the block sits. Both callers hand the block over as a CALL rather than as a
+    dict display: ``round_stop`` returns ``"fix_blast": fix_blast_radius(…)
+    .as_dict()`` and ``panel.py`` writes ``"seat_routing": routing.as_dict()``, so
+    :func:`nested_block_keys` sees the key and nothing under it. A check that
+    stopped there would have reported each block as fully bound — three keys on the
+    floor for one, four for the other — while the exemption lists for them sat in
+    this file reading like coverage.
 
-    Anchored on the class rather than on a bare ``def as_dict``, so a second
-    serialiser added to this module cannot be read as this one's. The
-    single-return assertion is this scan's own failure mode written down, exactly
-    as it is above: two returns would be two shapes of one block, and a reader
-    taking the first would check half of it while reading as though it had checked
-    all of it.
+    **Parameterised on the class rather than copied per block**, which is a
+    departure from the two readers above it and is the right way round: those two
+    read structurally different producers (a module-level ``def``, a dict literal
+    under a payload key) while these two are one shape with one name in it. A
+    second copy would be a second place to fix the ``ast`` handling and a second
+    chance for one of them to go quietly blind, which is the failure this whole
+    file is about.
+
+    Anchored on the class rather than on a bare ``def as_dict``, so another
+    serialiser in the same module cannot be read as this one's — and
+    ``panel_seats.py`` has several. The single-return assertion is this scan's own
+    failure mode written down, exactly as it is above: two returns would be two
+    shapes of one block, and a reader taking the first would check half of it while
+    reading as though it had checked all of it.
     """
     for node in ast.walk(module):
-        if isinstance(node, ast.ClassDef) and node.name == "BlastRadius":
+        if isinstance(node, ast.ClassDef) and node.name == cls:
             for fn in node.body:
                 if isinstance(fn, ast.FunctionDef) and fn.name == "as_dict":
                     returns = [n for n in ast.walk(fn)
                                if isinstance(n, ast.Return)
                                and isinstance(n.value, ast.Dict)]
                     assert len(returns) == 1, (
-                        f"BlastRadius.as_dict has {len(returns)} dict returns; "
+                        f"{cls}.as_dict has {len(returns)} dict returns; "
                         f"this scan reads one")
                     return _dict_keys_closed(returns[0].value,
-                                             "BlastRadius.as_dict's return")
-    raise AssertionError(f"no BlastRadius.as_dict in {PANEL_BLAST}")
+                                             f"{cls}.as_dict's return")
+    raise AssertionError(f"no {cls}.as_dict in {where}")
 
 
 def block_keys(block: str, panel: ast.Module, panel_rounds: ast.Module) -> set[str]:
@@ -792,7 +869,9 @@ def block_keys(block: str, panel: ast.Module, panel_rounds: ast.Module) -> set[s
     if block == "round_stop":
         keys |= _round_stop_return_keys(panel_rounds)
     if block == "fix_blast":
-        keys |= _blast_radius_dict_keys(panel_blast_source())
+        keys |= _serialiser_keys(panel_blast_source(), "BlastRadius", PANEL_BLAST)
+    if block == "seat_routing":
+        keys |= _serialiser_keys(panel_seats_source(), "SeatRouting", PANEL_SEATS)
     return keys
 
 
@@ -833,6 +912,10 @@ def test_the_nested_scan_actually_found_the_blocks(panel_source, panel_rounds_so
     # third file again: one bound, one exempt.
     assert {"lane", "evidence"} <= block_keys(
         "fix_blast", panel_source, panel_rounds_source)
+    # ...and for #775's block, whose keys come from a fourth file and whose only
+    # sites in `panel.py` are a CALL and a `None`: one bound, one exempt again.
+    assert {"held", "why"} <= block_keys(
+        "seat_routing", panel_source, panel_rounds_source)
 
 
 @pytest.mark.parametrize("block", sorted(NESTED_BLOCKS))
@@ -986,32 +1069,46 @@ def test_the_scanner_finds_a_key_added_to_the_producers_source(panel_rounds_sour
     assert len(_round_stop_return_keys(panel_rounds_source)) >= 20
 
 
-def test_the_scanner_finds_a_key_added_to_the_blast_blocks_own_serialiser():
-    """The same red/green, done to #770's reader in the third file.
+@pytest.mark.parametrize("block,cls,real,expected", [
+    ("fix_blast", "BlastRadius", lambda: _serialiser_keys(
+        panel_blast_source(), "BlastRadius", PANEL_BLAST),
+     {"lane", "categories", "evidence", "reason"}),
+    ("seat_routing", "SeatRouting", lambda: _serialiser_keys(
+        panel_seats_source(), "SeatRouting", PANEL_SEATS),
+     {"dispatched", "held", "why", "budget", "prior_round", "prior_dispatched"}),
+])
+def test_the_scanner_finds_a_key_added_to_an_as_dict_serialiser(
+        block, cls, real, expected):
+    """The same red/green, done to the reader that scans an ``as_dict`` producer.
 
-    This one is worth its own test rather than trusting the shape above, because
-    the reader it exercises is the only thing standing between ``fix_blast``'s
-    keys and the state the whole file is about: ``round_stop`` returns the block as
-    a CALL, so the tier-two reader sees the key and nothing under it, and a
-    `fix_blast` scan that quietly returned the empty set would report "nothing
-    dropped" for a block with three unbound keys in it — while the exemption list
-    for those three sat in this file reading like coverage.
+    Worth its own test rather than trusting the shape above, because this reader is
+    the only thing standing between these two blocks and the state the whole file
+    is about: both are handed to a payload as a CALL, so the tier-two reader sees
+    the key and nothing under it, and a scan that quietly returned the empty set
+    would report "nothing dropped" for a block with four unbound keys in it — while
+    the exemption list for those four sat in this file reading like coverage.
+
+    Parametrised over both blocks rather than written twice, because they now share
+    a reader: a second copy of this test would exercise the same function and prove
+    the same thing, while reading as though it had proved something about a second
+    one. The ``expected`` set is pinned per block for the reason the injection is
+    done at all — a mutation test that passed against a reader returning nothing
+    would be worthless.
     """
     source = textwrap.dedent(
-        """
-        class BlastRadius:
+        f"""
+        class {cls}:
             def as_dict(self):
-                return {"lane": self.lane, "a_key_nobody_bound": 1}
+                return {{"a_key_nobody_bound": 1}}
         """)
-    keys = _blast_radius_dict_keys(ast.parse(source))
+    keys = _serialiser_keys(ast.parse(source), cls, Path("<synthetic>"))
     assert "a_key_nobody_bound" in keys, (
-        "the reader did not find a key added to BlastRadius.as_dict — the scan, "
-        "not the comparison, is where this check would go blind")
-    assert nested_dropped_keys("fix_blast", keys) == {"a_key_nobody_bound"}
-    # ...and the real serialiser, read by that same reader, still carries the four
-    # keys the live assertion is made of.
-    assert _blast_radius_dict_keys(panel_blast_source()) == {
-        "lane", "categories", "evidence", "reason"}
+        f"the reader did not find a key added to {cls}.as_dict — the scan, not "
+        f"the comparison, is where this check would go blind")
+    assert nested_dropped_keys(block, keys) == {"a_key_nobody_bound"}
+    # ...and the real serialiser, read by that same reader, still carries every key
+    # the live assertion is made of.
+    assert real() == expected
 
 
 def test_a_producer_shape_the_scanner_cannot_read_fails_it():
@@ -1213,3 +1310,67 @@ def test_the_locality_repeat_counts_are_bound_and_stored(panel_source,
     # later pass that quietly binds one has to come through this line.
     assert NESTED_DROPPED_BY_DESIGN["locality_repeats"] == {"keys", "why"}
     assert not set(LOCALITY_COUNTS) & NESTED_DROPPED_BY_DESIGN["locality_repeats"]
+
+
+#: #775's two counts: the keys they are nested under, and the columns they land
+#: in. Written out here as well as bound on the model, for :data:`LOCALITY_COUNTS`'
+#: reason exactly — removing an entry from an exemption list says "no longer
+#: exempt", and this says "BOUND AND STORED", which is a different claim and the
+#: one that goes wrong quietly.
+SEAT_ROUTING_COUNTS = {"dispatched": "seats_dispatched", "held": "seats_held"}
+
+
+def test_the_seat_routing_counts_are_bound_and_stored(panel_source,
+                                                      panel_rounds_source):
+    """#775's evidence reaches a column, and the working beside it does not.
+
+    The pair is the entire argument for a seat budget. ``route_seats`` makes round
+    N's seats the set difference against round N-1's, and the shipped
+    ``round_budgets.multipliers`` of ``[1.0]`` computes no budget at all — because
+    nobody has measured a curve. What a measurement needs is a population of rounds
+    with a dispatch count beside a finding count, and the payload that carries one
+    lives in a temp directory on whichever host ran the panel.
+
+    Nothing else on this board can rebuild the pair. ``reviewers_selected`` is what
+    the round was CONFIGURED with and carries the whole panel, sonarqube included;
+    a held seat's ``review_reviewers`` row says ``ran: false``, and so does a
+    missing CLI, a crash and a ceiling cut. The word that separates those four is
+    ``why``, which is deliberately dropped.
+
+    Four assertions per count, on
+    ``test_the_locality_repeat_counts_are_bound_and_stored``'s argument: the halves
+    fail differently. A field on the model with no column stores nothing; a column
+    with no field is #626's shape exactly; and an entry left on the exemption list
+    would swallow the key again if the field were ever removed.
+    """
+    sent = block_keys("seat_routing", panel_source, panel_rounds_source)
+    accepted = model_accepts(reviews.SeatRoutingIn)
+    columns = {c.name for c in ReviewRun.__table__.columns}
+    for key, column in SEAT_ROUTING_COUNTS.items():
+        assert key in sent, f"the panel no longer nests {key} in seat_routing"
+        assert key in accepted, f"SeatRoutingIn does not bind {key}"
+        assert column in columns, f"review_runs has no column {column}"
+        assert key not in NESTED_DROPPED_BY_DESIGN["seat_routing"], (
+            f"{key} is exempted rather than stored")
+    # ...and the other half of the decision, asserted rather than left to the
+    # exemption list's own prose: these four are dropped ON PURPOSE, so a later
+    # pass that quietly binds one has to come through this line.
+    assert NESTED_DROPPED_BY_DESIGN["seat_routing"] == {
+        "why", "budget", "prior_round", "prior_dispatched"}
+    assert not set(SEAT_ROUTING_COUNTS) & NESTED_DROPPED_BY_DESIGN["seat_routing"]
+
+
+def test_the_seat_routing_block_is_bound_and_no_longer_dropped(panel_source):
+    """#775's top-level key came off :data:`DROPPED_BY_DESIGN` rather than onto it.
+
+    The one assertion the nested machinery above cannot make. ``seat_routing`` is a
+    TOP-LEVEL payload key, so a commit that removed the field from ``ReviewIn``
+    while leaving the block in ``NESTED_BLOCKS`` would fail
+    ``test_nothing_is_written_off_that_is_not_a_nested_block`` with a message about
+    a renamed block — true, and naming the repair backwards. Asserted by name for
+    the reason ``review_panel``'s test does it: the argument for binding the block
+    at all is specific to it.
+    """
+    assert "seat_routing" in panel_payload_keys(panel_source)
+    assert "seat_routing" in review_in_accepts()
+    assert "seat_routing" not in DROPPED_BY_DESIGN

@@ -14,9 +14,10 @@ keeps working for it.
 from __future__ import annotations
 
 # Named directly and BELOW the star imports, on `panel_rounds`' rule and for its
-# reason: `Iterator` has to still mean `collections.abc.Iterator` the day a module
-# above re-exports the name, and the last import wins.
-from collections.abc import Iterator  # noqa: E402
+# reason: `Iterator` and `Iterable` have to still mean `collections.abc.Iterator`
+# and `collections.abc.Iterable` the day a module above re-exports either name, and
+# the last import wins.
+from collections.abc import Iterable, Iterator  # noqa: E402
 
 import panel_core  # noqa: F401  — for anything wanting the module
 
@@ -4047,6 +4048,277 @@ def select_reviewers(rev: dict, spec: str | None) -> tuple[set[str], str | None]
                         + " (repo config overridden)")
 
 
+# ------------------------------------------------------- #775's complement routing
+#
+# Every round dispatches the same panel. A seat that read the diff in round 1 reads
+# the fix in round 2 with its own round-1 findings in front of it, and the cheapest
+# thing it can produce is more of the same shape. Nothing biased a later round
+# toward the questions nobody had asked yet.
+#
+# The rule, taken from mergeCraft's `route_lenses_complement`: round N's seats are
+# the SET DIFFERENCE against round N-1's, capped by a dispatch budget, falling back
+# to repeating a prior seat only when the complement runs out. It is one half of a
+# pair — this decides WHICH seats, and #776's `round_budgets.multipliers` decides
+# HOW MANY. That division is written into the `round_budgets` block in
+# `harness_rules.DEFAULTS` and is not a choice made here: "how many seats a round
+# dispatches, FLOORED AT 1. Never which seats: that is #775's routing decision and a
+# budget has no view on it."
+#
+# **WHAT MAKES IT SAFE, AND IT IS THE WHOLE OF WHY THIS IS NOT JUST A FILTER.** #790
+# declined the seat cut for a reason that survives complement routing untouched: a
+# seat that is installed, selected and then not dispatched produces no row, and its
+# silence is indistinguishable from a seat that ran and found nothing. The round
+# after it then banks "four seats looked at this and three had nothing to say" when
+# three were never asked — a dropped seat counted as coverage, which is the one
+# thing this repo's convergence rules forbid in as many words.
+#
+# So the seat's silence is RECORDED rather than left to be inferred, in one closed
+# vocabulary, and three readers were taught to read it: `coverage_veto` emits a veto
+# line for a held seat (it never banks as coverage, and it never reads as a fault in
+# the seat either), `load_baseline` refuses to let a partially-dispatched round
+# close earlier rounds' coverage gaps, and the payload records `dispatched` apart
+# from `reviewers_selected`. None of the three could tell the case apart before, and
+# the routing is not safe to run without all three.
+#
+# **THE FLOORS.** Two, and they are floors rather than preferences — they are taken
+# out of the budget before the complement gets any of it:
+#
+#   * A seat that can READ THE CODE (`SEAT_READS_CODE`) is kept whenever the round
+#     has one to keep. It is the only dimension this file can actually name: every
+#     other seat's whole evidence is the diff, so a round that routed the last
+#     code-reading seat away is a round where "I could not open that file" stopped
+#     being a finding and started being the panel's shape. `coverage_veto` already
+#     treats `code_blind` as a constant it must not veto on, which is exactly why
+#     the panel must not quietly become all-blind.
+#   * At least one seat, always. A round with no seats reviewed nothing, and a
+#     budget able to manufacture a clean round is the one thing #776 says its key
+#     must never be.
+#
+# **AND THE THREE-STATE RULE, which is the difference between this and a filter.**
+# "The prior round dispatched nobody" and "no prior round said what it dispatched"
+# are different facts and the second one is the common one: every payload written
+# before this existed is silent, and round 1 has no prior round at all. Unknown
+# means NO CUT — every selected seat is dispatched, exactly as it was before this
+# landed. A budget only ever binds where there is a recorded prior set to take a
+# complement against, because without one the only order available is the order the
+# names happen to be written in, and #790's first objection is precisely that
+# choosing seats by alphabet is a coin toss with a spreadsheet.
+
+#: Every word a seat's routing record may carry, mapped to whether the seat was
+#: DISPATCHED under it.
+#:
+#: A CLOSED VOCABULARY, and a mapping rather than a set so that adding a word forces
+#: whoever adds it to answer the one question every reader asks — was this seat
+#: asked? A free-text reason would have fallen through every branch in
+#: `coverage_veto` silently, which for a seat with no row means its silence banks as
+#: coverage: the exact defect this feature had to avoid, arriving through the field
+#: added to prevent it.
+#:
+#: Six of the seven mean the seat WAS dispatched, because the interesting record is
+#: not the hold — it is why each of the others was kept, and #775's prior art is
+#: explicit that a skipped lens's reason is "as informative as selected ones". A
+#: round under no budget records `all` for every seat and says so, rather than
+#: leaving a reader to infer from an absent field whether routing ran at all.
+SEAT_ROUTING_REASONS = {
+    # No routing decision was made about this seat: it ran because it was selected.
+    # Covers both ways that happens — no budget in force at all (the shipped `[1.0]`
+    # curve, which is every seat of every round on the whole fleet), and a budget at
+    # or above the size of the panel, which held nothing back. `SeatRouting.budget`
+    # is what tells those two apart, and only the second is a curve somebody could
+    # tighten.
+    "all": True,
+    # A budget was in force and there was no recorded prior dispatch set to take a
+    # complement against — round 1, a cycle with no baseline, or a payload written
+    # before `seat_routing` existed. Fails toward reading MORE, never less.
+    "unknown-prior": True,
+    # Selected, and its CLI is not on this box (#222). Dispatched anyway and outside
+    # the budget: `run_seat` is the single authority on absence, the seat costs
+    # nothing to dispatch, and the `absent: true` row it writes is what
+    # `coverage_veto` and `load_baseline` both need in order NOT to veto on it.
+    # Spending a budget slot on a seat that cannot run would buy the round nothing
+    # and cost it a seat that can.
+    "absent": True,
+    # #775's rule itself: it did not run in the prior round, so it is the seat most
+    # likely to ask a question the last round did not.
+    "floor-code": True,
+    "complement": True,
+    # The complement did not fill the budget, so a seat that ran last round was
+    # asked again. mergeCraft's fallback, and it is what keeps a full-coverage round
+    # reachable when the panel is smaller than the budget.
+    "repeat": True,
+    # THE ONE WORD THAT MEANS THE SEAT WAS NEVER ASKED. Its silence is not coverage,
+    # and `coverage_veto` says so.
+    "held": False,
+}
+
+#: The word above that means NOT DISPATCHED, named because three modules test for
+#: it and a fourth spelling of the string is a fourth chance to miss it. A held
+#: seat's silence is the fifth reason a seat has no row (#790) — beside not
+#: installed, ran and failed, ran and was silent, and cut by a ceiling.
+SEAT_HELD = "held"
+
+
+@dataclass(frozen=True)
+class SeatRouting:
+    """Which seats a round dispatched, which it held back, and why for each — #775.
+
+    Every SELECTED LLM seat appears in ``why`` exactly once, whether it ran or not,
+    because a reason recorded only for the seats that ran is a record of the
+    decision's outcome and not of the decision. The held seats are the ones a reader
+    six weeks later cannot reconstruct from anything else in the payload: a seat
+    absent from ``reviewers`` looks identical to a seat nobody ever configured.
+
+    ``prior_dispatched`` is ``None`` for "nothing recorded", which is not the same
+    as the empty set — see :func:`route_seats`. It is kept on the record rather than
+    recomputed by a reader because the complement is only checkable against the set
+    it was actually taken against, and `load_baseline` may have declined a payload
+    this round's caller thought it had.
+    """
+
+    #: The seats this round asked. Includes the absent ones, which are dispatched
+    #: and then refused by `run_seat` — the round ASKED, and that is what this says.
+    dispatched: frozenset[str] = frozenset()
+    #: Selected, installed, and deliberately not asked.
+    held: frozenset[str] = frozenset()
+    #: seat -> one word from :data:`SEAT_ROUTING_REASONS`, for every selected seat.
+    why: dict[str, str] = field(default_factory=dict)
+    #: How many seats the round could dispatch, or None for "no budget in force".
+    #: `None` and a budget at or above the panel's size are different facts and both
+    #: leave nothing held: the first says the curve is flat, the second says it was
+    #: not tight enough to bind, and only the first is true of the shipped fleet.
+    budget: int | None = None
+    #: Which earlier round's dispatch set the complement was taken against, and what
+    #: it was. Both None where nothing was recorded.
+    prior_round: int | None = None
+    prior_dispatched: frozenset[str] | None = None
+
+    @property
+    def routed(self) -> bool:
+        """Did routing actually decide anything this round? False for a flat curve,
+        an unknown prior round, or a budget that was never tight enough to bind —
+        the three ways this lands and changes nothing, which is every round on the
+        fleet today."""
+        return bool(self.held)
+
+    def as_dict(self) -> dict:
+        """The payload's ``seat_routing`` block.
+
+        Sorted lists rather than sets, because it is serialised straight into a
+        payload and a diff between two rounds' payloads has to mean something
+        changed. ``prior_dispatched`` keeps its null: an empty list would claim the
+        prior round dispatched nobody, which is a round that reviewed nothing and a
+        very different thing from a round that did not say.
+        """
+        return {
+            "dispatched": sorted(self.dispatched),
+            "held": sorted(self.held),
+            "why": dict(sorted(self.why.items())),
+            "budget": self.budget,
+            "prior_round": self.prior_round,
+            "prior_dispatched": (None if self.prior_dispatched is None
+                                 else sorted(self.prior_dispatched)),
+        }
+
+
+def route_seats(selected: Iterable[str], installed: Iterable[str], *,
+                prior_dispatched: Iterable[str] | None,
+                prior_round: int | None = None,
+                budget: int | None = None,
+                floor: Iterable[str] = SEAT_READS_CODE) -> SeatRouting:
+    """Which of this round's selected seats to dispatch — #775's complement rule.
+
+    ``selected`` is the LLM seats this round selected (the caller has already
+    resolved `.harness-rules` and `--reviewers`); ``installed`` is which of them
+    this box can actually run. ``prior_dispatched`` is the previous round's
+    dispatched set, or **None for "no round said"** — the distinction the whole
+    function turns on. ``budget`` is how many seats the round may dispatch, or None
+    for no budget.
+
+    **THE ORDER, and every step of it is a floor before it is a preference:**
+
+    1. A seat that is selected and NOT installed is dispatched and does not count
+       against the budget. It costs nothing to ask and its `absent` row is load
+       bearing downstream (#222).
+    2. Code-reading seats are taken out of the budget first, so the round cannot
+       route away its last pair of eyes that can open a file.
+    3. Then the COMPLEMENT — seats that did not run in the prior round — in
+       :data:`panel_core.LLM_REVIEWERS` order.
+    4. Then repeats, same order, until the budget is full.
+    5. Whatever is left is held, and every one of them is named.
+
+    **The tie-break inside a group is declaration order, and that is a last resort
+    rather than a ranking.** #790's objection to alphabetical seat-dropping stands
+    where the complement is bigger than the budget — nothing here knows which of two
+    equally-fresh seats is worth more. What has changed is that the FIRST cut is now
+    made on a property that is about the review (did this seat read the last round?)
+    rather than on a property of the name, and the arbitrary tie-break only decides
+    among seats the real rule could not separate. When something does rank a seat,
+    it replaces step 3's ordering and nothing else.
+
+    **NO PRIOR SET MEANS NO CUT.** With ``prior_dispatched`` None there is no
+    complement to compute, so a budget would be back to choosing by alphabet — the
+    thing #790 refused. Every selected seat is dispatched and recorded
+    ``unknown-prior``, which is both today's behaviour and the honest one: the
+    round read MORE than the budget asked, and a round that read more is never the
+    round that banks a gap.
+
+    ``budget`` is clamped up to 1 rather than honoured at 0. A zero-seat round is an
+    exhaustion, not a budget, and naming one belongs to a caller that can also end
+    the cycle `confident: false` — `harness_rules.tapered` already floors at 1, so
+    this only catches a caller that computed its own.
+    """
+    order = [n for n in LLM_REVIEWERS if n in set(selected)]
+    here = set(installed)
+    why: dict[str, str] = {}
+    # Absent seats first, and out of the budget entirely — see the docstring, and
+    # `seat_installed`'s in panel_core for why an absent seat still has to be asked.
+    absent = [n for n in order if n not in here]
+    for n in absent:
+        why[n] = "absent"
+    routable = [n for n in order if n in here]
+    if budget is None or prior_dispatched is None or budget >= len(routable):
+        # The three ways routing lands and decides nothing, and only one of them is
+        # worth its own word. No curve and a curve that was not tight enough both
+        # mean "no decision was made about this seat", and `SeatRouting.budget`
+        # already tells those two apart for anyone tuning the curve. The third — a
+        # budget that WOULD have bound and had no prior round to spend itself
+        # against — is the one a reader has to be able to see, because it is the
+        # case where the curve is written, is tight, and is deliberately doing
+        # nothing. Tested in that order so a loose budget over a missing record
+        # reads as the harmless thing it is rather than as a blocked cut.
+        word = ("all" if budget is None or budget >= len(routable)
+                else "unknown-prior")
+        for n in routable:
+            why[n] = word
+        return SeatRouting(dispatched=frozenset(order), held=frozenset(), why=why,
+                           budget=budget, prior_round=prior_round,
+                           prior_dispatched=(None if prior_dispatched is None
+                                             else frozenset(prior_dispatched)))
+    prior = frozenset(prior_dispatched)
+    room = max(1, int(budget))
+    keep: list[str] = []
+    for group in ([n for n in routable if n in set(floor)],
+                  [n for n in routable if n not in prior],
+                  routable):
+        for n in group:
+            if n not in keep and len(keep) < room:
+                keep.append(n)
+    # The word is decided AFTER the picking, not during it, so that a code-reading
+    # seat which is also in the complement reads `complement` — it would have been
+    # kept anyway, and recording the floor there would say the floor was load-bearing
+    # on a round where it was not. A reader counting how often the floor actually
+    # overrode the complement is reading a real number this way and an inflated one
+    # the other.
+    for n in routable:
+        why[n] = ("complement" if n in keep and n not in prior
+                  else "floor-code" if n in keep and n in set(floor)
+                  else "repeat" if n in keep else SEAT_HELD)
+    return SeatRouting(dispatched=frozenset(absent) | frozenset(keep),
+                       held=frozenset(n for n in routable if n not in keep),
+                       why=why, budget=budget, prior_round=prior_round,
+                       prior_dispatched=prior)
+
+
 def _int(v: object) -> int:
     """A usage figure as an int, or 0 — vendors omit fields they have nothing for.
 
@@ -5680,7 +5952,12 @@ __all__ = [
     "seat_label", "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args",
     "antigravity_args",
-    "pi_args", "grok_args", "select_reviewers", "_int", "_jsonl",
+    "pi_args", "grok_args", "select_reviewers",
+    # #775. `SEAT_HELD` is exported beside the router because `panel_rounds` tests
+    # for that exact string in two places — a fourth spelling of it is a fourth
+    # chance for a held seat's silence to fall through as coverage.
+    "SEAT_ROUTING_REASONS", "SEAT_HELD", "SeatRouting", "route_seats",
+    "_int", "_jsonl",
     "_usage", "claude_usage", "pi_usage", "codex_usage",
     "SeatParsed", "SeatTurn", "run_seat", "review_llm",
     "ask_llm", "_ask_gist", "_diff_added_text", "_diff_added_lines", "_diff_files_cut",

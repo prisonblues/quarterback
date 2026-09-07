@@ -951,6 +951,28 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   it is noted quietly instead. ⋆consensus needs two members that filed, so when only
   one did the report says agreement was *impossible* rather than letting its absence
   read as disagreement.
+- **A round may ask fewer seats than it configured, and a seat it does not ask is
+  never counted as coverage** (#775). Every round used to dispatch the same panel, so
+  a seat that read the diff in round 1 read the fix in round 2 with its own round-1
+  findings in front of it and the cheapest thing it could produce was more of the same
+  shape. `route_seats` biases round N toward the seats round N-1 did not use — the set
+  difference, spent within #776's per-round budget, repeating a prior seat only when
+  the complement runs out — and the payload's `seat_routing` records what was
+  dispatched apart from `reviewers_selected`, with one word per selected seat from a
+  closed vocabulary saying why. A seat that can read the code and the last remaining
+  seat are floors taken out of the budget first; an absent seat is asked anyway and
+  spends no slot.
+
+  The half that makes it safe is the **fifth reason a seat has no row**, beside not
+  installed, ran and failed, ran and was silent, and cut by a ceiling. A held seat
+  writes a row, `coverage_veto` gives it its own line — neither coverage nor a fault in
+  the seat — and that line is a **veto**, so a cycle wanting a confident stop has to
+  end on a round that asks everybody. `load_baseline` refuses to let a
+  partially-dispatched round be the one that erases earlier rounds' coverage gaps,
+  which is where the same defect would have deleted the evidence rather than merely
+  hiding it. And *no prior round said what it dispatched* is a third state, not a
+  falsy second: it means **no cut**, because a budget with no complement to spend
+  itself on would be choosing seats by alphabet. Inert on the shipped `[1.0]` curve.
 - **Merging happens once, in the judge, and adds rather than replaces.** The judge
   sees one entry per *reviewer*, merges the entries that are the same defect, and
   writes a `synthesis`; each reviewer's own title, detail, severity and line ride
