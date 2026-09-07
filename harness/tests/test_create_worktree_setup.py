@@ -152,3 +152,63 @@ class TestDocumentedWhereItIsUsed:
         assert "the arrays `symlinks`, `copies`, `setup`" in text, (
             "the README's key list is what a reader greps; `setup` must be in it"
         )
+
+
+# ── `"symlinks": []` means symlink nothing ────────────────────────────────
+
+
+_SYM_START = "# Collect symlinks, copies, reserved names, gitignore additions"
+_SYM_END = "COPIES=()"
+
+
+def symlink_block() -> str:
+    """The symlinks collection + defaulting, lifted out of create-worktree."""
+    src = SCRIPT.read_text()
+    assert _SYM_START in src and _SYM_END in src, (
+        "the symlink-collection markers moved; fix them rather than deleting the test"
+    )
+    block = src.split(_SYM_START, 1)[1].split(_SYM_END, 1)[0]
+    assert "cfg_has symlinks" in block, (
+        "the defaulting no longer asks whether the key is present, so a declared "
+        '`"symlinks": []` is about to get the default set again'
+    )
+    return block
+
+
+def resolve_symlinks(tmp_path: Path, config: str) -> list[str]:
+    """What SYMLINKS ends up as, for a given .worktree.json."""
+    main = tmp_path / "main"
+    main.mkdir(exist_ok=True)
+    for p in (".venv", ".claude"):
+        (main / p).mkdir(exist_ok=True)
+
+    script = f"""
+set -euo pipefail
+CONFIG_JSON='{config}'
+MAIN_REPO={main}
+cfg_array() {{ local key="$1"; [[ -n "$CONFIG_JSON" ]] && echo "$CONFIG_JSON" | jq -r "$key[]? // empty" 2>/dev/null; }}
+cfg_has() {{ local key="$1"; [[ -n "$CONFIG_JSON" ]] && echo "$CONFIG_JSON" | jq -e "has(\\"$key\\")" >/dev/null 2>&1; }}
+{symlink_block()}
+printf '%s\\n' "${{SYMLINKS[@]:-}}"
+"""
+    out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    return [line for line in out.stdout.split("\n") if line]
+
+
+class TestEmptySymlinksMeansNone:
+    def test_an_absent_key_still_gets_the_defaults(self, tmp_path):
+        """Back-compat: every repo that never mentioned symlinks relies on this."""
+        assert resolve_symlinks(tmp_path, '{"project": "x"}') == [".venv", ".claude"]
+
+    def test_a_declared_empty_list_symlinks_nothing(self, tmp_path):
+        """The case the defaulting could not express.
+
+        A repo whose worktrees build their own environment says so with `[]`. If
+        that reads as "unset", the default puts back the shared `.venv` it just
+        removed — silently, and only visible as one venv serving every worktree.
+        """
+        assert resolve_symlinks(tmp_path, '{"symlinks": []}') == []
+
+    def test_a_declared_list_is_used_verbatim(self, tmp_path):
+        assert resolve_symlinks(tmp_path, '{"symlinks": [".claude"]}') == [".claude"]

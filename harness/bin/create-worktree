@@ -221,6 +221,17 @@ cfg_array() {
     fi
 }
 
+# True when a key is PRESENT, whatever its value — including an empty array.
+# `cfg_array` cannot answer this: it yields nothing for a key that is absent and
+# nothing for one set to `[]`, so a config saying "symlink nothing" was
+# indistinguishable from one that never mentioned symlinks, and got the default
+# set instead. That is not hypothetical — it is how a repo that deliberately
+# wants no shared `.venv` had one symlinked back in anyway.
+cfg_has() {
+    local key="$1"
+    [[ -n "$CONFIG_JSON" ]] && echo "$CONFIG_JSON" | jq -e "has(\"$key\")" >/dev/null 2>&1
+}
+
 # Read a JSON object as key=value lines
 cfg_object() {
     local key="$1"
@@ -909,8 +920,11 @@ SYMLINKS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && SYMLINKS+=("$line")
 done < <(cfg_array '.symlinks')
-# Defaults if none configured
-if [[ ${#SYMLINKS[@]} -eq 0 ]]; then
+# Defaults, but only when the key is ABSENT. A declared `"symlinks": []` means
+# "symlink nothing" and must be honoured — a repo whose worktrees build their own
+# environment (see `setup`) needs to say exactly that, and silently handing it the
+# default set puts back the shared `.venv` it removed.
+if [[ ${#SYMLINKS[@]} -eq 0 ]] && ! cfg_has symlinks; then
     for p in .venv .claude CLAUDE.md; do
         [[ -e "$MAIN_REPO/$p" ]] && SYMLINKS+=("$p")
     done
