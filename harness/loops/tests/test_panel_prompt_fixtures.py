@@ -109,6 +109,17 @@ SPLIT = (_file("big.py", removed=MOVED)
          + _file("part_a.py", added=MOVED[:100])
          + _file("part_b.py", added=MOVED[100:]))
 
+#: The seat budget a manifest round renders under. Under `SPLIT`, so the pre-flight
+#: substitutes the manifest, and otherwise as WIDE as that allows — the fixture's job
+#: is to pin what the seat is told, and this dial decides a second thing besides the
+#: verdict: `PR_CLAIM_BUDGET_SHARE` sizes the claim block against it, so a tighter
+#: number here would drop the block and the golden would pin its absence. The yield
+#: rule that drops it has its own suite (`test_panel_pr_claim`), which is where that
+#: belongs; mixing the two axes here would mean a prompt change and a budget change
+#: are the same diff.
+MANIFEST_BUDGET = len(SPLIT) // 2
+
+
 def _cfg(**review_panel) -> dict:
     return {"github": REPO, "path": "/nonexistent/acme-board", "name": "board",
             "_rules_baseline": ".harness-rules.sample",
@@ -311,7 +322,7 @@ def test_a_move_round_sends_the_manifest_prompt_checked_in(monkeypatch, tmp_path
     below the brief must stay identical to the others; this file is where that is
     visible."""
     got = _render(monkeypatch, tmp_path, diff=SPLIT,
-                  review_panel={"max_diff_chars": len(SPLIT) // 3})
+                  review_panel={"max_diff_chars": MANIFEST_BUDGET})
     assert pf.MOVE_MANIFEST_HEADER in got, "the round did not reach a manifest verdict"
     _matches_fixture("move_manifest_code_blind.txt",
                      _as_template(got, manifest=True))
@@ -349,6 +360,77 @@ def test_every_ci_state_says_which_one_it_is_in_the_text_checked_in():
 # budgets on", which is a defect however the text was changed.
 
 
+def test_every_ci_state_the_panel_can_report_has_a_header_of_its_own():
+    """#792's guard, and the reason the header is a TABLE rather than a string.
+
+    The parenthetical used to read "run on this exact commit" for all nine states, so
+    on `none`, `blocked` and the three `local-*` a seat was told a suite ran on this
+    commit and then told, one clause later, that none had. A model resolving that
+    contradiction unaided can resolve it either way, and the way that hurts is reading
+    an absent run or a local pass as CI evidence — which is #628 arriving at the seat
+    rather than at the operator.
+
+    The states are read off the two vocabularies that DEFINE them — `CI_STATE_WORDS`
+    for what GitHub can report and `LOCAL_STATES` for what a local run can — rather
+    than listed here, because the failure this guards is a TENTH state landing in one
+    of those and inheriting a sentence that is not true of it. A list written in this
+    file would be written by whoever added the state, and would agree with them.
+    """
+    known = set(panel_scope.CI_STATE_WORDS.values()) | set(panel_scope.LOCAL_STATES)
+    assert set(panel_scope.CI_HEADER_PROVENANCE) == known, (
+        f"unheaded states: {sorted(known - set(panel_scope.CI_HEADER_PROVENANCE))}; "
+        f"stale entries: {sorted(set(panel_scope.CI_HEADER_PROVENANCE) - known)}. Every "
+        "state the panel can report needs its own provenance in "
+        "`panel_scope.CI_HEADER_PROVENANCE` — a state that falls through gets "
+        "`unknown`'s wording, which claims no run at all and is therefore safe, but it "
+        "is also silent about what did happen.")
+    # And the LABEL does not vary, which is the half #548 argued for: a header reading
+    # "Local suite:" would let a seat skim it and miss the distinction the body spends
+    # a sentence making. One label, nine provenances.
+    for status in sorted(known):
+        head = panel_scope.ci_brief(status, [], None, None).split(":", 1)[0]
+        assert head.startswith("CI (") and head.endswith(")"), (
+            f"the {status!r} brief opens {head!r}. The label is fixed at `CI (…)` for "
+            "every state and only the parenthetical carries the provenance.")
+
+
+def test_the_claims_closing_fence_names_what_actually_follows_it(monkeypatch, tmp_path):
+    """#791. The claim block's last line is a PROMISE about the next section, and on a
+    move-manifest round it was promising a diff that the prompt withholds by design.
+
+    That is not a wording slip. A seat told "the evidence follows" and handed no
+    evidence is being invited to answer from the claim instead — the direction the
+    block's own framing warns against — and a manifest round is the round least able
+    to absorb it, because its findings are already answers about code nobody read.
+
+    Asserted on the RENDERED prompt of both rounds rather than on the constants,
+    because the defect was never in the constant: the diff-shaped frame was correct
+    text, selected for a round it did not describe.
+    """
+    diff_round = _render(monkeypatch, tmp_path)
+    manifest_round = _render(monkeypatch, tmp_path, diff=SPLIT,
+                             review_panel={"max_diff_chars": MANIFEST_BUDGET})
+    assert pf.MOVE_MANIFEST_HEADER in manifest_round, (
+        "the round did not reach a manifest verdict, so this guard tested nothing")
+
+    assert panel.PR_CLAIM_END_MARK in diff_round
+    assert panel.PR_CLAIM_END_MARK_MANIFEST not in diff_round
+    assert diff_round.index("diff --git") > diff_round.index(panel.PR_CLAIM_END_MARK), (
+        "the diff round's claim announces that the diff follows and the diff is above "
+        "it — the fence has stopped being a promise about the next section")
+
+    assert panel.PR_CLAIM_END_MARK not in manifest_round, (
+        "the manifest round still tells its seats that `THE DIFF (THE EVIDENCE) "
+        "FOLLOWS`, and it withholds the diff by design (#791). Nothing follows the "
+        "fence but the manifest, and a seat promised evidence it is not given answers "
+        "from the claim.")
+    assert panel.PR_CLAIM_END_MARK_MANIFEST in manifest_round
+    assert (manifest_round.index(pf.MOVE_MANIFEST_HEADER)
+            > manifest_round.index(panel.PR_CLAIM_END_MARK_MANIFEST)), (
+        "the manifest round's claim says the manifest follows and the manifest is "
+        "above it")
+
+
 def test_no_unfilled_slot_token_survives_into_a_rendered_prompt(monkeypatch, tmp_path):
     """A `<<<…>>>` token in the text a seat reads is a feature half-wired: the template
     carries the slot and nothing swaps it, so every reviewer on every round is handed a
@@ -368,7 +450,7 @@ def test_no_unfilled_slot_token_survives_into_a_rendered_prompt(monkeypatch, tmp
         "repo scope": _render(monkeypatch, tmp_path,
                               review_panel={"reviewer_scope": "repo"}),
         "manifest": _render(monkeypatch, tmp_path, diff=SPLIT,
-                            review_panel={"max_diff_chars": len(SPLIT) // 3}),
+                            review_panel={"max_diff_chars": MANIFEST_BUDGET}),
     }
     leaked = {f"{where}: {name}" for where, prompt in rendered.items()
               for name, token in slots.items() if token in prompt}

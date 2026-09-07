@@ -1,29 +1,29 @@
 ===== PASS =====
-CI (the repo's own test suite, run on this exact commit): PASSED. Every test the project has thought to write is green on this commit. That REFUTES findings of the form "this new test never runs", "this may not even import", or "this migration looks syntactically incomplete" — do not spend a finding or a `could_not_assess` entry on them. It is NOT evidence the code is correct: it says nothing about a case nobody wrote a test for, which is where the defects you are looking for live.
+CI (the repo's own test suite, run by CI on this exact commit): PASSED. Every test the project has thought to write is green on this commit. That REFUTES findings of the form "this new test never runs", "this may not even import", or "this migration looks syntactically incomplete" — do not spend a finding or a `could_not_assess` entry on them. It is NOT evidence the code is correct: it says nothing about a case nobody wrote a test for, which is where the defects you are looking for live.
 
 ===== FAIL =====
-CI (the repo's own test suite, run on this exact commit): FAILED. Non-passing checks: pytest, lint. Something the project already tests is broken by this diff. Treat that as a fact you may reason from, not as a finding to re-report — it is already visible to everyone.
+CI (the repo's own test suite, run by CI on this exact commit): FAILED. Non-passing checks: pytest, lint. Something the project already tests is broken by this diff. Treat that as a fact you may reason from, not as a finding to re-report — it is already visible to everyone.
 
 ===== PENDING =====
-CI (the repo's own test suite, run on this exact commit): STILL RUNNING, so its result is NOT known. This is not a pass. Anything you would have checked against a green suite is still unchecked.
+CI (the repo's own test suite, running in CI on this exact commit): STILL RUNNING, so its result is NOT known. This is not a pass. Anything you would have checked against a green suite is still unchecked.
 
 ===== blocked =====
-CI (the repo's own test suite, run on this exact commit): EXISTS BUT WILL NOT RUN. A workflow run was created for this commit and is waiting on a human to approve it, so it has executed nothing and reports nothing. This is not a pass and it is not 'not started' — nothing will change until a person clicks. Whatever the last suite on this branch concluded is still the newest real result.
+CI (the repo's own test suite, which nothing has run on this commit): EXISTS BUT WILL NOT RUN. A workflow run was created for this commit and is waiting on a human to approve it, so it has executed nothing and reports nothing. This is not a pass and it is not 'not started' — nothing will change until a person clicks. Whatever the last suite on this branch concluded is still the newest real result.
 
 ===== none =====
-CI (the repo's own test suite, run on this exact commit): NO RUN EXISTS for this commit, so there is no suite result either way. This is not a pass. It means nothing mechanical has looked at this code, which is a fact about the commit rather than about the repo.
+CI (the repo's own test suite, which nothing has run on this commit): NO RUN EXISTS for this commit, so there is no suite result either way. This is not a pass. It means nothing mechanical has looked at this code, which is a fact about the commit rather than about the repo.
 
 ===== none (base in no trigger list) =====
-CI (the repo's own test suite, run on this exact commit): NO RUN EXISTS for this commit, so there is no suite result either way. This is not a pass. It means nothing mechanical has looked at this code, and none can: this pull request's base branch (`release/2.1`) appears in no workflow's trigger list in this repository, so no run will be created for this commit however long anyone waits.
+CI (the repo's own test suite, which nothing has run on this commit): NO RUN EXISTS for this commit, so there is no suite result either way. This is not a pass. It means nothing mechanical has looked at this code, and none can: this pull request's base branch (`release/2.1`) appears in no workflow's trigger list in this repository, so no run will be created for this commit however long anyone waits.
 
 ===== local-pass =====
-CI (the repo's own test suite, run on this exact commit): GITHUB HAS NO SETTLED RESULT for this commit, so the repo's own suite was run HERE instead, on a checkout at this exact commit, and it PASSED. That REFUTES findings of the form "this new test never runs", "this may not even import", or "this migration looks syntactically incomplete" — do not spend a finding or a `could_not_assess` entry on them. Two limits on it. It is NOT evidence the code is correct: it says nothing about a case nobody wrote a test for, which is where the defects you are looking for live. And it is WEAKER than a green CI run — a different machine, possibly different service versions, and no guarantee this is the commit that will merge.
+CI (the repo's own test suite, run HERE rather than by CI, on this exact commit): GITHUB HAS NO SETTLED RESULT for this commit, so the repo's own suite was run HERE instead, on a checkout at this exact commit, and it PASSED. That REFUTES findings of the form "this new test never runs", "this may not even import", or "this migration looks syntactically incomplete" — do not spend a finding or a `could_not_assess` entry on them. Two limits on it. It is NOT evidence the code is correct: it says nothing about a case nobody wrote a test for, which is where the defects you are looking for live. And it is WEAKER than a green CI run — a different machine, possibly different service versions, and no guarantee this is the commit that will merge.
 
 ===== local-fail =====
-CI (the repo's own test suite, run on this exact commit): GITHUB HAS NO SETTLED RESULT for this commit, so the repo's own suite was run HERE instead, on a checkout at this exact commit, and it FAILED: make test. Something the project already tests is broken by this diff. Treat that as a fact you may reason from, not as a finding to re-report — it is already visible to everyone.
+CI (the repo's own test suite, run HERE rather than by CI, on this exact commit): GITHUB HAS NO SETTLED RESULT for this commit, so the repo's own suite was run HERE instead, on a checkout at this exact commit, and it FAILED: make test. Something the project already tests is broken by this diff. Treat that as a fact you may reason from, not as a finding to re-report — it is already visible to everyone.
 
 ===== local-unknown =====
-CI (the repo's own test suite, run on this exact commit): GITHUB HAS NO SETTLED RESULT for this commit. The repo's own suite was run HERE instead and produced no result (the suite timed out after 600s). This is not a pass, and it is not a failure either: nothing was established either way, so anything you would have checked against a green suite is still unchecked.
+CI (the repo's own test suite, attempted HERE rather than by CI): GITHUB HAS NO SETTLED RESULT for this commit. The repo's own suite was run HERE instead and produced no result (the suite timed out after 600s). This is not a pass, and it is not a failure either: nothing was established either way, so anything you would have checked against a green suite is still unchecked.
 
 ===== unknown =====
-CI (the repo's own test suite, run on this exact commit): could NOT be read (gh exited 1). Its result is unknown. This is not a pass.
+CI (the repo's own test suite, whose CI result could not be read): could NOT be read (gh exited 1). Its result is unknown. This is not a pass.

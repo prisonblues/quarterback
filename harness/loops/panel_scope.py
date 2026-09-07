@@ -2885,6 +2885,77 @@ def review_sonarqube(sonar: dict, pr: dict,
     return "no-pr-analysis", [], soft, note
 
 
+#: The three states a local run can produce. Deliberately NOT members of
+#: `CI_STATE_WORDS`: that mapping is `qbdata.CI_STATES` in this module's vocabulary
+#: and every one of its names is something GitHub can report, which none of these
+#: is. They are lower-case for #324's reason — the three shouted names are #91's and
+#: are in prompts, payloads and a refusal notice — and hyphenated so that no reader
+#: skimming a payload can mistake one for `PASS`.
+LOCAL_PASS = "local-pass"
+LOCAL_FAIL = "local-fail"
+LOCAL_UNREAD = "local-unknown"
+LOCAL_STATES = (LOCAL_PASS, LOCAL_FAIL, LOCAL_UNREAD)
+
+#: The header's parenthetical, per state — what actually produced the result the
+#: body then describes (#792).
+#:
+#: **The label stays `CI` for all nine; only the provenance moves.** A header that
+#: varied its LABEL ("CI:" / "Local suite:") would let a seat skim it and miss the
+#: distinction the body spends a sentence making, and the two are the same question
+#: about the same commit asked of two sources of differing strength — which is what
+#: one heading with a careful body says and two headings do not. So the invariant
+#: part of the header is the part a skimmer reads, and the part that varies is the
+#: clause that was making a claim.
+#:
+#: **And it was making a false one on five of the nine.** The parenthetical used to
+#: read "run on this exact commit" for every state, including `none` (no run exists
+#: anywhere), `blocked` (a run exists and executed nothing) and the three `local-*`
+#: (a suite ran, and it was not CI's). A seat was told in one breath that the suite
+#: ran on this commit and in the next that no run exists, and a model resolving that
+#: unaided resolves it in whichever direction it likes — the direction that hurts
+#: being to treat an absent run or a local pass as CI evidence. That is #628's shape
+#: exactly: the remedy is to make the sentence true, not to append a warning to a
+#: sentence that is not.
+#:
+#: A tenth state has to land here or the prompt fixtures' guard on this table goes
+#: red (`test_every_ci_state_the_panel_can_report_has_a_header_of_its_own`, which
+#: reads the states off `CI_STATE_WORDS` and :data:`LOCAL_STATES` rather than off a
+#: list somebody has to remember to extend). :func:`ci_brief` falls back to the
+#: `unknown` wording rather than raising,
+#: because a prompt render is the wrong place to die and that wording is the only one
+#: in the table that asserts no run at all — the safe thing to say about a state
+#: nobody has described yet.
+CI_HEADER_PROVENANCE = {
+    "PASS": "the repo's own test suite, run by CI on this exact commit",
+    "FAIL": "the repo's own test suite, run by CI on this exact commit",
+    # A run exists and is executing, so "run on this commit" is true in the
+    # progressive rather than the perfect — which is the whole of what the body
+    # then spends its first sentence on.
+    "PENDING": "the repo's own test suite, running in CI on this exact commit",
+    # #324's state. A run object exists for this commit and has executed nothing,
+    # so there is a run to point at and no suite result behind it. "which nothing
+    # has run" is true of both halves; "run on this exact commit" was true of
+    # neither.
+    "blocked": "the repo's own test suite, which nothing has run on this commit",
+    "none": "the repo's own test suite, which nothing has run on this commit",
+    # #548's three. The commit half of the old claim was right for these two and the
+    # CI half was wrong, so the correction is "not by CI" rather than "not this
+    # commit": `_local_head_problem` gates the run on the checkout already being at
+    # the PR's head, and a pass whose tree moved underneath it is downgraded to
+    # LOCAL_UNREAD rather than reported as a pass at the wrong sha.
+    LOCAL_PASS: "the repo's own test suite, run HERE rather than by CI, on this exact commit",
+    LOCAL_FAIL: "the repo's own test suite, run HERE rather than by CI, on this exact commit",
+    # ATTEMPTED, not run: this state also covers a suite that was never started
+    # (nothing declared, the checkout refused) as well as one that started and
+    # established nothing, so it may assert no completed run at all.
+    LOCAL_UNREAD: "the repo's own test suite, attempted HERE rather than by CI",
+    # The lookup failed, so whether a run exists is itself unknown. This is the one
+    # wording in the table that claims nothing about a run, which is why it is also
+    # the fallback for a state that reaches here undescribed.
+    "unknown": "the repo's own test suite, whose CI result could not be read",
+}
+
+
 def ci_brief(status: str, failing: list[str], skip: str | None = None,
              unrunnable: dict | None = None) -> str:
     """The CI result, in words, for both prompts (#91).
@@ -2921,6 +2992,13 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None,
       argument is that a passing signal is the dangerous kind.
     * **It never adds a fetch.** If `review_ci` was skipped or unreadable the
       brief says so, rather than retrying to make the prompt tidier.
+    * **The HEADER must not assert what the body then denies** (#792). It used to
+      say "run on this exact commit" for all nine, so on `none`, `blocked` and the
+      three `local-*` a seat read a claim that a suite ran and then read, one clause
+      later, that none had. A model resolving that contradiction is doing so
+      unaided, and the direction that hurts is reading an absent run or a local pass
+      as CI evidence. :data:`CI_HEADER_PROVENANCE` carries the state's own
+      provenance instead; the label stays `CI` for all nine.
 
     `unrunnable` is :func:`ci_unrunnable`'s record, and it corrects exactly one
     factual claim in the `none` body: "a fact about the commit rather than about the
@@ -2933,13 +3011,13 @@ def ci_brief(status: str, failing: list[str], skip: str | None = None,
     should conclude from it. `None` leaves the body byte-identical to what it has
     always been, which is every round on a repo whose CI can run.
     """
-    # One header for all nine states, and the WORDS that follow it are what say
-    # which channel answered. A header that varied ("CI:" / "Local suite:") would
-    # let a seat skim the label and miss the distinction the body spends a sentence
-    # making — and the two are the same question about the same commit, asked of
-    # two sources of differing strength, which is exactly what one heading with a
-    # careful body says and two headings do not.
-    head = "CI (the repo's own test suite, run on this exact commit):"
+    # One header for all nine states — one LABEL, and a parenthetical that says what
+    # produced this state's result. The WORDS after it are still what say which
+    # channel answered in full; the parenthetical only has to stop contradicting
+    # them. See `CI_HEADER_PROVENANCE` for why the label is fixed and the
+    # provenance is not, and why the fallback is `unknown`'s wording rather than a
+    # `KeyError` in the middle of a prompt render.
+    head = f"CI ({CI_HEADER_PROVENANCE.get(status, CI_HEADER_PROVENANCE['unknown'])}):"
     if status == "PASS":
         body = ("PASSED. Every test the project has thought to write is green on this commit. "
                 "That REFUTES findings of the form \"this new test never runs\", \"this may not "
@@ -3639,17 +3717,6 @@ def review_ci_settled(gh_repo: str, pr_number: int, *,
 #: approval, and a feature that quietly makes the gate stop mattering is not a floor
 #: under the seats, it is a way past a control somebody chose to put there.
 LOCAL_SUITE_WHEN = frozenset({"none", "unknown"})
-
-#: The three states a local run can produce. Deliberately NOT members of
-#: `CI_STATE_WORDS`: that mapping is `qbdata.CI_STATES` in this module's vocabulary
-#: and every one of its names is something GitHub can report, which none of these
-#: is. They are lower-case for #324's reason — the three shouted names are #91's and
-#: are in prompts, payloads and a refusal notice — and hyphenated so that no reader
-#: skimming a payload can mistake one for `PASS`.
-LOCAL_PASS = "local-pass"
-LOCAL_FAIL = "local-fail"
-LOCAL_UNREAD = "local-unknown"
-LOCAL_STATES = (LOCAL_PASS, LOCAL_FAIL, LOCAL_UNREAD)
 
 #: Wall clock for the WHOLE declared run, not per command. A ceiling per command
 #: bounds nothing: a repo declaring four of them would get four times the number it
@@ -4376,7 +4443,7 @@ __all__ = [
     "WORKFLOW_FILE_CAP", "WORKFLOW_READ_TIMEOUT", "workflow_triggers",
     "workflow_can_run", "ci_unrunnable",
     "ReviewScope", "_cut_note", "_cut_note_reserve", "_SONAR_SEV",
-    "_sonar_findings", "_try", "review_sonarqube", "ci_brief",
+    "_sonar_findings", "_try", "review_sonarqube", "CI_HEADER_PROVENANCE", "ci_brief",
     "review_ci",
     "LOCAL_SUITE_WHEN", "LOCAL_PASS", "LOCAL_FAIL", "LOCAL_UNREAD", "LOCAL_STATES",
     "LOCAL_SUITE_TIMEOUT", "LOCAL_SUITE_GIST", "LOCAL_SUITE_TAIL_BYTES",

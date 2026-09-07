@@ -2072,6 +2072,39 @@ class Baseline:
     #: no code at all), and under increment scope the next round's anchor steps
     #: over the code it did not read, exactly as it does past an unread round.
     manifest_rounds: set[int] = field(default_factory=set)
+    #: ``round -> the seats that round DISPATCHED`` (#775), for the rounds whose
+    #: payload said so. The read-back half of complement routing: round N asks for
+    #: the seats round N-1 did not, and this is the only place round N-1's answer
+    #: survives.
+    #:
+    #: **THREE STATES, AND THE THIRD IS THE COMMON ONE.** A round missing from this
+    #: dict said NOTHING about which seats it dispatched — every payload written
+    #: before `seat_routing` existed, a hand-written baseline, a refused or skipped
+    #: round that dispatched nobody by a different mechanism. That is not the same
+    #: fact as a round that dispatched the empty set, and :meth:`last_dispatch`
+    #: answers None for it rather than an empty set, because the two produce
+    #: opposite routing decisions: an empty prior set makes EVERY seat a complement
+    #: seat and hands a tight budget the whole panel to choose from by name order,
+    #: which is the alphabet cut #790 refused. Unknown means no cut at all.
+    #:
+    #: A dict rather than one set, on ``head_shas``' reasoning: the round number is
+    #: what selects "the previous one", and a cycle whose payloads all predate the
+    #: field reads as "nothing to take a complement against" and leaves routing
+    #: exactly where it was.
+    dispatched: dict[int, set[str]] = field(default_factory=dict)
+    #: Earlier rounds that HELD A SEAT BACK — selected it, could have run it, and
+    #: deliberately did not (#775).
+    #:
+    #: Its own set beside ``unread_rounds`` and ``truncated_rounds`` because it is a
+    #: fourth thing and none of the three describes it: every seat that ran read its
+    #: whole target, so nothing was truncated; some seat ran, so the round is not
+    #: unread; and it read a diff rather than a manifest. It would therefore have
+    #: satisfied every term of ``reread`` below — the flag that ERASES every earlier
+    #: round's recorded coverage gap — while having asked half the panel. That is
+    #: #790's failure mode ("a seat dropped for budget banks as coverage") arriving
+    #: at the one reader with the power to delete the record of it, and this set is
+    #: what stops it.
+    partial_rounds: set[int] = field(default_factory=set)
     #: Files that preceding round could not read in full (:func:`_diff_files_cut`).
     #: A new finding in one of them is a coverage failure, not a reviewer miss.
     unread_files: set[str] = field(default_factory=set)
@@ -2208,6 +2241,36 @@ class Baseline:
     #: which payload supplies the anchor and the coverage record.
     trend: list[RoundTrend] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+
+    def last_dispatch(self) -> tuple[set[str] | None, int | None]:
+        """The seats the most recent round that SAID dispatched, and which round —
+        #775's complement is taken against this and nothing else.
+
+        ``(None, None)`` where no accepted baseline recorded a dispatch set, which
+        is not an error and is the answer on the great majority of rounds: round 1
+        has no earlier round, every payload written before ``seat_routing`` is
+        silent, and a cycle whose baselines were all refused on identity has nothing
+        to read. :func:`panel_seats.route_seats` turns that into "dispatch
+        everything", so an unknown prior round costs a round nothing and can never
+        cost it coverage.
+
+        **The LATEST that said, not the latest accepted**, which is ``head_sha``'s
+        rule and it is right here for the same reason: the question is *what did the
+        last look at this PR consist of*, so a newer payload written by an older
+        panel — carrying no ``seat_routing`` at all — must not clear an answer an
+        older one gave. What it costs when that happens is that the complement is
+        taken against a round further back than the previous one, which reads MORE
+        seats than a strict N-1 complement would, never fewer.
+
+        It is deliberately NOT "the immediately preceding round or nothing". A cycle
+        can skip a round number (a refused round, a `--round 3` after a manual round
+        2), and a rule that insisted on N-1 would silently stop routing on exactly
+        the cycles that have been going on longest.
+        """
+        if not self.dispatched:
+            return None, None
+        was = max(self.dispatched)
+        return set(self.dispatched[was]), was
 
     def raised_before(self, finding: Canonical) -> bool:
         """Did an earlier round raise this defect — under this key, or under a
@@ -2764,6 +2827,56 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                         and str(pre.get("verdict") or "") == "manifest")
         if was_manifest:
             b.manifest_rounds.add(was)
+        # #775's record: which seats that round actually ASKED, apart from which it
+        # was configured with. Read out of `seat_routing` and not reconstructed from
+        # the per-seat `routing` words beside it, so that the complement is taken
+        # against the round's own statement of what it did rather than against a
+        # derivation of it — two readings of one fact is how a payload and a report
+        # come to disagree about which seats ran.
+        #
+        # ABSENT IS UNKNOWN, and that is the whole of the defensive reading here: a
+        # payload with no `seat_routing` leaves this round out of `b.dispatched`
+        # entirely, and `last_dispatch` then answers None, and `route_seats` then
+        # cuts nothing. A `{}` or an empty list, by contrast, would claim the round
+        # dispatched nobody — which would make every seat a complement seat and hand
+        # a tight budget a free choice by name order.
+        #
+        # Reported and not swallowed, on this function's rule: a register nobody can
+        # read reverts the routing to "dispatch everything", which is safe, and the
+        # caller still has to be told the record it was counting on was not there.
+        routing = payload.get("seat_routing")
+        held_back = False
+        if isinstance(routing, dict):
+            got = routing.get("dispatched")
+            if isinstance(got, list) and all(isinstance(n, str) for n in got):
+                b.dispatched[was] = {n.strip().lower() for n in got if n.strip()}
+            else:
+                b.problems.append(
+                    f"baseline {path} records a `seat_routing.dispatched` that is not "
+                    f"a list of seat names ({got!r}) — round {was}'s dispatch set was "
+                    "NOT read, so this round asks every configured seat rather than "
+                    "the ones that round did not")
+            # The other half of the same record, and the one with teeth. A round
+            # that held a seat back read LESS than a full panel, so it cannot be the
+            # round that closes every earlier round's coverage gap — see
+            # `partial_rounds`. Read off the `held` list rather than off the budget,
+            # because a budget that never bound held nothing and cost the round
+            # nothing.
+            held = routing.get("held")
+            if isinstance(held, list) and held:
+                held_back = True
+                b.partial_rounds.add(was)
+            elif held is not None and not isinstance(held, list):
+                b.problems.append(
+                    f"baseline {path} records a `seat_routing.held` that is not a list "
+                    f"({held!r}) — round {was} may have asked fewer than its "
+                    "configured seats, and this run could not tell")
+                # Unreadable is treated as "it may have held one", which is the
+                # direction every unknown in this function takes: the cost is an
+                # inherited coverage gap that stays open one round longer, and the
+                # cost of the other direction is a gap deleted by a round that never
+                # looked.
+                held_back = True
         # `ran`, not `not absent` (#222): a seat that was present and then crashed
         # is "not absent" while having read nothing, so the weaker test let a round
         # where every seat failed still qualify to erase earlier gaps.
@@ -2771,7 +2884,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         ran = payload.get("reviewers_ran")
         if isinstance(ran, list) and not ran:
             b.unread_rounds.add(was)
-        # FOUR terms, and each rules out a different way a round can look like it
+        # FIVE terms, and each rules out a different way a round can look like it
         # read the whole PR without having done so. `reread` erases every earlier
         # round's recorded gap, so it is the most destructive thing in this
         # function and every one of them is load-bearing:
@@ -2785,7 +2898,18 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         #     with nothing truncated, because the manifest fitted. It therefore
         #     satisfies every OTHER term here while having read not one line of the
         #     diff, which would make it the round that closes everyone else's gaps.
+        #   `not held_back` (#775) — every seat the round selected was actually
+        #     ASKED. A complement-routed round satisfies all four terms above with
+        #     half the panel: the seats it did dispatch ran, read their whole target
+        #     and read a diff, and the ones it held back wrote a `ran: false` row
+        #     that `read_something` does not care about and `truncated_any` does not
+        #     see. It would therefore have been the round that erases every earlier
+        #     round's recorded gap — on the strength of a panel that never looked at
+        #     most of them. This is #790's "a dropped seat banks as coverage" in the
+        #     one place where banking it also DELETES the evidence, which is why the
+        #     routing could not land without this term.
         elif (recorded and read_something and not truncated_any and not was_manifest
+                and not held_back
                 and str(payload.get("scope") or "pr") == "pr"):
             reread.add(was)
         # Tolerant of both shapes on purpose: this run writes a {key: round}
@@ -3326,6 +3450,26 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     of coming up short — a crash, a timeout, a budget someone typed, a reply that
     would not parse — is about THIS run and still vetoes.
 
+    **THE FIFTH REASON A SEAT HAS NO ROW, and it is an inclusion rather than an
+    exemption** (#775, #790). Four reasons were already distinguishable here: not
+    installed, ran and failed, ran and was silent, cut by a ceiling. #775's
+    complement routing adds a fifth — *the round chose not to ask it* — and #790 is
+    the issue that declined the seat cut until this function could tell it from the
+    other four. It could not: a seat that is installed, selected and then not
+    dispatched produces no row, and its silence is indistinguishable from a seat
+    that ran and found nothing, so the next round inherits "four seats looked and
+    three had nothing to say" when three were never asked.
+
+    A held seat is recorded with a word from :data:`panel_seats.SEAT_ROUTING_REASONS`
+    and gets its OWN line here, which is a veto. The reasoning is in the branch that
+    emits it; the short form is that it is not the sort of constant the paragraph
+    above rules out. `absent`, `code_blind` and `argv_capped` are facts about the
+    host or the panel's design that no round can change; this is a fact about a
+    policy the round ran under, false on every round of every repo running the
+    shipped flat curve, and answerable by asking everybody on the round that wants
+    to stop. It is the same distinction `ci_declared_absent` makes below: a silence a
+    repo can state its way out of is not a standing veto, and an unexplained one is.
+
     **`ci_status` asks the same question about EXECUTION EVIDENCE that everything
     above asks about READING** (#546). Every observation above is about whether a
     seat saw the diff; a round can satisfy all of them and still have had no test
@@ -3453,6 +3597,53 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
             # CLI whose stderr tail happens to read that way skip the veto, and
             # would silently restore the standing veto the first time this
             # branch's wording gained a suffix.
+            # #775's seat, and the FIFTH reason a seat has no row — checked before
+            # `absent` so that the two can never be confused in the direction that
+            # costs coverage. Four reasons existed: not installed, ran and failed,
+            # ran and was silent, and cut by a ceiling. This one is "the round chose
+            # not to ask it", and #790 is the issue that says it must exist before
+            # any routing may drop a seat: without it the held seat's silence is
+            # indistinguishable from a seat that ran and found nothing, and the next
+            # round banks "four seats looked and three had nothing to say" when
+            # three were never asked.
+            #
+            # **IT VETOES, and that is deliberate rather than an oversight of the
+            # constant rule this docstring spends four paragraphs on.** A round that
+            # did not ask every seat it could have asked is not evidence that the PR
+            # is clean, and the routing's whole saving is bought out of coverage —
+            # so a cycle wanting a confident stop has to end on a round that asked
+            # everybody. That is the honest price and it is what "never a dropped
+            # seat counted as coverage" costs when you say it and mean it.
+            #
+            # It is NOT the constant `absent`, `code_blind` and `argv_capped` are.
+            # Those are facts about the HOST or about the panel's DESIGN — true of
+            # every round this box will ever run, so vetoing on them makes a
+            # confident stop permanently unreachable and no action clears them. This
+            # is a fact about a POLICY the round ran under: it is false on every
+            # round of every repo that has written no taper (the shipped `[1.0]`,
+            # which is the whole fleet), and where it is true the remedy is in the
+            # operator's own hands — a flatter curve on the last round asks
+            # everybody and the veto is gone. That is exactly the line
+            # `ci_declared_absent` draws a few paragraphs down: a fact a repo can
+            # state its way out of is not a standing veto, and an UNEXPLAINED
+            # silence still is.
+            #
+            # Read off the recorded WORD (`panel_seats.SEAT_HELD`, from a closed
+            # vocabulary), never off the skip TEXT — the rule every exemption and
+            # inclusion in this function keeps. A payload written before the field
+            # existed carries no `routing` at all and falls through to the ordinary
+            # "did not run" line below, which is the old behaviour preserved rather
+            # than a new silence.
+            if meta.get("routing") == panel_seats.SEAT_HELD:
+                # Worded for the two things it must not be read as. Not coverage:
+                # the seat did not look, so it found nothing in the sense that it
+                # found nothing OUT. And not a fault in the seat: nothing failed,
+                # nothing timed out, nothing was missing from the box — this round
+                # spent its seat budget somewhere else on purpose.
+                out.append(f"{name} was not asked this round — the seat budget went "
+                           "to the seats the previous round left out, so its silence "
+                           "is a question nobody put rather than an answer")
+                continue
             if meta.get("absent"):
                 continue
             out.append(f"{name} did not run ({skip or 'no reason recorded'})")
