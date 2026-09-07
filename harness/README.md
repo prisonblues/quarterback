@@ -5135,7 +5135,39 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `worker.{type,command,container_prefix,queue_env,queue_default}`,
 `nginx.{config,container,main_port,resolver,extra_proxy_headers}`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
-and the arrays `symlinks`, `copies`, `reserved_names`, `gitignore_additions`.
+and the arrays `symlinks`, `copies`, `setup`, `reserved_names`, `gitignore_additions`.
+
+### `setup` — building a worktree its own environment
+
+`setup` is a list of shell commands run **in the new worktree**, after symlinks
+and copies (so the files are where they will finally be) and before Docker (so an
+image build can use what they produced).
+
+It exists because `symlinks` and `copies` were the only two levers, and neither
+builds anything. The motivating case is a Python project whose worktrees should
+have their **own** virtualenv rather than a symlink to the main checkout's:
+
+```json
+"setup": ["uv sync --frozen"]
+```
+
+**A shared `.venv` is one mutable dependency set behind N branches.** Symlinking
+it is cheap and correct only while every branch agrees about dependencies. When
+they do not, whichever worktree last ran `uv sync` decides what all of them have
+installed, and the rest silently run against the wrong versions — measured in
+lexray at 44 worktrees sharing one venv across 4 distinct `uv.lock` files, where
+a sync from one branch removed four packages the others import. The `.pth`
+editing-install path has the same shape and is the more famous half, but it is
+the smaller one.
+
+The trade is disk and a few seconds: a warm `uv` cache builds a project venv in
+~6s, and the venv costs a few hundred MB per worktree.
+
+**A failed setup command does not abort.** The worktree already exists, and
+tearing it down would lose the branch and the port along with the mistake. The
+failure is named where it happens, repeated in the closing summary, and printed
+with the command to re-run — because an absent `.venv` otherwise surfaces much
+later as a pre-push refusal or an import error with no obvious cause.
 
 ### Three prerequisites for database isolation
 

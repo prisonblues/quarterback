@@ -177,6 +177,15 @@
           # `templates/test_migrations_self_contained.py` — a template, not a suite — is not
           # picked up by being present.
           cp -r ${./harness/templates} harness/templates
+          # The two places `create-worktree`'s config keys are documented, because
+          # test_create_worktree_setup.py asserts the `setup` key reaches both.
+          # worktree.example.json is the annotated one-file reference and README.md
+          # carries the key list a reader greps; a key in neither is a key nobody
+          # discovers, which is how `setup` would have shipped invisible. Without
+          # these two lines that half of the suite errors on a missing file here,
+          # in the only check that runs it — #163 again.
+          install -Dm644 ${./harness/worktree.example.json} harness/worktree.example.json
+          install -Dm644 ${./harness/README.md} harness/README.md
           # And the brief that has to run it. test_check_db_isolation.py is in two halves on
           # purpose (its docstring says why): the mechanism, driven against real git
           # worktrees with the git above, and the shipped text of `/fix-issue` that calls it.

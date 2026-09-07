@@ -61,6 +61,9 @@ count_steps() {
     # git worktree, env, database, symlinks, copies, port, claude-local,
     # workspace, gitignore, quiet-git
     TOTAL_STEPS=10
+    if [[ ${#SETUP_COMMANDS[@]} -gt 0 ]]; then
+        TOTAL_STEPS=$((TOTAL_STEPS + 1))  # setup commands
+    fi
     if [[ "$SKIP_DOCKER" = false ]]; then
         TOTAL_STEPS=$((TOTAL_STEPS + 4))  # network, images, compose, start
     fi
@@ -918,6 +921,16 @@ while IFS= read -r line; do
     [[ -n "$line" ]] && COPIES+=("$line")
 done < <(cfg_array '.copies')
 
+# Commands run IN the new worktree once its files are in place. The reason this
+# exists: a project whose worktrees need their own environment rather than a
+# symlink to the main checkout's had no way to build one — the tool could
+# symlink or copy, and nothing else. `uv sync` is the motivating case (see
+# harness/README.md), but nothing here is Python-specific.
+SETUP_COMMANDS=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && SETUP_COMMANDS+=("$line")
+done < <(cfg_array '.setup')
+
 RESERVED_NAMES=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && RESERVED_NAMES+=("$line")
@@ -1138,6 +1151,14 @@ if [[ "$DRY_RUN" = true ]]; then
     if [[ ${#COPIES[@]} -gt 0 ]]; then
         local_step=$((local_step + 1))
         echo -e "  $local_step. Copy: ${COPIES[*]}"
+    fi
+
+    if [[ ${#SETUP_COMMANDS[@]} -gt 0 ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Run setup in the worktree:"
+        for c in "${SETUP_COMMANDS[@]}"; do
+            echo -e "       $c"
+        done
     fi
 
     local_step=$((local_step + 1))
@@ -1725,6 +1746,41 @@ else
         fi
     done
 fi
+
+# ============================================
+# STEP: Setup commands
+# ============================================
+# After symlinks and copies, so a command can rely on the worktree's files being
+# where they will finally be, and before Docker, so an image build can use what
+# the command produced.
+#
+# A failure here does NOT abort. The worktree exists and is otherwise usable, and
+# tearing it down would lose the branch and the port along with the mistake. But
+# it must not pass quietly either: an absent .venv surfaces much later as a
+# pre-push refusal or an import error with no obvious cause, so the failure is
+# named here, repeated in the final summary, and carries the command to re-run.
+# >>> setup
+SETUP_FAILED=()
+if [[ ${#SETUP_COMMANDS[@]} -gt 0 ]]; then
+    step "Running setup..."
+    for cmd in "${SETUP_COMMANDS[@]}"; do
+        echo -e "  ${YELLOW}\$ $cmd${NC}"
+        # The subshell keeps the cd local, so command N+1 is not run from
+        # wherever command N happened to leave the process. `|| SETUP_FAILED+=`
+        # rather than a bare call, because `set -e` would otherwise abort the
+        # whole script on the first failure and skip the port, nginx and
+        # summary steps that still need to run.
+        if (cd "$WORKTREE_DIR" && eval "$cmd"); then
+            echo -e "  ${GREEN}ok${NC}"
+        else
+            SETUP_FAILED+=("$cmd")
+            echo -e "  ${RED}FAILED: $cmd${NC}"
+            echo -e "  ${RED}  the worktree exists but is not fully set up${NC}"
+            echo -e "  ${RED}  re-run it yourself: cd $WORKTREE_DIR && $cmd${NC}"
+        fi
+    done
+fi
+# <<< setup
 
 # ============================================
 # STEP: Assign port
@@ -2320,6 +2376,15 @@ elif [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" && -n "$NGINX_MAIN_PORT" ]];
 fi
 if [[ "$SKIP_DOCKER" = false ]]; then
     echo -e "    Direct:    ${GREEN}http://localhost:${NEXT_PORT}/${NC}"
+fi
+
+if [[ ${#SETUP_FAILED[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "  ${RED}Setup did not complete — this worktree is not ready:${NC}"
+    for cmd in "${SETUP_FAILED[@]}"; do
+        echo -e "    ${RED}failed:${NC} $cmd"
+    done
+    echo -e "  ${RED}Run the above in $WORKTREE_DIR before using it.${NC}"
 fi
 
 echo ""
