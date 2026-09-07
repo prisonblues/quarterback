@@ -57,6 +57,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # sandbox it exists to protect.
 import _flake_sandbox  # noqa: E402
 
+# `_gitcopy` is a sibling of the same kind, imported the same way. It is what lets the
+# repo below be built once and handed out as copies rather than rebuilt per test (#800).
+import _gitcopy  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[2]
 BIN = ROOT / "harness" / "bin"
 HOOKS = ROOT / "harness" / "githooks"
@@ -166,13 +170,32 @@ def ship_tools(repo: Path, *names: str) -> None:
         shutil.copy(SCRIPTS / name, repo / "scripts" / name)
 
 
-@pytest.fixture
-def repo(tmp_path, home):
-    """A repo with migrations, a CHANGELOG, both tools, the guard installed, and one commit
-    already on the remote — so `refs/remotes/origin/main` exists and the release check has a
-    base to be fork-relative against."""
-    bare = bare_remote(tmp_path, home)
-    work = tmp_path / "work"
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory):
+    """Everything `repo` hands out, built ONCE for the whole module (#800).
+
+    Ten `git` processes and a `qb-hooks install` — which is itself a bash script running
+    several more — were being paid by each of this file's 54 tests to arrive at the same
+    two directories. That measured as 49% of the file's CPU, and it bought nothing: what
+    these tests need is a repo and a remote NOBODY ELSE IS PUSHING TO, not a freshly built
+    one.
+
+    The `home` this is built with is deliberately outside the template. It is the empty
+    global/system git config `env()` describes, so the delegate `qb-hooks install` resolves
+    here is the same "none" every test resolves — but `_gitcopy.copy` carries every child
+    of the template into the test's `tmp_path`, where the `home` fixture below is already
+    building its own.
+    """
+    build = tmp_path_factory.mktemp("pre-push-template")
+    home = build / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("")
+    (home / ".gitconfig-system").write_text("")
+
+    template = build / "template"
+    template.mkdir()
+    bare = bare_remote(template, home)
+    work = template / "work"
     init(work, home)
     write_migration(work, "0001", None)
     write_migration(work, "0002", "0001")
@@ -183,7 +206,24 @@ def repo(tmp_path, home):
     install(work, home)
     push = git(work, "push", "-q", "-u", "origin", "main", home=home, check=False)
     assert push.returncode == 0, push.stderr
-    return work
+    return template
+
+
+@pytest.fixture
+def repo(_repo_template, tmp_path):
+    """A repo with migrations, a CHANGELOG, both tools, the guard installed, and one commit
+    already on the remote — so `refs/remotes/origin/main` exists and the release check has a
+    base to be fork-relative against.
+
+    A copy of the module's template, and the copy is the whole point: every test here
+    PUSHES, and most of them commit first. Shared, one test's refused push would be the next
+    test's remote state, and the failures this file exists to catch are all of the form "a
+    push that should have stopped" — a suite that agreed with itself for the wrong reason.
+    `_gitcopy.copy` repoints `remote.origin.url`, `core.hooksPath` and `qb.hooksDelegate` at
+    this test's own copy, so the template is read once and written to never.
+    """
+    _gitcopy.copy(_repo_template, tmp_path)
+    return tmp_path / "work"
 
 
 def push(repo: Path, home: Path, *args) -> subprocess.CompletedProcess:

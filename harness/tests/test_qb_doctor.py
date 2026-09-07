@@ -37,6 +37,12 @@ import pytest
 BIN = Path(__file__).resolve().parent.parent / "bin"
 HARNESS = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BIN))
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in this
+# directory and `_inproc` followed. `_gitcopy` is what lets the fixtures below build
+# their repository once and hand out copies (#800).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _gitcopy  # noqa: E402
 
 
 def _load():
@@ -85,18 +91,49 @@ def _git(repo: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """A real git repository with one commit and no hooks installed."""
-    r = tmp_path / "repo"
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory) -> Path:
+    """The repository `repo` hands out, built ONCE for the whole module (#800).
+
+    269 tests here were each spending five `git` processes rebuilding the same
+    empty repository — 62% of this file's CPU, buying nothing: not one of them
+    depends on the repository having been made freshly, only on having one of
+    its own, which is what `_gitcopy.copy` gives them.
+
+    `_gitcopy.hermetic_env` and not `_hermetic_git`, for the reason that helper's
+    docstring gives: a module-scoped fixture cannot use a function-scoped
+    monkeypatch, and without the redirection this template's one commit is made
+    under this host's global `core.hooksPath`.
+    """
+    build = tmp_path_factory.mktemp("doctor-repo-template")
+    env = _gitcopy.hermetic_env(build)           # one level up: see its docstring
+    template = build / "template"
+    template.mkdir()
+
+    def run(*args: str) -> None:
+        subprocess.run(["git", *args], check=True, capture_output=True, env=env)
+
+    r = template / "repo"
     r.mkdir()
-    subprocess.run(["git", "init", "-q", str(r)], check=True)
-    _git(r, "config", "user.email", "t@example.com")
-    _git(r, "config", "user.name", "T")
+    run("init", "-q", str(r))
+    run("-C", str(r), "config", "user.email", "t@example.com")
+    run("-C", str(r), "config", "user.name", "T")
     (r / "a.txt").write_text("one\n")
-    _git(r, "add", "a.txt")
-    _git(r, "-c", "core.hooksPath=/nonexistent", "commit", "-qm", "init")
-    return r
+    run("-C", str(r), "add", "a.txt")
+    run("-C", str(r), "-c", "core.hooksPath=/nonexistent", "commit", "-qm", "init")
+    return template
+
+
+@pytest.fixture
+def repo(_repo_template: Path, tmp_path: Path) -> Path:
+    """A real git repository with one commit and no hooks installed.
+
+    A copy of the module's template rather than a fresh build (#800). The tests
+    below add remotes, install hooks, cut worktrees and commit, so the repository
+    is a per-test input and stays one — what is shared is the building of it.
+    """
+    _gitcopy.copy(_repo_template, tmp_path)
+    return tmp_path / "repo"
 
 
 @pytest.fixture
@@ -1256,14 +1293,37 @@ TAGGER_THAT_RESERVES_NOTHING = (
 )
 
 
+@pytest.fixture(scope="module")
+def _landing_repo_template(_repo_template: Path, tmp_path_factory) -> Path:
+    """`landing_repo` below, built once for the same reason `repo` is (#800).
+
+    151 of this file's tests want this shape, and the two extra `git` processes
+    were being paid by every one of them. The remote is a URL and not a path on
+    disk, so — as with the base template — nothing in the copy points back here.
+    """
+    build = tmp_path_factory.mktemp("doctor-landing-template")
+    env = _gitcopy.hermetic_env(build)           # one level up: see its docstring
+    template = build / "template"
+    template.mkdir()
+    _gitcopy.copy(_repo_template, template)
+    r = template / "repo"
+    for args in (("remote", "add", "origin", "git@github.com:acme/thing.git"),
+                 ("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")):
+        subprocess.run(["git", "-C", str(r), *args], check=True, capture_output=True, env=env)
+    (r / "scripts").mkdir()
+    (r / "scripts" / "release_tag.py").write_text(RESERVING_TAGGER)
+    return template
+
+
 @pytest.fixture
-def landing_repo(repo: Path) -> Path:
-    """A repo in scope for the merges row: a GitHub remote and a tagger that reserves."""
-    _git(repo, "remote", "add", "origin", "git@github.com:acme/thing.git")
-    _git(repo, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-    (repo / "scripts").mkdir()
-    (repo / "scripts" / "release_tag.py").write_text(RESERVING_TAGGER)
-    return repo
+def landing_repo(_landing_repo_template: Path, tmp_path: Path) -> Path:
+    """A repo in scope for the merges row: a GitHub remote and a tagger that reserves.
+
+    A copy of the module's own template, exactly as `repo` is — no test here holds
+    both fixtures, so this still hands out the only repository its test has.
+    """
+    _gitcopy.copy(_landing_repo_template, tmp_path)
+    return tmp_path / "repo"
 
 
 def _gh_says(monkeypatch, *, out: str = "", rc: int = 0, err: str = "") -> None:

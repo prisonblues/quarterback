@@ -35,6 +35,11 @@ BIN = Path(__file__).resolve().parent.parent / "bin"
 HARNESS = Path(__file__).resolve().parent.parent
 CATCHUP = BIN / "qb-catchup"
 sys.path.insert(0, str(BIN))
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in this
+# directory. `_gitcopy` is what lets the fleet below be built once and copied (#800).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _gitcopy  # noqa: E402
 
 
 def git(where, *args, check=True):
@@ -83,30 +88,70 @@ def _hermetic_git(monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(tmp_path / "gitconfig-system"))
 
 
+@pytest.fixture(scope="module")
+def _fleet_template(tmp_path_factory):
+    """The three repositories `fleet` hands out, built ONCE for the module (#800).
+
+    A bare init, two clones, a commit and a push — eleven `git` processes, paid by
+    each of this file's 71 tests to arrive at the same three directories, and 45%
+    of the file's CPU. No test here wants them FRESHLY made; every one wants them
+    to itself, which `_gitcopy.copy` gives it far more cheaply.
+
+    Built under `_gitcopy.hermetic_env`, because that is what this fixture already
+    ran under: `_hermetic_git` above is autouse and function-scoped, so it reached
+    the old `fleet` and would not reliably reach a module-scoped one.
+
+    `stubbin` is deliberately NOT here. It goes on PATH, and three of the stubs
+    written into it stand in for `git` and `date` themselves — the per-test input
+    #785 found masquerading as a constant in `test_qb_seats.py`. It stays built
+    per test, below.
+    """
+    build = tmp_path_factory.mktemp("catchup-fleet-template")
+    env = _gitcopy.hermetic_env(build)           # one level up: see its docstring
+    template = build / "template"
+    template.mkdir()
+
+    def run(*args):
+        subprocess.run(["git", *args], check=True, capture_output=True, text=True, env=env)
+
+    remote = template / "remote.git"
+    run("init", "-q", "--bare", "-b", "main", str(remote))
+
+    main = template / "proj"
+    run("clone", "-q", str(remote), str(main))
+    run("-C", str(main), "config", "user.email", "t@e")
+    run("-C", str(main), "config", "user.name", "T")
+    (main / "first").write_text("x")
+    run("-C", str(main), "add", "first")
+    run("-C", str(main), "commit", "-qm", "first")
+    run("-C", str(main), "push", "-q", "-u", "origin", "main")
+
+    # A second clone standing in for "somebody else's machine", so the remote can
+    # be advanced without touching anything under test.
+    elsewhere = template / "elsewhere"
+    run("clone", "-q", str(remote), str(elsewhere))
+    run("-C", str(elsewhere), "config", "user.email", "t@e")
+    run("-C", str(elsewhere), "config", "user.name", "T")
+    return template
+
+
 @pytest.fixture
-def fleet(tmp_path):
+def fleet(_fleet_template, tmp_path):
     """A bare 'remote', a main checkout tracking it, and a way to add worktrees.
 
     Shaped like the real thing: linked worktrees share the common git dir, which
     is why one fetch updates every one of them — a property qb-catchup relies on
     and this fixture therefore has to reproduce rather than fake.
+
+    A copy of the module's template, and every test needs its own: `land_upstream`
+    and `land_branch` PUSH, `worktree()` cuts linked worktrees, and most tests
+    commit. `_gitcopy.copy` repoints both clones at the bare remote beside them,
+    so a push here cannot be seen by the next test.
     """
+    _gitcopy.copy(_fleet_template, tmp_path)
     remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(remote)], check=True)
-
     main = tmp_path / "proj"
-    subprocess.run(["git", "clone", "-q", str(remote), str(main)], check=True)
-    git(main, "config", "user.email", "t@e")
-    git(main, "config", "user.name", "T")
-    commit(main, "first")
-    git(main, "push", "-q", "-u", "origin", "main")
-
-    # A second clone standing in for "somebody else's machine", so the remote can
-    # be advanced without touching anything under test.
     elsewhere = tmp_path / "elsewhere"
-    subprocess.run(["git", "clone", "-q", str(remote), str(elsewhere)], check=True)
-    git(elsewhere, "config", "user.email", "t@e")
-    git(elsewhere, "config", "user.name", "T")
 
     stub_dir = tmp_path / "stubbin"
     stub_dir.mkdir()

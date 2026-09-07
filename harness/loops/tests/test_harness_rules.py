@@ -23,12 +23,93 @@ def git(cwd, *args):
                           capture_output=True, text=True, check=True)
 
 
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory):
+    """The pristine repo every test starts from, built ONCE.
+
+    Ten `git` subprocesses to stand up a work tree, a bare origin and a remote
+    HEAD, paid 135 times, was 71% of this file's runtime and every copy of it was
+    identical (#800). It is built here and copied below.
+
+    MODULE SCOPE AND NOT SESSION, deliberately. `tmp_path_factory` outlives the
+    module either way, but a session-scoped template is one more thing whose
+    lifetime does not match the file that owns it, and there is a single module
+    here — the wider scope would buy nothing and would make this template visible
+    to a file that never asked for it.
+
+    Nothing here reads the environment, which is what makes hoisting it safe: the
+    two `delenv` calls and `XDG_CONFIG_HOME` in `repo` below are about the
+    RESOLVER's environment at call time, not about how the repo was built, so they
+    stay function-scoped where `monkeypatch` can undo them.
+    """
+    base = tmp_path_factory.mktemp("rules-template")
+
+    # BUILT UNDER AN EMPTIED GIT CONFIG, and this is not tidiness — it is the one
+    # thing hoisting this fixture could have broken silently. A module-scoped
+    # fixture runs BEFORE the function-scoped one below, so the `XDG_CONFIG_HOME`
+    # redirect that used to be in force while these commits were made no longer is.
+    # This host's `~/.config/git/config` sets `core.hooksPath` to a nix store path
+    # holding a gitleaks `pre-commit`, so without this the template's commit fires
+    # the developer's hook: slower, and host-dependent in a file whose whole subject
+    # is not reading the developer's own configuration (#239, #240).
+    #
+    # `GIT_CONFIG_*` rather than another `XDG_CONFIG_HOME` redirect, because it
+    # closes `~/.gitconfig` as well as the XDG path, and because it is what the
+    # `_hermetic_git` fixtures elsewhere in this repo settled on.
+    empty = base / "gitconfig-none"
+    empty.write_text("")
+    env = {"GIT_CONFIG_GLOBAL": str(empty), "GIT_CONFIG_SYSTEM": str(empty)}
+    with pytest.MonkeyPatch.context() as mp:
+        for k, v in env.items():
+            mp.setenv(k, v)
+        mp.delenv("GIT_CONFIG_COUNT", raising=False)
+        _build_template(base)
+    return base
+
+
+def _build_template(base):
+    """The ten subprocesses, kept apart from the environment they run under so the
+    hermetic block above reads as one thing rather than being threaded through."""
+    work = base / "myrepo"
+    work.mkdir()
+    git(work, "init", "-q", "-b", "main")
+    git(work, "config", "user.email", "t@example.com")
+    git(work, "config", "user.name", "T")
+    (work / "README").write_text("x\n")
+    git(work, "add", "-A")
+    git(work, "commit", "-qm", "init")
+
+    bare = base / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    # The URL is set to the github one FIRST and then re-pointed at the bare clone,
+    # because `harness_rules` reads the configured remote to name the repo and the
+    # tests assert on `acme/myrepo`. Both writes are kept here rather than split, so
+    # the copy below inherits a remote that is already in its final shape.
+    git(work, "remote", "add", "origin", "https://github.com/acme/myrepo.git")
+    git(work, "remote", "set-url", "origin", str(bare))
+    git(work, "push", "-q", "origin", "main")
+    git(work, "remote", "set-head", "origin", "main")
+    return work
+
+
 @pytest.fixture
-def repo(tmp_path, monkeypatch):
+def repo(tmp_path, monkeypatch, _repo_template):
     """A real git repo with an 'origin' remote, on branch 'main'.
 
     origin is a bare clone on disk so `git show origin/main:...` and the
     remote-HEAD detection both behave like the real thing.
+
+    A COPY of the template rather than the template itself, because these tests
+    mutate what they are given — `write_rules` writes into the tree and `_commit`
+    commits and pushes — so a shared repo would carry one test's rules file into
+    the next and the two-ref tests would be reading a state nobody built. The copy
+    is the whole point: the construction is shared, the mutation is not.
+
+    The remote is re-pointed at the COPIED bare origin. `git remote set-url` wrote
+    an absolute path into the template's config, so a copy that skipped this would
+    push into the template and every later test would inherit it — which is the
+    silent-sharing failure this pattern exists to avoid, arriving through the one
+    file a `copytree` cannot fix by itself.
     """
     monkeypatch.delenv("HARNESS_UNATTENDED", raising=False)
     # The per-box overlay lives OUTSIDE the checkout (#240), so without this every
@@ -39,20 +120,10 @@ def repo(tmp_path, monkeypatch):
     monkeypatch.delenv(hr.BOX_RULES_ENV, raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
     work = tmp_path / "myrepo"
-    work.mkdir()
-    git(work, "init", "-q", "-b", "main")
-    git(work, "config", "user.email", "t@example.com")
-    git(work, "config", "user.name", "T")
-    (work / "README").write_text("x\n")
-    git(work, "add", "-A")
-    git(work, "commit", "-qm", "init")
-
     bare = tmp_path / "origin.git"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
-    git(work, "remote", "add", "origin", "https://github.com/acme/myrepo.git")
+    shutil.copytree(_repo_template / "myrepo", work)
+    shutil.copytree(_repo_template / "origin.git", bare)
     git(work, "remote", "set-url", "origin", str(bare))
-    git(work, "push", "-q", "origin", "main")
-    git(work, "remote", "set-head", "origin", "main")
     return work
 
 
