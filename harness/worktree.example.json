@@ -58,6 +58,14 @@
 
   "symlinks": [".venv", ".claude", "CLAUDE.md"],
 
+  "_setup": [
+    "Shell commands run IN the worktree, after symlinks/copies and before Docker.",
+    "Drop '.venv' from symlinks and use this instead when branches disagree about",
+    "dependencies \u2014 a shared venv is one mutable dependency set behind N branches,",
+    "and whichever worktree last synced decides what all of them have installed."
+  ],
+  "setup": ["uv sync --frozen"],
+
   "workspace": {
     "enabled": false
   }
