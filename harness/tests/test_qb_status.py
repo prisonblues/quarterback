@@ -34,6 +34,12 @@ from pathlib import Path
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 STATUS = BIN / "qb-status"
 
@@ -128,19 +134,31 @@ def board_client():
     return {"script": copied, "tools": tools, "tmux": panes != "none"}
 
 
-def run(box: dict, *args: str, session: str | None = SESSION):
+def run(box: dict, *args: str, session: str | None = SESSION, spawn: bool = False):
     """`qb-status` in the sandbox. $CLAUDE_CODE_SESSION_ID is cleared and the
     session passed as an argument instead, so a test never reads the identity of
     whatever is running the suite; `session=None` is how the no-session-anywhere
-    case is reached."""
+    case is reached.
+
+    `spawn=True` runs the copy as a real process; the default calls its `main()`
+    in this interpreter (#785). `_inproc` replaces the environment wholesale and
+    loads the copy fresh every call, which matters here because the seam this
+    helper rests on is the stub `qbdata.py` beside that copy — a cached one from
+    an earlier test would answer for it. One test at the foot of the file keeps
+    the spawn, and says there why.
+
+    The `tmux` this suite doubles is still a subprocess of the tool either way.
+    """
     env = {**os.environ, "PATH": f"{box['tools']}{os.pathsep}{os.environ['PATH']}"}
     env.pop("TMUX", None)
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if box["tmux"]:
         env["TMUX"] = "/tmp/fake,1,0"
     positional = [] if args or session is None else [session]
-    return subprocess.run([sys.executable, str(box["script"]), *positional, *args],
-                          capture_output=True, text=True, env=env)
+    if spawn:
+        return subprocess.run([sys.executable, str(box["script"]), *positional, *args],
+                              capture_output=True, text=True, env=env)
+    return _inproc.run(box["script"], [*positional, *args], env=env)
 
 
 #: A lease whose beacon moved a moment ago. Substituted by :func:`sandbox` at the
@@ -457,3 +475,29 @@ def test_the_pane_verdicts_are_the_ones_the_table_expects(verdict):
 @pytest.mark.parametrize("verdict", ["leased", "ended", "lapsed", "never", "unknown"])
 def test_the_agent_verdicts_are_the_ones_the_table_expects(verdict):
     assert f'"verdict": "{verdict}"' in STATUS.read_text()
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_status_runs_as_a_program_and_reports_a_live_seat(tmp_path):
+    """    The one test in this file that is deliberately still a subprocess (#785).
+
+    The rest call `main()` inside the interpreter pytest is already running, which
+    proves nothing about whether the tool can be *started*: importing a file does
+    not run its `if __name__ == "__main__"` block, does not make
+    `sys.path.insert(0, dirname(__file__))` resolve `qbdata` from a clean
+    interpreter — the seam this whole file rests on — and would keep passing if
+    the tool grew a dependency that only exists inside this suite's process.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run, so an exec here would fail for a
+    reason that says nothing about this code.
+
+    The `tmux` it consults is a stub on PATH either way, so what this asserts is
+    the tool starting, reading both sources and agreeing with itself.
+    """
+    got = run(sandbox(tmp_path, panes=[pane()], lease=LIVE), spawn=True)
+    assert got.returncode == ALIVE, got.stderr
+    assert "alive:" in got.stderr

@@ -28,6 +28,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 HARNESS = Path(__file__).resolve().parents[1]
 QB_BACKFILL = HARNESS / "bin" / "qb-backfill"
 
@@ -125,6 +131,14 @@ class Handler(BaseHTTPRequestHandler):
         self._send(404, {"detail": "not here"})
 
 
+#: How often `serve_forever` looks to see whether `shutdown()` has been called.
+#: The stdlib default is 0.5s and `shutdown()` blocks until the loop next comes
+#: round, so every test that took a board down paid a flat half-second in teardown
+#: — twelve of this file's fourteen seconds, spent on nothing this suite asserts
+#: (#785). Not zero, or the thread spins a core for the life of the test.
+POLL = 0.01
+
+
 @pytest.fixture
 def serve():
     started = []
@@ -132,7 +146,7 @@ def serve():
     def _start(board: Board) -> str:
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         httpd.board = board
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        threading.Thread(target=httpd.serve_forever, args=(POLL,), daemon=True).start()
         started.append(httpd)
         return f"http://127.0.0.1:{httpd.server_address[1]}"
 
@@ -210,12 +224,23 @@ def paths(*names: str) -> list[dict]:
     return [{"path": n, "additions": 1, "deletions": 0} for n in names]
 
 
-def run(tmp_path: Path, url: str, bin_dir: Path, *args: str) -> subprocess.CompletedProcess:
+def run(tmp_path: Path, url: str, bin_dir: Path, *args: str,
+        spawn: bool = False) -> subprocess.CompletedProcess:
+    """`qb-backfill` against this board, with `bin_dir`'s `gh` and no other.
+
+    `spawn=True` runs it as a real process; the default calls `main()` in this
+    interpreter (#785). `_inproc` replaces the environment wholesale and loads
+    `qb-backfill` fresh per call, so what the tool reads is what this builds, and
+    the `gh` it shells out to is still a real subprocess either way. One test at
+    the foot of the file keeps the spawn, and says there why.
+    """
     env = {**os.environ, "PATH": str(bin_dir), "QUARTERBACK_BASE_URL": url,
            "QUARTERBACK_TOKEN": "t", "QUARTERBACK_TOKEN_CMD": "",
            "QUARTERBACK_CONFIG": str(tmp_path / "nope")}
-    return subprocess.run([sys.executable, str(QB_BACKFILL), "--repo", REPO, *args],
-                          capture_output=True, text=True, env=env, timeout=90)
+    if spawn:
+        return subprocess.run([sys.executable, str(QB_BACKFILL), "--repo", REPO, *args],
+                              capture_output=True, text=True, env=env, timeout=90)
+    return _inproc.run(QB_BACKFILL, ["--repo", REPO, *args], env=env)
 
 
 # ---------------------------------------------------------------------- the tests
@@ -633,3 +658,33 @@ def test_a_pr_list_that_reached_the_limit_is_not_a_whole_repo_sweep(tmp_path, se
     assert json.loads(got.stdout)["pr_list_may_be_short"] is True
     assert "may have open PRs this run never saw" in got.stderr
     assert got.returncode == 1, "a partial sweep must not read as a whole one"
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_backfill_runs_as_a_program_and_writes_a_row(tmp_path, serve):
+    """The one test here that is deliberately still a subprocess (#785).
+
+    The rest of this file calls `main()` inside the interpreter pytest is already
+    running, which is worth a couple of seconds a run and proves nothing about
+    whether `qb-backfill` can be *started*: importing a file does not run its
+    `if __name__ == "__main__"` block, does not make `sys.path.insert(0,
+    dirname(__file__))` resolve `qbdata` from a clean interpreter, and would keep
+    passing if the tool grew a dependency that only exists inside this suite's
+    process. So one test spawns, and it takes the tool all the way through the
+    job — enumerate, read, POST — rather than stopping at a refusal.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` in the nix build
+    sandbox until `patchShebangs` has run, so an exec here would fail for a reason
+    that says nothing about this code.
+    """
+    board = Board()
+    url = serve(board)
+    bin_dir = gh_stub(tmp_path, [pr_meta(7, 2)], {7: paths("a.py", "b.py")})
+
+    got = run(tmp_path, url, bin_dir, "--apply", spawn=True)
+
+    assert got.returncode == 0, got.stderr
+    assert [r["pr"] for r in board.posted] == [7]

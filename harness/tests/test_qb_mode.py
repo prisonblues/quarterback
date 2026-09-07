@@ -39,6 +39,12 @@ QB_MODE = HARNESS / "bin" / "qb-mode"
 QB_HOOK = HARNESS / "bin" / "qb-hook"
 LOOPS = HARNESS / "loops"
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 AGREES, VIOLATED, CANNOT_TELL = 0, 3, 4
 
 pytestmark = pytest.mark.skipif(shutil.which("git") is None, reason="git not on PATH")
@@ -49,22 +55,40 @@ def git(cwd: Path, *args: str) -> None:
                    capture_output=True, text=True)
 
 
-def run(*args: str, cwd: Path | None = None) -> subprocess.CompletedProcess:
+def run(*args: str, cwd: Path | None = None,
+        spawn: bool = False) -> subprocess.CompletedProcess:
     """`qb-mode`, as a caller runs it.
 
     XDG_CONFIG_HOME is redirected because the per-box overlay lives outside the
     checkout: without it this suite reads the developer's own
     `~/.config/quarterback/harness-rules.json` and passes or fails on what that
     machine happens to hold, which is the host-dependent suite #239 was filed for.
+
+    `spawn=True` runs it as a real process; the default calls `main()` in this
+    interpreter (#785). Nearly all of what a spawn cost here was `harness_rules`
+    being imported from cold once per test — six thousand lines, and `qb-mode`
+    imports it at call time on purpose. In-process that import is cached, which is
+    the saving and also the hazard: `harness_rules` evaluates `REPO_ROOT` and
+    `QB_CONFIG` from the ENVIRONMENT while its body runs, so a cached copy would
+    hold the first test's `XDG_CONFIG_HOME` — the very redirection this helper
+    exists to make per-test. `fresh=` drops it before each call so its body runs
+    again against that call's environment, which costs well under a millisecond
+    once the bytecode is compiled.
+
+    `git` is still a subprocess of the tool either way, so what this suite is
+    actually about — what `qb-mode` reads out of a real checkout and a real
+    `origin` — is untouched.
     """
     env = dict(os.environ, XDG_CONFIG_HOME=str(HARNESS / ".no-such-config"))
     env.pop("QUARTERBACK_HARNESS_RULES", None)
     # No board: the mode is a property of the repo and must resolve without one.
     env.pop("QUARTERBACK_BASE_URL", None)
     env["QUARTERBACK_DIALS"] = ""
-    return subprocess.run([sys.executable, str(QB_MODE), *args],
-                          cwd=str(cwd) if cwd else None,
-                          capture_output=True, text=True, env=env)
+    if spawn:
+        return subprocess.run([sys.executable, str(QB_MODE), *args],
+                              cwd=str(cwd) if cwd else None,
+                              capture_output=True, text=True, env=env)
+    return _inproc.run(QB_MODE, args, env=env, cwd=cwd, fresh=("harness_rules",))
 
 
 @pytest.fixture
@@ -367,3 +391,28 @@ def test_a_boardless_host_says_nothing_on_other_events(repo):
                                          "prompt": "x"}),
                        capture_output=True, text=True, env=env, timeout=60)
     assert (r.returncode, r.stdout) == (0, "")
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_mode_runs_as_a_program_and_reports_the_declared_mode(repo):
+    """The one test here that is deliberately still a subprocess (#785).
+
+    The rest call `main()` inside the interpreter pytest is already running, which
+    proves nothing about whether `qb-mode` can be *started*: importing a file does
+    not run its `if __name__ == "__main__"` block, and — the part that matters for
+    this tool specifically — does not exercise the `sys.path.insert(0, where)`
+    that finds `harness/loops` beside the installed script. A `qb-mode` that could
+    no longer locate `harness_rules` from a cold interpreter would still pass
+    every in-process test in this file, because this file's process has already
+    got `harness_rules` on its path.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run.
+    """
+    declare(repo, {"name": "cleanroom"})
+    r = run("--bar", cwd=repo, spawn=True)
+    assert r.stdout.strip() == "⌂ CLEANROOM", r.stderr
+    assert r.returncode == VIOLATED

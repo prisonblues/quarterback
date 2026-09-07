@@ -41,6 +41,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 HARNESS = Path(__file__).resolve().parents[1]
 QB_LINE = HARNESS / "bin" / "qb-line"
 
@@ -154,10 +160,19 @@ class _Handler(BaseHTTPRequestHandler):
         pass
 
 
+#: How often `serve_forever` looks to see whether `shutdown()` has been called.
+#: The stdlib default is 0.5s and `shutdown()` blocks until the loop next comes
+#: round, so every test that stood a board up and took it down again paid a flat
+#: half-second of waiting — twelve of this file's sixteen seconds, spent in
+#: teardown rather than on anything the tests assert (#785). Not zero, or the
+#: thread spins a core for the life of the test.
+POLL = 0.01
+
+
 def serve(board: Board):
     handler = type("Bound", (_Handler,), {"board": board})
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, args=(POLL,), daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_port}"
 
 
@@ -202,7 +217,17 @@ def pr_row(number: int, head: str = HEAD_A, draft: bool = False,
             "headRefOid": head, "baseRefName": "main"}
 
 
-def run(url: str, gh_path: Path, *args: str, env: dict | None = None):
+def run(url: str, gh_path: Path, *args: str, env: dict | None = None,
+        spawn: bool = False):
+    """`qb-line` against this board and this `gh`, and nothing else on PATH.
+
+    `spawn=True` runs it as a real process; the default calls `main()` in this
+    interpreter (#785). The tool sees the same thing either way — `_inproc`
+    replaces the environment wholesale and loads `qb-line` fresh per call — and
+    the `gh` stub it shells out to is still a real subprocess, which is the part
+    of this suite's isolation that was doing work. One test at the foot of the
+    file keeps the spawn, and says there why.
+    """
     environ = {
         "QUARTERBACK_BASE_URL": url,
         "QUARTERBACK_TOKEN": "test-token",
@@ -211,8 +236,10 @@ def run(url: str, gh_path: Path, *args: str, env: dict | None = None):
         "HOME": "/nonexistent",
         **(env or {}),
     }
-    return subprocess.run([sys.executable, str(QB_LINE), "--repo", REPO, *args],
-                          capture_output=True, text=True, timeout=120, env=environ)
+    if spawn:
+        return subprocess.run([sys.executable, str(QB_LINE), "--repo", REPO, *args],
+                              capture_output=True, text=True, timeout=120, env=environ)
+    return _inproc.run(QB_LINE, ["--repo", REPO, *args], env=environ)
 
 
 @pytest.fixture
@@ -571,3 +598,29 @@ def test_the_base_filter_reaches_gh_rather_than_being_applied_after(board_of):
     (gh_path / "gh").chmod(0o755)
     assert run(url, gh_path, "--base", "test").returncode == 0
     assert "--base" in argv.read_text() and "test" in argv.read_text()
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_line_runs_as_a_program_and_reports_a_backlog(board_of):
+    """The one test here that is deliberately still a subprocess (#785).
+
+    Every other test in this file calls `main()` inside the interpreter pytest is
+    already running. That is worth several seconds a run and proves nothing about
+    whether `qb-line` can be *started*: importing a file does not run its
+    `if __name__ == "__main__"` block, does not make `sys.path.insert(0,
+    dirname(__file__))` resolve `qbdata` from a clean interpreter, and would keep
+    passing if the tool grew a dependency that only exists inside this suite's
+    process. So one test spawns, and it asserts the whole job rather than an edge:
+    a PR enumerated from `gh`, a board asked about it, a tier on stdout.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run. Whether the shipped file is
+    executable and patched is the build's assertion, not this suite's.
+    """
+    board, url, gh_path = board_of([pr_row(7)], {}, {})
+    got = run(url, gh_path, "--json", spawn=True)
+    assert got.returncode == 0, got.stderr
+    assert json.loads(got.stdout)["prs"][0]["tier"] == "never-panelled"

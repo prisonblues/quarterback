@@ -22,12 +22,19 @@ import subprocess
 import sys
 from pathlib import Path
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 END = BIN / "qb-end"
 
 
 def run(*args, board: str | None = "http://b", answer: dict | None = None,
-        status: int = 200, tmp_path: Path = None, session_env: str | None = None):
+        status: int = 200, tmp_path: Path = None, session_env: str | None = None,
+        spawn: bool = False):
     """Run `qb-end` against a stubbed board.
 
     Stubbed the way `test_qb_claim.py` stubs one, and for the same reason: a COPY
@@ -69,8 +76,10 @@ def board_client():
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if session_env is not None:
         env["CLAUDE_CODE_SESSION_ID"] = session_env
-    return subprocess.run([sys.executable, str(copied), *args],
-                          capture_output=True, text=True, env=env)
+    if spawn:
+        return subprocess.run([sys.executable, str(copied), *args],
+                              capture_output=True, text=True, env=env)
+    return _inproc.run(copied, args, env=env)
 
 
 RECORDED, REFUSED, UNKNOWN = 0, 1, 2
@@ -183,3 +192,29 @@ def test_claims_it_would_not_release_are_reported_rather_than_swallowed(tmp_path
                       "refused_claims": [{"kind": "merge", "key": "acme/w:main"}]})
     assert got.returncode == RECORDED
     assert "held by another machine and were left alone" in got.stderr
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_end_runs_as_a_program_and_records_an_ending(tmp_path):
+    """    The one test in this file that is deliberately still a subprocess (#785).
+
+    The rest call `main()` inside the interpreter pytest is already running, which
+    proves nothing about whether the tool can be *started*: importing a file does
+    not run its `if __name__ == "__main__"` block, does not make
+    `sys.path.insert(0, dirname(__file__))` resolve `qbdata` from a clean
+    interpreter — the seam this whole file rests on — and would keep passing if
+    the tool grew a dependency that only exists inside this suite's process.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run, so an exec here would fail for a
+    reason that says nothing about this code.
+"""
+    got = run("s-1", "--reason", "killed", tmp_path=tmp_path, spawn=True,
+              answer={"ended": True, "lease_was": "released",
+                      "released_claims": []})
+    assert got.returncode == RECORDED, got.stderr
+    assert "ended: s-1" in got.stderr
+    assert _sent(got)["path"] == "/session/end"

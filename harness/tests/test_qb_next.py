@@ -45,6 +45,13 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets the tests below call `qb-next` without
+# paying for an interpreter each time; its docstring says what that costs.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 HARNESS = Path(__file__).resolve().parents[1]
 QB_NEXT = HARNESS / "bin" / "qb-next"
 BRIEF = HARNESS / "commands" / "get-involved.md"
@@ -267,11 +274,25 @@ class _Handler(BaseHTTPRequestHandler):
         pass                                                     # quiet under pytest
 
 
+#: How often `serve_forever` looks to see whether `shutdown()` has been called.
+#:
+#: The stdlib default is 0.5s, and `shutdown()` blocks until the loop next comes
+#: round — so every test in this file that stands a board up and takes it down
+#: again paid a flat half-second of doing nothing (#785). That is where 19 of this
+#: file's 20 seconds went, and it is why the per-test cost was suspiciously
+#: uniform: it was not the work, it was the wait.
+#:
+#: Not zero: the loop would then spin a core for the life of the test. 10ms is
+#: below the noise of everything else a test here does and still lets the thread
+#: sleep between looks.
+POLL = 0.01
+
+
 def serve(board: Board):
     """A board on a loopback port, torn down with the test that asked for it."""
     handler = type("Bound", (_Handler,), {"board": board})
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    threading.Thread(target=httpd.serve_forever, args=(POLL,), daemon=True).start()
     return httpd, f"http://127.0.0.1:{httpd.server_port}"
 
 
@@ -299,13 +320,23 @@ def gh(tmp_path: Path) -> Path:
 
 
 def run(url: str, *args: str, session: str | None = "sess-a", gh_path: Path | None = None,
-        env: dict | None = None) -> subprocess.CompletedProcess:
-    """One agent, as a process, pointed at a board and at nothing else.
+        env: dict | None = None, spawn: bool = False) -> subprocess.CompletedProcess:
+    """One agent, pointed at a board and at nothing else.
 
     The environment is built rather than inherited so the outcome cannot turn on
     the developer's own board config, their `gh`, or a `QUARTERBACK_*` they happen
     to export — the failure mode the fleet's own notes call "green here, red in
     CI".
+
+    `spawn=True` runs it as a real process; the default calls `main()` in this
+    interpreter (#785). What the tool sees is the same either way — `_inproc`
+    replaces the environment wholesale, sets `sys.argv`, and loads `qb-next`
+    fresh so nothing it caches reaches the next test — and it still talks to the
+    board over a real socket, which is the coupling this file exists to hold. The
+    two places that keep the process are the two where the boundary is the
+    subject: the race below needs two agents that really are separate (one
+    `os.environ` cannot hold two sessions at once), and the smoke test at the foot
+    of the file is the one that proves `qb-next` starts at all.
     """
     environ = {
         "QUARTERBACK_BASE_URL": url,
@@ -317,8 +348,10 @@ def run(url: str, *args: str, session: str | None = "sess-a", gh_path: Path | No
     }
     if session is not None:
         environ["CLAUDE_CODE_SESSION_ID"] = session
-    return subprocess.run([sys.executable, str(QB_NEXT), *args],
-                          capture_output=True, text=True, timeout=60, env=environ)
+    if spawn:
+        return subprocess.run([sys.executable, str(QB_NEXT), *args],
+                              capture_output=True, text=True, timeout=60, env=environ)
+    return _inproc.run(QB_NEXT, args, env=environ)
 
 
 @pytest.fixture
@@ -387,8 +420,14 @@ def test_two_agents_handed_the_same_next_take_different_items(gh):
     httpd, url = serve(board)
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
+            # `spawn=True`, and it is not an optimisation left behind: two agents
+            # is the whole test, and two in-process calls would share one
+            # `os.environ` and one `sys.argv`, so the second would overwrite the
+            # first's session and both would claim as the same agent — the
+            # collision this asserts on would stop happening for a reason that has
+            # nothing to do with the board.
             futures = [pool.submit(run, url, "--scope", SCOPE, "--json",
-                                   session=s, gh_path=gh)
+                                   session=s, gh_path=gh, spawn=True)
                        for s in ("sess-a", "sess-b")]
             a, b = (f.result() for f in futures)
     finally:
@@ -938,3 +977,32 @@ def test_an_ordinary_pickup_says_nothing_about_a_previous_holder(gh):
     assert got.returncode == 0
     assert "previously" not in got.stderr
     assert json.loads(got.stdout)["previously"] is None
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_next_runs_as_a_program_and_takes_an_item(three, gh):
+    """The one test in this file that is deliberately still a subprocess (#785).
+
+    Every other test above calls `main()` in the interpreter pytest is already
+    running, which is worth about nineteen seconds a run and proves nothing about
+    whether `qb-next` can be *started*. Importing a file does not run its
+    `if __name__ == "__main__"` block, does not make `sys.path.insert(0,
+    dirname(__file__))` resolve `qbdata` from a clean interpreter, and would go on
+    passing if the tool grew an import that only exists inside this suite's
+    process. So one test spawns, and it is the tool's whole job end to end rather
+    than an edge: a board, an item, a claim and a dispatch line on stdout.
+
+    It runs the file with `sys.executable` and not through its shebang, for the
+    reason `test_check_db_isolation.py` gives about the same choice: there is no
+    `/usr/bin/env` inside the nix build sandbox until `patchShebangs` has run, so
+    an exec here would fail for a reason that says nothing about the code. That
+    the shipped file is executable and correctly patched is the build's assertion
+    to make, not this suite's.
+    """
+    board, url = three
+    got = run(url, "--scope", SCOPE, gh_path=gh, spawn=True)
+    assert got.returncode == 0, got.stderr
+    assert got.stdout.strip() == "/fix-issue 61"
+    assert board.row(1)["claim"]["session"] == "sess-a"

@@ -37,6 +37,12 @@ from pathlib import Path
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 RELEASE = BIN / "qb-release"
 
@@ -46,8 +52,16 @@ RELEASED, REFUSED, UNKNOWN = 0, 1, 2
 def run(*args, tmp_path: Path, claims: list | None = None, board: bool = True,
         repo: str | None = "acme/widget", release_status: int = 200,
         get_status: int = 200, cwd: Path | None = None,
-        session_env: str | None = None):
-    """Run `qb-release` against a stubbed board that answers with `claims`."""
+        session_env: str | None = None, spawn: bool = False):
+    """Run `qb-release` against a stubbed board that answers with `claims`.
+
+    `spawn=True` runs the copy as a real process; the default calls its `main()`
+    in this interpreter (#785). `_inproc` replaces the environment wholesale and
+    loads the copy fresh every call, which matters here because the seam this
+    helper rests on is the stub `qbdata.py` beside that copy — a cached one from
+    an earlier test would answer for it. One test at the foot of the file keeps
+    the spawn, and says there why.
+    """
     stub = tmp_path / "stub"
     stub.mkdir(exist_ok=True)
     copied = stub / RELEASE.name
@@ -97,9 +111,11 @@ def board_client():
     env.pop("CLAUDE_CODE_SESSION_ID", None)
     if session_env is not None:
         env["CLAUDE_CODE_SESSION_ID"] = session_env
-    return subprocess.run([sys.executable, str(copied), *args],
-                          capture_output=True, text=True, env=env,
-                          cwd=str(cwd) if cwd else None)
+    if spawn:
+        return subprocess.run([sys.executable, str(copied), *args],
+                              capture_output=True, text=True, env=env,
+                              cwd=str(cwd) if cwd else None)
+    return _inproc.run(copied, args, env=env, cwd=cwd)
 
 
 def calls(got) -> list[dict]:
@@ -269,3 +285,26 @@ def test_quiet_says_nothing_at_all(tmp_path):
     assert got.returncode == RELEASED
     assert got.stdout == ""
     assert [ln for ln in got.stderr.splitlines() if not ln.startswith('{"verb"')] == []
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_release_runs_as_a_program_and_gives_a_claim_back(tmp_path):
+    """    The one test in this file that is deliberately still a subprocess (#785).
+
+    The rest call `main()` inside the interpreter pytest is already running, which
+    proves nothing about whether the tool can be *started*: importing a file does
+    not run its `if __name__ == "__main__"` block, does not make
+    `sys.path.insert(0, dirname(__file__))` resolve `qbdata` from a clean
+    interpreter — the seam this whole file rests on — and would keep passing if
+    the tool grew a dependency that only exists inside this suite's process.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run, so an exec here would fail for a
+    reason that says nothing about this code.
+"""
+    got = run("issue", "337", tmp_path=tmp_path, claims=LIVE, spawn=True)
+    assert got.returncode == RELEASED, got.stderr
+    assert calls(got)[0]["path"] == "/claims"

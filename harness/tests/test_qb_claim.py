@@ -33,6 +33,12 @@ from pathlib import Path
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 CLAIM, CLAIMED = BIN / "qb-claim", BIN / "qb-claimed"
 
@@ -40,7 +46,7 @@ CLAIM, CLAIMED = BIN / "qb-claim", BIN / "qb-claimed"
 def run(script: Path, *args, board: str | None = None, repo: str = "acme/widget",
         answer: dict | None = None, status: int = 200,
         replies: list | None = None, tmp_path: Path = None,
-        gh_title: str | None = None):
+        gh_title: str | None = None, spawn: bool = False):
     """Run one of the CLIs against a stubbed board and a stubbed repo lookup.
 
     Both are stubbed by running a COPY of the script beside a stub `qbdata.py`.
@@ -122,10 +128,34 @@ def lapsed_redirect(previously, repo_path="."):
 """)
     env = {**os.environ}
     env.pop("CLAUDE_CODE_SESSION_ID", None)
-    if gh_title is not None:
-        env["PATH"] = f"{_fake_gh(tmp_path, gh_title)}{os.pathsep}{env['PATH']}"
-    return subprocess.run([sys.executable, str(copied), *args],
-                          capture_output=True, text=True, env=env)
+    # PATH is this suite's and not the developer's, and that is a correctness fix
+    # rather than a tidy-up (#785). `qb-claim` looks an issue title up by running
+    # `gh`, best-effort; on an inherited PATH that found the REAL `gh`, which then
+    # spent a third of a second going to the network on behalf of every test in
+    # this file that never mentioned a title — asking github.com about a repo
+    # called `acme/widget`. What came back was "no title", which is also what
+    # comes back when `gh` is absent, so nothing here was ever asserting on it and
+    # nothing changes by taking it away. What does change: the answer no longer
+    # depends on whether the developer has `gh` installed and authenticated, which
+    # is the "green here, red in CI" this directory keeps writing comments about.
+    env["PATH"] = str(_fake_gh(tmp_path, gh_title) if gh_title is not None
+                      else _no_gh(tmp_path))
+    if spawn:
+        return subprocess.run([sys.executable, str(copied), *args],
+                              capture_output=True, text=True, env=env)
+    return _inproc.run(copied, args, env=env)
+
+
+def _no_gh(tmp_path: Path) -> Path:
+    """A PATH directory holding nothing, so the title lookup finds no `gh` at all.
+
+    Not `PATH=""`: an empty PATH is a state a tool can read as "unset" and search
+    the default path from, and a directory that exists and is empty says the same
+    thing without depending on how the lookup is spelled.
+    """
+    bindir = tmp_path / "nobin"
+    bindir.mkdir(exist_ok=True)
+    return bindir
 
 
 def _fake_gh(tmp_path: Path, title: str) -> Path:
@@ -136,8 +166,14 @@ def _fake_gh(tmp_path: Path, title: str) -> Path:
     # Quoted through `shlex`, not interpolated: `tmp_path` is pytest's and a title
     # is a PR's, so both can carry a space or a quote, and a fake tool that breaks
     # on one would fail the test it is the seam for rather than the code.
+    #
+    # `: >` and not `touch`, and `printf` because it is a builtin too: PATH now
+    # holds this directory and nothing else, so there are no coreutils on it. It
+    # used to hold the developer's PATH as well, which is the same reason the real
+    # `gh` was being consulted; taking that away takes the external `touch` with
+    # it. `test_qb_line.py`'s `write_gh` documents the identical constraint.
     gh.write_text("#!/bin/sh\n"
-                  f"touch {shlex.quote(str(tmp_path / 'gh_asked'))}\n"
+                  f": > {shlex.quote(str(tmp_path / 'gh_asked'))}\n"
                   f"printf '%s\\n' {shlex.quote(title)}\n")
     gh.chmod(0o755)
     return bindir
@@ -560,3 +596,42 @@ def test_an_ordinary_claim_still_reports_its_item_the_way_it_always_did(tmp_path
     assert got.returncode == 0, got.stderr
     assert "on the plan at rank 1 of acme/widget" in got.stderr
     assert "WARNING" not in got.stderr
+
+
+# ------------------------------------------------ and they still run as programs
+
+
+def test_qb_claim_runs_as_a_program_and_takes_a_claim(tmp_path):
+    """One of the two tests here that is deliberately still a subprocess (#785).
+
+    Everything above calls `main()` inside the interpreter pytest is already
+    running, which proves nothing about whether `qb-claim` can be *started*:
+    importing a file does not run its `if __name__ == "__main__"` block, and does
+    not make `sys.path.insert(0, dirname(__file__))` resolve `qbdata` from a clean
+    interpreter — which for this suite is load-bearing twice over, because that
+    insert is the seam the whole file relies on to reach the doubled `qbdata.py`
+    beside the copied script rather than the real one.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` in the nix build
+    sandbox until `patchShebangs` has run.
+    """
+    got = run(CLAIM, "issue", "172", board="http://b", tmp_path=tmp_path,
+              answer=TAKEN, spawn=True)
+    assert got.returncode == 0, got.stderr
+    assert got.stdout.strip() == "abc-123"
+    # The copy really did import the stub beside it rather than the real `qbdata`:
+    # only the stub writes this file, and only when the claim reached it.
+    called = json.loads((tmp_path / "stub" / "call.json").read_text())
+    assert (called["kind"], called["value"]) == ("issue", "172")
+
+
+def test_qb_claimed_runs_as_a_program_and_reports_a_hold(tmp_path):
+    """The same, for the reading half. Two tools ship from this file and they are
+    installed and started separately, so one spawned test does not cover both."""
+    got = run(CLAIMED, board="http://b", tmp_path=tmp_path, spawn=True,
+              answer={"held": True, "holder": "zeus/me", "claims": [
+                  {"key": "acme/widget#172", "note": "landing it",
+                   "expires": "2026-08-20T18:00:00Z"}], "unattributed": []})
+    assert got.returncode == 0, got.stderr
+    assert "acme/widget#172" in got.stderr

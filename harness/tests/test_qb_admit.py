@@ -34,6 +34,12 @@ from pathlib import Path
 
 import pytest
 
+# A sibling module, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _inproc  # noqa: E402
+
 BIN = Path(__file__).resolve().parents[1] / "bin"
 ADMIT = BIN / "qb-admit"
 
@@ -43,7 +49,8 @@ ROOM, FULL, UNKNOWN = 0, 1, 2
 def run(*args, tmp_path: Path, rules: object = "absent", count: int = 0,
         holders: list | None = None, repo: str | None = "acme/widget",
         board: bool = True, status: int = 200, sample: bool = True,
-        also_untracked: object = "absent", explode_on_import: bool = False):
+        also_untracked: object = "absent", explode_on_import: bool = False,
+        spawn: bool = False):
     """Run `qb-admit` over a checkout whose rules file says `rules`.
 
     `rules="absent"` writes no file at all. `explode_on_import` makes the stub
@@ -99,8 +106,16 @@ def board_client():
             continue
         text = body if isinstance(body, str) else json.dumps(body)
         (root / name).write_text(text)
-    got = subprocess.run([sys.executable, str(copied), "--repo-path", str(root), *args],
-                         capture_output=True, text=True, env={**os.environ})
+    argv = ["--repo-path", str(root), *args]
+    # `spawn=True` runs the copy as a real process; the default calls its `main()`
+    # in this interpreter (#785). `_inproc` loads the copy fresh every call, which
+    # matters here because the seam this helper rests on is the stub `qbdata.py`
+    # beside that copy — including the one that raises on IMPORT, which a cached
+    # module from an earlier test would quietly stop doing. One test at the foot of
+    # the file keeps the spawn, and says there why.
+    got = (subprocess.run([sys.executable, str(copied), *argv],
+                          capture_output=True, text=True, env={**os.environ})
+           if spawn else _inproc.run(copied, argv, env={**os.environ}))
     got.requests = [json.loads(ln) for ln in
                     (seen.read_text().splitlines() if seen.exists() else [])]
     return got
@@ -265,3 +280,31 @@ def test_quiet_wins_over_json(tmp_path):
               rules={"in_flight": {"max": 1}}, count=1)
     assert got.returncode == FULL
     assert got.stdout == "" and got.stderr == ""
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_admit_runs_as_a_program_and_answers_under_a_ceiling(tmp_path):
+    """    The one test in this file that is deliberately still a subprocess (#785).
+
+    The rest call `main()` inside the interpreter pytest is already running, which
+    proves nothing about whether the tool can be *started*: importing a file does
+    not run its `if __name__ == "__main__"` block, does not make
+    `sys.path.insert(0, dirname(__file__))` resolve `qbdata` from a clean
+    interpreter — the seam this whole file rests on — and would keep passing if
+    the tool grew a dependency that only exists inside this suite's process.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run, so an exec here would fail for a
+    reason that says nothing about this code.
+
+    Under a ceiling rather than over it, so the board stub is really reached: the
+    "costs nothing" tests never import it at all, and a spawned test that also
+    never imported it would leave the import path unexercised from cold.
+    """
+    got = run(tmp_path=tmp_path, rules={"in_flight": {"max": 3}}, count=1,
+              spawn=True)
+    assert got.returncode == ROOM, got.stderr
+    assert got.requests, "the spawned copy never reached the stub beside it"
