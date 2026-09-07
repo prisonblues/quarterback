@@ -37,7 +37,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Sibling modules, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `check()` below skip the interpreter start.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import _flake_sandbox
+import _inproc
 import pytest
 
 HARNESS = Path(__file__).resolve().parents[1]
@@ -101,15 +106,23 @@ def worktree(main: Path, name: str, env: str) -> Path:
     return path
 
 
-def check(checkout: Path, *args: str) -> subprocess.CompletedProcess:
+def check(checkout: Path, *args: str, spawn: bool = False) -> subprocess.CompletedProcess:
     """Run the script as it ships — no `QB_DBTARGET`, so it resolves `dbtarget.py` itself.
 
-    `sys.executable` rather than the shebang: in a nix sandbox there is no
-    `/usr/bin/env` until `patchShebangs` has run, and a test that fails on exec
-    says nothing about the code under test.
+    `spawn=True` runs it as a real process; the default calls `main()` in this
+    interpreter (#785). The resolution under test is unaffected: `main` locates
+    `dbtarget.py` from `Path(__file__).resolve().parent`, and `_inproc` loads the
+    script with its own path as `__file__`, so the search starts where it would
+    have. One test at the foot of the file keeps the spawn, and says there why.
+
+    `sys.executable` rather than the shebang wherever it does spawn: in a nix
+    sandbox there is no `/usr/bin/env` until `patchShebangs` has run, and a test
+    that fails on exec says nothing about the code under test.
     """
-    return subprocess.run([sys.executable, str(SCRIPT), *args, str(checkout)],
-                          capture_output=True, text=True)
+    if spawn:
+        return subprocess.run([sys.executable, str(SCRIPT), *args, str(checkout)],
+                              capture_output=True, text=True)
+    return _inproc.run(SCRIPT, [*args, str(checkout)])
 
 
 # ---- the mechanism ---------------------------------------------------------
@@ -431,3 +444,29 @@ def test_the_brief_says_reuse_must_re_verify(brief):
     assert "already exists" in step3, (
         "step 3 does not tell the agent what create-worktree's refusal looks like, which is "
         "the moment the reuse decision actually gets made")
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_check_db_isolation_runs_as_a_program_and_clears_an_isolated_worktree(main_checkout):
+    """The one test here that is deliberately still a subprocess (#785).
+
+    The rest call `main()` inside the interpreter pytest is already running, which
+    proves nothing about whether the script can be *started*: importing a file
+    does not run its `if __name__ == "__main__"` block, and would not notice a
+    `dbtarget.py` lookup that only resolves because this suite's own process
+    already has the repository on `sys.path`. That resolution is the whole point
+    of the docstring on `check()` — "the script as it ships" — so it gets a test
+    that really ships it.
+
+    `sys.executable` and not the shebang, for the reason `check()` already gives:
+    there is no `/usr/bin/env` in the nix build sandbox until `patchShebangs` has
+    run, and a test that fails on exec says nothing about this code.
+    """
+    fresh = worktree(main_checkout, "fix-issue-340", f"DATABASE_URL={OWN_URL}\n")
+
+    got = check(fresh, spawn=True)
+
+    assert got.returncode == 0, got.stdout + got.stderr
+    assert "myapp_fix_issue_340" in got.stdout

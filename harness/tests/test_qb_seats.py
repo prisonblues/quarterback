@@ -499,6 +499,41 @@ def typing_shell(run):
     return typed
 
 
+def nothing_was_typed(run, typed, seats, name="t"):
+    """Assert the seat panes were typed into with NOTHING, and do it by polling.
+
+    The absence of an event is the one thing a poll cannot wait for, and "sleep
+    long enough that I would probably have seen it" is exactly the shape the note
+    by `press` rules out — it is a race dressed as a wait, and it pays its full
+    cost on every run for the privilege. So this asks the panes a question that
+    HAS an answer instead: it types a sentinel into every seat and waits for that
+    to come back out of the recording shell. A pane is a pty, a pty is a queue,
+    and the shell reads it in order — so a sentinel that has arrived is proof
+    that anything qb-seats typed into that pane got there first and has already
+    been read. The log holding the sentinels and nothing else is then the
+    assertion the sleep was reaching for, made rather than assumed.
+
+    Stricter than the sleep it replaces, too. A line typed with the Enter withheld
+    — which is precisely what --staged does on purpose — left the pane's shell
+    blocked mid-`read` and the log empty, so the old assertion passed against a
+    seat that had very much been typed into. Here the withheld line is still
+    sitting in the terminal driver's buffer and arrives glued to the sentinel.
+    """
+    sentinel = "qb-nothing-was-typed"
+    seat_panes = [pid for pid, n in panes(run, name) if n]
+    assert len(seat_panes) == seats, \
+        f"expected {seats} seats to prove nothing was typed into, got {seat_panes}"
+    for pane in seat_panes:
+        # -l and a separate C-m, for the reason qb-seats' own type_into gives:
+        # send-keys looks its argument up as a KEY NAME first, and -l disables
+        # exactly the lookup that turns C-m into Enter.
+        run.tmux("send-keys", "-t", pane, "-l", "--", sentinel)
+        run.tmux("send-keys", "-t", pane, "C-m")
+    lines = wait_for_log(typed, seats)
+    assert lines == [sentinel] * seats, \
+        f"a seat was typed into on a screen built without an agent: {lines}"
+
+
 def test_the_screen_is_n_seats_plus_one_board(screen):
     screen("-n", "3")
     got = panes(screen)
@@ -560,8 +595,7 @@ def test_an_empty_initial_command_leaves_a_bare_shell(screen):
     typed = typing_shell(screen)
     screen("-n", "2")
     assert panes(screen), "the panes are still built"
-    time.sleep(1.0)
-    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+    nothing_was_typed(screen, typed, 2)
 
 
 def test_the_initial_command_may_carry_a_prompt(screen):
@@ -588,8 +622,7 @@ def test_cmd_with_an_empty_string_is_a_screen_of_shells(screen):
     typed = typing_shell(screen)
     screen("-n", "1", "--cmd", "")
     assert panes(screen)
-    time.sleep(1.0)
-    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+    nothing_was_typed(screen, typed, 1)
 
 
 def test_an_initial_command_with_a_newline_in_it_is_refused(screen):
@@ -706,8 +739,7 @@ def test_a_screen_of_bare_shells_stays_that_way_when_a_seat_is_added(screen):
     screen("-n", "1", "--cmd", "")
     screen("--add")
     assert len([n for _, n in panes(screen) if n]) == 2
-    time.sleep(1.0)
-    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+    nothing_was_typed(screen, typed, 2)
 
 
 def test_an_added_seat_can_be_told_something_else(screen):
@@ -772,7 +804,12 @@ def test_interrupting_one_seat_leaves_the_others_working(screen):
     wait_for_log(screen.log, 2)
     first, second = (next(pid for pid, n in panes(screen) if n == k) for k in ("1", "2"))
     screen.tmux("send-keys", "-t", first, "C-c")
-    time.sleep(2)
+    # Poll for the interrupt LANDING rather than sleeping over it. Seat 1 dropping
+    # back to its shell is the event that says the C-c was delivered and acted on,
+    # and only once it has is "seat 2 is still running" a statement about an
+    # interrupt rather than about which of two panes the scheduler reached first.
+    assert wait_until(lambda: _idle(screen, first)), \
+        "the C-c never reached seat 1, so this proves nothing about seat 2"
     assert _idle(screen, second) is False, "seat 2 must still be running its agent"
 
 
@@ -846,8 +883,22 @@ def test_rerunning_reattaches_rather_than_rebuilding(screen):
 def test_staged_seats_wait_rather_than_starting(screen):
     """start_suspended: eyeball the layout before N agents start claiming."""
     screen("-n", "2", "--staged")
-    time.sleep(3)
     assert not screen.log.exists(), "no seat may have run its agent yet"
+    # And then PROVE it, rather than sleeping until it is probably true. A staged
+    # seat is a line already typed and waiting on its Enter, so finishing that
+    # line with an argument of our own and pressing Enter runs the very command
+    # the screen staged — and the argument comes back in the log. The pane is a
+    # pty and its shell reads the queue in order, so a log line carrying our
+    # argument is proof that nothing ran in that pane before it: had qb-seats
+    # sent the Enter itself, the stub would already have run bare, logged
+    # `args=` and exec'd a sleep that never reads our bytes at all.
+    for seat, woke in (("1", "--woke-1"), ("2", "--woke-2")):
+        pane = next(pid for pid, n in panes(screen) if n == seat)
+        screen.tmux("send-keys", "-t", pane, "-l", "--", f" {woke}")
+        screen.tmux("send-keys", "-t", pane, "C-m")
+    lines = wait_for_log(screen.log, 2)
+    assert sorted(line.split("args=")[-1] for line in lines) == ["--woke-1", "--woke-2"], \
+        f"a seat ran its agent before anybody pressed Enter in it: {lines}"
 
 
 def test_kill_tears_the_screen_down(screen):
@@ -3814,8 +3865,7 @@ def test_obey_brings_the_seats_up_as_shells_rather_than_refusing_the_screen(scre
     assert "these seats come up as" in done.stderr, done.stderr
     assert "bare shells" in done.stderr, done.stderr
     assert "resets in 12m" in done.stderr, "and it says when it comes back"
-    time.sleep(1.0)
-    assert not typed.exists() or typed.read_text() == "", typed.read_text()
+    nothing_was_typed(screen, typed, 2)
 
 
 def test_a_pace_hold_does_not_become_what_the_screen_is(screen):
@@ -3829,16 +3879,27 @@ def test_a_pace_hold_does_not_become_what_the_screen_is(screen):
     _pace_stub(screen, "echo 'pace: HOLD'\nexit 3\n")
     screen.env["QB_SEATS_PACE"] = "obey"
     screen("-n", "1", "--cmd", "seat-stub original")
-    # Nothing was started — the gate did its job for this invocation …
-    assert len(wait_for_log(screen.log, 1, timeout=2)) == 0
+    # Nothing was started — the gate did its job for this invocation … and that is
+    # ASKED rather than waited out. A `wait_for_log` for a line that must not come
+    # burns its whole timeout on every green run and still only says "not yet"; a
+    # line typed into the pane ourselves comes back, and the pane is a pty whose
+    # shell reads the queue in order, so ours arriving FIRST is proof that nothing
+    # was typed into that seat before it. Had the gate leaked, the pane would be
+    # away in the stub's `sleep 300` and never read these bytes at all.
+    withheld = next(pid for pid, n in panes(screen) if n == "1")
+    screen.tmux("send-keys", "-t", withheld, "-l", "--", "seat-stub withheld")
+    screen.tmux("send-keys", "-t", withheld, "C-m")
+    assert "args=withheld" in wait_for_log(screen.log, 1)[0], \
+        "the withheld seat started an agent of its own"
     # … and the screen still knows what it is made of.
     assert screen.tmux("show-options", "-v", "-t", "t:",
                        "@qb_initial_cmd").stdout.strip() == "seat-stub original"
 
-    # So when the window comes back, an --add is a seat again.
+    # So when the window comes back, an --add is a seat again. Line two, because
+    # line one is the seat we started by hand above.
     _pace_stub(screen, "echo 'pace: go'\nexit 0\n")
     screen("--add")
-    assert "args=original" in wait_for_log(screen.log, 1)[0]
+    assert "args=original" in wait_for_log(screen.log, 2)[1]
 
 
 def test_warn_says_the_window_is_spent_and_starts_the_seats_anyway(screen):
@@ -3869,8 +3930,16 @@ def test_obey_withholds_a_seat_added_to_a_spent_screen_too(screen):
     done = screen("--add")
     assert done.returncode == 0, done.stderr
     assert len([p for p in panes(screen) if p[1]]) == 2, "the pane is still added"
-    time.sleep(1.0)
-    assert len(wait_for_log(screen.log, 2, timeout=1)) == 1, "and no second agent"
+    # And no second agent — asked rather than waited out, the same way the hold
+    # test above asks it. The added pane is a bare shell if the gate held, so a
+    # line typed into it runs and comes back; the pane is a pty read in order, so
+    # a second log line that is OURS is proof qb-seats put nothing there first.
+    added = next(pid for pid, n in panes(screen) if n == "2")
+    screen.tmux("send-keys", "-t", added, "-l", "--", "seat-stub withheld")
+    screen.tmux("send-keys", "-t", added, "C-m")
+    lines = wait_for_log(screen.log, 2)
+    assert len(lines) == 2 and "args=withheld" in lines[1], \
+        f"an agent was started on a seat the spent window withheld one from: {lines}"
 
 
 def test_a_pace_that_cannot_answer_does_not_withhold_anything(screen):

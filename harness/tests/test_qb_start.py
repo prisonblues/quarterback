@@ -49,6 +49,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _inproc  # noqa: E402
 import _path_sandbox  # noqa: E402
 
 BIN = Path(__file__).resolve().parents[1] / "bin"
@@ -149,7 +150,16 @@ class _Client:
             # `None` is a board with no dial layer at all — the pre-#563 board, and
             # the ordinary state of a fleet that has set none. qb-start's ceiling
             # then comes off the policy file, which is the fail-open property.
-            if {dials!r} is None:
+            #
+            # `{dials is None!r}` and not `{dials!r} is None`: the question is
+            # about the argument this fixture was given, and answering it here
+            # writes a literal `True`/`False` into the stub. Interpolating the
+            # VALUE and comparing it in the stub asks Python whether a string
+            # literal is `None` — always false, so it worked, and it emitted a
+            # SyntaxWarning on every generated stub. That went unread for as long
+            # as the stub only ever ran in a subprocess whose stderr nothing
+            # looked at (#785).
+            if {dials is None!r}:      # the identity test is decided HERE, not in the stub
                 raise AttributeError("this stub board holds no dials")
             # A STRING is how a test asks for a body that is not the shape the
             # caller expects: `"list"` answers a JSON array, which is truthy and has
@@ -161,7 +171,7 @@ class _Client:
                 return {{"dials": "several"}}
             return {{"dials": {dials!r}}}
         if path == "/active":
-            if {active!r} is None:
+            if {active is None!r}:     # likewise — see the note on the dials branch
                 raise AttributeError("this stub board answers no /active")
             if {active!r} == "list":
                 return [1, 2]
@@ -236,9 +246,23 @@ def board_client():
 
 
 def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
-        env: dict | None = None, cwd: Path | None = None):
+        env: dict | None = None, cwd: Path | None = None, spawn: bool = False):
     """`qb-start` inside the sandbox. `tmux` is what $TMUX is set to — empty means
-    there is no multiplexer, which is a different answer from a broken one."""
+    there is no multiplexer, which is a different answer from a broken one.
+
+    `spawn=True` runs the copy as a real process; the default calls its `main()`
+    in this interpreter (#785). 125 tests live in this file and the interpreter
+    start was the largest single thing any of them did. Nothing the sandbox
+    arranges is weakened by that: `_inproc` replaces the environment wholesale, so
+    `sandbox_env`'s PATH is still the only PATH the tool sees, and it loads the
+    COPY under `stub/` fresh every call — which matters here more than anywhere,
+    because the stub `qbdata.py` beside it raises on import for most tests and a
+    cached one from an earlier test would quietly stop it raising.
+
+    Every neighbour `qb-start` reaches — `tmux`, `qb-claim`, `qb-pace` — is still
+    a real subprocess found on that PATH, so the wiring this file is about is
+    unchanged. One test at the foot of the file keeps the spawn, and says why.
+    """
     over = {"XDG_CONFIG_HOME": str(box["config"]), **(env or {})}
     if tmux:
         over["TMUX"] = tmux
@@ -261,10 +285,13 @@ def run(box: dict, *args: str, repo_path: str | None = None, tmux: str = "",
     if not tmux:
         where.pop("TMUX", None)
     where.pop("TMUX_PANE", None)
-    got = subprocess.run(
-        [sys.executable, str(box["script"]),
-         "--repo-path", repo_path or str(box["repo"]), *args],
-        capture_output=True, text=True, env=where, cwd=str(cwd) if cwd else None)
+    argv = ["--repo-path", repo_path or str(box["repo"]), *args]
+    if spawn:
+        got = subprocess.run(
+            [sys.executable, str(box["script"]), *argv],
+            capture_output=True, text=True, env=where, cwd=str(cwd) if cwd else None)
+    else:
+        got = _inproc.run(box["script"], argv, env=where, cwd=cwd)
     got.ran = (box["log"].read_text().splitlines() if box["log"].exists() else [])
     got.posts = [json.loads(ln) for ln in
                  (box["posts"].read_text().splitlines() if box["posts"].exists() else [])]
@@ -1528,3 +1555,33 @@ def test_a_fleet_count_of_the_wrong_shape_fails_open_rather_than_raising(tmp_pat
     assert "not an object" in got.stderr
     assert "Traceback" not in got.stderr
 
+
+
+# ------------------------------------------------ and it still runs as a program
+
+
+def test_qb_start_runs_as_a_program_and_starts_a_spawn(tmp_path):
+    """The one test in this file that is deliberately still a subprocess (#785).
+
+    The other 125 call `main()` inside the interpreter pytest is already running,
+    which is worth about three and a half seconds a run and proves nothing about
+    whether `qb-start` can be *started*. Importing a file does not run its
+    `if __name__ == "__main__"` block, does not make `sys.path.insert(0,
+    dirname(__file__))` resolve the stub `qbdata` from a clean interpreter, and
+    would keep passing if the tool grew an import that only resolves because this
+    suite's own process already has it loaded.
+
+    `--dry-run` rather than a real pane: what is being proved here is that the
+    file starts, reads its policy and reaches a decision, not what tmux does with
+    it — the real-tmux tests above own that and they are still real either way,
+    since `tmux` is a subprocess of the tool however the tool was invoked.
+
+    `sys.executable` and not the shebang, for the reason `test_check_db_isolation.
+    py` gives about the same choice: there is no `/usr/bin/env` inside the nix
+    build sandbox until `patchShebangs` has run, so an exec here would fail for a
+    reason that says nothing about this code.
+    """
+    box = sandbox(tmp_path, policy=ENABLED, explode=False)
+    got = run(box, "/fix-issue", "277", "--dry-run", tmux="/tmp/fake,1,0", spawn=True)
+    assert got.returncode == STARTED, got.stderr
+    assert "Traceback" not in got.stderr

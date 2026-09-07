@@ -48,6 +48,11 @@
 # Run: pytest harness/tests/test_create_worktree_nginx.py — or, for the report on
 # stdout, `bash harness/tests/create_worktree_nginx.test.sh`. Started with `bash`
 # explicitly, for the reason at the top of this file.
+#
+# A case name as the one argument runs just that scenario, and `--list` prints the
+# names; both are for the pytest wrapper, which runs one case per test so xdist
+# can spread them (#785). With no argument every case runs, in CASES order, and
+# the report is the same one this file has always printed.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -239,90 +244,133 @@ block(){        # block <conf> <safe-name>
 }
 
 # ---------------------------------------------------------------------------
-echo "A slash in the branch name (fix/issue-42)"
+# The cases.
+#
+# Each scenario below is a function, and the selector at the foot of this file
+# runs one of them by name. That is for wall time, not for coverage: this whole
+# file used to be a single pytest test, one test is one xdist worker, and so on a
+# 32-core box this suite on its own set the floor for the entire harness suite at
+# the time it takes to run every scenario back to back — 24s, against 33s for
+# everything else in harness/tests put together. Split, the floor is the slowest
+# single scenario instead.
+#
+# The trade that buys is deliberate: scenarios that used to share a sandbox with
+# their neighbour now each build their own. A sandbox costs ~90ms against ~3.4s
+# for one `create-worktree` run, so the duplicated setup is noise next to the work
+# it sets up, and the thing it buys is that no case can pass because of what an
+# earlier case happened to leave behind — which, in a suite that spent years
+# passing while testing nothing, is worth more than the milliseconds.
+#
+# Order of definition is not the run order; CASES at the foot of the file is.
 # ---------------------------------------------------------------------------
-repo=$(make_sandbox)
-out=$(run_create "$repo" fix/issue-42)
-conf="$repo/nginx/app.conf"
-block "$conf" fix-issue-42 > "$repo/block.txt"
 
-has "block is keyed on the slash-free name" "$conf" "# WORKTREE-START:fix-issue-42"
-# Guards the assertions below from passing vacuously on an empty extraction.
-eq "a block was extracted" "$([ -s "$repo/block.txt" ] && echo yes || echo no)" "yes"
-has "proxies to the container that exists" "$repo/block.txt" \
-    'set $fix_issue_42_backend "myproj-fix-issue-42:5005";'
-hasnt "no slash survives into a backend host" "$repo/block.txt" "myproj-fix/issue-42"
-has "location path is the safe name" "$repo/block.txt" "location /fix-issue-42/ {"
-says "summary advertises the route it wrote" "$out" "http://localhost:5085/fix-issue-42/"
+# The first two cases both read the block generated for `fix/issue-42` in an
+# otherwise default sandbox, and pin unrelated regressions in it — how the block
+# is keyed, and whether configured headers reach it. They are two cases rather
+# than one so a failure names which of the two broke and so they can run on
+# separate workers; the shared setup lives here so that being two cases cannot
+# let the two copies of it drift apart.
+default_block(){   # sets repo/conf/out in the caller; writes $repo/block.txt
+    repo=$(make_sandbox)
+    conf="$repo/nginx/app.conf"
+    out=$(run_create "$repo" fix/issue-42)
+    block "$conf" fix-issue-42 > "$repo/block.txt"
+}
 
-# ---------------------------------------------------------------------------
-echo "Configured extra_proxy_headers"
-# ---------------------------------------------------------------------------
-has "X-Product reaches the block" "$repo/block.txt" 'proxy_set_header X-Product $x_product;'
-eq "X-Script-Name is emitted exactly once" \
-    "$(grep -c 'proxy_set_header X-Script-Name' "$repo/block.txt")" "1"
-has "X-Script-Name matches the location prefix" "$repo/block.txt" \
-    "proxy_set_header X-Script-Name /fix-issue-42;"
+case_slash_in_branch_name(){
+    local repo conf out
+    echo "A slash in the branch name (fix/issue-42)"
+    default_block
 
-# ---------------------------------------------------------------------------
-echo "Sibling names that prefix one another (feat-a / feat-abc)"
-# ---------------------------------------------------------------------------
-# Written longest-first on purpose: a substring check on "feat-a" answers to
-# "feat-abc"'s marker, and the block is then skipped but still advertised.
-repo=$(make_sandbox)
-run_create "$repo" feat-abc >/dev/null
-out=$(run_create "$repo" feat-a)
-conf="$repo/nginx/app.conf"
-has "both blocks are written" "$conf" "# WORKTREE-START:feat-abc"
-has "shorter sibling gets its own block" "$conf" "myproj-feat-a:5005"
-says "and its route is advertised truthfully" "$out" "http://localhost:5085/feat-a/"
+    has "block is keyed on the slash-free name" "$conf" "# WORKTREE-START:fix-issue-42"
+    # Guards the assertions below from passing vacuously on an empty extraction.
+    eq "a block was extracted" "$([ -s "$repo/block.txt" ] && echo yes || echo no)" "yes"
+    has "proxies to the container that exists" "$repo/block.txt" \
+        'set $fix_issue_42_backend "myproj-fix-issue-42:5005";'
+    hasnt "no slash survives into a backend host" "$repo/block.txt" "myproj-fix/issue-42"
+    has "location path is the safe name" "$repo/block.txt" "location /fix-issue-42/ {"
+    says "summary advertises the route it wrote" "$out" "http://localhost:5085/fix-issue-42/"
+}
 
-run_remove "$repo" feat-a >/dev/null
-# Anchored: the marker for feat-a, not the feat-abc line that starts with it.
-hasnt_re "removed branch's block is gone" "$conf" "# WORKTREE-START:feat-a$"
-hasnt "removed branch's backend is gone" "$conf" "myproj-feat-a:5005"
-has "sibling block survives" "$conf" "# WORKTREE-START:feat-abc"
-has "sibling backend survives" "$conf" 'myproj-feat-abc:5005'
-has "surrounding config is intact" "$conf" "listen 5085;"
+case_extra_proxy_headers(){
+    local repo conf out
+    echo "Configured extra_proxy_headers"
+    default_block
 
-# ---------------------------------------------------------------------------
-echo "Configured nginx file does not exist (#1501)"
-# ---------------------------------------------------------------------------
-repo=$(make_sandbox nginx/deleted.conf)
-out=$(run_create "$repo" fix/issue-1501)
+    has "X-Product reaches the block" "$repo/block.txt" 'proxy_set_header X-Product $x_product;'
+    eq "X-Script-Name is emitted exactly once" \
+        "$(grep -c 'proxy_set_header X-Script-Name' "$repo/block.txt")" "1"
+    has "X-Script-Name matches the location prefix" "$repo/block.txt" \
+        "proxy_set_header X-Script-Name /fix-issue-42;"
+}
 
-says_not "no sub-path URL is advertised" "$out" "http://localhost:5085/"
-says "the missing config is named" "$out" "nginx/deleted.conf"
-says "the consequence is stated" "$out" "will NOT work"
+# Deliberately one case and not two. Every assertion here is about the two
+# branches interacting — the second block must be written despite the first
+# marker being a prefix of it, and removing one must leave the other standing —
+# so a "write" case and a "remove" case would both have to create both worktrees
+# anyway, and splitting would buy a second copy of the setup rather than a
+# shorter wall. This is the slowest case in the file for that reason: two
+# `create-worktree` runs plus a removal.
+case_prefix_siblings(){
+    local repo conf out
+    echo "Sibling names that prefix one another (feat-a / feat-abc)"
+    # Written longest-first on purpose: a substring check on "feat-a" answers to
+    # "feat-abc"'s marker, and the block is then skipped but still advertised.
+    repo=$(make_sandbox)
+    run_create "$repo" feat-abc >/dev/null
+    out=$(run_create "$repo" feat-a)
+    conf="$repo/nginx/app.conf"
+    has "both blocks are written" "$conf" "# WORKTREE-START:feat-abc"
+    has "shorter sibling gets its own block" "$conf" "myproj-feat-a:5005"
+    says "and its route is advertised truthfully" "$out" "http://localhost:5085/feat-a/"
 
-# ---------------------------------------------------------------------------
-echo "A config the block cannot be inserted into"
-# ---------------------------------------------------------------------------
-repo=$(make_sandbox nginx/app.conf "" unmarkable)
-out=$(run_create "$repo" fix/issue-42)
+    run_remove "$repo" feat-a >/dev/null
+    # Anchored: the marker for feat-a, not the feat-abc line that starts with it.
+    hasnt_re "removed branch's block is gone" "$conf" "# WORKTREE-START:feat-a$"
+    hasnt "removed branch's backend is gone" "$conf" "myproj-feat-a:5005"
+    has "sibling block survives" "$conf" "# WORKTREE-START:feat-abc"
+    has "sibling backend survives" "$conf" 'myproj-feat-abc:5005'
+    has "surrounding config is intact" "$conf" "listen 5085;"
+}
 
-says_not "no route advertised when nothing was written" "$out" "http://localhost:5085/"
-says "the failed write is reported" "$out" "No block was written"
+case_missing_nginx_config(){
+    local repo out
+    echo "Configured nginx file does not exist (#1501)"
+    repo=$(make_sandbox nginx/deleted.conf)
+    out=$(run_create "$repo" fix/issue-1501)
 
-# ---------------------------------------------------------------------------
-echo "An extra header the template also emits"
-# ---------------------------------------------------------------------------
-repo=$(make_sandbox nginx/app.conf '["Host $host", "X-Product $x_product"]')
-run_create "$repo" feat-h >/dev/null
-block "$repo/nginx/app.conf" feat-h > "$repo/block.txt"
+    says_not "no sub-path URL is advertised" "$out" "http://localhost:5085/"
+    says "the missing config is named" "$out" "nginx/deleted.conf"
+    says "the consequence is stated" "$out" "will NOT work"
+}
 
-# Both locations end up with the configured value (the static one already used
-# it), and the template's default is gone rather than sitting alongside it.
-eq "the configured Host value wins in both locations" \
-    "$(grep -cF 'proxy_set_header Host $host;' "$repo/block.txt")" "2"
-hasnt "the template's Host default is replaced, not duplicated" "$repo/block.txt" \
-    'proxy_set_header Host $host:$server_port;'
-has "unrelated extras are still appended" "$repo/block.txt" \
-    'proxy_set_header X-Product $x_product;'
+case_unmarkable_config(){
+    local repo out
+    echo "A config the block cannot be inserted into"
+    repo=$(make_sandbox nginx/app.conf "" unmarkable)
+    out=$(run_create "$repo" fix/issue-42)
 
-# ---------------------------------------------------------------------------
-echo "The board is out of reach (#528)"
-# ---------------------------------------------------------------------------
+    says_not "no route advertised when nothing was written" "$out" "http://localhost:5085/"
+    says "the failed write is reported" "$out" "No block was written"
+}
+
+case_header_the_template_also_emits(){
+    local repo
+    echo "An extra header the template also emits"
+    repo=$(make_sandbox nginx/app.conf '["Host $host", "X-Product $x_product"]')
+    run_create "$repo" feat-h >/dev/null
+    block "$repo/nginx/app.conf" feat-h > "$repo/block.txt"
+
+    # Both locations end up with the configured value (the static one already used
+    # it), and the template's default is gone rather than sitting alongside it.
+    eq "the configured Host value wins in both locations" \
+        "$(grep -cF 'proxy_set_header Host $host;' "$repo/block.txt")" "2"
+    hasnt "the template's Host default is replaced, not duplicated" "$repo/block.txt" \
+        'proxy_set_header Host $host:$server_port;'
+    has "unrelated extras are still appended" "$repo/block.txt" \
+        'proxy_set_header X-Product $x_product;'
+}
+
 # The regression test for the reason this file was changed at all. It is not
 # enough that the assertions above pass: they passed before too, while every run
 # of this suite made an authenticated call to the production board. So the board
@@ -331,27 +379,82 @@ echo "The board is out of reach (#528)"
 # Asserted against the tools that DID run rather than against the runner's own
 # source, because what matters is what arrived — a stanza that resolved its
 # credential by some other route would still be caught.
-repo=$(make_sandbox)
-box="$(dirname "$repo")"
-run_create "$repo" fix/issue-42 >/dev/null
-run_remove "$repo" fix/issue-42 >/dev/null
+case_board_out_of_reach(){
+    local repo box
+    echo "The board is out of reach (#528)"
+    repo=$(make_sandbox)
+    box="$(dirname "$repo")"
+    run_create "$repo" fix/issue-42 >/dev/null
+    run_remove "$repo" fix/issue-42 >/dev/null
 
-eq "a board tool was actually reached, so this case can fail" \
-    "$([ -s "$box/board.calls" ] && echo yes || echo no)" "yes"
-hasnt "no board URL reached the tools" "$box/board.calls" "QUARTERBACK_BASE_URL=http"
-eq "no bearer token reached the tools" \
-    "$(grep -c '^QUARTERBACK_TOKEN=.' "$box/board.calls")" "0"
-eq "no token command reached the tools" \
-    "$(grep -c '^QUARTERBACK_TOKEN_CMD=.' "$box/board.calls")" "0"
-# The config file the ONE rule in qb-env:57 and qbdata.resolve_config() resolves.
-eq "every HOME they were given is inside the sandbox" \
-    "$(grep '^HOME=' "$box/board.calls" | grep -cv "^HOME=$box/")" "0"
-eq "every config path they were given is inside the sandbox" \
-    "$(grep '^QUARTERBACK_CONFIG=' "$box/board.calls" | grep -cv "^QUARTERBACK_CONFIG=$box/")" "0"
-eq "and that config file does not exist" \
-    "$([ -e "$box/home/no-such-quarterback-config" ] && echo yes || echo no)" "no"
-eq "nor does the one \$XDG_CONFIG_HOME points at" \
-    "$([ -e "$box/home/.config/quarterback/config" ] && echo yes || echo no)" "no"
+    eq "a board tool was actually reached, so this case can fail" \
+        "$([ -s "$box/board.calls" ] && echo yes || echo no)" "yes"
+    hasnt "no board URL reached the tools" "$box/board.calls" "QUARTERBACK_BASE_URL=http"
+    eq "no bearer token reached the tools" \
+        "$(grep -c '^QUARTERBACK_TOKEN=.' "$box/board.calls")" "0"
+    eq "no token command reached the tools" \
+        "$(grep -c '^QUARTERBACK_TOKEN_CMD=.' "$box/board.calls")" "0"
+    # The config file the ONE rule in qb-env:57 and qbdata.resolve_config() resolves.
+    eq "every HOME they were given is inside the sandbox" \
+        "$(grep '^HOME=' "$box/board.calls" | grep -cv "^HOME=$box/")" "0"
+    eq "every config path they were given is inside the sandbox" \
+        "$(grep '^QUARTERBACK_CONFIG=' "$box/board.calls" | grep -cv "^QUARTERBACK_CONFIG=$box/")" "0"
+    eq "and that config file does not exist" \
+        "$([ -e "$box/home/no-such-quarterback-config" ] && echo yes || echo no)" "no"
+    eq "nor does the one \$XDG_CONFIG_HOME points at" \
+        "$([ -e "$box/home/.config/quarterback/config" ] && echo yes || echo no)" "no"
+}
+
+# ---------------------------------------------------------------------------
+# The case list, and the selector test_create_worktree_nginx.py drives.
+#
+# CASES is the run order for a bare `bash create_worktree_nginx.test.sh`, and it
+# is also what `--list` prints, which is how the python wrapper learns the names
+# to parametrise over. Nothing on the python side names a case: one added here
+# becomes a new test id with no python edit, because a hardcoded mirror of a list
+# is how a suite quietly stops covering whatever went into the list last — the
+# same shape of silence this whole file was resurrected from.
+# ---------------------------------------------------------------------------
+CASES=(
+    slash_in_branch_name
+    extra_proxy_headers
+    prefix_siblings
+    missing_nginx_config
+    unmarkable_config
+    header_the_template_also_emits
+    board_out_of_reach
+)
+
+case "${1:-}" in
+    --list)
+        printf '%s\n' "${CASES[@]}"
+        exit 0
+        ;;
+    "")
+        for case_name in "${CASES[@]}"; do
+            "case_$case_name"
+        done
+        ;;
+    *)
+        # An unknown name must not read as a suite that passed: with no case run,
+        # `fail` is 0 and so is the exit status, and a typo in the wrapper would
+        # then be indistinguishable from green.
+        if ! declare -F "case_$1" >/dev/null; then
+            printf 'FAIL: no such case: %s\n' "$1" >&2
+            printf 'known cases: %s\n' "${CASES[*]}" >&2
+            exit 2
+        fi
+        "case_$1"
+        ;;
+esac
+
+# Belt to the selector's braces: a case whose body stopped asserting anything —
+# a renamed helper, an extraction that came back empty and was never checked —
+# would otherwise report "passed 0, failed 0" and exit 0.
+if [ $((pass + fail)) -eq 0 ]; then
+    echo "FAIL: no assertions ran" >&2
+    exit 1
+fi
 
 echo ""
 printf 'passed %d, failed %d\n' "$pass" "$fail"
