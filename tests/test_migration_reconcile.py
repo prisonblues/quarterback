@@ -643,11 +643,27 @@ def _write(repo: Path, name: str, rev_id: str, down: str | None, col: str) -> No
     p.write_text(text(rev_id, down, col))
 
 
-@pytest.fixture
-def collided_repo(tmp_path: Path) -> Path:
+#: Every one of these repos is ten `git` subprocesses, and the same two graphs were built
+#: 31 times over — 71% of this file's runtime was `git init` (#800). They are built once
+#: per module as pristine TEMPLATES and each test gets its own `shutil.copytree` of one.
+#:
+#: The copy is what keeps this honest. Almost every test below mutates its repo — that is
+#: the point of the file: `cmd_apply` renames migrations in the working tree, `merged_repo`
+#: merges `main` in, and several tests commit, delete or symlink on top — so a SHARED repo
+#: would hand the next test whatever the last one left behind, and most of these assertions
+#: would still pass. `copytree` copies the working tree, the index and `.git` whole, so what
+#: a test receives is byte-for-byte the repo it used to build for itself; only the building
+#: is shared.
+
+
+def _copy_of(template: Path, dest: Path) -> Path:
+    shutil.copytree(template, dest, symlinks=True)
+    return dest
+
+
+def _build_collided(repo: Path) -> Path:
     """A repo where `main` and a feature branch each landed their own `0018`."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     _git(repo, "init", "-q", "-b", "main")
     _write(repo, "0016_a.py", "0016", None, "a")
     _write(repo, "0017_b.py", "0017", "0016", "b")
@@ -662,13 +678,11 @@ def collided_repo(tmp_path: Path) -> Path:
     return repo
 
 
-@pytest.fixture
-def behind_repo(tmp_path: Path) -> Path:
+def _build_behind(repo: Path) -> Path:
     """A repo where `main` moved on to `0018` while the feature branch, cut at `0017`,
     added `0019`. Nothing is contested — the branch's base just points at the wrong
     parent — so the resolution is a relink rather than a renumber."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
+    repo.mkdir(parents=True)
     _git(repo, "init", "-q", "-b", "main")
     _write(repo, "0016_a.py", "0016", None, "a")
     _write(repo, "0017_b.py", "0017", "0016", "b")
@@ -681,6 +695,30 @@ def behind_repo(tmp_path: Path) -> Path:
     _commit(repo, "main: 0018")
     _git(repo, "checkout", "-q", "feature")
     return repo
+
+
+@pytest.fixture(scope="module")
+def _collided_template(tmp_path_factory) -> Path:
+    return _build_collided(tmp_path_factory.mktemp("collided") / "repo")
+
+
+@pytest.fixture(scope="module")
+def _behind_template(tmp_path_factory) -> Path:
+    return _build_behind(tmp_path_factory.mktemp("behind") / "repo")
+
+
+@pytest.fixture
+def collided_repo(tmp_path: Path, _collided_template: Path) -> Path:
+    """A repo where `main` and a feature branch each landed their own `0018`."""
+    return _copy_of(_collided_template, tmp_path / "repo")
+
+
+@pytest.fixture
+def behind_repo(tmp_path: Path, _behind_template: Path) -> Path:
+    """A repo where `main` moved on to `0018` while the feature branch, cut at `0017`,
+    added `0019`. Nothing is contested — the branch's base just points at the wrong
+    parent — so the resolution is a relink rather than a renumber."""
+    return _copy_of(_behind_template, tmp_path / "repo")
 
 
 def test_preflight_reads_the_graph_out_of_git(collided_repo: Path):

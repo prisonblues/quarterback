@@ -39,10 +39,12 @@ QB_MODE = HARNESS / "bin" / "qb-mode"
 QB_HOOK = HARNESS / "bin" / "qb-hook"
 LOOPS = HARNESS / "loops"
 
-# A sibling module, imported by bare name — the convention `_path_sandbox` set in
-# this directory. `_inproc` is what lets `run()` below skip the interpreter start.
+# Sibling modules, imported by bare name — the convention `_path_sandbox` set in
+# this directory. `_inproc` is what lets `run()` below skip the interpreter start,
+# and `_gitcopy` what lets the fixture below be built once and copied (#800).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _gitcopy  # noqa: E402
 import _inproc  # noqa: E402
 
 AGREES, VIOLATED, CANNOT_TELL = 0, 3, 4
@@ -91,17 +93,23 @@ def run(*args: str, cwd: Path | None = None,
     return _inproc.run(QB_MODE, args, env=env, cwd=cwd, fresh=("harness_rules",))
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """A checkout with a real `origin` on disk, on a pushed `main`.
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory) -> Path:
+    """The checkout-and-origin pair `repo` hands out, built ONCE (#800).
 
-    A bare clone rather than a URL, because `qb-mode` reads the rules from
-    `origin/<default>` — so a fixture whose origin does not exist would exercise
-    the "protected ref unreadable" fallback in every test rather than the path
-    under test. The URL is set first and then rewritten, so `resolve_repo` still
-    names the repo `acme/myrepo`.
+    Nine `git` processes, one of them a push, were being paid by each of this
+    file's 23 tests — 53% of its CPU — to arrive at the same two directories every
+    time. Nothing here wants a FRESH checkout; what the tests want is one they can
+    commit to and push without the next test seeing it, and `_gitcopy.copy` gives
+    them that for a fraction of the cost.
+
+    The environment is deliberately the ambient one rather than
+    `_gitcopy.hermetic_env`: this suite redirects `XDG_CONFIG_HOME` for the tool
+    and has never redirected git's own config, so building the template under a
+    different one would change what the fixture is rather than when it is made.
     """
-    work = tmp_path / "myrepo"
+    root = tmp_path_factory.mktemp("qb-mode-template")
+    work = root / "myrepo"
     work.mkdir()
     git(work, "init", "-q", "-b", "main")
     git(work, "config", "user.email", "t@example.com")
@@ -110,13 +118,33 @@ def repo(tmp_path: Path) -> Path:
     git(work, "add", "-A")
     git(work, "commit", "-qm", "init")
 
-    bare = tmp_path / "origin.git"
+    bare = root / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
     git(work, "remote", "add", "origin", "https://github.com/acme/myrepo.git")
     git(work, "remote", "set-url", "origin", str(bare))
     git(work, "push", "-q", "origin", "main")
     git(work, "remote", "set-head", "origin", "main")
-    return work
+    return root
+
+
+@pytest.fixture
+def repo(_repo_template: Path, tmp_path: Path) -> Path:
+    """A checkout with a real `origin` on disk, on a pushed `main`.
+
+    A bare clone rather than a URL, because `qb-mode` reads the rules from
+    `origin/<default>` — so a fixture whose origin does not exist would exercise
+    the "protected ref unreadable" fallback in every test rather than the path
+    under test. The URL is set first and then rewritten, so `resolve_repo` still
+    names the repo `acme/myrepo`.
+
+    A copy of the module's template, and the copy is not optional: `declare()`
+    below COMMITS AND PUSHES, and half the tests in this file call it. Sharing one
+    origin would let the first test's declared mode decide the answer for every
+    test after it, all of them still passing — so `_gitcopy.copy` repoints the
+    checkout at the bare remote beside it rather than at the template's.
+    """
+    _gitcopy.copy(_repo_template, tmp_path)
+    return tmp_path / "myrepo"
 
 
 def declare(repo: Path, mode: dict) -> None:

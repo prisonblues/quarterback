@@ -136,6 +136,28 @@ not_root = pytest.mark.skipif(
 )
 
 
+def _hermetic_env(empty: Path) -> dict[str, str]:
+    """The variables `hermetic_git` installs, as a mapping.
+
+    A mapping and not just four `setenv` calls because the module-scoped template below is
+    built before any function-scoped fixture has run, so it has no `monkeypatch` to install
+    them with and has to set the same list for itself. Two copies of this list would let the
+    template drift out of the hermetic environment its tests run under, which is exactly the
+    kind of difference that shows up as one machine's suite going red.
+    """
+    return {
+        "GIT_CONFIG_GLOBAL": str(empty),
+        "GIT_CONFIG_SYSTEM": str(empty),
+        # The release commit is written by `git commit`, which wants a name and an email; with
+        # the global config emptied there is nothing for git to fall back on except the
+        # hostname, and a runner whose hostname has no dot fails the commit outright.
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.com",
+    }
+
+
 @pytest.fixture(autouse=True)
 def hermetic_git(monkeypatch, tmp_path: Path) -> None:
     """No developer's global git config reaches these repos.
@@ -149,16 +171,9 @@ def hermetic_git(monkeypatch, tmp_path: Path) -> None:
     """
     empty = tmp_path / "gitconfig-none"
     empty.write_text("")
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(empty))
+    for name, value in _hermetic_env(empty).items():
+        monkeypatch.setenv(name, value)
     monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
-    # The release commit is written by `git commit`, which wants a name and an email; with the
-    # global config emptied there is nothing for git to fall back on except the hostname, and
-    # a runner whose hostname has no dot fails the commit outright.
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "t")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "t@example.com")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "t")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "t@example.com")
 
 
 @pytest.fixture(autouse=True)
@@ -200,8 +215,7 @@ def terminal(no_terminal, monkeypatch):
     return person
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
+def _build_repo(into: Path) -> Path:
     """`main` at v2.33, tagged, level with an `origin` it can push to, holding one fragment.
 
     A real bare remote rather than a stub: `run` refuses a checkout that is not level with
@@ -211,11 +225,14 @@ def repo(tmp_path: Path) -> Path:
     Tags for every release, because the served-version inference measures from the PREVIOUS
     release's tag and refuses where there is none — a checkout with no tags is a real state
     and it has its own test.
-    """
-    origin = tmp_path / "origin.git"
-    git(tmp_path, "init", "-q", "--bare", "-b", "main", str(origin))
 
-    root = tmp_path / "repo"
+    The remote lives beside the checkout and not inside it: two tests reach it as
+    `repo.parent / "origin.git"`, so the pair has to be copied and stay siblings.
+    """
+    origin = into / "origin.git"
+    git(into, "init", "-q", "--bare", "-b", "main", str(origin))
+
+    root = into / "repo"
     root.mkdir()
     git(root, "init", "-q", "-b", "main")
     git(root, "config", "user.email", "t@example.com")
@@ -234,6 +251,50 @@ def repo(tmp_path: Path) -> Path:
     fragment(root)
     commit(root, "feat: a thing")
     git(root, "push", "-q", "origin", "main")
+    return root
+
+
+@pytest.fixture(scope="module")
+def _repo_template(tmp_path_factory) -> Path:
+    """The checkout-and-remote pair above, built once for the whole file (#800).
+
+    Building it is seventeen `git` subprocesses including two pushes, and every one of the
+    84 tests taking `repo` was paying for all of them — 71% of this file's runtime went on
+    it. This is a TEMPLATE and nothing runs against it: `repo` hands each test a copy,
+    because the tests do the mutating this file is about — they cut releases, commit, tag
+    and push — and a shared repo would leave the second test in a file that has already had
+    v2.34 released into it, with most of the assertions still passing.
+
+    Built inside its own `MonkeyPatch` context because a module-scoped fixture is set up
+    before the function-scoped autouse `hermetic_git` runs, so without this the template
+    alone would be built under the developer's global git config — the one thing that
+    fixture exists to keep out.
+    """
+    into = tmp_path_factory.mktemp("release-template")
+    empty = into / "gitconfig-none"
+    empty.write_text("")
+    with pytest.MonkeyPatch.context() as mp:
+        for name, value in _hermetic_env(empty).items():
+            mp.setenv(name, value)
+        mp.delenv("GIT_CONFIG_COUNT", raising=False)
+        _build_repo(into)
+    return into
+
+
+@pytest.fixture
+def repo(tmp_path: Path, _repo_template: Path) -> Path:
+    """A private copy of `_repo_template`, laid out exactly where the fixture used to build it.
+
+    `copytree` and not `git clone`: a clone would give the test a repo whose branches, remote
+    and reflog are all subtly different from the one it used to get, whereas a copy of both
+    directories is the same bytes. Only the absolute `origin` URL has to be re-pointed, since
+    the copy moved it.
+    """
+    root = shutil.copytree(_repo_template / "repo", tmp_path / "repo", symlinks=True)
+    origin = shutil.copytree(
+        _repo_template / "origin.git", tmp_path / "origin.git", symlinks=True
+    )
+    git(root, "remote", "set-url", "origin", str(origin))
     return root
 
 
