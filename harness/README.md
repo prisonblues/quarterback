@@ -5151,6 +5151,20 @@ have their **own** virtualenv rather than a symlink to the main checkout's:
 "setup": ["uv sync --frozen"]
 ```
 
+**Drop `.venv` from `symlinks` at the same time, and say so explicitly.** An
+*absent* `symlinks` key means "use the defaults", which are
+`[.venv, .claude, CLAUDE.md]` filtered to what exists — so deleting the key puts
+the shared venv straight back. A **declared empty list** is how you say
+"symlink nothing":
+
+```json
+"symlinks": [],
+"setup": ["uv venv --python 3.12 .venv", "uv pip install -e '.[dev]'"]
+```
+
+Absent and empty used to be indistinguishable here, and a repo that removed the
+shared `.venv` silently got it again.
+
 **A shared `.venv` is one mutable dependency set behind N branches.** Symlinking
 it is cheap and correct only while every branch agrees about dependencies. When
 they do not, whichever worktree last ran `uv sync` decides what all of them have
