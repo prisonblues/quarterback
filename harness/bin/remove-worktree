@@ -928,8 +928,11 @@ if [[ -d "$WORKTREE_DIR" ]]; then
                 if [[ -n "$PROVISIONED_LIST" ]]; then
                     # Named, because a backup that quietly omits things is the
                     # other way to make one untrustworthy.
+                    # `paste -d` takes a LIST of delimiters and cycles
+                    # through it, so `-d', '` joined the first pair with a comma
+                    # and the next with a space: three entries read as two.
                     echo "  omitting what create-worktree installs:" \
-                         "$(echo "$PROVISIONED_LIST" | paste -sd', ' -)"
+                         "$(echo "$PROVISIONED_LIST" | paste -sd, - | sed 's/,/, /g')"
                 fi
                 # A FAILED BACKUP ABORTS. This used to be `|| echo "Backup
                 # failed"` with no exit, so the recursive delete below ran
