@@ -24,6 +24,7 @@ mine would have predicted the `-z` rename record.
 Run: pytest harness/tests
 """
 
+import json
 import subprocess
 import sys
 import tarfile
@@ -292,3 +293,113 @@ def test_a_clean_worktree_writes_no_backup_at_all(repo, worktree, tmp_path):
 
     assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
     assert backups(repo) == []
+
+
+def provisioned_repo(repo, copies=("models",), generated=("*.code-workspace",)):
+    """Give the project a `.worktree.json` that declares what provisioning
+    installs, and put the `copies` payload in the main checkout.
+
+    The main-checkout copy is not decoration: the exclusion is conditional on
+    it, because a path the source no longer holds may exist only in the
+    worktree, and dropping that would be the loss the backup exists to prevent.
+    """
+    (repo / ".worktree.json").write_text(json.dumps({
+        "project": "proj",
+        "copies": list(copies),
+        "gitignore_additions": list(generated),
+    }) + "\n")
+    for c in copies:
+        src = repo / c
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "weights.bin").write_bytes(b"\x00" * 128)
+
+
+def test_a_provisioned_copy_is_not_dragged_into_the_backup(repo, worktree,
+                                                           tmp_path):
+    """`copies` are byte-copies of the main checkout, which still has them.
+
+    On a repo whose `copies` is a spaCy/MiniLM model directory this was 110 MB
+    of identical weights in every teardown's tarball, gzipped around the few KB
+    of config anybody would actually open.
+    """
+    provisioned_repo(repo)
+    (worktree / ".gitignore").write_text(".env\ndata/\nmodels/\n")
+    (worktree / ".env").write_text("SECRET=1\n")
+    (worktree / "models").mkdir()
+    (worktree / "models" / "weights.bin").write_bytes(b"\x00" * 128)
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    names = archived(repo)
+    assert ".env" in names, names
+    assert not [n for n in names if n.startswith("models")], names
+
+
+def test_a_generated_scaffolding_file_is_not_archived(repo, worktree, tmp_path):
+    """`gitignore_additions` are patterns, not names — `*.code-workspace` is
+    one — and every one of them is written by the next `create-worktree`."""
+    provisioned_repo(repo)
+    (worktree / ".gitignore").write_text(".env\ndata/\n*.code-workspace\n")
+    (worktree / ".env").write_text("SECRET=1\n")
+    (worktree / "proj-fix-issue-43.code-workspace").write_text("{}\n")
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    names = archived(repo)
+    assert ".env" in names, names
+    assert not [n for n in names if n.endswith(".code-workspace")], names
+
+
+def test_a_copy_the_main_checkout_no_longer_holds_is_still_archived(
+        repo, worktree, tmp_path):
+    """The condition that makes the exclusion safe, tested from its own side.
+
+    Declaring a path under `copies` says where it CAME from. If the source is
+    gone, the worktree's is the last copy on the disk, and this is exactly the
+    teardown on which the backup has to hold it.
+    """
+    provisioned_repo(repo)
+    (repo / "models" / "weights.bin").unlink()
+    (repo / "models").rmdir()
+    (worktree / ".gitignore").write_text(".env\ndata/\nmodels/\n")
+    (worktree / "models").mkdir()
+    (worktree / "models" / "weights.bin").write_bytes(b"\x00" * 128)
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert "models/weights.bin" in archived(repo)
+
+
+def test_a_tracked_file_under_a_provisioned_path_is_still_archived(
+        repo, worktree, tmp_path):
+    """`!!` entries only, same as the cache filter.
+
+    A repo that commits something under a `copies` directory has an edit there
+    like any other, and a filter reaching past "ignored" would discard tracked
+    work.
+    """
+    provisioned_repo(repo)
+    (worktree / "models").mkdir()
+    (worktree / "models" / "notes.md").write_text("kept\n")
+    assert git(worktree, "add", "models/notes.md").returncode == 0
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert "models/notes.md" in archived(repo)
+
+
+def test_a_repo_declaring_neither_key_is_unaffected(repo, worktree, tmp_path):
+    """No `.worktree.json`, no exclusions — the behaviour every other project
+    had before this, unchanged."""
+    (worktree / ".gitignore").write_text(".env\ndata/\nmodels/\n")
+    (worktree / "models").mkdir()
+    (worktree / "models" / "weights.bin").write_bytes(b"\x00" * 128)
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert "models/weights.bin" in archived(repo)

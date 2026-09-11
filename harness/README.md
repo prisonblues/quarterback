@@ -5137,6 +5137,19 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
 and the arrays `symlinks`, `copies`, `setup`, `reserved_names`, `gitignore_additions`.
 
+**`copies` and `gitignore_additions` also tell `remove-worktree` what NOT to back up.**
+The teardown tarball is for what somebody would otherwise lose, and neither of these is
+that: a `copies` path is a byte-copy of the main checkout, and a `gitignore_additions`
+entry names a file provisioning generates. Both come back with the next `create-worktree`.
+Archiving them made the backup an expensive copy of the setup — on a repo whose `copies`
+is a spaCy/MiniLM model directory, 110 MB of identical weights in every teardown's
+tarball, around the few KB of `.env` and `CLAUDE.local.md` anybody would actually open.
+The exclusion applies to **ignored** entries only, so a tracked edit under one of those
+paths is archived like any other, and a `copies` path the **main checkout no longer
+holds** is archived too: the worktree's may be the last copy on the disk. `env.copy_from`
+is deliberately not excluded — `.env` carries the worktree's own port and database name,
+is the file people hand-edit, and is a few KB.
+
 ### `setup` — building a worktree its own environment
 
 `setup` is a list of shell commands run **in the new worktree**, after symlinks

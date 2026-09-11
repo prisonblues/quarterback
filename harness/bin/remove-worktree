@@ -357,6 +357,63 @@ release_the_claim() {
 # directory genuinely called `venv-notes` is not swept up with them.
 DISPOSABLE='(^|/)(\.venv|venv|node_modules|__pycache__|\.pytest_cache|\.ruff_cache|\.mypy_cache|\.tox|\.next|\.nuxt|\.parcel-cache|\.gradle|\.terraform|htmlcov)(/|$)'
 
+# What create-worktree INSTALLED is not what anybody stands to lose, and the
+# repo's own `.worktree.json` is the manifest: `copies` are byte-copies taken
+# from the main checkout at provisioning, and `gitignore_additions` name the
+# files provisioning generates (a port number, an editor workspace). Both come
+# back with the next `create-worktree`.
+#
+# Left in, they dominate. On a repo whose `copies` is a spaCy/MiniLM model
+# directory, every teardown gzipped 110 MB of identical model weights — 133
+# archives, 8.3 GB on disk — around the ~6 KB of `.env` and `CLAUDE.local.md`
+# anybody would actually go looking for. A backup nobody can open is not one.
+#
+# `env.copy_from` is deliberately NOT here. `.env` is provisioned too, but it
+# carries the worktree's own port and database name and is the file people
+# hand-edit; it is also a few KB. Cheap to keep, and the one thing a restore
+# usually wants.
+provisioned_globs() {
+    local c
+    while IFS= read -r c; do
+        [[ -n "$c" ]] || continue
+        # Only when the main checkout still holds it. If it does not, the copy
+        # in the worktree may be the last one on this disk, and dropping it
+        # would be the real loss this backup exists to prevent.
+        [[ -e "$MAIN_REPO/$c" ]] || continue
+        echo "$c"
+    done < <(cfg_array '.copies')
+    cfg_array '.gitignore_additions'
+}
+
+# Set once from provisioned_globs before the backup runs; empty for a repo that
+# configures neither key, which is the pre-existing behaviour unchanged.
+PROVISIONED_LIST=""
+
+is_provisioned() {
+    local path="${1%/}" glob
+    [[ -n "$PROVISIONED_LIST" ]] || return 1
+    while IFS= read -r glob; do
+        [[ -n "$glob" ]] || continue
+        glob="${glob%/}"
+        # An unquoted right-hand side is a glob on purpose: `gitignore_additions`
+        # holds patterns (`*.code-workspace`), not only literal names.
+        # shellcheck disable=SC2053
+        if [[ "$path" == $glob || "$path" == $glob/* ]]; then
+            return 0
+        fi
+    done <<< "$PROVISIONED_LIST"
+    return 1
+}
+
+# Read a JSON array as newline-separated values — create-worktree's helper,
+# kept identical so the two agree about what a repo declared.
+cfg_array() {
+    local key="$1"
+    if [[ -n "$CONFIG_JSON" ]]; then
+        echo "$CONFIG_JSON" | jq -r "$key[]? // empty" 2>/dev/null
+    fi
+}
+
 collect_dirty_files() {
     local root="$1" rec status path
     while IFS= read -r -d '' rec; do
@@ -375,6 +432,11 @@ collect_dirty_files() {
         # archived like any other — `!!` is the status git gives the things
         # .gitignore covers, and it is the only status this drops.
         if [[ "$status" = "!!" && "$path" =~ $DISPOSABLE ]]; then
+            continue
+        fi
+        # Same rule, same reason, for what provisioning installed: ignored
+        # entries only, so an edit git is tracking survives wherever it sits.
+        if [[ "$status" = "!!" ]] && is_provisioned "$path"; then
             continue
         fi
         # A deletion has no bytes to archive, and `tar -T` fails the WHOLE run on
@@ -846,6 +908,7 @@ if [[ -d "$WORKTREE_DIR" ]]; then
         # `.worktree-port`, `.claude/`. Everything the old list DID cover is
         # either committed elsewhere or trivially regenerated, so the backup was
         # archiving the recoverable half and dropping the rest.
+        PROVISIONED_LIST=$(provisioned_globs)
         DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain --ignored 2>/dev/null || true)
         if [[ -n "$DIRTY_FILES" ]]; then
             FILE_LIST_FILE=$(mktemp "${TMPDIR:-/tmp}/remove-worktree-backup.XXXXXX" 2>/dev/null)
@@ -862,6 +925,12 @@ if [[ -d "$WORKTREE_DIR" ]]; then
             if [[ "$FILE_COUNT" -gt 0 ]]; then
                 BACKUP="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
                 echo -e "${YELLOW}Uncommitted changes found, creating backup of dirty files...${NC}"
+                if [[ -n "$PROVISIONED_LIST" ]]; then
+                    # Named, because a backup that quietly omits things is the
+                    # other way to make one untrustworthy.
+                    echo "  omitting what create-worktree installs:" \
+                         "$(echo "$PROVISIONED_LIST" | paste -sd', ' -)"
+                fi
                 # A FAILED BACKUP ABORTS. This used to be `|| echo "Backup
                 # failed"` with no exit, so the recursive delete below ran
                 # anyway: the one teardown on which the backup matters was the
