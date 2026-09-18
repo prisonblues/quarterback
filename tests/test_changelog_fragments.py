@@ -13,8 +13,8 @@ The tests that matter are the ones where this could be wrong and silently so:
     number, which is the collision this whole convention exists to prevent.
   * `test_a_fragment_naming_a_version_is_refused` — a fragment that names one has opted its
     branch back into the race, and it would read as correct right up to the merge.
-  * `test_the_bullet_lands_where_the_renderer_puts_it` — the README bullet and the CHANGELOG
-    entry are written by one command precisely so they cannot disagree.
+  * `test_assembly_leaves_the_readme_alone` — the release history lives in CHANGELOG.md, so
+    assembly must not put generated history back into the README.
 
 The `required` half, below the assembly tests, is the opposite question — not "is this
 fragment well formed" but "should there have been one at all" (#365). Those build real git
@@ -73,15 +73,7 @@ The body of v2.
 
 README = """# Board
 
-### Every release, oldest first
-
-Ending with what is next:
-
-- **v2** — presence.
-- **v2.1** — dev context.
-- **Not yet numbered** — a roadmap item.
-
-**[CHANGELOG.md](CHANGELOG.md)** has each release in full.
+See CHANGELOG.md for release history.
 """
 
 
@@ -238,15 +230,12 @@ def test_one_untitled_fragment_with_no_title_given_is_refused(repo):
 
 
 def assemble(repo: Path, title: str | None = None, version: str = "v2.2") -> None:
-    """What `release.py run` does with these four functions, in the order it does it."""
+    """What `release.py run` does with these functions, in the order it does it."""
     fragments = cf.load(repo)
     heading = cf.release_title(fragments, title)
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    readme = (repo / "README.md").read_text(encoding="utf-8")
     changelog = cf.insert_entry(changelog, cf.entry(fragments, heading, version))
     (repo / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
-    (repo / "README.md").write_text(
-        cf.insert_bullet(readme, changelog, heading, version), encoding="utf-8")
     for f in fragments:
         f.path.unlink()
 
@@ -393,15 +382,12 @@ def test_an_indented_top_level_heading_is_refused_like_an_unindented_one(repo):
     assert "opens a RELEASE" in str(e.value)
 
 
-def test_the_bullet_lands_where_the_renderer_puts_it(repo):
-    """The README bullet and the CHANGELOG entry are written in one pass, so they cannot
-    disagree about whether this release exists."""
+def test_assembly_leaves_the_readme_alone(repo):
+    """The changelog is the release history; README stays current-facing documentation."""
     fragment(repo, "296.feat.md", BODY)
+    before = (repo / "README.md").read_text(encoding="utf-8")
     assemble(repo)
-    readme = (repo / "README.md").read_text(encoding="utf-8")
-    assert ("- **v2.1** — dev context.\n"
-            "- **v2.2** — a branch stops guessing.\n"
-            "- **Not yet numbered** — a roadmap item.\n") in readme
+    assert (repo / "README.md").read_text(encoding="utf-8") == before
 
 
 def test_assembly_consumes_the_fragments(repo):

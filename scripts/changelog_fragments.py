@@ -46,8 +46,7 @@ until the release job reads `CHANGELOG.md` on `main`, which is after assembly. S
 would have to be driven with a placeholder version and its `--draft`/`build` split
 reinterpreted, and this repo would own a second grammar for release entries beside the one
 `release.py` already parses — two answers to "what is a release entry", which is the defect
-this repo keeps writing changelog entries about. It also renders one file, and half of what
-drifts here is the README's release list.
+this repo keeps writing changelog entries about.
 
 ## A fragment that lands unassembled is not lost
 
@@ -64,7 +63,6 @@ import json
 import re
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
@@ -72,8 +70,7 @@ _SCRIPTS = Path(__file__).resolve().parent
 
 
 # `scripts/` holds standalone tools rather than an importable package, so its siblings are
-# loaded by path. Both are imported for the same reason: the shapes of a release entry and of
-# the README's list are defined once, where they are already defined.
+# loaded by path. The release entry shape is defined once, in `release.py`.
 def _sibling(name: str):
     # An already-loaded module is handed back rather than re-executed. `release.py` loads
     # THIS file lazily and this file loads it back; a second module object would mean two
@@ -89,7 +86,6 @@ def _sibling(name: str):
 
 
 rs = _sibling("release")
-rr = _sibling("readme_releases")
 
 #: Where fragments live. One directory, so "what is in flight" is `ls`.
 FRAGMENT_DIR = "changelog.d"
@@ -155,10 +151,6 @@ _NOT_A_PARAGRAPH = re.compile(
 #: is documentation of a convention, not a use of it.
 _RETIRED_PLACEHOLDER = "vNEXT"
 _PLACEHOLDER_MENTION = re.compile(rf"(?<![0-9A-Za-z]){_RETIRED_PLACEHOLDER}(?![0-9A-Za-z])")
-
-#: The README wraps its release list at 100 columns with a two-space hanging indent.
-_WRAP, _INDENT = 100, "  "
-
 
 class FragmentError(Exception):
     """A fragment, or a tree of them, that this tool will not assemble."""
@@ -385,26 +377,6 @@ def insert_entry(changelog: str, text: str, where: str = "CHANGELOG.md") -> str:
     return changelog[:at] + text + "\n" + changelog[at:]
 
 
-def insert_bullet(readme: str, changelog: str, title: str, version: str) -> str:
-    """`readme` with a `- **vX.Y** — <title>.` bullet, placed by the list renderer.
-
-    Appended to the end of the block and then rendered, rather than positioned here: where a
-    bullet goes is `readme_releases.render`'s question, it answers it from the CHANGELOG that
-    was just written, and a second placement rule here could disagree with it.
-
-    The README's release list is generated in exactly this sense — ordered by the renderer,
-    extended only by the release job, and never by a branch. The bullets themselves stay
-    hand-written, because a bullet is a summary somebody chose rather than a copy of the
-    CHANGELOG heading; what a branch no longer does is write one.
-    """
-    lead = title if title.endswith((".", "!", "?", ":")) else title + "."
-    bullet = textwrap.fill(f"- **{version}** — {lead}", width=_WRAP,
-                           subsequent_indent=_INDENT, break_long_words=False,
-                           break_on_hyphens=False) + "\n"
-    _, end = rr.find_list(readme)
-    return rr.render(readme[:end] + bullet + readme[end:], changelog)
-
-
 # ------------------------------------------------------ was an entry written at all
 
 #: The trailer that waives the requirement, written on a commit of the branch that owes the
@@ -449,9 +421,7 @@ def _exempt(path: str) -> str | None:
     * `changelog.d/` — the mechanism itself. A branch that only writes a fragment cannot owe
       a fragment.
     * `CHANGELOG.md` — the assembled notes, which is what a release commit consists of.
-    * any `README.md` — description of the code rather than the code, and the root one's
-      release list is written by the release job, so requiring an entry for touching it
-      would be circular.
+    * any `README.md` — description of the code rather than the code.
     * anything under a `tests/` directory, plus test files by name — a test asserts about
       behaviour that already shipped, and the release notes have nothing to say about it.
       `test` is one of `KINDS` all the same: a test-only branch MAY write a fragment, it is
@@ -716,7 +686,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     try:
         return args.func(args)
-    except (FragmentError, rr.ListError, rs.ReleaseError) as e:
+    except (FragmentError, rs.ReleaseError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
