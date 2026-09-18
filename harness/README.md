@@ -821,9 +821,8 @@ which releases happen to be in flight — has stopped being one, and it is worth
 rather than quietly swapping it: quarterback's branches no longer write in `CHANGELOG.md` at
 all (#122), so there is no CHANGELOG conflict left to replay an answer to. A branch writes one
 fragment, in a path no other branch opens, and `release.py guard` refuses it if it reaches for
-the file anyway. The README narrative that had to be *rewritten* by hand is deleted, and the
-release list is written on the base by the release job. That removes the case; it does not
-remove the class. A
+the file anyway. The README narrative that had to be *rewritten* by hand is deleted. That
+removes the case; it does not remove the class. A
 replayed resolution is still last time's answer, and the merge that made this rule worth
 having had three prose conflicts where keep-both was right and a fourth, in `panel.py`,
 where it was not. `rerere.autoUpdate` is therefore pinned to
@@ -1198,14 +1197,13 @@ refusal names both heads and the `preflight`/`apply` pair that resolves them. Pr
 branches are `main`, `master` and `test` unless the repo says otherwise
 (`git config --add qb.protectedBranch <name>`).
 
-**A branch that has edited a file the release job generates.** `CHANGELOG.md`'s release
-entries and the README's release list are written on the integration branch after the merge,
-by `scripts/release.py run`, and by nothing else. A branch that writes either of them is
-writing a file every other branch also has to write, at the same offset, so N such branches in
-flight is N-choose-2 conflicts **by construction** — over nothing, since both entries are right
-and both belong. On 2026-08-23 that was three of six open pull requests, all `CONFLICTING`,
-while the three that wrote no release entry all merged clean; PR #398 landed both ways and
-settled it (#122).
+**A branch that has edited a file the release job generates.** `CHANGELOG.md` release entries
+are written on the integration branch after the merge, by `scripts/release.py run`, and by
+nothing else. A branch that writes them is writing a file every other branch also has to write,
+at the same offset, so N such branches in flight is N-choose-2 conflicts **by construction** —
+over nothing, since both entries are right and both belong. On 2026-08-23 that was three of
+six open pull requests, all `CONFLICTING`, while the three that wrote no release entry all
+merged clean; PR #398 landed both ways and settled it (#122).
 
 `release.py guard` answers it, and **the refusal names `changelog.d/<issue>.<kind>.md`** — a
 worker told only "no" retries or works around it, and both are worse than the original mistake.
@@ -4557,13 +4555,9 @@ commonest consequence, and a row that waits for the conflict cannot fire on the 
 to make it. The conflict count is reported beside the finding because it says how urgent it
 is, not because it is the test.
 
-Two things it does not see, both written down because a limit nobody wrote down is a limit
-nobody remembers. The README's release list is guarded by the same rule and is not asked
-about here: the guard exempts the rest of `README.md` so that documenting anything is not
-taxed, and a list of changed paths cannot tell an edit to the release list from an edit to
-the installation instructions. And a **rename away** from `CHANGELOG.md` is missed, because
-GitHub reports the resulting path — a different and much rarer fault than writing an entry
-into it.
+One thing it does not see, written down because a limit nobody wrote down is a limit nobody
+remembers: a **rename away** from `CHANGELOG.md` is missed, because GitHub reports the
+resulting path — a different and much rarer fault than writing an entry into it.
 
 ##### `stamper` and `briefs` — two sites, two rows
 

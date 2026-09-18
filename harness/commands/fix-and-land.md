@@ -156,7 +156,7 @@ turns the merge off.
    **Once READY, there is no release step here.** A branch that ships something writes
    `changelog.d/<issue>.<kind>.md` — one file, named after the issue, that no other branch will
    ever open — and that is the whole of it. It names no version, not even a placeholder, and it
-   does not open `CHANGELOG.md` or the README's release list.
+   does not open `CHANGELOG.md`.
 
    That fragment belongs with the work, back in step 3, not here. If the branch changed
    something that ships and carries none, the `a change that ships carries a release note` CI
@@ -178,10 +178,10 @@ turns the merge off.
    a full extra CI cycle and its place in the queue, purely to undo something that should never
    have been on the branch.
 
-   If you write to `CHANGELOG.md` or the README's release list anyway, `harness/githooks/pre-push`
-   refuses the push and names `changelog.d/<issue>.<kind>.md` in the refusal, and the `generated
-   release files are output` CI job refuses the pull request. Both are the answer, not an
-   obstacle: obey the refusal, do not route around it.
+   If you write to `CHANGELOG.md` anyway, `harness/githooks/pre-push` refuses the push and
+   names `changelog.d/<issue>.<kind>.md` in the refusal, and the `generated release files are
+   output` CI job refuses the pull request. Both are the answer, not an obstacle: obey the
+   refusal, do not route around it.
 
    So step 4 ends at READY. Nothing is pushed here that was not already pushed, nothing is
    re-enqueued, and the head preland read is still the head.
@@ -390,9 +390,9 @@ re-derive it, and do not go looking for the trap by hand.
   ships carries a release note"* (#365, v2.95). It parses the fragments too, and since #122 it
   is the only place a malformed one is caught before the release job reads it.
 - **A branch that writes to a file the release job generates** — the `generated release files
-  are output` job (#122). `CHANGELOG.md` and the README's release list are written on `$BASE`
-  after the merge and by nothing else; a branch that edits either is refused here and by
-  `pre-push`, with `changelog.d/<issue>.<kind>.md` named in the refusal.
+  are output` job (#122). `CHANGELOG.md` is written on `$BASE` after the merge and by nothing
+  else; a branch that edits it is refused here and by `pre-push`, with
+  `changelog.d/<issue>.<kind>.md` named in the refusal.
 - **A merge that would leave two migration heads** — the `migration-heads` job, *"one migration
   head after the merge"* (#351, v2.88). The `pre-push` hook asks the same question and never gets
   to answer it on the path this fleet lands by: the merge is an API call, and no push carries the

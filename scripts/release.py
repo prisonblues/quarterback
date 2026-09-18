@@ -18,14 +18,13 @@ the tenth arrived an hour after an allocator shipped and worked — two agents s
 call it. So the number moved to land time and a placeholder took its place, and that half
 worked: no branch picked a number again.
 
-What did not work was leaving `apply` runnable on a branch. Every stamped branch rewrote the
-same two files — `CHANGELOG.md` and the README's release list — so N stamped branches in
-flight was N-choose-2 conflicts BY CONSTRUCTION, over nothing: both entries were right and
-both belonged, and git cannot know that two insertions at one offset are independent. On the
-night this file was rewritten, six pull requests were open; the three that had stamped were
-all `CONFLICTING`, the three that had not were all `MERGEABLE`, and PR #398 landed both ways
-— unmergeable stamped, zero conflicts once the stamp was reverted. Same branch, same work,
-same base.
+What did not work was leaving `apply` runnable on a branch. Every stamped branch rewrote
+`CHANGELOG.md` at the same offset, so N stamped branches in flight was N-choose-2 conflicts
+BY CONSTRUCTION, over nothing: both entries were right, both belonged, and git cannot know
+that two insertions at one offset are independent. On the night this file was rewritten, six
+pull requests were open; the three that had stamped were all `CONFLICTING`, the three that
+had not were all `MERGEABLE`, and PR #398 landed both ways — unmergeable stamped, zero
+conflicts once the stamp was reverted. Same branch, same work, same base.
 
 The affordance was the bug (#122). A rule against using a command every brief in the repo
 tells you to run is a convention, and this repo has settled that argument elsewhere: "if
@@ -43,9 +42,8 @@ the loudest thing a removal can say.
 3. Numbers the release: one past the highest `## vX[.Y]` heading in `CHANGELOG.md`, folding
    in any number a release TAG already holds. Both inputs are read at HEAD, which on `main`
    after the merge is the commit being released.
-4. Writes the entry at the top of `CHANGELOG.md`, adds the README bullet and re-renders that
-   list into CHANGELOG order, bumps the served version if the release touched `app/` or
-   `migrations/`, and deletes the fragments it consumed.
+4. Writes the entry at the top of `CHANGELOG.md`, bumps the served version if the release
+   touched `app/` or `migrations/`, and deletes the fragments it consumed.
 5. Commits `chore(release): vX.Y — <title>`, tags the commit it just made, and pushes both
    in ONE atomic push, so a release never reaches `main` without its tag.
 
@@ -81,11 +79,10 @@ the judgement back on a branch, which is the affordance this change exists to re
 
 ## `guard` — the consolidated files are OUTPUT
 
-`CHANGELOG.md`'s release entries and the README's release list are regenerated here and stay
-in git, so `git log CHANGELOG.md` keeps working and a reader with no network keeps the
-history. A branch that edits either is refused, and the refusal NAMES
-`changelog.d/<issue>.<kind>.md` — a worker told only "no" retries or works around it, and both
-are worse than the original mistake.
+`CHANGELOG.md`'s release entries are regenerated here and stay in git, so
+`git log CHANGELOG.md` keeps working and a reader with no network keeps the history. A branch
+that edits them is refused, and the refusal NAMES `changelog.d/<issue>.<kind>.md` — a worker
+told only "no" retries or works around it, and both are worse than the original mistake.
 
 The CHANGELOG's PREAMBLE is outside the guard on purpose: it documents the convention the file
 follows, so a branch changing the convention has to be able to change it. That is the same
@@ -551,9 +548,8 @@ def release_entries(text: str, where: str = "") -> dict[Release, str]:
 def entry_names(text: str, where: str = "") -> list[str]:
     """Every release ENTRY heading in file order, spelled the way the file spells it.
 
-    `releases_in` in string form, for `scripts/readme_releases.py` — which renders the
-    README's release list from the CHANGELOG's order and wants labels, not tuples. Kept here
-    rather than there so the answer to "what is a release heading" stays in one place.
+    `releases_in` in string form. Kept here so the answer to "what is a release heading"
+    stays in one place.
     """
     masked = mask_code(text, where)
     return [fmt(release(m.group(1), m.group(2))) for m in _HEADING.finditer(masked)]
@@ -1344,7 +1340,7 @@ def _write_all(edits: list[tuple[str, Path, str]]) -> list[str]:
 #: stays in git so `git log CHANGELOG.md` keeps working offline, and the guard rather than
 #: the file's absence is what removes the affordance, because nothing stops a branch creating
 #: a file that does not exist.
-GENERATED = ("CHANGELOG.md", "README.md § Releases")
+GENERATED = ("CHANGELOG.md",)
 
 #: What a refused branch is told to write instead. Spelled once: a refusal that says only
 #: "no" gets retried or worked around, and both are worse than the original mistake.
@@ -1352,12 +1348,12 @@ FRAGMENT_PATH = "changelog.d/<issue>.<kind>.md"
 
 
 def _siblings() -> tuple:
-    """`changelog_fragments` and `readme_releases`, loaded by path, only when needed.
+    """`changelog_fragments`, loaded by path only when needed.
 
-    Lazy because they import THIS module — the shapes of a release entry and of the README's
-    list are defined here and neither should redefine them — and a module-level import in
-    both directions is a cycle. `_sibling` hands back an already-loaded module rather than
-    re-executing it, so the `ReleaseError` they raise is the one this file catches.
+    Lazy because it imports THIS module — the release-entry shape is defined here and should
+    not be redefined — and a module-level import in both directions is a cycle. `_sibling`
+    hands back an already-loaded module rather than re-executing it, so the `ReleaseError`
+    it raises is the one this file catches.
     """
     import importlib.util
 
@@ -1373,7 +1369,7 @@ def _siblings() -> tuple:
         return mod
 
     sys.modules.setdefault("release", sys.modules[__name__])
-    return _sibling("changelog_fragments"), _sibling("readme_releases")
+    return (_sibling("changelog_fragments"),)
 
 
 @dataclass
@@ -1547,7 +1543,7 @@ def _served_plan(repo: Path, cut: Cut, serve: bool | None, since: str,
 def plan_cut(repo: Path, *, major: bool = False, title: str | None = None,
              serve: bool | None = None) -> Cut:
     """What the next release would be. Reads the worktree and git; writes nothing."""
-    cf, _ = _siblings()
+    (cf,) = _siblings()
     cut = Cut(major=major)
     fragments = cf.load(repo)
     cut.fragments = [f.path.name for f in fragments]
@@ -1656,7 +1652,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     """Assemble, number, write, commit and tag. The only writer of a version number."""
     repo = Path(args.repo).resolve()
     branch = _refuse_off_main(repo)
-    cf, rr = _siblings()
+    (cf,) = _siblings()
 
     cut = plan_cut(repo, major=args.major, title=args.title, serve=args.serve)
     if not cut.cutting:
@@ -1676,17 +1672,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     version = fmt(cut.version)  # type: ignore[arg-type]
     fragments = cf.load(repo)
-    changelog_path, readme_path = repo / "CHANGELOG.md", repo / "README.md"
+    changelog_path = repo / "CHANGELOG.md"
     changelog = _read(changelog_path, "CHANGELOG.md")
-    readme = _read(readme_path, "README.md")
 
     new_changelog = cf.insert_entry(changelog, cf.entry(fragments, cut.title, version))
     _self_check_frozen(changelog, new_changelog)
-    new_readme = cf.insert_bullet(readme, new_changelog, cut.title, version)
 
     edits: list[tuple[str, Path, str]] = [
         ("CHANGELOG.md", changelog_path, new_changelog),
-        ("README.md", readme_path, new_readme),
     ]
     if cut.serves:
         main_py, pyproject = _served_files(repo)
@@ -1810,23 +1803,6 @@ def _entries_from(text: str, where: str = "CHANGELOG.md") -> str:
     return text[first.start():] if first else ""
 
 
-def _releases_block(repo: Path, ref: str) -> str | None:
-    """The README's release-list block at `ref`, or None if that ref has no README."""
-    _, rr = _siblings()
-    try:
-        readme = _show(repo, ref, "README.md")
-    except ReleaseError:
-        return None
-    try:
-        start, end = rr.find_list(readme)
-    except rr.ListError:
-        # A README with no recognisable list is not this guard's finding to report: it is
-        # `readme_releases.py check`'s, which says so in a sentence naming the heading. Here
-        # it would mean refusing every branch in the repo over a file none of them touched.
-        return None
-    return readme[start:end]
-
-
 def cmd_guard(args: argparse.Namespace) -> int:
     """Refuse a branch that edits a file the release job generates.
 
@@ -1873,20 +1849,6 @@ def cmd_guard(args: argparse.Namespace) -> int:
                  else _entries_from(_show(repo, branch_sha, "CHANGELOG.md")))
         if before != after:
             edited.append("CHANGELOG.md")
-    if "README.md" in changed:
-        before, after = _releases_block(repo, base), _releases_block(repo, branch_sha)
-        # Only the release LIST. The README is 900 lines of prose a branch is meant to edit,
-        # and refusing the whole file would make the guard a tax on documentation — which is
-        # how a guard stops being installed.
-        #
-        # `before is not None and after is None` is the branch having BROKEN the list — the
-        # heading removed, or every bullet gone — and it is a finding rather than a pass.
-        # Reading it as "cannot tell" made deleting the block the one edit that got through,
-        # which is the largest version of the defect wearing the smallest diff (Codex).
-        # Neither side parsing is a repo that does not keep a release list, and stays silent.
-        if before is not None and (after is None or before != after):
-            edited.append("README.md § Releases")
-
     payload |= {"ok": not edited, "fork_point": base, "edited": edited}
     if args.json:
         print(json.dumps(payload, indent=2))

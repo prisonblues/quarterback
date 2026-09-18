@@ -2,24 +2,25 @@
 
 #46's smaller half. Two branches once claimed v2.14 at the same time — each correctly,
 from what it could see, since `main` was on v2.13 when both forked — and the rename cost
-a pass across `CHANGELOG.md`, `README.md`'s release list, `pyproject.toml`, `app/main.py`,
-a migration docstring, two module docstrings and a test filename. The docstrings and the
-filename were missed on the first pass and caught by a reviewer, because nothing ties them
-together. On 2026-08-15 it happened four more times in one day, and a `pyproject.toml` at
-2.15.0 shipped for several commits beside an `app/main.py` at 2.14.0.
+a pass across `CHANGELOG.md`, `pyproject.toml`, `app/main.py`, a migration docstring, two
+module docstrings and a test filename. The docstrings and the filename were missed on the
+first pass and caught by a reviewer, because nothing ties them together. On 2026-08-15 it
+happened four more times in one day, and a `pyproject.toml` at 2.15.0 shipped for several
+commits beside an `app/main.py` at 2.14.0.
 
 Allocation (a board that hands out the next free number) is the issue's larger half and
 needs a board. This needs nothing, and it catches the class: a number that disagrees with
 itself, a heading claimed twice, a new release whose entry was written but never listed.
 
-**Scope, stated because the paragraph above names more than this enforces.** The four sites
-asserted here are `pyproject.toml`, `app/main.py`, `CHANGELOG.md` and `README.md` — the ones
-that decide what a running instance reports and what a reader is told is current. Docstrings
-naming the release that added a feature (`migrations/versions/0015_*.py`, `app/api/reviews.py`)
-are NOT asserted and can still drift: they are prose about history, so a check would have to
-encode "does this sentence still describe the past correctly". Narrow and honest beats broad
-and noisy — this suite's whole argument is that a check which fires on a correctly-updated
-repo gets switched off.
+**Scope, stated because the paragraph above names more than this enforces.** The three sites
+asserted here are `pyproject.toml`, `app/main.py` and `CHANGELOG.md` — the ones that decide
+what a running instance reports and what release history exists. README now points at the
+changelog instead of carrying a second release index. Docstrings naming the release that added
+a feature (`migrations/versions/0015_*.py`, `app/api/reviews.py`) are NOT asserted and can
+still drift: they are prose about history, so a check would have to encode "does this
+sentence still describe the past correctly". Narrow and honest beats broad and noisy — this
+suite's whole argument is that a check which fires on a correctly-updated repo gets switched
+off.
 
 **Two things changed under this file's feet, and it now asserts both.**
 
@@ -193,20 +194,9 @@ def changelog_text() -> str:
 
 
 @pytest.fixture(scope="module")
-def readme_text() -> str:
-    return (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-
-
-@pytest.fixture(scope="module")
 def changelog_prose(changelog_text) -> str:
     """CHANGELOG.md with its fenced examples blanked — what every heading pattern reads."""
     return _without_fenced_blocks(changelog_text)
-
-
-@pytest.fixture(scope="module")
-def readme_prose(readme_text) -> str:
-    """README.md with its fenced examples blanked — what every bullet pattern reads."""
-    return _without_fenced_blocks(readme_text)
 
 
 @pytest.fixture(scope="module")
@@ -351,16 +341,6 @@ def test_the_changelog_carries_no_retired_placeholder(changelog_prose):
         + ". Nothing stamps that any more — write changelog.d/<issue>.<kind>.md instead")
 
 
-def test_the_readme_release_list_carries_no_retired_placeholder(readme_prose):
-    """The other half, and it fails on a different day. A `- **vNEXT** — …` bullet is what
-    `insert_bullet` used to write on a branch; the release list is now written on `main` by
-    the release job, with the number it just issued."""
-    found = re.findall(rf"^- \*\*{PLACEHOLDER}\*\*.*$", readme_prose, flags=re.MULTILINE)
-    assert not found, (
-        f"README.md's release list carries a `{PLACEHOLDER}` bullet: "
-        + " | ".join(f.strip() for f in found))
-
-
 def test_no_test_file_is_named_after_a_release():
     """`tests/test_v234.py` is a release number a branch had to guess before landing, and
     two branches guessing the same one add the same PATH with different contents — which
@@ -443,98 +423,7 @@ def test_the_tracked_filenames_check_names_the_files_it_refuses(monkeypatch):
         test_no_test_file_is_named_after_a_release()
 
 
-def _readme_bullet(release_name: str) -> re.Pattern[str]:
-    """The README's own list entry for one release, in whatever punctuation style it is
-    written: `- **v2.33** — …`, `- **v2.33**: …`, `- **v2.33**`.
-
-    The closing `**` right after the number is still required, and is what keeps this
-    specific: the list's collapsed range entries and its `- **v3 (next)** —` do not match,
-    and neither does a three-component `- **v2.33.1** —`, so a README listing something
-    adjacent to the newest release cannot satisfy the assertion instead of it."""
-    return re.compile(rf"^- \*\*{re.escape(release_name)}\*\*", re.MULTILINE)
-
-
-def test_the_readme_release_list_has_an_entry_for_the_newest_release(changelog_releases,
-                                                                     readme_prose):
-    """The bulleted history below the prose, which is a second place and drifts
-    independently of the first.
-
-    Only the newest is required to have a bullet of its own. Older releases are
-    deliberately collapsed into range entries as the list ages — `- **v2.2–v2.5** — the
-    session registry…`, `- **v1–v2.1** —` — so asserting a bullet per release would fail
-    on a README that is doing exactly what it is supposed to. The docstring's claim is
-    scoped to match: what this catches is a release written up and never listed, which
-    is the mistake that happens on the day of the release.
-
-    No separator is required after the bold run: `- **v2.34**: …` is a bullet this repo
-    accepts. Demanding the em dash here would have failed a correctly-listed release on its
-    punctuation alone, and said the bullet did not exist while it sat in the file."""
-    newest = _fmt(changelog_releases[0])
-    assert _readme_bullet(newest).search(readme_prose), (
-        f"README.md's release list has no `- **{newest}**` entry")
-
-
-#: `scripts/readme_releases.py`, loaded once and by path: `scripts/` is a directory of
-#: standalone tools rather than an importable package, and there is no `sys.path` entry that
-#: would make `import readme_releases` mean this repo's file rather than somebody's.
-_RENDERER = None
-
-
-def _renderer():
-    """The README list renderer, imported lazily.
-
-    Lazily because this file is also collected in sandboxes: an import at module level would
-    turn a sandbox missing `scripts/` into a collection ERROR for the whole suite, taking the
-    other twenty-odd release-metadata assertions down with it. The flake comparison below is
-    what keeps the sandbox stocked, and it can only report a missing copy if the suite it
-    guards is still collectable.
-    """
-    global _RENDERER
-    if _RENDERER is None:
-        spec = importlib.util.spec_from_file_location(
-            "readme_releases", REPO_ROOT / "scripts" / "readme_releases.py")
-        assert spec and spec.loader
-        _RENDERER = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = _RENDERER
-        spec.loader.exec_module(_RENDERER)
-    return _RENDERER
-
-
-def test_the_readme_release_list_is_in_changelog_order(readme_text, changelog_text):
-    """The list is RENDERED from CHANGELOG.md's order, and this is where drift is a failure.
-
-    It drifted for three releases in a row — `v2.61, v2.59, v2.60, v2.62, …` — and by the time
-    #296 was written nine bullets were out of place, because the ordering convention
-    was written down nowhere and checked by nothing. `74a0453` is a human pushing
-    `docs(readme): put v2.62 at the end of the release list`, which is the same class being
-    corrected by whoever happened to notice.
-
-    The renderer only ever REORDERS whole bullets, so this test failing means one of two
-    things and the message says which: the list is out of order (run
-    `scripts/readme_releases.py write`), or a release has no bullet at all, which nothing can
-    write for you.
-
-    Asserted against the renderer rather than against a second hand-rolled ordering rule here.
-    A test that re-derived the order would be the third copy of the fact — CHANGELOG, README,
-    and this file — and the third copy is the one that goes stale unnoticed."""
-    renderer = _renderer()
-    try:
-        rendered = renderer.render(readme_text, changelog_text)
-    except renderer.ListError as e:
-        pytest.fail(str(e))
-    assert rendered == readme_text, (
-        "README.md's release list is not in CHANGELOG.md's order. It is rendered, not "
-        "hand-kept: run `scripts/readme_releases.py write`")
-
-
-#: A release bullet and only a release bullet: `- **v2.33** — …`. Anchoring the closing `**`
-#: right after the number is what keeps the list's deliberate range entries out of this — a
-#: `- **v1–v2.1** —` or a `- **v3 (next)** —` simply does not match, rather than matching as
-#: a bare `v1` and `v3` and inventing a duplicate out of the README's own summarising style.
-_README_RELEASE_BULLET = re.compile(rf"^- \*\*({_V})\*\*", re.MULTILINE)
-
-
-def test_no_release_number_appears_twice(changelog_releases, readme_prose):
+def test_no_release_number_appears_twice(changelog_releases):
     """A number that means two releases is the one state nothing else here can see.
 
     Only the release job writes a number now and it reads the file before it does, so this is
@@ -543,10 +432,8 @@ def test_no_release_number_appears_twice(changelog_releases, readme_prose):
     where it does conflict. Every heading is then present, unique-looking and correctly
     ordered, and one number documents two releases.
 
-    Both files, because they carry the number independently. The CHANGELOG half restates
-    `test_no_release_number_is_claimed_twice` from the merge's side rather than the parser's,
-    and is kept because a failure here says what happened; the README half is not asserted
-    anywhere else at all."""
+    This restates `test_no_release_number_is_claimed_twice` from the merge's side rather than
+    the parser's, and is kept because a failure here says what happened."""
 
     def dupes(numbers: list[Release]) -> list[str]:
         seen, twice = set(), []
@@ -557,20 +444,16 @@ def test_no_release_number_appears_twice(changelog_releases, readme_prose):
         return twice
 
     in_changelog = dupes(changelog_releases)
-    in_readme = dupes(
-        [_release(m.group(1)) for m in _README_RELEASE_BULLET.finditer(readme_prose)])
-    assert not in_changelog and not in_readme, (
+    assert not in_changelog, (
         "a release number is used twice — a merge kept both sides of an edit to this list, "
         "so the number now means two releases: "
-        + "; ".join(filter(None, [
-            f"CHANGELOG.md headings for {', '.join(in_changelog)}" if in_changelog else "",
-            f"README.md bullets for {', '.join(in_readme)}" if in_readme else ""])))
+        f"CHANGELOG.md headings for {', '.join(in_changelog)}")
 
 
 # --------------------------------------------------------------- the helpers themselves
 #
-# Everything above reads the real CHANGELOG.md and README.md, which is this suite's whole
-# argument and also its blind spot: a helper that stops matching what the release tool matches
+# Everything above reads the real CHANGELOG.md, which is this suite's whole argument and also
+# its blind spot: a helper that stops matching what the release tool matches
 # stays green for as long as the repo happens to be in a shape the loosened helper still
 # accepts, and goes wrong on the one day a release is written in the shape it lost. Each
 # test below pins a rule where this file and `scripts/release.py` had already drifted
@@ -583,18 +466,6 @@ def test_a_three_component_heading_is_not_read_as_a_release():
     out of order in the newest-first check."""
     text = "## v2.33.1 — a patch\n\n## v2.33 — the release\n"
     assert re.findall(rf"^## ({_V})", text, flags=re.MULTILINE) == ["v2.33"]
-    assert not _README_RELEASE_BULLET.findall("- **v2.33.1** — a patch\n")
-    assert _README_RELEASE_BULLET.findall("- **v2.33** — the release\n") == ["v2.33"]
-
-
-def test_a_release_bullet_is_found_whatever_punctuation_follows_it():
-    """The em dash is this README's house style and not a rule the release tool enforces."""
-    for line in ("- **v2.34** — the release\n", "- **v2.34**: the release\n",
-                 "- **v2.34** - the release\n", "- **v2.34**\n"):
-        assert _readme_bullet("v2.34").search(line), line
-    for line in ("- **v2.34.1** — a patch\n", "- **v2.34 (next)** — not this release\n",
-                 "- **v2.340** — a later release\n"):
-        assert not _readme_bullet("v2.34").search(line), line
 
 
 def test_an_inner_info_fence_does_not_close_an_outer_block():
@@ -642,14 +513,8 @@ _FLAKE_CHECK = "release-metadata-tests"
 #: comparison does not report it: pytest opens the suite's own file by path, and the shared
 #: reader below is imported rather than read.
 #:
-#: `scripts/release.py` is the third: this suite never opens it, but
-#: `scripts/readme_releases.py` — which it does open — imports it by path for the one
-#: definition of what a release heading is. A sandbox holding the renderer and not the
-#: release tool errors on the import rather than on a read, which the read-side comparison
-#: cannot see.
 _COPIED_BUT_NOT_READ = frozenset({"harness/tests/test_release_numbers.py",
-                                  "harness/tests/_flake_sandbox.py",
-                                  "scripts/release.py"})
+                                  "harness/tests/_flake_sandbox.py"})
 
 #: Reading a check's block out of flake.nix, parsing its copy lines and checking they land
 #: where this suite looks, is the same job for every suite with this problem — and it was
@@ -974,5 +839,3 @@ def test_every_use_of_repo_root_is_one_the_reader_can_follow():
 # already drifted from the shared one (this copy had no `cp -r` of a directory, so the shape
 # most likely to regress was covered in one place and not the other). The coupling test above
 # still runs the reader against the real flake.nix, which is what this suite needs from it.
-
-

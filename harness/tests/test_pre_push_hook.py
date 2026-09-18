@@ -1148,11 +1148,10 @@ READS = (
     "harness/githooks",      # the hook under test, and the forwarder it chains through
     "scripts/migration_reconcile.py",
     "scripts/release.py",
-    # `release.py guard` loads both of these from beside itself, lazily — which is why they
-    # are declared here rather than trusted to the import graph: the failure would arrive
-    # inside a refusal path, in a build log, rather than at startup.
+    # `release.py guard` loads this from beside itself, lazily — which is why it is declared
+    # here rather than trusted to the import graph: the failure would arrive inside a refusal
+    # path, in a build log, rather than at startup.
     "scripts/changelog_fragments.py",
-    "scripts/readme_releases.py",
     "scripts/release_tag.py",
 )
 
@@ -1184,7 +1183,6 @@ def test_every_declared_read_is_a_path_this_file_names(path: str):
         str((SCRIPTS / name).relative_to(ROOT)) for name in ("migration_reconcile.py",
                                                              "release.py",
                                                              "changelog_fragments.py",
-                                                             "readme_releases.py",
                                                              "release_tag.py")}
     assert any(p == path or p.startswith(path + "/") for p in named), (
         f"READS declares {path}, which no constant in this module resolves to — either the "
