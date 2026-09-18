@@ -98,9 +98,7 @@ def entry(version: str, body: str = "did a thing.", title: str = "a release") ->
 
 
 def readme(bullets: list[str], extra: str = "") -> str:
-    lines = ["# quarterback", "", "### Every release, oldest first", ""]
-    lines += [f"- **{b}** — a release." for b in bullets]
-    return "\n".join(lines) + "\n" + extra
+    return "# quarterback\n\nRelease history lives in CHANGELOG.md.\n" + extra
 
 
 def git(repo: Path, *args: str) -> str:
@@ -558,10 +556,10 @@ def test_there_is_no_apply_or_stamp_subcommand_left(repo, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_the_readme_gets_a_bullet_in_changelog_order(repo):
+def test_the_readme_is_not_written_by_release_run(repo):
+    before = (repo / "README.md").read_text()
     assert cut(repo, "--no-push") == 0
-    bullets = re.findall(r"^- \*\*(v[\d.]+)\*\*", (repo / "README.md").read_text(), re.M)
-    assert bullets == ["v2", "v2.32", "v2.33", "v2.34"]
+    assert (repo / "README.md").read_text() == before
 
 
 def test_the_fragments_it_consumed_are_deleted(repo):
@@ -698,30 +696,14 @@ def test_guard_refuses_a_release_entry_written_above_the_ones_it_can_parse(repo,
     assert "edits CHANGELOG.md" in capsys.readouterr().err
 
 
-def test_guard_refuses_a_branch_that_removed_the_readmes_release_list(repo, capsys):
-    """The other half Codex found: a release list that stops PARSING on the branch used to
-    read as "cannot tell" and pass, which made deleting the block the one edit that got
-    through — the largest version of the defect wearing the smallest diff."""
+def test_guard_lets_a_branch_rewrite_the_readme(repo, capsys):
+    """The README is prose, not generated release output."""
     branch(repo)
-    text = (repo / "README.md").read_text()
-    write(repo, "README.md", text[:text.index("### Every release, oldest first")])
-    commit(repo, "docs: drop the release list")
+    write(repo, "README.md", "# quarterback\n\nA shorter entry point.\n")
+    commit(repo, "docs: rewrite the readme")
 
-    assert run(repo, "guard", "--onto", "main", "--branch", "HEAD") == 2
-    assert "README.md § Releases" in capsys.readouterr().err
-
-
-def test_guard_refuses_a_branch_that_edits_the_readmes_release_list(repo, capsys):
-    """The expensive half of every landing conflict. A bullet appended at the end of the block
-    by two branches at once is the same insertion-at-one-offset that made CHANGELOG.md
-    conflict."""
-    branch(repo)
-    text = (repo / "README.md").read_text()
-    write(repo, "README.md", text + "- **v2.34** — a release.\n")
-    commit(repo, "a release bullet on a branch")
-
-    assert run(repo, "guard", "--onto", "main", "--branch", "HEAD") == 2
-    assert "README.md § Releases" in capsys.readouterr().err
+    assert run(repo, "guard", "--onto", "main", "--branch", "HEAD") == 0
+    assert "no generated release file edited" in capsys.readouterr().out
 
 
 def test_guard_lets_a_branch_edit_the_rest_of_the_readme(repo, capsys):
@@ -2002,5 +1984,4 @@ def test_a_depth_one_clone_says_it_read_nothing_rather_than_reporting_a_clean_bi
     assert "limited: HEAD is already contained in origin/main" in captured.err
     assert "0 released entries compared" in captured.out, (
         "the count is what a reader checks; two entries were there and neither was judged")
-
 

@@ -3379,10 +3379,7 @@ def test_a_pull_request_editing_the_generated_changelog_is_the_finding(
 
 
 def test_a_pull_request_touching_the_readme_is_not_the_finding(monkeypatch, landing_host):
-    """The guard exempts the rest of README.md so that documenting anything is not taxed,
-    and a list of changed paths cannot tell an edit to the release list from an edit to
-    the installation instructions. Failing a branch for improving its own docs is how a
-    row gets ignored."""
+    """README.md is documentation, not generated release output."""
     _gh_answers(monkeypatch, {"pr list": (0, json.dumps([
         {"number": 401, "isDraft": False, "mergeStateStatus": "CLEAN",
          "files": [{"path": "README.md"}, {"path": "changelog.d/401.docs.md"}]}]), "")})

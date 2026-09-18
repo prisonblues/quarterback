@@ -47,11 +47,11 @@ Not `v3.13`, and not `vNEXT` either — the placeholder is retired and a fragmen
 refused. There is no number to name: the release is numbered on `main`, after the merge, by
 `scripts/release.py`, against the commit that actually exists.
 
-## Do not open CHANGELOG.md or the README's release list
+## Do not open CHANGELOG.md
 
-Those are **output**. `scripts/release.py run` writes them and nothing else does, and a branch
-that edits either is refused — by `harness/githooks/pre-push` at the moment you would go wrong,
-and by the `generated release files are output` CI job on the pull request.
+Its release entries are **output**. `scripts/release.py run` writes them and nothing else does,
+and a branch that edits them is refused — by `harness/githooks/pre-push` at the moment you
+would go wrong, and by the `generated release files are output` CI job on the pull request.
 
 The refusal is not a formality. Every branch that shipped anything used to edit the same lines
 at the top of the same file, so N such branches in flight was N-choose-2 conflicts **by

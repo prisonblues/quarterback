@@ -26,10 +26,9 @@ name: Cut a release
 # ONE THING THIS DOES NOT GET, said here rather than left to be discovered: a push made with
 # `GITHUB_TOKEN` does not trigger other workflows, so the `Tests` run and the board
 # announcement that normally follow a push to `main` do not fire for the release commit. What
-# that commit contains is `CHANGELOG.md`, `README.md`'s release list and — when the release
-# touched `app/` — two version literals, none of which any suite asserts about beyond the
-# checks `release.py run` makes itself before it writes. Run it at a keyboard instead if you
-# want the full suite over it.
+# that commit contains is `CHANGELOG.md` and — when the release touched `app/` — two version
+# literals, none of which any suite asserts about beyond the checks `release.py run` makes
+# itself before it writes. Run it at a keyboard instead if you want the full suite over it.
 
 on:
   workflow_dispatch:
