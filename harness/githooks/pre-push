@@ -11,14 +11,13 @@
 #      files at a ref. Two refusals, not one, because the reconciler has two answers here
 #      and only the first wants a renumber: it counted the heads and the count was not one,
 #      or it DECLINED TO ANSWER and there is no head count to report (#357).
-#   2. A branch that edits a file the release job GENERATES — `CHANGELOG.md`, or the
-#      README's release list. Those are output: the release number is applied on `main`
-#      after the merge, by `release.py run`, against the commit that actually exists. A
-#      branch that writes one of them conflicts with every sibling that does the same, over
-#      nothing, and on 2026-08-23 that was three of six open PRs while the three that had
-#      written no release entry all merged clean (#122). Delegated to `release.py guard`,
-#      fork-relative so a branch that is merely BEHIND — and has therefore inherited a
-#      release somebody else cut — passes by construction.
+#   2. A branch that edits the release entries generated in `CHANGELOG.md`. They are output:
+#      the release number is applied on `main` after the merge, by `release.py run`, against
+#      the commit that actually exists. A branch that writes one conflicts with every sibling
+#      that does the same, over nothing, and on 2026-08-23 that was three of six open PRs
+#      while the three that had written no release entry all merged clean (#122). Delegated
+#      to `release.py guard`, fork-relative so a branch that is merely BEHIND — and has
+#      therefore inherited a release somebody else cut — passes by construction.
 #      THE REFUSAL NAMES `changelog.d/<issue>.<kind>.md`. A worker told only "no" retries or
 #      works around it, and both are worse than the original mistake.
 #      This is half a guard on its own and is meant to be: a local hook cannot see
@@ -457,12 +456,12 @@ check_migration_heads() {
 # ---------------------------------------------------------------------------
 # 2. this branch has not edited a file the release job generates
 # ---------------------------------------------------------------------------
-# `CHANGELOG.md` and the README's release list are OUTPUT. The release number is applied on
-# the integration branch after the merge, by `release.py run`, against the commit that
-# actually exists — so a branch that writes either of them is writing a file every other
-# branch also has to write, at the same offset, and N such branches in flight is N-choose-2
-# conflicts by construction. On 2026-08-23 that was three of six open PRs, all `CONFLICTING`,
-# while the three that wrote no release entry were all `MERGEABLE` and merged clean (#122).
+# `CHANGELOG.md` release entries are OUTPUT. The release number is applied on the
+# integration branch after the merge, by `release.py run`, against the commit that actually
+# exists — so a branch that writes one is writing a file every other release branch also has
+# to write, at the same offset, and N such branches in flight is N-choose-2 conflicts by
+# construction. On 2026-08-23 that was three of six open PRs, all `CONFLICTING`, while the
+# three that wrote no release entry were all `MERGEABLE` and merged clean (#122).
 #
 # The files stay in git — decision (a) on #122 — so `git log CHANGELOG.md` keeps working and
 # a reader offline keeps the history. The guard is the mechanism, not the file's absence:

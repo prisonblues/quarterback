@@ -161,7 +161,7 @@ do_install() {
     echo "  write the shared refs/stash while linked worktrees exist. Use 'qb-stash'."
     echo -e "  ${GREEN}pre-push guard installed${NC} — a push is refused when it would leave a"
     echo "  protected branch multi-headed in migrations, when the branch edits a file the"
-    echo "  release job generates (CHANGELOG.md, the README's release list), or when it"
+    echo "  release job generates (CHANGELOG.md), or when it"
     echo "  rewrites the text of a release that already shipped. Silent where none applies."
     if [[ "$exported" -gt 0 ]]; then
         echo "  ($exported managed hook(s) re-exported from $delegate)"

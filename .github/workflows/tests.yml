@@ -406,12 +406,12 @@ jobs:
 
   generated:
     name: generated release files are output
-    # `CHANGELOG.md` and the README's release list are written by the release job on `main`
-    # and by nothing else. A branch that edits either conflicts with every sibling that does
-    # the same, at the same offset, over nothing — on 2026-08-23 that was three of six open
-    # PRs, all CONFLICTING, while the three that wrote no release entry all merged clean.
-    # PR #398 landed both ways and settles it: unmergeable stamped, zero conflicts once the
-    # stamp was reverted, same branch, same work, same base (#122).
+    # `CHANGELOG.md` release entries are written by the release job on `main` and by nothing
+    # else. A branch that edits them conflicts with every sibling that does the same, at the
+    # same offset, over nothing — on 2026-08-23 that was three of six open PRs, all
+    # CONFLICTING, while the three that wrote no release entry all merged clean. PR #398
+    # landed both ways and settles it: unmergeable stamped, zero conflicts once the stamp was
+    # reverted, same branch, same work, same base (#122).
     #
     # This is the CI half of a guard that also lives in `harness/githooks/pre-push`, and both
     # are needed for #343's reason. A local hook cannot see `gh pr merge`; a CI job cannot

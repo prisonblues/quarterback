@@ -213,13 +213,10 @@
           # test_pre_push_hook.py's own coupling guard holds this set against what it reads.
           install -Dm644 ${./scripts/migration_reconcile.py} scripts/migration_reconcile.py
           install -Dm644 ${./scripts/release.py} scripts/release.py
-          # `release.py` loads `changelog_fragments.py` and `readme_releases.py` from beside
-          # itself — the release list's shape and a fragment's shape are each defined once —
-          # so `guard` errors on a missing import without them. They are lazy imports, which
-          # is exactly why they have to be here: the failure would arrive inside a refusal
-          # path rather than at startup.
+          # `release.py` loads `changelog_fragments.py` from beside itself, so `guard`
+          # errors on a missing import without it. The lazy import is exactly why it has to
+          # be here: the failure would arrive inside a refusal path rather than at startup.
           install -Dm644 ${./scripts/changelog_fragments.py} scripts/changelog_fragments.py
-          install -Dm644 ${./scripts/readme_releases.py} scripts/readme_releases.py
           # And `release_tag.py`, which the suite copies into fixture repos as one of the
           # tools a repo may ship. It loads `release.py` from beside itself for the one
           # definition of a release heading, which is why the file above is not optional.
@@ -385,12 +382,6 @@
           install -Dm644 ${./harness/tests/_flake_sandbox.py} repo/harness/tests/_flake_sandbox.py
           install -Dm644 ${./CHANGELOG.md}   repo/CHANGELOG.md
           install -Dm644 ${./README.md}      repo/README.md
-          # The README's release list is RENDERED from the CHANGELOG's order (#296), and the
-          # suite asserts the file matches the render — so the renderer is part of the
-          # question, not a tool beside it. It imports `release.py` by path for the one
-          # definition of a release heading, which is why both are here; the suite records
-          # `release.py` in `_COPIED_BUT_NOT_READ` because it reaches it through an import.
-          install -Dm644 ${./scripts/readme_releases.py} repo/scripts/readme_releases.py
           install -Dm644 ${./scripts/release.py}        repo/scripts/release.py
           install -Dm644 ${./pyproject.toml} repo/pyproject.toml
           install -Dm644 ${./app/main.py}    repo/app/main.py

@@ -2194,11 +2194,7 @@ _READY_TO_LAND = "CLEAN"
 #: it is unready.
 _STATE_UNKNOWN = ("UNKNOWN", "", None)
 
-#: The file the release job writes and no branch may edit (#122, decision (a)). The
-#: README's release list is guarded too, and is deliberately NOT looked for here: the
-#: guard exempts the rest of README.md so that documentation is not taxed, and a list of
-#: changed paths cannot tell an edit to the release list from an edit to anything else in
-#: the file. Naming README.md here would fail a branch for improving its own docs.
+#: The file the release job writes and no branch may edit (#122, decision (a)).
 GENERATED_BY_THE_RELEASE_JOB = ("CHANGELOG.md",)
 
 #: A code fence in a brief running one of these is a document telling the next agent to do
@@ -3266,14 +3262,8 @@ def check_generated(host: Host) -> Check:
     is reported beside the finding because it says how urgent it is, not because it is the
     test.
 
-    TWO THINGS IT DOES NOT SEE, both stated because a limit nobody wrote down is a limit
-    nobody remembers:
-
-    * **The README's release list**, which the same guard covers. The guard exempts the
-      rest of `README.md` so that documenting anything is not taxed, and a list of changed
-      paths cannot tell an edit to the release list from an edit to the installation
-      instructions. A row that named `README.md` would fail a branch for improving its own
-      docs, which is how a row gets ignored.
+    ONE THING IT DOES NOT SEE, stated because a limit nobody wrote down is a limit nobody
+    remembers:
     * **A rename AWAY from `CHANGELOG.md`.** GitHub reports the resulting path, so a
       branch that renamed the generated file out of the way looks like a branch that
       touched some other file. That is a different and much rarer fault than writing an
@@ -4835,8 +4825,8 @@ CHECKS = (
                     "Name no version in the fragment, not even a placeholder. The number "
                     "is derived on `main` after the merge, against the commit that "
                     "actually exists.",
-                    "Do not edit `CHANGELOG.md` or the README's release list to fix this. "
-                    "They are output; the pre-push hook and a CI job both refuse a branch "
+                    "Do not edit `CHANGELOG.md` to fix this. Its release entries are output; "
+                    "the pre-push hook and a CI job both refuse a branch "
                     "that touches them.",
                     "These are other people's branches. Say what needs doing on each "
                     "before you push to one.",
