@@ -1292,7 +1292,7 @@ $root has $n entr(y/ies) on that one stack, and this repo has linked worktrees �
 
 $entries
 
-A pop or apply puts one of those into THIS tree, and a pop drops it from the stack as well. Where its files do not clash with yours it succeeds silently — and somebody else's uncommitted work is now in your tree, where a later 'git add -A' commits it under your name. That is #210, and it has taken two working trees on this fleet.
+A pop or apply puts one of those into THIS tree, and a pop drops it from the stack as well. Where its files do not clash with yours it succeeds silently — and somebody else's uncommitted work is now in your tree, where a later 'git add -A' commits it under your name.
 
 If you got here from a REFUSED 'git stash push': that refusal left your tree untouched and put nothing on the stack, so there is nothing of yours down there to get back.
 
@@ -1354,7 +1354,7 @@ _shared_tree_harm_guard() {   # _shared_tree_harm_guard <harm> <root>: `destroys
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names
 
-This stages or commits EVERYTHING uncommitted, and in a shared checkout you cannot tell your files from theirs — so it takes their half-finished work into your commit, under your message. That is board 3879: one agent's in-flight clash.py committed by another as 409bae0, with a message saying the work was not theirs. Nothing was destroyed and its author still lost it.
+This stages or commits EVERYTHING uncommitted, and in a shared checkout you cannot tell your files from theirs — so it takes their half-finished work into your commit, under your message. Nothing is destroyed, and its author still loses it.
 
 What to do instead, cheapest first:
   1. Work somewhere else: $(_take_a_worktree "$root")
@@ -1398,7 +1398,7 @@ If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names
 
-This command destroys uncommitted work, and in a shared checkout some of that work is theirs — that has now happened five times on this fleet, most recently tonight (board 6236/6241), where a hard reset here took a peer's in-flight review fixes.
+This command destroys uncommitted work, and in a shared checkout some of that work is theirs: a hard reset in a shared tree has already destroyed a peer's in-flight work on this fleet.
 
 What to do instead, cheapest first:
   1. Work somewhere else: $(_take_a_worktree "$root")
@@ -1633,7 +1633,7 @@ case "$EVENT" in
           start_notes="${start_notes#"${start_notes%%[![:space:]]*}"}"
           shared=$(jq -nr --arg c "${_wtroot:-$cwd}" --arg l "$sharers" --arg r "$_tree_remedy" \
             '"⚠️ quarterback: you are SHARING a working tree, not just a repo. Also in " + $c + ":\n" + $l
-              + "\nThis is the one kind of overlap that is not free. Their uncommitted edits are in the same files as yours, so anything you build or test here compiles their half-finished work as if it were yours, and `git reset --hard`, `git checkout --`, `git clean` and `git restore` destroy it outright, while `git commit -a` and `git add .` quietly take it into YOUR commit — that has happened five times on this fleet." + $r + " If you must stay, say so to them first — they cannot see you either."')
+              + "\nThis is the one kind of overlap that is not free. Their uncommitted edits are in the same files as yours, so anything you build or test here compiles their half-finished work as if it were yours, and `git reset --hard`, `git checkout --`, `git clean` and `git restore` destroy it outright, while `git commit -a` and `git add .` quietly take it into YOUR commit." + $r + " If you must stay, say so to them first — they cannot see you either."')
           start_notes="${start_notes:+$start_notes$SEP}$shared"
         fi
       fi

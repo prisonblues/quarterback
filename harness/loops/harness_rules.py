@@ -5487,9 +5487,7 @@ def mode_violation(mode: Mode, tree: Tree) -> str | None:
             f"`create-worktree <branch>`. Nothing stops another agent starting "
             f"here too, and when one does, whichever of you types `git reset`, "
             f"`git checkout --` or `git stash` destroys the other's uncommitted "
-            f"work with no warning and nothing to recover it from. That is not "
-            f"hypothetical: it happened here on 2026-08-17 and again on "
-            f"2026-08-25.")
+            f"work with no warning and nothing to recover it from.")
 
 
 def _qbdata_candidates() -> list[Path]:
