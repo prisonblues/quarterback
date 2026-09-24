@@ -53,7 +53,8 @@ from test_panel_reconstruct import _new_repo  # noqa: E402
 
 #: The repo root, for the two briefs. Four levels up: tests -> loops -> harness -> repo.
 REPO_ROOT = Path(__file__).resolve().parents[3]
-REVIEW_PR = REPO_ROOT / "harness/commands/review-pr.md"
+#: The fixer's brief, which `/review-pr` and `/panel-review-pr` both hand their fixer.
+REVIEW_PR_BRIEF = REPO_ROOT / "harness/loops/docs/review-pr-brief.md"
 PANEL_REVIEW_PR = REPO_ROOT / "harness/commands/panel-review-pr.md"
 
 #: The anchor round's brief as `Baseline.fixed_findings` carries it: one sub-floor
@@ -1115,7 +1116,7 @@ def test_the_fixers_brief_asks_for_a_seam_the_harness_can_actually_READ():
     commit body by the finding it answers" is what the brief said before this landed,
     and it does not say WHICH name — so a fixer quoting the title left a seam nothing
     could aim at."""
-    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    flat = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
     assert "**Land each budgeted fix as its own commit, and name the finding in the " \
            "commit body.**" in flat
     # The id the report actually prints, and the key as the alternative.

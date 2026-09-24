@@ -1439,7 +1439,8 @@ def test_naming_it_does_not_end_the_cycle(repo, monkeypatch, capsys, tmp_path):
 # ---------------------------------------------------------------------- the two briefs
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-REVIEW_PR = (REPO_ROOT / "harness/commands/review-pr.md").read_text()
+#: The fixer's brief — what `/review-pr` and `/panel-review-pr` both hand their fixer.
+REVIEW_PR_BRIEF = (REPO_ROOT / "harness/loops/docs/review-pr-brief.md").read_text()
 PANEL_REVIEW_PR = (REPO_ROOT / "harness/commands/panel-review-pr.md").read_text()
 
 
@@ -1447,8 +1448,8 @@ def test_the_fixers_brief_tells_it_to_declare_before_it_patches():
     """Step 3a is where a premise is already stated in one sentence; #84 is the count and
     the stop around it. A mechanism whose declaration nobody is asked for is #169's
     unwired key with extra steps."""
-    assert "--premise-file" in REVIEW_PR
-    assert "before you write the patch" in REVIEW_PR
+    assert "--premise-file" in REVIEW_PR_BRIEF
+    assert "before you write the patch" in REVIEW_PR_BRIEF
 
 
 def test_the_orchestrators_brief_runs_the_brake_before_it_re_briefs_a_fix_pass():
@@ -1496,9 +1497,9 @@ def test_the_fixers_brief_carries_the_fourth_test_and_says_it_stands_alone(
     """The mechanism is a flag, and a flag nobody is told to answer is #169's unwired key
     with extra steps. The "stands alone" half is load-bearing: as a fourth CONJUNCT it
     could never fire, because test 3 passes precisely when test 4 is failing."""
-    assert "decidable in the runtime the assertion runs" in REVIEW_PR
-    assert "It is an escalation if tests 1-3 all hold, or if test 4 fails." in REVIEW_PR
-    assert "--premise-decidable" in REVIEW_PR
+    assert "decidable in the runtime the assertion runs" in REVIEW_PR_BRIEF
+    assert "It is an escalation if tests 1-3 all hold, or if test 4 fails." in REVIEW_PR_BRIEF
+    assert "--premise-decidable" in REVIEW_PR_BRIEF
 
 
 def test_the_orchestrators_brief_asks_for_the_answer_it_is_placed_to_give():
@@ -1514,7 +1515,7 @@ def test_both_briefs_say_the_counter_is_blind_rather_than_leaving_it_to_discipli
     """"State the premise, never the proxy" is a discipline, and the cycle that produced
     #491 shows what a discipline is worth here: four honest declarations, none matching.
     A brief that offered only the instruction would be promising a detector again."""
-    assert "does not depend on your wording" in REVIEW_PR
+    assert "does not depend on your wording" in REVIEW_PR_BRIEF
     assert "restates" in PANEL_REVIEW_PR and "the answer to this flag is" in PANEL_REVIEW_PR
 
 
@@ -1523,11 +1524,11 @@ def test_both_briefs_place_the_declaration_where_the_fixer_is_the_orchestrator()
     assuming a fixer that somebody else briefs, and `panel-review-pr.md` §2 recommends
     the configuration where nobody does the briefing. Left there, "before the patch" is
     an instruction addressed to a role that is not present."""
-    assert "you are running the panel and the fix yourself" in REVIEW_PR
+    assert "you are running the panel and the fix yourself" in REVIEW_PR_BRIEF
     assert "declares before its\n  first edit" in PANEL_REVIEW_PR
     # And the register path, which is the concrete thing that went missing: the live
     # cycle's fixer was given none, so `--premise` was uncallable during the pass.
-    assert "Choose the register\npath yourself" in REVIEW_PR
+    assert "Choose the register\npath yourself" in REVIEW_PR_BRIEF
     assert "passes\n  the same path to every round's `--premise-file`" in PANEL_REVIEW_PR
 
 
@@ -1537,9 +1538,9 @@ def test_both_briefs_say_what_the_check_does_not_cover():
     declaration was made from" and stops reads as a safety net over the whole
     ordering, and the common workflow — edit, then commit — is precisely the half it
     does not cover. An agent that believes it is being checked declares carelessly."""
-    assert "does not cover you for the common case" in REVIEW_PR
+    assert "does not cover you for the common case" in REVIEW_PR_BRIEF
     assert "It catches nothing else, deliberately" in PANEL_REVIEW_PR
-    assert "(#622)" in REVIEW_PR and "(#622)" in PANEL_REVIEW_PR
+    assert "(#622)" in REVIEW_PR_BRIEF and "(#622)" in PANEL_REVIEW_PR
 
 
 def test_neither_brief_claims_the_check_survives_an_actor_working_around_it():
@@ -1548,13 +1549,13 @@ def test_neither_brief_claims_the_check_survives_an_actor_working_around_it():
     not that nobody could have arranged for it not to show."""
     assert "(#622)" in PANEL_REVIEW_PR
     assert "whatever its summary says" not in PANEL_REVIEW_PR
-    assert "matter of your own account of it" not in REVIEW_PR
+    assert "matter of your own account of it" not in REVIEW_PR_BRIEF
 
 
 def test_both_briefs_carry_the_limit_rather_than_implying_coverage():
     """The brake compares DECLARATIONS. Two proxies for one premise are two premises, and
     a brief that did not say so would be promising a detector."""
-    assert "unescalatable" in REVIEW_PR.lower()
+    assert "unescalatable" in REVIEW_PR_BRIEF.lower()
     assert "state the premise, never the proxy" in PANEL_REVIEW_PR
 
 

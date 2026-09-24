@@ -59,8 +59,12 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
-#: The canonical brief. Every other fix loop either lifts it verbatim or points at it, so this is
-#: where the requirement is defined and the only file whose step numbering matters.
+#: The canonical brief. `/review-pr` and `/panel-review-pr` both hand it to their fixer by its
+#: installed path, so this is where the requirement is defined and the only file whose step
+#: numbering matters.
+BRIEF = "harness/loops/docs/review-pr-brief.md"
+
+#: The orchestrator that launches a fixer with the brief above.
 REVIEW_PR = "harness/commands/review-pr.md"
 
 #: The loop that replaces the brief's step 2 and pastes the rest into a sub-agent. Its §4 is the
@@ -83,7 +87,7 @@ HARNESS_README = "harness/README.md"
 #: so a rename here has to be a rename everywhere.
 COLUMN = "Consumers"
 
-#: The step of `review-pr.md`'s SUB-AGENT BRIEF that owes the line. A string, not an int, for the
+#: The step of the SUB-AGENT BRIEF that owes the line. A string, not an int, for the
 #: same reason `ESCALATION_STEP` next door is one: it is matched against heading text.
 CONSUMER_STEP = "3"
 
@@ -96,7 +100,7 @@ SUMMARY_STEP = "6"
 #: `nix build .#checks.<system>.prose-consistency-tests` installs. A read nobody installed does
 #: not FAIL there, it ERRORS on a missing file, which is #163's mechanism and how four suites
 #: before this one sat red in a check no workflow runs.
-READS = frozenset({REVIEW_PR, PANEL_REVIEW_PR, FIX_ISSUE, FIX_ISSUE_HERE,
+READS = frozenset({BRIEF, REVIEW_PR, PANEL_REVIEW_PR, FIX_ISSUE, FIX_ISSUE_HERE,
                    HARNESS_README})
 
 
@@ -127,16 +131,24 @@ class Loop(NamedTuple):
 #: through `/review-pr` or `/panel-review-pr`, so the requirement reaches their fixer through the
 #: brief they lift, and restating it in them would be two more copies to keep in step.
 FIX_LOOPS = {
-    REVIEW_PR: Loop(
-        why="defines the requirement; the canonical brief every other path lifts",
+    BRIEF: Loop(
+        why="defines the requirement; the canonical brief every other path hands its fixer",
         behaviour=("Before you fix a finding, write one line naming who consumes the code",
                    "the entitlement tier it is served to"),
         behaviour_is="the requirement itself — the callers before the patch, and the tier for "
                      "code that reaches a response",
     ),
+    REVIEW_PR: Loop(
+        why="launches the fixer; the requirement reaches it only if the brief is what it hands",
+        behaviour=("~/.claude/loops/docs/review-pr-brief.md", "Do not summarise it"),
+        behaviour_is="that the fixer is handed the brief itself, verbatim or by path, and "
+                     "never a summary that can drop the line",
+    ),
     PANEL_REVIEW_PR: Loop(
-        why="replaces the brief's step 2 and pastes the rest into a sub-agent that cannot read it",
-        behaviour=("does NOT remove step 3's consumer line",
+        why="replaces the brief's step 2 and hands the rest to a sub-agent that cannot read "
+            "this file",
+        behaviour=("~/.claude/loops/docs/review-pr-brief.md",
+                   "does NOT remove step 3's consumer line",
                    f"require the **{COLUMN}** column"),
         behaviour_is="that swapping self-discovery for a panel's findings leaves the pre-fix "
                      "line standing, and that the returned table has to carry it",
@@ -206,13 +218,12 @@ def _slice(text: str, start: str, end: str | None) -> str:
 
 @pytest.fixture(scope="module")
 def brief() -> str:
-    """`review-pr.md`'s SUB-AGENT BRIEF — the slice `panel-review-pr.md` lifts, and nothing else.
+    """The SUB-AGENT BRIEF — the whole of what a fixer is handed, and nothing else.
 
-    Bounded on the right by §2b, the first of the orchestrator's own sections: a requirement that
-    lives outside these bounds is one the pasted-into sub-agent never receives, and asserting it
-    against the whole file is a false pass on exactly that reader.
+    It is its own file, so a requirement that lives in an orchestrator's command is one the
+    fixer never receives; asserting against the brief file alone is what keeps that honest.
     """
-    return _slice(doc(REVIEW_PR), "### SUB-AGENT BRIEF", "## 2b. Record what happened")
+    return _slice(doc(BRIEF), "# SUB-AGENT BRIEF", None)
 
 
 @pytest.fixture(scope="module")

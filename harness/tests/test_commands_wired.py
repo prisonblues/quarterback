@@ -50,6 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: every `/fix-and-land` run, and are inside that same tree.
 READS = frozenset({"harness/commands", "harness/hm-module.nix",
                    "harness/loops/preland.py", "harness/loops/docs/landing-hazards.md",
+                   "harness/loops/docs/review-pr-brief.md",
                    ".github/workflows/tests.yml"})
 
 
@@ -301,7 +302,8 @@ def test_fix_and_reviews_escalation_citation_resolves():
 
     The panel reviewed this PR against a base 114 commits behind main and reported that
     `review-pr.md` had no step 3a and that nothing invoked `panel.py --ask`. Both were true of
-    THAT base and false of main: `review-pr.md` now carries `#### 3a. When a finding says the
+    THAT base and false of main: the fixer brief `/review-pr` hands over
+    (`harness/loops/docs/review-pr-brief.md`) carries `#### 3a. When a finding says the
     APPROACH is wrong, escalate it` and invokes `--ask` directly. That is #241 — a round scoped to
     a stale base reporting confidently about code that had already moved.
 
@@ -309,9 +311,10 @@ def test_fix_and_reviews_escalation_citation_resolves():
     to care about: that it keeps resolving. A cross-file reference is only as good as the target."""
     assert "step 3a" in command("fix-and-review"), (
         "the escalation route lost its citation — a reader cannot find the mechanism")
-    assert re.search(r"^#### 3a\.", command("review-pr"), re.MULTILINE), (
-        "review-pr.md no longer has a step 3a, so fix-and-review.md now cites nothing — either "
-        "restore it there or stop citing it here")
+    brief = _at("harness/loops/docs/review-pr-brief.md").read_text(encoding="utf-8")
+    assert re.search(r"^#### 3a\.", brief, re.MULTILINE), (
+        "the review-pr fixer brief no longer has a step 3a, so fix-and-review.md now cites "
+        "nothing — either restore it there or stop citing it here")
 
 
 def test_the_reads_are_declared_rather_than_summarised():

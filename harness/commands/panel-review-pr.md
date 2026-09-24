@@ -82,10 +82,11 @@ Each sub-agent's brief is §3 + §4 + §5 of this file for its own PR — includ
 the re-review rounds, which are not the orchestrator's job to run afterwards —
 with these parallel-mode overrides:
 
-- **Write the brief out in full — a sub-agent cannot see this file.** Read
-  `~/.claude/commands/review-pr.md` **once** and paste its **SUB-AGENT BRIEF**
-  into every agent's brief, alongside §3's panel instructions and that PR's
-  resolved context (repo, remote, abs repo path, PR number, base, head branch).
+- **Write the brief out in full — a sub-agent cannot see this file.** Each agent's
+  prompt carries §3's panel instructions, §4's overrides and that PR's resolved
+  context (repo, remote, abs repo path, PR number, base, head branch), and tells it
+  to Read the fixer brief at `~/.claude/loops/docs/review-pr-brief.md` before it
+  fixes (or carries that file pasted verbatim).
 - **No nested fixer.** §4 says to launch a fixer sub-agent; in parallel mode the
   per-PR agent *is* that fixer — it runs the panel and then fixes, rather than
   spawning a second agent to repeat the same pipeline. (It may still split a
@@ -463,10 +464,11 @@ phase sit on the same branch, the same PR and the same commit range, so without
 it the bar cannot tell "waiting on four reviewers" from "a sub-agent is
 rewriting the code right now" — and those want very different things from you.
 
-Read `~/.claude/commands/review-pr.md` and lift its **SUB-AGENT BRIEF** verbatim
-— that is the canonical boil-the-ocean fix/verify/commit discipline; keep it
-single-sourced. Launch **one** `general-purpose` sub-agent with that brief,
-with these overrides:
+The fixer's brief is `~/.claude/loops/docs/review-pr-brief.md` — the canonical
+fix/verify/commit discipline, shared with `/review-pr`; keep it single-sourced.
+Launch **one** `general-purpose` sub-agent whose prompt puts the resolved target
+context and these overrides above the brief, and either pastes the brief verbatim or
+tells the sub-agent to Read that file first and follow it:
 
 - **Replace step 2 "Deep review" (self-discovery) with the supplied panel
   findings.** They are already exhaustively reviewed and judged — the sub-agent

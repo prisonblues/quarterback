@@ -58,6 +58,8 @@ from conftest import gh_stub  # noqa: E402
 #: The repo root, for the two briefs. Four levels up: tests -> loops -> harness -> repo.
 REPO_ROOT = Path(__file__).resolve().parents[3]
 REVIEW_PR = REPO_ROOT / "harness/commands/review-pr.md"
+#: The fixer's brief — what `/review-pr` and `/panel-review-pr` both hand their fixer.
+REVIEW_PR_BRIEF = REPO_ROOT / "harness/loops/docs/review-pr-brief.md"
 PANEL_REVIEW_PR = REPO_ROOT / "harness/commands/panel-review-pr.md"
 
 PANEL_CFG = {"github": "acme/board", "path": "/tmp/acme-board",
@@ -330,7 +332,7 @@ def test_fixer_may_defer_is_on_by_default_and_the_brief_says_what_that_permits()
     change is for" had no legal way to say it, and the only move left was the patch.
     That is the incentive behind the 63.7%."""
     assert harness_rules.DEFAULTS["review_panel"]["fixer_may_defer"] is True
-    brief = REVIEW_PR.read_text(encoding="utf-8")
+    brief = REVIEW_PR_BRIEF.read_text(encoding="utf-8")
     flat = " ".join(brief.split())
     assert "Three things may leave a finding unfixed" in flat
     assert "fixer_may_defer" in flat
@@ -350,7 +352,7 @@ def test_fixer_may_defer_off_is_the_old_two_exit_behaviour():
     """The non-default value, and the only place it can be enforced: this permission
     has no code path — nothing can stop a sub-agent patching something — so the brief
     has to spell out both settings or the `false` half is undocumented behaviour."""
-    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    flat = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
     assert ('With `fixer_may_defer` off, the first two are the whole list and '
             '"not now" is not available to you.') in flat
 
@@ -360,8 +362,9 @@ def test_the_bar_for_what_is_in_scope_did_not_move():
     round DOES take on is unchanged: fixed properly, with a test, and note-and-move-on
     still forbidden. A brief that gained an outcome and lost a standard has not gained
     anything."""
-    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
-    for standard in ("fix everything you find", "never note a problem and move on",
+    flat = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
+    for standard in ("ends in exactly one named outcome",
+                     "A finding is never noted and walked past",
                      "None of that lowers the bar for what IS in scope"):
         assert standard in flat, f"the brief no longer says {standard!r}"
 
@@ -373,12 +376,14 @@ def test_a_deferral_still_has_to_go_somewhere():
     is the one who writes it, never the fixer, which is the same division step 3a
     already draws."""
     orchestrator = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    brief = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
     assert "deferred_to" in orchestrator
     assert ("the orchestrator records it — a board row always, an issue where "
-            "`file_deferral_issues` calls for one. You open nothing") in orchestrator
+            "`file_deferral_issues` calls for one. You open nothing") in brief
     # And the prose above the template does not promise an issue the gate may refuse.
-    assert "the ORCHESTRATOR opens the issue and records the finding against it" \
-        not in orchestrator
+    for text in (orchestrator, brief):
+        assert "the ORCHESTRATOR opens the issue and records the finding against it" \
+            not in text
     panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
     assert "Three roads arrive here and all three are the same row" in panel_md
     assert "review_panel.fixer_may_defer" in panel_md
@@ -1929,7 +1934,7 @@ def test_the_fixers_brief_carries_the_spend_rule_and_not_a_judgement_call():
     the panel can measure a fix that has not been made, so the panel budgets and the
     fixer counts. A brief that named the budget without the procedure would be asking
     the fixer to invent one, which is the discretion #297 exists to remove."""
-    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    flat = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
     assert "low_severity_fix_lines" in flat
     # Measure, then spend: the order is the whole of what makes cheapest-first
     # possible, since a fix's cost is not knowable until it has been made.
@@ -2627,18 +2632,20 @@ def test_the_review_brief_no_longer_says_every_deferral_gets_an_issue():
     """Asserted partly as an ABSENCE, which is how a contradiction elsewhere in the same
     brief survives a green suite. `review-pr.md` used to instruct the orchestrator to
     open an issue on all three roads unconditionally, in the sentence a fixer's deferral
-    lands on."""
+    lands on. The rule now lives once, in `panel-review-pr.md` §4b, and `/review-pr`'s
+    §2b sends the orchestrator there rather than restating it."""
     flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
     assert "Your job is the same on all three and it is the half the fixer is " \
            "forbidden to do: open the issue," not in flat
-    assert "open an issue for it only if `review_panel.file_deferral_issues` says so" \
-        in flat
-    assert ("The row is the record; the issue is a work item, and they are not the "
-            "same thing (#482).") in flat
+    assert ("Record outcomes exactly as `panel-review-pr.md` §4b says, including which "
+            "deferrals get an issue under `review_panel.file_deferral_issues`") in flat
+    panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "Every deferral gets a board row. Only some of them get a GitHub issue" \
+        in panel_md
     # And the deferral still has somewhere to go — the point was never that the record
     # is optional.
-    assert "a one-line `note`" in flat
-    assert "An escalation is exempt at every setting" in flat
+    assert "a one-line `note`" in panel_md
+    assert "An escalation is exempt at every setting" in panel_md
 
 
 # --------------------------------------------------------------- the report says which
@@ -2796,10 +2803,12 @@ def test_the_fixer_is_asked_for_the_id_it_was_given_and_never_for_a_key():
     cannot supply one, and a template demanding it produces either a fabricated key or
     a blank row."""
     flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
-    assert "Key: <the finding's key, verbatim" not in flat
-    assert "a deferral nobody can key is a deferral nothing tracks" not in flat
-    assert "a premise nobody can key stays in the loop" not in flat
-    assert "ID: <the panel's finding ID for it, verbatim" in flat
+    brief = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
+    for text in (flat, brief):
+        assert "Key: <the finding's key, verbatim" not in text
+        assert "a deferral nobody can key is a deferral nothing tracks" not in text
+        assert "a premise nobody can key stays in the loop" not in text
+    assert "ID: <the panel's finding ID for it, verbatim" in brief
     assert "The fixer reports finding IDs; you supply the keys." in flat
     # And the orchestrator's own brief states the mapping rather than implying it.
     panel_md = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
@@ -2891,6 +2900,7 @@ def test_the_reader_finds_the_briefs_it_is_meant_to_find():
     """The guard below is only worth having if its reader works, and a reader that silently
     found NOTHING would make it pass against any flake at all."""
     assert _repo_root_reads() == {"harness/commands/review-pr.md",
+                                 "harness/loops/docs/review-pr-brief.md",
                                  "harness/commands/panel-review-pr.md",
                                  "flake.nix"}
 

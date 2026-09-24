@@ -241,6 +241,6 @@ def test_every_member_gates_the_reads_it_does_declare(member):
     # filename — so this asks each one for something it must accept rather than a uniform shape.
     accepted = {"test_fixer_escalation": lambda: gate(sorted(reads)[0]),
                 "test_fixer_consumers": lambda: gate(sorted(reads)[0]),
-                "test_regression_test_redgreen": lambda: gate("review-pr.md"),
+                "test_regression_test_redgreen": lambda: gate("review-pr-brief.md"),
                 "test_commands_wired": lambda: gate("harness/hm-module.nix")}[member]
     assert accepted() is not None

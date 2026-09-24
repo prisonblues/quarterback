@@ -51,6 +51,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: README and the app, and every path printed on the way out is a path a reader can type.
 REVIEW_PR = "harness/commands/review-pr.md"
 
+#: The SUB-AGENT BRIEF itself. `/review-pr` and `/panel-review-pr` both hand it to their fixer by
+#: its installed path (`~/.claude/loops/docs/review-pr-brief.md`), so it is the file that
+#: defines the step every other one points at.
+BRIEF = "harness/loops/docs/review-pr-brief.md"
+
 #: The author's own fix pass, and the one loop that runs before a PR exists — so the only
 #: place the premise check is shown without `--pr`. Named, like `REVIEW_PR`, because two
 #: things read it: the `FIX_LOOPS` entry below and the guard on that snippet.
@@ -98,11 +103,19 @@ class Loop(NamedTuple):
 #: pattern loose enough to find them all also finds `/panel` (which reviews and never fixes).
 #: A rename fails this suite loudly, which is the intent.
 FIX_LOOPS = {
-    REVIEW_PR: Loop(
-        why="defines the escalation; the canonical brief every other path lifts",
+    BRIEF: Loop(
+        why="defines the escalation; the canonical brief every fix path hands its fixer",
         behaviour=("Write no patch for it", "Never redesign on your own authority"),
         behaviour_is="the permission itself — no patch, and no redesign on a fixer's authority",
         defines=True,
+        records_outcomes=True,
+    ),
+    REVIEW_PR: Loop(
+        why="launches the fixer and relays what it returns",
+        behaviour=("An escalation is the headline, not a footnote",
+                   "do not answer it yourself by launching another fixer"),
+        behaviour_is="that an escalation leads the relay and is never answered by re-briefing "
+                     "a fixer at the same finding",
         records_outcomes=True,
     ),
     "harness/commands/panel-review-pr.md": Loop(
@@ -251,7 +264,7 @@ def doc(relpath: str) -> str:
 
 
 def _located(haystack: str, marker: str, what: str, start: int = 0,
-             where: str = REVIEW_PR) -> int:
+             where: str = BRIEF) -> int:
     """`str.index` with a message. A bare `.index()` miss aborts the whole module with
     `ValueError: substring not found`, naming neither the marker nor the file it was looked for
     in — in a suite whose every other failure says what moved."""
@@ -263,20 +276,14 @@ def _located(haystack: str, marker: str, what: str, start: int = 0,
 
 
 @pytest.fixture(scope="module")
-def review_pr() -> str:
-    return doc(REVIEW_PR)
+def brief() -> str:
+    """Just the SUB-AGENT BRIEF: what a sub-agent that cannot see the commands is handed.
 
-
-@pytest.fixture(scope="module")
-def brief(review_pr: str) -> str:
-    """Just the SUB-AGENT BRIEF: what a sub-agent that cannot see the file is handed.
-
-    The orchestrator's own sections around it are addressed to a different reader, so a
-    permission or an obligation that lands outside these markers has landed on the wrong agent.
+    It is its own file, so a permission or an obligation written into an orchestrator's command
+    instead has landed on the wrong agent.
     """
-    start = _located(review_pr, "### SUB-AGENT BRIEF", "the start of the brief")
-    end = _located(review_pr, "\n## 2b.", "the end of the brief", start)
-    return review_pr[start:end]
+    text = doc(BRIEF)
+    return text[_located(text, "# SUB-AGENT BRIEF", "the start of the brief"):]
 
 
 @pytest.fixture(scope="module")
@@ -323,7 +330,8 @@ def test_the_brief_still_forbids_note_and_move_on(brief: str):
     permits escalating and no longer insists on fixing everything else has not gained an
     outcome, it has lost a standard."""
     flat = normalised(brief)
-    for standard in ("fix everything you find", "never note a problem and move on"):
+    for standard in ("ends in exactly one named outcome",
+                     "A finding is never noted and walked past"):
         assert standard in flat, (
             f"the brief no longer says {standard!r}; step {ESCALATION_STEP} is a carve-out from "
             "that standard, and without it the carve-out is the whole rule")
@@ -446,13 +454,15 @@ def test_nothing_points_at_a_step_the_brief_does_not_have(brief: str):
     headings = set(re.findall(r"^#### (\d+[a-z]?)\.", brief, re.MULTILINE))
     assert ESCALATION_STEP in headings, (
         f"the brief has no step {ESCALATION_STEP} heading; the references below cannot resolve")
-    sources = {name: doc(name) for name in (*FIX_LOOPS, *ANCHOR_DOCS)}
+    # The definer is not a pointer at itself: its own steps are the headings.
+    sources = {name: doc(name) for name in (*FIX_LOOPS, *ANCHOR_DOCS)
+               if name not in FIX_LOOPS or not FIX_LOOPS[name].defines}
     found: dict[str, set[str]] = {}
     for name, text in sources.items():
         found[name] = set(_STEP_REFERENCE.findall(normalised(text)))
         for ref in sorted(found[name]):
             assert ref in headings, (
-                f"{name} points at the brief's step {ref}, which review-pr.md's brief does not "
+                f"{name} points at the brief's step {ref}, which the brief does not "
                 f"have — it has {sorted(headings)}")
     # Non-vacuous, in both senses: a regex that matches nothing passes every assertion above
     # over an empty set, and that is exactly how a guard like this dies. Every guarded file has
@@ -469,15 +479,14 @@ def test_nothing_points_at_a_step_the_brief_does_not_have(brief: str):
 
 
 def test_the_brief_cites_no_section_of_the_file_it_was_lifted_out_of(brief: str):
-    """The same anchor, inward. `panel-review-pr.md` pastes this slice into a sub-agent that
-    cannot open `review-pr.md`, so a `§2b` inside it resolves to nothing for the one reader it
-    was written for — an instruction that reads as complete and names nothing, which is what the
-    test above guards in the other direction. Step numbers are fine: the brief carries its own
-    headings. Section marks are not, because the sections they name are the orchestrator's, and
-    the fixture's own boundary at `## 2b.` is what proves the reader cannot see them."""
+    """The same anchor, inward. The brief is handed to a sub-agent that is not reading
+    `review-pr.md`, so a `§2b` inside it resolves to nothing for the one reader it was written
+    for — an instruction that reads as complete and names nothing, which is what the test above
+    guards in the other direction. Step numbers are fine: the brief carries its own headings.
+    Section marks are not, because the sections they name are the orchestrators'."""
     cited = sorted(set(re.findall(r"§\s*\S+", brief)))
     assert not cited, (
-        f"the brief cites {cited} — sections of {REVIEW_PR} that the sub-agent it is handed to "
+        f"the brief cites {cited} — sections of an orchestrator's command that the sub-agent "
         "cannot see. Say what the orchestrator does with the finding, not where that is written")
 
 
