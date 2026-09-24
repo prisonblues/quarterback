@@ -1,7 +1,9 @@
-# Loops — Reviewer Panel
+---
+description: "Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate where the repo enables that seat) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults."
+argument-hint: "<pr ...> [repo] [--no-post] [--reviewers a,b]   (repo defaults to the cwd's repo)"
+---
 
-@description Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate where the repo enables that seat) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults.
-@arguments $ARGS: <pr ...> [repo] [--no-post] [--reviewers a,b]   (repo defaults to the cwd's repo)
+# Loops — Reviewer Panel
 
 Run the reviewer panel over a pull request. Each reviewer (and the master judge)
 applies the **same exhaustive bar as `/review-pr`** — full Core / Completeness /

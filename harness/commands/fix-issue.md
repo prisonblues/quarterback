@@ -1,7 +1,9 @@
-# Fix GitHub Issue
+---
+description: "Plan, implement, test, and PR for a GitHub issue in a worktree with its own database copy."
+argument-hint: "<issue-number> [--base <branch>]"
+---
 
-@description Plan, implement, test, and PR for a GitHub issue in a worktree with its own database copy.
-@arguments $ARGS: <issue-number> [--base <branch>]
+# Fix GitHub Issue
 
 Parse `$ARGS`: the first integer is the **issue number** (`$ISSUE_NUMBER`
 below). An optional `--base <branch>` names the branch this issue's work

@@ -1,7 +1,9 @@
-# Loops — Fix and Land an issue (autonomous, confidence-gated merge)
+---
+description: "Implement an issue, review it, run the mechanical pre-land guardrails, and MERGE it if confident enough — otherwise stop for a human."
+argument-hint: "<issue-number> [repo]   (repo defaults to the cwd's repo)"
+---
 
-@description Implement an issue, review it, run the mechanical pre-land guardrails, and MERGE it if confident enough — otherwise stop for a human.
-@arguments $ARGS: <issue-number> [repo]   (repo defaults to the cwd's repo)
+# Loops — Fix and Land an issue (autonomous, confidence-gated merge)
 
 End-to-end autonomous flow for ONE issue. Unlike the epic driver (which always stops at the
 human-merge gate), this **will merge** when the gates pass and you are genuinely confident. Treat it

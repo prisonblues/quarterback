@@ -1,7 +1,9 @@
-# Review and Fix PR
+---
+description: "Delegated boil-the-ocean PR review+fix. Resolves the target (current branch by default, or a PR number), then launches ONE autonomous sub-agent that reviews, fixes every finding, writes tests, runs the quality pipeline, amends, and pushes. Run it right after a fix — fresh-eyes review without a new conversation."
+argument-hint: "[pr-number]  (optional — defaults to the current branch's diff vs its base)"
+---
 
-@description Delegated boil-the-ocean PR review+fix. Resolves the target (current branch by default, or a PR number), then launches ONE autonomous sub-agent that reviews, fixes every finding, writes tests, runs the quality pipeline, amends, and pushes. Run it right after a fix — fresh-eyes review without a new conversation.
-@arguments $ARGS: [pr-number]  (optional — defaults to the current branch's diff vs its base)
+# Review and Fix PR
 
 You are the **ORCHESTRATOR**. You do **not** review or fix in this
 conversation. You resolve the target, launch a single autonomous sub-agent

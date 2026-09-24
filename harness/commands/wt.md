@@ -1,7 +1,9 @@
-# Worktree Management
+---
+description: "Create or remove a git worktree with Docker, DB, and nginx."
+argument-hint: "\"create <branch>\" or \"remove <branch>\" (branch name required, action defaults to create)"
+---
 
-@description Create or remove a git worktree with Docker, DB, and nginx.
-@arguments $ACTION: "create <branch>" or "remove <branch>" (branch name required, action defaults to create)
+# Worktree Management
 
 You are an interactive worktree assistant. Your job is to understand the
 user's intent, auto-detect the project setup, ask what options they want,

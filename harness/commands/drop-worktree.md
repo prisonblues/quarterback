@@ -1,6 +1,8 @@
-# Drop worktree — destroy this session's worktree, keep the branch
+---
+description: "Tear down the worktree this session is working in and all its trappings — Docker containers, nginx block, isolated DB, port entry, directory — but KEEP the branch. Blocks if the tree is dirty. Clears the session's statusline markers (worktree + PR + stage)."
+---
 
-@description Tear down the worktree this session is working in and all its trappings — Docker containers, nginx block, isolated DB, port entry, directory — but KEEP the branch. Blocks if the tree is dirty. Clears the session's statusline markers (worktree + PR + stage).
+# Drop worktree — destroy this session's worktree, keep the branch
 
 Thin, safe driver over `remove-worktree --keep-branch`. The script does the
 actual teardown (containers, nginx + restart, DB drop, port prune, dir removal);

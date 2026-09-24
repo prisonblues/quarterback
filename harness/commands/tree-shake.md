@@ -1,7 +1,9 @@
-# Tree-shake — sweep worktree debris
+---
+description: "Clean up the detritus left after running many worktrees: orphan databases, stale port entries, leftover directories, orphan Docker containers, and orphan nginx blocks. Dry-run first, apply on confirm. Optionally tears down finished (merged) live worktrees properly."
+argument-hint: "(none) — operates on the current repo"
+---
 
-@description Clean up the detritus left after running many worktrees: orphan databases, stale port entries, leftover directories, orphan Docker containers, and orphan nginx blocks. Dry-run first, apply on confirm. Optionally tears down finished (merged) live worktrees properly.
-@arguments $ARGS: (none) — operates on the current repo
+# Tree-shake — sweep worktree debris
 
 You are a careful cleanup driver. The deterministic logic lives in the
 `prune-worktrees` and `remove-worktree` **scripts** — you drive them from this

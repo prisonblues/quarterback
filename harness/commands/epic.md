@@ -1,7 +1,9 @@
-# Loops — Epic Driver
+---
+description: "Decompose an epic and work each issue: master triages doability + routes a model per issue → choose a landing model → worktree → /fix-issue → CI → panel → /review-pr → STOP at human merge."
+argument-hint: "<epic-number> [repo] [--execute] [--max-issues N] [--landing auto|integration|multi] [--integration-branch NAME] [--sub-pr-merge auto|gate] [--base BRANCH] [--model fable|opus|sonnet]"
+---
 
-@description Decompose an epic and work each issue: master triages doability + routes a model per issue → choose a landing model → worktree → /fix-issue → CI → panel → /review-pr → STOP at human merge.
-@arguments $ARGS: <epic-number> [repo] [--execute] [--max-issues N] [--landing auto|integration|multi] [--integration-branch NAME] [--sub-pr-merge auto|gate] [--base BRANCH] [--model fable|opus|sonnet]
+# Loops — Epic Driver
 
 Drive an epic's sub-issues through the per-issue pipeline.
 

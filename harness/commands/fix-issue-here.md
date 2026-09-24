@@ -1,7 +1,9 @@
-# Fix GitHub Issue — in place (no worktree, no branch)
+---
+description: "Plan, implement, and test a GitHub issue RIGHT HERE — current checkout, current branch, no worktree. The deliberate \"just do it inline\" path; relies on you (and quarterback) to control the chaos."
+argument-hint: "<issue-number>"
+---
 
-@description Plan, implement, and test a GitHub issue RIGHT HERE — current checkout, current branch, no worktree. The deliberate "just do it inline" path; relies on you (and quarterback) to control the chaos.
-@arguments $ARGS: <issue-number>
+# Fix GitHub Issue — in place (no worktree, no branch)
 
 The in-place sibling of `/fix-issue`. Same implementation discipline, but it
 does **not** create a worktree, does **not** create a branch, and does **not**

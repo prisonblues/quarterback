@@ -1,7 +1,9 @@
-# Loops — Dependabot Lander
+---
+description: "Dependabot CI-green auto-lander: classify bumps, gate on CI, merge patch/minor, fix red CI in a worktree."
+argument-hint: "[repo] [--execute]   (repo defaults to the cwd's repo)"
+---
 
-@description Dependabot CI-green auto-lander: classify bumps, gate on CI, merge patch/minor, fix red CI in a worktree.
-@arguments $ARGS: [repo] [--execute]   (repo defaults to the cwd's repo)
+# Loops — Dependabot Lander
 
 Run the dependabot lander for a repo.
 

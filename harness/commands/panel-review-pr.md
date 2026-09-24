@@ -1,7 +1,9 @@
-# Panel Review and Fix PR
+---
+description: "Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge, plus the SonarCloud hard gate where the repo enables that seat) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. It ends by running the pre-land gate and offering to land only on READY; merging stays opt-in."
+argument-hint: "[pr ...] [repo] [--reviewers a,b] [--rounds N|--loop]  (defaults: the current branch's open PR in the cwd's repo, the repo's configured reviewers, and 6 rounds)"
+---
 
-@description Like /review-pr, but the findings come from the multi-reviewer PANEL (Claude + Codex + Antigravity + master judge, plus the SonarCloud hard gate where the repo enables that seat) instead of one sub-agent reviewer. Ensures a PR exists, runs ~/.claude/loops/panel.py (which comments the summary on the PR), then a sub-agent fixes every master-confirmed finding boil-the-ocean style and pushes — and the panel then RE-REVIEWS that fix commit, which is the round nobody used to run. Give it several PR numbers and each one is reviewed+fixed by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample and can be named explicitly. It ends by running the pre-land gate and offering to land only on READY; merging stays opt-in.
-@arguments $ARGS: [pr ...] [repo] [--reviewers a,b] [--rounds N|--loop]  (defaults: the current branch's open PR in the cwd's repo, the repo's configured reviewers, and 6 rounds)
+# Panel Review and Fix PR
 
 You are the **ORCHESTRATOR**. This is `/review-pr` with the panel as the
 finding engine: the panel finds, an autonomous sub-agent fixes everything to the

@@ -1,7 +1,9 @@
-# Loops — Fix and Review an issue (implement, independent review, merge-ready, stop)
+---
+description: "Implement an issue, have an INDEPENDENT agent panel-review it, do every piece of merge prep that is stable — and stop at the merge for a human. `/fix-and-land` without the landing."
+argument-hint: "<issue-number> [repo] [--rounds N|--loop] [--base <branch>]   (repo defaults to the cwd's repo)"
+---
 
-@description Implement an issue, have an INDEPENDENT agent panel-review it, do every piece of merge prep that is stable — and stop at the merge for a human. `/fix-and-land` without the landing.
-@arguments $ARGS: <issue-number> [repo] [--rounds N|--loop] [--base <branch>]   (repo defaults to the cwd's repo)
+# Loops — Fix and Review an issue (implement, independent review, merge-ready, stop)
 
 End-to-end for ONE issue, up to but **not including** the merge. This is the command for anything
 you intend to look at yourself: it spends the review properly, leaves the PR mechanically
@@ -41,7 +43,7 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
    overrode it. `headless_permission_mode` is what the sub-agents run under.
 
    **Then check the repo argument is one you can actually honour.** `/fix-issue` has **no repo
-   parameter** — its `@arguments` is `<issue-number> [--base <branch>]` and it operates on the
+   parameter** — its `argument-hint` is `<issue-number> [--base <branch>]` and it operates on the
    canonical remote of whatever checkout it runs in. So a repo argument
    naming anything other than the cwd's repo cannot be carried into step 2: it would resolve
    *that* repo's rules and then implement the issue *here*, silently. If `<repo>` was given and

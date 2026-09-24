@@ -137,11 +137,12 @@ def test_every_linked_command_has_a_file(name: str, shipped: set[str]):
 
 @pytest.mark.parametrize("name", sorted(_shipped()))
 def test_every_command_declares_a_description(name: str):
-    """`@description` is what Claude Code shows in the command list, and a command nobody can tell
-    apart from its siblings is most of the way to not being installed."""
+    """The frontmatter `description:` is what Claude Code shows in the command list (an `@description`
+    body line never reaches it), and a command nobody can tell apart from its siblings is most of
+    the way to not being installed."""
     text = _brief(name).read_text(encoding="utf-8")
-    assert re.search(r"^@description \S", text, re.MULTILINE), (
-        f"harness/commands/{name}.md has no `@description` line")
+    assert re.match(r"---\n(?:.*\n)*?description: \S.*\n(?:.*\n)*?---\n", text), (
+        f"harness/commands/{name}.md has no frontmatter `description:`")
 
 
 # --------------------------------------------- what makes /fix-and-review that command

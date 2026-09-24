@@ -368,7 +368,7 @@ def test_the_brief_never_asks_create_worktree_for_a_shared_database(brief):
         f"fix-issue.md still passes --shared-db to create-worktree: {offenders}. Step 7 runs "
         "the full suite unconditionally and its teardown truncates, so a shared database is "
         "never safe here — #340")
-    argline = next(line for line in brief.splitlines() if line.startswith("@arguments"))
+    argline = next(line for line in brief.splitlines() if line.startswith("argument-hint:"))
     assert "--shared-db" not in argline and "--isolated-db" not in argline, (
         f"the brief still advertises a DB mode in its arguments: {argline}")
 

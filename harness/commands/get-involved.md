@@ -1,7 +1,9 @@
-# Get Involved — take the next item off the plan
+---
+description: "Take the highest free item off the board's plan for this scope, claim it before starting, and work it with the right skill. No issue number: the plan already has the order."
+argument-hint: "[scope] — `owner/name` or `project:<name>`. Default: this checkout's repo."
+---
 
-@description Take the highest free item off the board's plan for this scope, claim it before starting, and work it with the right skill. No issue number: the plan already has the order.
-@arguments $ARGS: [scope] — `owner/name` or `project:<name>`. Default: this checkout's repo.
+# Get Involved — take the next item off the plan
 
 Somebody worked out an order with another agent and put it on the board. This picks the top of it
 up. **You are not being asked to decide what is worth doing** — a human did that when they ordered

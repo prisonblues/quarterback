@@ -1,6 +1,8 @@
-# Loops — overview & command reference
+---
+description: "Explain the agent coding-loops system and list every way to run it."
+---
 
-@description Explain the agent coding-loops system and list every way to run it.
+# Loops — overview & command reference
 
 The user wants to understand the loops system and what they can run. The loop engine ships with
 **quarterback** (source: `harness/loops/` in that repo) and is installed to **`~/.claude/loops/`**;
