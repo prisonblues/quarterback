@@ -153,10 +153,10 @@ def advice(repo: str, states: list[dict[str, Any]]) -> str | None:
         )
 
     if first["dirty"]:
-        line += " Working tree is dirty — commit or stash first."
+        line += " Working tree is dirty, so pull only after committing (or `qb-stash push`)."
     if first["ahead"]:
         n = first["ahead"]
-        line += f" You also have {n} commit{'s' if n != 1 else ''} not on the remote — push them."
+        line += f" You also have {n} commit{'s' if n != 1 else ''} not on the remote."
     if len(stale) > 1:
         line += f" ({len(stale) - 1} other worktree(s) stale too.)"
     return line

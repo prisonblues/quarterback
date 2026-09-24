@@ -243,6 +243,11 @@ _once() {   # _once <key>: true the first time only (no expiry) — dedupe by id
   [ -f "$mark" ] && return 1
   : > "$mark"; return 0
 }
+_unseen() {  # _unseen <key> <text>: true unless this exact <text> was already injected
+  # under <key>. A cadence limits how often an advisory fires, not whether it
+  # repeats; an unchanged note the session has already read is only noise.
+  _once "$1-$(printf '%s' "$2" | sha256sum | cut -c1-16)"
+}
 
 # ---- is this turn somebody declaring work? (#157) ---------------------------
 # A prompt is not a claim. The UserPromptSubmit block below publishes the turn
@@ -1551,6 +1556,7 @@ case "$EVENT" in
     # which is the only moment it saves a wasted build. Merged with the occupancy
     # note below into one injection.
     SEP=$'\n\n'; start_notes="$(_sync_note)"
+    [ -n "$start_notes" ] && { _unseen "sync-$sid" "$start_notes" || :; }
     # The mode next, and above the occupancy note on purpose: "several agents are
     # live in this repo" reads completely differently depending on whether this
     # repo expects them to share a tree, and the answer has to arrive first to
@@ -1725,15 +1731,16 @@ case "$EVENT" in
               + (if $top.last_post_id then ", re=" + ($top.last_post_id|tostring) else "" end)
               + ", summary=\"...\")."
           end' 2>/dev/null)
-      [ -n "$p" ] && notes="${notes:+$notes$SEP}$p"
+      [ -n "$p" ] && _unseen "discover-$sid" "$p" && notes="${notes:+$notes$SEP}$p"
     fi
 
     # (c) Stale checkout (v2.8): a peer published commits this checkout doesn't
     # have. Throttled per session — the SessionStart note covers the start, this
-    # catches a peer landing work mid-session, before we build on stale code.
+    # catches a peer landing work mid-session, before we build on stale code. An
+    # unchanged note is not re-injected (_unseen); a new count or commit is.
     if [ -n "$repo" ] && _throttle "sync-$sid" 300; then
       s=$(_sync_note)
-      [ -n "$s" ] && notes="${notes:+$notes$SEP}$s"
+      [ -n "$s" ] && _unseen "sync-$sid" "$s" && notes="${notes:+$notes$SEP}$s"
     fi
 
     if [ -n "$notes" ]; then

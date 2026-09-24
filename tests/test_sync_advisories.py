@@ -100,6 +100,7 @@ def test_advice_names_the_commit_publisher_and_local_hazards():
     assert "git pull" in line
     assert "dirty" in line                      # don't pull onto uncommitted work
     assert "1 commit not on the remote" in line  # the other half of drift
+    assert "git stash" not in line and "push them" not in line
 
 
 # ---- /sync over the real board ----------------------------------------------
