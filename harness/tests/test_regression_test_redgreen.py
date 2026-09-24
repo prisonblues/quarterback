@@ -249,16 +249,17 @@ def test_a_file_the_fix_added_is_captured_and_removed_correctly(briefs):
 
     `git diff` ignores untracked files, so without `git add -N` a fix spanning an edit
     and a new module is half-captured and the red run imports the new half. And a path
-    absent from HEAD cannot be restored by `git checkout HEAD --`, so the removal of an
-    added file is an `rm`. Codex flagged the first half; the second follows from it and
-    is the one that errors confusingly rather than silently."""
+    absent from HEAD cannot be restored by `git checkout HEAD --` (which dcg refuses in any
+    case), so the removal of an added file is either `git apply -R` on the captured patch,
+    which deletes it, or an `rm`. Codex flagged the first half; the second follows from it
+    and is the one that errors confusingly rather than silently."""
     for name, text in briefs.items():
         assert re.search(r"add -N", text), (
             f"{name} omits `git add -N`, so `git diff` ignores a file the fix ADDED "
             f"and the red run imports it — the fix is only half removed")
-        assert re.search(r"\brm\b", text), (
-            f"{name} does not say a file the fix ADDED comes out with `rm`; "
-            f"`git checkout HEAD --` cannot restore a path absent from HEAD")
+        assert re.search(r"apply -R|\brm\b", text), (
+            f"{name} does not say how a file the fix ADDED comes out (`git apply -R` "
+            f"or `rm`); `git checkout HEAD --` cannot restore a path absent from HEAD")
 
 
 def test_the_failure_has_to_be_the_assertion(briefs):

@@ -25,10 +25,10 @@ confirmation.
 
 ## Philosophy
 
-The marginal cost of completeness is near zero. Do the whole
-thing. Write the tests. Update the docs. Fix the related code.
-Never leave a dangling thread when tying it off takes five more
-minutes. The standard is "nothing left to improve".
+Deliver the complete fix in one PR: root cause, regression tests,
+affected docs, and the same defect wherever it recurs in sibling
+code. Unrelated improvements you notice go in a follow-up issue,
+not this diff.
 
 ## 0. Pre-flight
 
@@ -59,23 +59,9 @@ Write an implementation plan. List:
 - Related code that needs to change for consistency
 - Risks and how you'll mitigate them
 
-**There is no DB mode to decide, and that is deliberate** (#340). This step used
-to ask you to classify the change — schema churn gets an isolated database copy,
-read-only work shares the main one and skips the copy — and step 3 offered
-`--shared-db` to act on the answer.
-
-The classification asked the wrong question. What decides whether the shared
-database is safe is not whether *your change* writes to it; it is whether
-*anything you run* truncates it. Step 7 runs the full suite on every invocation,
-without exception, and this suite's teardown truncates. So the answer was already
-"unsafe" before you had finished reading the issue, and a correct classification
-led to a worktree the suite's own guard then refused to run in — which is how
-that guard came to stop two runs in one day.
-
-So: the worktree always gets its own database copy, this skill passes no DB flag,
-and there is nothing here for you to weigh. (`--shared-db` still exists on
-`create-worktree`, where it is meaningful for a caller that genuinely never runs
-a suite. This is not one of them.)
+The worktree always gets its own database copy, and this skill passes no DB
+flag. Step 7 runs the full suite and its teardown truncates the database, so
+sharing the main one is never safe here.
 
 ## 3. Get an isolated worktree — provision, reuse or inherit — then verify it
 
@@ -110,13 +96,9 @@ docs. The branch is `{prefix}issue-$ISSUE_NUMBER`.
   prior work is sometimes exactly what the issue needs — and nothing here
   forbids it.
 
-  What it forbids is inheriting that worktree's configuration unexamined.
-  **Nothing provisioned it this time, so nothing gave it its own database**, and
-  a worktree created before per-worktree databases existed still names the
-  **main** one. That is the second route into #340 and the one nobody chose:
-  `feat/issue-85` reached the shared database with no `--shared-db` anywhere,
-  because a reused worktree carried a `.env` older than the isolation that was
-  supposed to protect it.
+  What it forbids is trusting that worktree's configuration: nothing
+  provisioned it this time, and a worktree older than per-worktree databases
+  still names the **main** one in its `.env`.
 
   Resolve `WT_DIR` for the existing worktree with the same `git worktree list`
   command below, then go to **Isolation check**.
@@ -237,14 +219,6 @@ the offending `.env` variable, or `remove-worktree` and provision again, then
 re-run the check. If you cannot resolve it, say so and stop; do not carry on with
 DB work flagged as "probably fine".
 
-**Why it is a command and not a paragraph.** The check this replaces read
-`create-worktree`'s output for its residual-`.env` warning, so it only ran when
-`create-worktree` ran — and a **reused** worktree, the one route where nothing
-provisioned a database and the `.env` is therefore least trustworthy, skipped the
-check entirely. That is how `feat/issue-85` came to point at the shared database
-with every decision above it made correctly. A check conditional on the safe path
-having been taken is not a check.
-
 `check-db-isolation` ships with this harness, so it is on `PATH` wherever this
 brief is. If it is not, do not read that as permission: run
 `harness/bin/check-db-isolation` from the harness checkout, or compare
@@ -272,7 +246,7 @@ Follow the project's CLAUDE.md standards.
 
 Write the complete solution:
 - Fix the root cause, not the symptom.
-- If related code has the same problem, fix it too — don't leave
+- If sibling code has the same defect, fix it too — don't leave
   known bugs for a follow-up.
 - If a rename or pattern change should propagate, propagate it
   everywhere.
@@ -304,8 +278,7 @@ Before you commit, make each new regression test fail:
 cd "$WT_DIR" && git add -N <every file your fix changed OR ADDED>
 cd "$WT_DIR" && git diff HEAD -- <those same files> > .redgreen.patch
 cd "$WT_DIR" && { test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }; }
-cd "$WT_DIR" && git checkout HEAD -- <the files that existed before>
-cd "$WT_DIR" && rm <the files your fix ADDED>
+cd "$WT_DIR" && git apply -R .redgreen.patch   # fix out; files it ADDED are deleted
 cd "$WT_DIR" && pytest <the new tests>    # MUST fail, on the assertion
 cd "$WT_DIR" && git apply .redgreen.patch && rm .redgreen.patch
 cd "$WT_DIR" && pytest <the new tests>    # green again
@@ -334,19 +307,20 @@ run the check existed to prevent.
 **`git add -N` is what puts a file the fix ADDED into the patch.**
 Without intent-to-add, `git diff` ignores untracked files, so a fix
 spanning an edit and a new module is half-captured and the red run
-imports the new half. Added files come back out with `rm`, not `git
-checkout HEAD --`, which cannot restore a path absent from HEAD.
-Your new *test* file is not in the list and stays put — the point.
+imports the new half. `git apply -R` then deletes each added file,
+so no `rm` or `git checkout` is needed. Do not reach for `git
+checkout <ref> -- <path>`: dcg refuses it. Your new *test* file is
+not in the list and stays put — the point.
 
-**If the fix is already committed** there is nothing uncommitted to
-capture: use `git checkout <remote>/<base> -- <the files your fix
-changed>`, run the tests, then `git checkout HEAD -- <the same
-files>`.
+**If the fix is already committed**, build the patch against the
+base instead (`git diff <remote>/<base> -- <the files your fix
+changed> > .redgreen.patch`) and run the same `test -s` / `apply -R`
+/ test / `apply` sequence.
 
 Read *how* it failed. An import error, a missing fixture or a
 `TypeError` demonstrates nothing — the failure has to be the
-assertion that names the defect. Stash the **fix**, not the test:
-stash both and all you have proved is that a file you removed no
+assertion that names the defect. Remove the **fix**, not the test:
+remove both and all you have proved is that a file you removed no
 longer runs.
 
 **Exempt only where there is genuinely nothing to fail against:** a
@@ -374,6 +348,11 @@ not a follow-up.
 For non-trivial features: add or update the relevant doc section
 with enough detail for someone unfamiliar with the code to
 understand what was built and why.
+
+If the repo has a `changelog.d/` directory and this change ships
+(anything outside docs/tests), write `changelog.d/$ISSUE_NUMBER.<kind>.md`
+as that directory's README describes. Name no version, and never
+edit `CHANGELOG.md` directly.
 
 ## 7. Build, test, lint
 
@@ -440,10 +419,10 @@ Fold genuine bugs Codex flags into your fixes — don't dismiss one just because
 you didn't spot it. Drop only clear false positives or pure nits. If `codex` is
 absent, not logged in, or errors, skip it silently — it never blocks.
 
-Rank findings P1-P4 for the summary. Fix all of them. The only
-valid skip is a genuine false positive where re-examination
-confirms the code is correct. "Not worth the churn" is not valid.
-"Can do later" is not valid.
+Rank findings P1-P4 for the summary. Fix every P1-P3 unless
+re-examination shows it is a false positive; take a P4 only when it
+is trivial and inside code the fix already touches, and list the
+rest in the PR body.
 
 **Before you fix a finding, write one line naming who consumes the
 code the fix would change** — the callers, from a search you ran, and

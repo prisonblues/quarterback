@@ -144,7 +144,7 @@ fix as a patch, remove it, watch the tests go red, put it back:
 git add -N <every file your fix changed OR ADDED>
 git diff HEAD -- <those files> > .redgreen.patch
 test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }
-git checkout HEAD -- <the files that existed before>; rm <the files it ADDED>
+git apply -R .redgreen.patch      # fix out; files it ADDED are deleted
 pytest <the new tests>            # MUST fail, on the assertion
 git apply .redgreen.patch && rm .redgreen.patch
 pytest <the new tests>            # green again
@@ -160,11 +160,13 @@ exit 1; }`, never a bare `|| echo …`, which warns and carries on: an empty cap
 paths, or a fix already committed) leaves the red run executing with the fix in place,
 coming out **green**, reading exactly like the step passing. `git add -N` is what puts a file the
 fix ADDED into the patch — without it `git diff` ignores untracked files and the red
-run imports the new half; those come back out with `rm`, not `git checkout HEAD --`.
+run imports the new half; `git apply -R` then deletes those, so no `rm` or `git
+checkout` is needed. Do not reach for `git checkout <ref> -- <path>`: dcg refuses it.
 Your new *test* file is not in the list and stays put, which is the point: remove it
 too and the red run collects nothing, which is not a red test.
-If the fix is already committed: `git checkout <remote>/<base> -- <the files your fix
-changed>`, test, then `git checkout HEAD -- <the same files>`.
+If the fix is already committed, build the patch against the base instead
+(`git diff <remote>/<base> -- <the files your fix changed> > .redgreen.patch`) and run
+the same `test -s` / `apply -R` / test / `apply` sequence.
 
 Read *how* it failed. An import error, a missing fixture or a `TypeError` proves
 nothing — the failure has to be the assertion that names the defect. A removed fix
