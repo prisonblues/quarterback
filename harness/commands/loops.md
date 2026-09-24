@@ -20,9 +20,11 @@ always present once the harness is installed.
      not write the code and stops at merge-ready; `/fix-and-land` goes on to merge on a mechanical
      gate plus stated confidence. Wanting the first one to merge is the signal to have run the
      second.
-   - **Gate model:** SonarCloud = the only HARD gate; Claude + Codex = soft findings; **master
-     judgment, no consensus gate** (a real bug from one reviewer still gets fixed); **merge is
-     always a human step** (except dependabot patch/minor).
+   - **Gate model:** CI and, where a repo enables the `sonarqube` seat, SonarCloud are hard
+     gates; reviewer findings are soft and the master judges them (**no consensus gate** — one
+     reviewer's real bug still gets fixed). Merge is a human step except for dependabot
+     patch/minor and `/fix-and-land`, which merges on a READY preland verdict plus stated
+     confidence.
    - **Per-repo config:** each repo carries its own tracked `.harness-rules.sample` for policy,
      beside an untracked per-box `.harness-rules` holding only what THIS machine's providers
      serve (`reviewers.<seat>.{enabled,model,effort}`, narrowing only). Omitted keys fall back to
@@ -54,8 +56,8 @@ always present once the harness is installed.
    in the working tree whoever put it there and so is read on the interactive path only.
    Interactive runs use the working tree, so your local edits apply immediately.
 
-4. State current reality briefly: panel is live (Claude + Codex + master judge); SonarCloud gate is
-   wired but dormant until the repo's CI publishes PR analysis; everything defaults to dry-run/report-only;
-   auto-execute paths exist but should be trialled supervised first.
+4. State current reality from `harness_rules.py --json`: which seats are enabled here, whether
+   `sonarqube` is on, that everything defaults to dry-run/report-only, and that auto-execute paths
+   exist but should be trialled supervised first.
 
 Keep it tight and tailored to what the repo at hand actually resolves to.
