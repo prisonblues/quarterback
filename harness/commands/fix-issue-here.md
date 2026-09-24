@@ -212,7 +212,7 @@ related code that should also change.
 command -v codex >/dev/null && git diff | \
   codex exec "Review this diff for REAL defects only (correctness, security,
   error handling, broken edge cases — not style). file:line + one line each.
-  Concise, conservative." 2>/dev/null || true
+  Concise." 2>/dev/null || true
 ```
 Fold genuine bugs in; drop only clear false positives. Skip silently if absent.
 

@@ -412,7 +412,7 @@ command -v codex >/dev/null && \
   git diff <remote>/<base>...HEAD | \
   codex exec "Review this diff for REAL defects only (correctness, security,
   error handling, broken edge cases — not style). List each as file:line + a one-
-  line description. Be concise and conservative." 2>/dev/null || true
+  line description. Be concise." 2>/dev/null || true
 ```
 
 Fold genuine bugs Codex flags into your fixes — don't dismiss one just because

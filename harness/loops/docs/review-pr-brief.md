@@ -403,7 +403,7 @@ you are fixing the class rather than the finding.
 
 The harness measures this and reports it: `fix_surface` in the round payload names the
 files the fix range touched and how many of them no earlier round had seen. It **gates
-nothing** today — instrumented, printed and read, per #67's instrument-before-gate rule
+nothing** — instrumented, printed and read, per #67's instrument-before-gate rule
 — so there is no threshold here for you to apply and none for you to invent.
 
 **The low-severity band is on a budget, and you spend it by COUNTING.** Findings
@@ -798,7 +798,7 @@ if the script isn't there.
   told to decide nothing and write no patch, and filing the premise yourself is
   the first move of the redesign you are declining to make.
 
-  The board ROW is nobody's to file any more: when the brake refuses your fix,
+  You do not file the board ROW either: when the brake refuses your fix,
   `--premise` raises it for you (#555) and prints what it did on the `board` line
   of its report. Re-raising an identical open question is a no-op at the board, so
   a second declaration of the same premise re-uses the row rather than opening a
@@ -849,8 +849,7 @@ would have caught anything. Before you commit, make each one fail:
 git add -N <every file your fix changed OR ADDED>
 git diff HEAD -- <those same files> > .redgreen.patch
 test -s .redgreen.patch || { echo "STOP: captured nothing"; exit 1; }
-git checkout HEAD -- <the files that existed before>   # drop the edits
-rm <the files your fix ADDED>                          # and the additions
+git apply -R .redgreen.patch                           # fix out; files it ADDED are deleted
 pytest <the new tests>                                 # MUST fail, on the assertion
 git apply .redgreen.patch && rm .redgreen.patch        # put the fix back
 pytest <the new tests>                                 # green again
@@ -864,21 +863,18 @@ mistyped paths, or a fix already committed — the "red" run executes with the f
 in place, comes out **green**, and reads exactly like the step passing. So the guard is
 `|| { echo …; exit 1; }` and not `|| echo …`: a bare `echo` prints a warning, exits 0,
 and carries straight on into the run it was meant to prevent, which is the failure mode
-wearing the costume of a check. Every version
-of this check that trusted something other than "did we actually capture bytes" failed
-on that state: a `git stash list | head -1` label match is answered yes by a leftover
-stash from an earlier run.
+wearing the costume of a check.
 
 **`git add -N` is what makes a file the fix ADDED show up in the patch.** Without
 intent-to-add, `git diff` ignores untracked files, so a fix spanning an edit and a new
-module is half-captured and the red run imports the new half. Those same added files
-are removed with `rm` rather than `git checkout HEAD --`, which cannot restore a path
-that is absent from HEAD. Your new *test* file is not in this list and stays where it
-is — which is the point.
+module is half-captured and the red run imports the new half. `git apply -R` then
+deletes each added file, so no `rm` or `git checkout` is needed. Do not reach for
+`git checkout <ref> -- <path>`: dcg refuses it. Your new *test* file is not in this list
+and stays where it is — which is the point.
 
-**If your fix is already committed**, there is nothing uncommitted to capture: get the
-pre-fix state with `git checkout <remote>/<base> -- <the files your fix changed>`, run
-the tests, then `git checkout HEAD -- <the same files>` to put your fix back.
+**If your fix is already committed**, build the patch against the base instead
+(`git diff <remote>/<base> -- <the files your fix changed> > .redgreen.patch`) and run
+the same `test -s` / `apply -R` / test / `apply` sequence.
 
 Read *how* it failed. A test that errors on an import, a missing fixture or a
 `TypeError` has not demonstrated anything — it has to fail on the assertion that

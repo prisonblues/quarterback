@@ -182,7 +182,7 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
 
    Where the script *is* present: exit 2 names the paths that ship and the fragment to write,
    and the repair is to write it — one file, named after the issue, naming no version. Do not
-   satisfy it by writing in `CHANGELOG.md`: that no longer counts, and it is refused separately
+   satisfy it by writing in `CHANGELOG.md`: that does not count, and it is refused separately
    by `pre-push` and by the `generated release files are output` CI job. A branch confined to
    docs or tests passes in silence.
 
