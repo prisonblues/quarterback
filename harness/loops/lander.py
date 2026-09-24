@@ -42,13 +42,16 @@ GROUP_RE = re.compile(r"\bgroup\b", re.I)
 
 DEPENDABOT_LOGIN = "dependabot[bot]"
 FIX_PROMPT = (
-    "This branch is a Dependabot dependency bump and its CI is failing. "
-    "Investigate the failing checks for PR #{n} in {repo}, then fix ONLY the breakage "
-    "caused by the dependency update (lockfile, imports, renamed/removed APIs, "
-    "type/signature changes). Keep the change minimal; do not touch unrelated code. "
-    "Make the source edits ONLY — do NOT run shell commands, and do NOT commit or "
-    "push. CI re-runs to validate; the loop handles commit and push."
+    "This branch is a Dependabot dependency bump for PR #{n} in {repo}, and its CI is "
+    "failing. The failing checks' output is below. Fix only the breakage the dependency "
+    "update caused (lockfile, imports, renamed/removed APIs, type/signature changes) and "
+    "leave unrelated code alone. You can edit files but not run commands: this loop "
+    "commits, pushes and lets CI re-run as the validation.\n\n"
+    "--- FAILING CHECKS ---\n{ci_log}"
 )
+#: How much of the failed-run log the fixer sees. The tail is where the error is,
+#: and the whole log of a matrix run can be megabytes.
+CI_LOG_TAIL_CHARS = 12000
 
 
 @dataclass
@@ -140,6 +143,29 @@ def head_commit_author(gh_repo: str, branch: str) -> str:
     return out.strip()
 
 
+def failing_checks_log(gh_repo: str, branch: str) -> str:
+    """The tail of the newest failed CI run's log on `branch`, for the fixer.
+
+    The fixer runs edit-only, with no shell or gh of its own, so the log it needs
+    to see what broke has to arrive in the prompt. A lookup that fails says so in
+    the text rather than raising: the agent can still read the diff and lockfile.
+    """
+    try:
+        runs = subprocess.run(
+            ["gh", "run", "list", "--repo", gh_repo, "--branch", branch,
+             "--status", "failure", "--limit", "1", "--json", "databaseId"],
+            capture_output=True, text=True, check=True).stdout
+        run_ids = [r["databaseId"] for r in json.loads(runs or "[]")]
+        if not run_ids:
+            return "(no failed run found on this branch; read the lockfile and diff instead)"
+        log = subprocess.run(
+            ["gh", "run", "view", str(run_ids[0]), "--repo", gh_repo, "--log-failed"],
+            capture_output=True, text=True, check=True).stdout
+    except (subprocess.CalledProcessError, OSError, ValueError, KeyError, TypeError) as e:
+        return f"(could not fetch the failing checks' log: {e})"
+    return log[-CI_LOG_TAIL_CHARS:] or "(the failed run's log was empty)"
+
+
 def fix_red(d: Decision, gh_repo: str, repo_path: str, execute: bool) -> None:
     """Open a plain worktree on the dependabot branch, let an agent fix the
     breakage, and push back to the same branch so the PR re-runs CI.
@@ -154,7 +180,6 @@ def fix_red(d: Decision, gh_repo: str, repo_path: str, execute: bool) -> None:
         return
 
     wt_dir = f"{repo_path}-dependabot-{d.number}"
-    prompt = FIX_PROMPT.format(n=d.number, repo=gh_repo)
 
     if not execute:
         print(f"  #{d.number}: WOULD fix red CI — "
@@ -171,6 +196,8 @@ def fix_red(d: Decision, gh_repo: str, repo_path: str, execute: bool) -> None:
                        check=True)
         subprocess.run(["git", "-C", repo_path, "worktree", "add", wt_dir,
                         f"origin/{d.head}"], check=True)
+        prompt = FIX_PROMPT.format(n=d.number, repo=gh_repo,
+                                   ci_log=failing_checks_log(gh_repo, d.head))
         # Headless agent EDITS ONLY (acceptEdits) — no shell/git access needed.
         # The loop owns commit+push, so the agent never gets bash in an unattended
         # loop. CI is the validation gate.
