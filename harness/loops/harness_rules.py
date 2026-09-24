@@ -157,8 +157,11 @@ AGY_EFFORTS = ("low", "medium", "high")
 # CLI validates the level before the turn starts, so a typo costs a startup
 # rather than a whole reviewer's turn — but only for the levels it knows.
 GROK_EFFORTS = ("low", "medium", "high", "xhigh")
+# claude takes `--effort`, and on current models it is the only control over how
+# deeply a seat thinks.
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS,
-           "grok": GROK_EFFORTS}
+           "grok": GROK_EFFORTS, "claude": CLAUDE_EFFORTS}
 
 # ------------------------------------------------------ SHADOW AND ENFORCE (#779)
 #

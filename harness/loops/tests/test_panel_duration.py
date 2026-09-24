@@ -46,6 +46,6 @@ def test_a_config_error_reports_a_duration_too(monkeypatch):
     measured."""
     monkeypatch.setattr(panel_seats, "run_cli",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("ran")))
-    got = panel.review_llm("claude", "sonnet", "p", effort="high")
-    assert "takes no reasoning effort" in got.skip
+    got = panel.review_llm("claude", "sonnet", "p", effort="maxx")
+    assert "unknown reasoning effort" in got.skip
     assert isinstance(got.duration_ms, int) and got.duration_ms >= 0

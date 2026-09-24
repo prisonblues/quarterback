@@ -104,10 +104,16 @@ def test_effort_sets_are_per_cli_not_unioned(monkeypatch):
     assert called == [] and "unknown reasoning effort" in got.skip and "minimal" in got.skip
 
 
-def test_a_cli_with_no_effort_knob_says_so(monkeypatch):
-    """claude takes no reasoning level. Setting one is a config error worth
-    naming, not a flag to quietly drop on the floor."""
+def test_a_claude_effort_typo_is_refused_before_anything_runs(monkeypatch):
+    """claude's levels are checked like every other seat's: a typo is a config
+    error worth naming, not a flag to hand the CLI."""
     called = []
     monkeypatch.setattr(panel_seats, "run_cli", lambda *a, **k: called.append(a) or (None, None))
-    got = panel.review_llm("claude", "sonnet", "p", effort="high")
-    assert called == [] and "takes no reasoning effort" in got.skip
+    got = panel.review_llm("claude", "sonnet", "p", effort="maxx")
+    assert called == [] and "unknown reasoning effort" in got.skip and "xhigh" in got.skip
+
+
+def test_a_claude_effort_reaches_the_cli():
+    args = panel.claude_args("sonnet", "sid", effort="high")
+    assert args[args.index("--effort") + 1] == "high"
+    assert "--effort" not in panel.claude_args("sonnet", "sid")

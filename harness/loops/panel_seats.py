@@ -39,6 +39,7 @@ import panel_core  # noqa: F401  — for anything wanting the module
 # tuple. Import direction is fixed by panel_core already importing harness_rules.
 from harness_rules import (  # noqa: F401  — re-exported, see __all__
     AGY_EFFORTS,
+    CLAUDE_EFFORTS,
     CODEX_EFFORTS,
     EFFORTS,
     GROK_EFFORTS,
@@ -3685,7 +3686,8 @@ def code_budget(panel: dict, notes: list[str]) -> float | None:
 
 
 def claude_args(model: str, session_id: str, reads_code: bool = False,
-                budget_usd: float | None = None) -> list[str]:
+                budget_usd: float | None = None, effort: str = "",
+                json_schema: dict | None = None) -> list[str]:
     """`claude -p` argv for a panel seat.
 
     **The tool pin is only applied when the seat has a tree to read**, and the
@@ -3709,8 +3711,16 @@ def claude_args(model: str, session_id: str, reads_code: bool = False,
     `--permission-mode manual` accompanies the allowlist rather than replacing it.
     The allowlist says what may be used; the mode says nothing may be granted
     interactively, which matters because a headless seat cannot be asked and the
-    default mode's answer to "may I?" is a prompt nobody will see."""
+    default mode's answer to "may I?" is a prompt nobody will see.
+
+    `json_schema` makes the CLI validate the reply against it and print only the
+    JSON object, so a seat whose whole answer is structured cannot come back as
+    prose around it."""
     args = ["claude", "-p", "--model", model, "--session-id", session_id]
+    if effort:
+        args += ["--effort", effort]
+    if json_schema is not None:
+        args += ["--json-schema", json.dumps(json_schema, separators=(",", ":"))]
     if reads_code:
         args += ["--permission-mode", "manual",
                  "--allowedTools", *READ_ONLY_TOOLS]
@@ -4863,7 +4873,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # the seat is pinned to read-only tools for a checkout it does not
                 # have — the pin and the cwd disagreeing about the same fact.
                 return claude_args(model, new_session(), reads_code=reads_code,
-                                   budget_usd=budget_usd)
+                                   budget_usd=budget_usd, effort=asked_effort[0])
         elif cmd_name == "antigravity":
             # Not instrumented: `agy` has no session-id to pin, and its usage
             # lives only in the JSON mode this design declines. It reviews
@@ -5916,6 +5926,7 @@ __all__ = [
     "LOCAL_SUITE_TIMEOUT_MAX", "LOCAL_SUITE_TIMEOUT_MIN", "trusted_panel_block",
     "local_suite_commands", "local_suite_timeout",
     "panel_core", "CODEX_EFFORTS", "PI_EFFORTS", "AGY_EFFORTS", "GROK_EFFORTS",
+    "CLAUDE_EFFORTS",
     # #776, re-exported for the efforts' reason: `panel.py` scales the diff budget
     # with the same function this file scales the fix budget with, and two spellings
     # of the taper is two ways for a `None` to become a ceiling.

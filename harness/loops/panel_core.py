@@ -1439,6 +1439,15 @@ the one thing you can do with a question the prompt does not answer, and it is h
 learns what to put in the prompt next time.
 """
 
+#: What a judge that was NOT handed the tree is told. Not NO_TOOLS_BRIEF: the judge
+#: is a claude seat, which keeps its default tools in an empty sandbox, and it has
+#: no `could_not_assess` to put a gap in.
+JUDGE_NO_CODE_BRIEF = """You have not been given this project's code. Your working directory is an
+EMPTY repository, not this project, so any tool you use finds nothing there: the reports, the
+coverage declarations, the CI result and the diff in this prompt are the whole of the evidence.
+Do not go looking, and do not guess at a path on the machine running this and ask to read it.
+"""
+
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
 a pull request diff, held to the standard "nothing left to improve". The reports below come from
 several independent reviewers (Claude, Codex, SonarCloud), listed ONE PER REVIEWER — so the same
@@ -1470,8 +1479,7 @@ flagged by only ONE reviewer MUST be marked real — never dismiss it because th
 Mark real=false ONLY when the issue is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
-Return ONLY a JSON object (no prose), with one `verdicts` entry per REAL-WORLD ISSUE,
-covering every report id:
+Return one `verdicts` entry per REAL-WORLD ISSUE, covering every report id, in this shape:
   {{"verdicts": [{{"id": "F01",
                   "members": [<the bracketed report NUMBERS merged into this issue, e.g. 0, 3>],
                   "real": true|false,
@@ -1528,6 +1536,43 @@ takes):
 <<<CODE_ACCESS_BRIEF>>>
 <<<RECURRENCE_BRIEF>>>{diff}
 """
+
+#: The judge's reply shape, passed to `claude -p --json-schema` so the CLI returns
+#: exactly one validated object. JUDGE_PROMPT still carries the field semantics;
+#: this carries only the structure. Items stay open to extra keys because the
+#: recurrence brief adds `premise` to each verdict on rounds that ask it.
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "integer"}},
+                "real": {"type": "boolean"},
+                "severity": {"type": "string", "enum": ["P1", "P2", "P3", "P4"]},
+                "file": {"type": "string"},
+                "line": {"type": ["integer", "null"]},
+                "synthesis": {"type": "string"},
+                "related": {"type": "array", "items": {"type": "string"}},
+                "reason": {"type": "string"},
+            },
+            "required": ["id", "members", "real", "severity", "synthesis", "reason"],
+        }},
+        "coverage_rulings": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "declarations": {"type": "array", "items": {"type": "integer"}},
+                "claim": {"type": "string"},
+                "resolvable_in_harness": {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["declarations", "claim", "resolvable_in_harness", "reason"],
+        }},
+        "coverage_note": {"type": "string"},
+    },
+    "required": ["verdicts", "coverage_rulings", "coverage_note"],
+}
 
 ASK_PROMPT = """You are answering ONE question about a system, as a point of order. This is NOT a
 code review: do not look for defects, do not suggest improvements, and do not report anything the
@@ -3442,7 +3487,7 @@ __all__ = [
     "CODE_ACCESS_BRIEF",
     "NO_TOOLS_BRIEF",
     "NO_TOOLS_RULE",
-    "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
+    "JUDGE_PROMPT", "JUDGE_SCHEMA", "JUDGE_NO_CODE_BRIEF", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
     "HARNESS_DIGEST_SCHEME", "HARNESS_GIT_TIMEOUT_S", "_harness_git",
     "_harness_digest", "_harness_checkout", "harness_identity", "_loops_dir",
