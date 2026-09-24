@@ -421,3 +421,20 @@ def test_a_real_review_that_found_nothing_still_counts(monkeypatch, tmp_path):
     suspect halts an integration epic on its first clean sub-PR."""
     monkeypatch.setattr(epic.subprocess, "run", _panel_writing(_reviewed()))
     assert epic.run_panel(str(tmp_path), 99) == (True, 0)
+
+
+def test_triage_asks_the_cli_for_a_schema_validated_verdict(monkeypatch):
+    """The verdict is structured output, not JSON scraped out of prose, and the
+    schema only offers the tiers this run may spend."""
+    seen = []
+    monkeypatch.setattr(epic.shutil, "which", lambda name: "/usr/bin/claude")
+    monkeypatch.setattr(subprocess, "run", lambda args, **kw: seen.append(args) or ran(
+        out='{"doable": true, "reason": "clear scope", "model": "sonnet"}'))
+
+    doable, _, model, _cls = epic.triage(work(), "opus")
+
+    args = seen[0]
+    schema = json.loads(args[args.index("--json-schema") + 1])
+    assert schema["properties"]["model"]["enum"] == ["sonnet", "opus"]
+    assert args[args.index("--effort") + 1] == "low"
+    assert doable is True and model == "sonnet"
