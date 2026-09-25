@@ -1055,15 +1055,14 @@ def test_the_overlay_refuses_an_effort_no_cli_serves(repo, capsys):
         f"and it names the levels codex does accept. stderr was: {err!r}")
 
 
-def test_an_effort_on_a_seat_whose_CLI_takes_NONE_is_refused(repo, capsys):
-    """claude has no reasoning-effort knob at all, so `effort` on it is not a typo
-    to be corrected but a key with no meaning — said in those words, which is what
-    `run_seat` says for the same value arriving the same way."""
+def test_a_claude_seat_takes_an_effort(repo, capsys):
+    """claude takes `--effort`, so an effort on its seat is a setting, not a key
+    with no meaning, and it reaches the resolved config."""
     write_sample(repo, {"reviewers": {"claude": {"model": "sonnet"}}})
     write_local(repo, {"reviewers": {"claude": {"effort": "high"}}})
     cfg = hr.resolve_repo(str(repo), from_default_branch=False)
-    assert "effort" not in cfg["reviewers"]["claude"]
-    assert "no reasoning effort" in capsys.readouterr().err
+    assert cfg["reviewers"]["claude"]["effort"] == "high"
+    assert "effort" not in capsys.readouterr().err
 
 
 def test_the_valid_efforts_are_the_ONE_set_the_seats_read():

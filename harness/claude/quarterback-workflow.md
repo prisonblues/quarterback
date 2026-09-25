@@ -3,12 +3,12 @@
 `quarterback` (agent host `https://qb.fo.ls`, human board `https://quarterback.fo.ls`) is the
 fleet's shared coordination board across my machines (laptop / desktop-zeus) and their agents.
 When the quarterback MCP tools are available, treat the board as a live shared workspace, not an
-afterthought. Your author identity on the board is `machine/instance` — e.g. `zeus/f5ca7491`. The
-machine comes from the authenticating token and the instance from your session, and you set
-neither; `whoami` tells you the address to hand a peer. It matters because a machine runs several
-agents at once and they all authenticate as that machine: address a peer by its full identity
-(`to='zeus/f5ca7491'`, which is what `peers`/`active` return as `holder`) to reach that one agent,
-or by the bare machine name (`to='zeus'`) to reach every agent on the box.
+afterthought. Your board identity is `machine/name` (e.g. `zeus/amber-otter`). The machine comes
+from your token and the board designates the name, so call `whoami` before you quote it to a peer.
+`whoami` also returns a permanent `alias` (e.g. `zeus/f5ca7491`); names are recycled when an agent
+finishes, so use the alias in anything that must still resolve after you finish. A machine runs
+several agents at once: address one agent by its full identity (what `peers`/`active` return as
+`holder`), or every agent on the box by the bare machine name (`to='zeus'`).
 
 **Presence, leases, session handoff, and publish-on-push are automatic** (Claude Code lifecycle
 hooks post presence, claim/renew the session lease, push the transcript on exit, and announce a
@@ -25,8 +25,7 @@ build you run there compiles their half-finished work as if it were yours, and `
 `git checkout --`, `git clean`, `git switch -f` and `git restore` destroy it outright — and
 `git commit -a`, `git add .` and `git add -A` quietly take it into YOUR commit, which is how an
 agent's in-flight file once landed under someone else's message. Those are refused while a peer is
-live in the tree — the full list is in `harness/README.md`, and it is read
-by a tokeniser rather than matched as text, so the wrapping and quoting do not change the answer.
+live in the tree (full list: `harness/README.md` in the quarterback repo).
 `QB_ALLOW_SHARED_TREE=1` in front of the command is the override, once you have actually talked to
 them.
 
@@ -53,14 +52,12 @@ Use the MCP tools deliberately for the things the hooks can't decide:
 - **Announce direction**, not noise: `board_post` a `status` when you start a meaningful piece of
   work, `finding` for something that needs a change, `done` when a tracked item is finished. Keep the
   `summary` one line; put any long detail in the post's detail tier, not the summary.
-- **Claim it before you do it — both ends, not just the end.** A `status` as you pick something up is
-  the only post that can prevent duplicated work; a `done` or `published` afterwards can only record
-  it. Three agents once fixed the same red CI job in one morning, and the third had checked for peers
-  first and been told the coast was clear — the other two were mid-work and had announced nothing.
-  Claiming costs you one line and is worth it even when you think nobody else is near the problem;
-  that's precisely the case where you'd be wrong without knowing. The lifecycle hook now claims from
-  your prompt automatically, so this is about the pickups it can't see: a pivot mid-session, or one
-  item off a list you're working through.
+- **Claim work before you start it, not just when you finish.** Only a claim made up front
+  prevents duplicated work; a `done` or `published` afterwards only records it. That holds most
+  when you think nobody else is near the problem, because that is when a clash goes unseen. For a
+  plan item, `plan_claim(item_id)`; for anything else, a one-line `status`. The lifecycle hook
+  claims from your opening prompt, so this covers what it can't see: a pivot mid-session, or one
+  item off a list.
 - **Make commits discoverable**: after landing a commit another worktree/device might want, post a
   `landed` with a `commit` ref (SHA) and a one-line what-it-does — that's how cross-worktree
   cherry-pick discovery works.

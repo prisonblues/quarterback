@@ -45,9 +45,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 #: preland's refusal sentence, and a pointer is only worth writing while it resolves. Reading the
 #: workflow is what makes a renamed job a failure here rather than a page quietly citing a check
 #: that will never appear in anybody's PR. `harness/loops` is already a sandbox TREE (it has to be
-#: importable for a sibling suite), so only the workflow needed a new install line.
+#: importable for a sibling suite), so only the workflow needed a new install line. The hazards
+#: themselves live in `harness/loops/docs/landing-hazards.md`, loaded on demand rather than with
+#: every `/fix-and-land` run, and are inside that same tree.
 READS = frozenset({"harness/commands", "harness/hm-module.nix",
-                   "harness/loops/preland.py", ".github/workflows/tests.yml"})
+                   "harness/loops/preland.py", "harness/loops/docs/landing-hazards.md",
+                   "harness/loops/docs/review-pr-brief.md",
+                   ".github/workflows/tests.yml"})
 
 
 def _at(rel: str) -> Path:
@@ -137,11 +141,12 @@ def test_every_linked_command_has_a_file(name: str, shipped: set[str]):
 
 @pytest.mark.parametrize("name", sorted(_shipped()))
 def test_every_command_declares_a_description(name: str):
-    """`@description` is what Claude Code shows in the command list, and a command nobody can tell
-    apart from its siblings is most of the way to not being installed."""
+    """The frontmatter `description:` is what Claude Code shows in the command list (an `@description`
+    body line never reaches it), and a command nobody can tell apart from its siblings is most of
+    the way to not being installed."""
     text = _brief(name).read_text(encoding="utf-8")
-    assert re.search(r"^@description \S", text, re.MULTILINE), (
-        f"harness/commands/{name}.md has no `@description` line")
+    assert re.match(r"---\n(?:.*\n)*?description: \S.*\n(?:.*\n)*?---\n", text), (
+        f"harness/commands/{name}.md has no frontmatter `description:`")
 
 
 # --------------------------------------------- what makes /fix-and-review that command
@@ -297,7 +302,8 @@ def test_fix_and_reviews_escalation_citation_resolves():
 
     The panel reviewed this PR against a base 114 commits behind main and reported that
     `review-pr.md` had no step 3a and that nothing invoked `panel.py --ask`. Both were true of
-    THAT base and false of main: `review-pr.md` now carries `#### 3a. When a finding says the
+    THAT base and false of main: the fixer brief `/review-pr` hands over
+    (`harness/loops/docs/review-pr-brief.md`) carries `#### 3a. When a finding says the
     APPROACH is wrong, escalate it` and invokes `--ask` directly. That is #241 — a round scoped to
     a stale base reporting confidently about code that had already moved.
 
@@ -305,9 +311,10 @@ def test_fix_and_reviews_escalation_citation_resolves():
     to care about: that it keeps resolving. A cross-file reference is only as good as the target."""
     assert "step 3a" in command("fix-and-review"), (
         "the escalation route lost its citation — a reader cannot find the mechanism")
-    assert re.search(r"^#### 3a\.", command("review-pr"), re.MULTILINE), (
-        "review-pr.md no longer has a step 3a, so fix-and-review.md now cites nothing — either "
-        "restore it there or stop citing it here")
+    brief = _at("harness/loops/docs/review-pr-brief.md").read_text(encoding="utf-8")
+    assert re.search(r"^#### 3a\.", brief, re.MULTILINE), (
+        "the review-pr fixer brief no longer has a step 3a, so fix-and-review.md now cites "
+        "nothing — either restore it there or stop citing it here")
 
 
 def test_the_reads_are_declared_rather_than_summarised():
@@ -625,6 +632,10 @@ def test_the_landing_claim_is_taken_on_a_bounded_ttl(name: str):
 #: and the two review commands that point here rather than carrying a copy.
 HAZARDS_HEADING = "The hazards"
 
+#: Where the hazards themselves live. `fix-and-land.md`'s `## The hazards` section is a pointer at
+#: this page, which is installed at `~/.claude/loops/docs/landing-hazards.md`.
+HAZARDS_DOC = "harness/loops/docs/landing-hazards.md"
+
 #: The pointer shape the guarded list uses — ``the `frozen` job, *"no shipped release entry
 #: was rewritten"*`` — parsed rather than listed here, so a guard added to that list in the
 #: same shape is checked without anybody remembering to extend this file. Whitespace is
@@ -646,14 +657,17 @@ def _squashed(text: str) -> str:
 
 
 def _hazards() -> str:
-    """`fix-and-land.md` from the hazards heading to the end of the file."""
+    """The landing-hazards page, reached through `fix-and-land.md`'s pointer section."""
     text = command("fix-and-land")
     marker = f"\n## {HAZARDS_HEADING}\n"
     at = text.find(marker)
     assert at >= 0, (
-        f"fix-and-land.md has no `## {HAZARDS_HEADING}` section. Every assertion below would "
-        "then be about an empty string, and three files point at that heading by name (#367)")
-    return text[at:]
+        f"fix-and-land.md has no `## {HAZARDS_HEADING}` section, and three files point at that "
+        "heading by name (#367)")
+    assert "~/.claude/loops/docs/landing-hazards.md" in text[at:], (
+        f"fix-and-land.md's `## {HAZARDS_HEADING}` section no longer points at the installed "
+        "hazards page, so a lander has no route to it")
+    return _at(HAZARDS_DOC).read_text(encoding="utf-8")
 
 
 def _workflow_jobs() -> dict[str, str]:
@@ -671,7 +685,6 @@ def _workflow_jobs() -> dict[str, str]:
 _MEASURED = {
     "the --delete-branch cleanup failing from a worktree": r"delete-branch[\s\S]*worktree",
     "#260 itself, by number": r"#260",
-    "the host-specific artefact, in the words the grep looked for": r"host artefact",
     "two concurrent pytest runs": r"concurrent[\s\S]{0,80}pytest|pytest[\s\S]{0,80}concurrent",
 }
 
@@ -741,15 +754,16 @@ def test_the_closing_keyword_check_is_the_graphql_query_and_never_a_grep():
     """#374's whole finding is that the check everyone reaches for does not work: GitHub's
     parser ignores negation, so `close #371` inside "this does not close #371" is a closing
     reference and a keyword grep reads the sentence as a disclaimer. The runnable block has to
-    be the authoritative query, because what an agent copies is the fenced text."""
-    hazards = _hazards()
+    be the authoritative query, because what an agent copies is the fenced text. It lives in
+    `fix-and-land.md`'s Rules, which is the one copy."""
+    hazards = command("fix-and-land")
     # Codex, round 1: the identifier appearing anywhere in any fence proves nothing — a passing
     # mention in an unrelated block would satisfy it. What the reader copies is one block, so the
     # block that names the field has to be the `gh api graphql` call that fetches it.
     blocks = re.findall(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", hazards, re.DOTALL | re.MULTILINE)
     queries = [b for b in blocks if "closingIssuesReferences" in b]
     assert queries, (
-        "the hazards section describes the closing-keyword trap without a runnable "
+        "fix-and-land.md describes the closing-keyword trap without a runnable "
         "`closingIssuesReferences` query — leaving a reader to invent the check, which is how "
         "#374 happened twice in one day")
     assert any("gh api graphql" in b and "pullRequest" in b for b in queries), (
@@ -757,30 +771,8 @@ def test_the_closing_keyword_check_is_the_graphql_query_and_never_a_grep():
         "pull request, so the thing an agent copies out of this section is not the check. The "
         "whole finding of #374 is that the obvious check — a grep — gives the wrong answer")
     assert "#374" in hazards, (
-        "nothing points at #374, so a reader cannot tell whether a CI guard has since landed "
-        "and made this section background rather than procedure")
-
-
-def test_the_host_specific_trap_is_fenced_off_from_the_permanent_ones():
-    """The half of #367 that is easy to get wrong. #260 and the dcg refusals are properties of
-    tools and will be true on the next box; the failing claim test is a property of THIS box's
-    PATH and will read as nonsense elsewhere. A page that mixes them ages badly and then gets
-    distrusted whole — so the host-specific one lives under its own heading, below everything
-    permanent, and carries the date it was checked."""
-    hazards = _hazards()
-    artefact = "test_a_missing_qb_claim_does_not_abort_the_run_under_set_e"
-    heading = re.search(r"^### (?P<title>.*this box.*)$", hazards, re.MULTILINE | re.IGNORECASE)
-    assert heading, (
-        "the hazards section has no heading marking which trap is a property of this machine "
-        "rather than of the tools, so a reader on another box cannot tell what to ignore")
-    assert re.search(r"\d{4}-\d{2}-\d{2}", heading.group("title")), (
-        "the host-specific heading carries no date. It is a claim about one machine's PATH, and "
-        "the date is what tells a later reader how much to trust it")
-    at = hazards.find(artefact)
-    assert at > heading.start(), (
-        f"{artefact} is named at or above the host-specific heading. It fails here and passes "
-        "in CI because this box has qb-claim on PATH — filed among the permanent traps it reads "
-        "as a defect in the repo")
+        "nothing points at #374, so a reader cannot tell why the check is still a step "
+        "beside the `closing-refs` CI job")
 
 
 @pytest.mark.parametrize("name", ("review-pr", "panel-review-pr"))

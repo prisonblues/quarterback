@@ -1,7 +1,9 @@
-# Loops — Fix and Review an issue (implement, independent review, merge-ready, stop)
+---
+description: "Implement an issue, have an INDEPENDENT agent panel-review it, do every piece of merge prep that is stable — and stop at the merge for a human. `/fix-and-land` without the landing."
+argument-hint: "<issue-number> [repo] [--rounds N|--loop] [--base <branch>]   (repo defaults to the cwd's repo)"
+---
 
-@description Implement an issue, have an INDEPENDENT agent panel-review it, do every piece of merge prep that is stable — and stop at the merge for a human. `/fix-and-land` without the landing.
-@arguments $ARGS: <issue-number> [repo] [--rounds N|--loop] [--base <branch>]   (repo defaults to the cwd's repo)
+# Loops — Fix and Review an issue (implement, independent review, merge-ready, stop)
 
 End-to-end for ONE issue, up to but **not including** the merge. This is the command for anything
 you intend to look at yourself: it spends the review properly, leaves the PR mechanically
@@ -35,13 +37,13 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
    ```
    `harness_rules.py --repo` takes "path or name (default: cwd)", so a bare invocation reads *this*
    checkout's answers and uses them for a PR in another repo — exactly what the sentence above
-   forbids. (`fix-and-land.md`:19 carries the identical defect; fix them together or they drift.)
+   forbids.
 
    `$BASE` = `executor_pr_base` (`test` for lexray, `main`/`master` elsewhere), unless `--base`
    overrode it. `headless_permission_mode` is what the sub-agents run under.
 
    **Then check the repo argument is one you can actually honour.** `/fix-issue` has **no repo
-   parameter** — its `@arguments` is `<issue-number> [--base <branch>]` and it operates on the
+   parameter** — its `argument-hint` is `<issue-number> [--base <branch>]` and it operates on the
    canonical remote of whatever checkout it runs in. So a repo argument
    naming anything other than the cwd's repo cannot be carried into step 2: it would resolve
    *that* repo's rules and then implement the issue *here*, silently. If `<repo>` was given and
@@ -155,12 +157,8 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
      prose: step 5 asks you to report what 4a found, and the closing-keyword check is the one
      piece of prep that is load-bearing on a non-default `$BASE`.
 
-   **4a. Check that the branch carries its release note.** There is no release-number question
-   to ask any more, and that is the point of #122: a branch writes
-   `changelog.d/<issue>.<kind>.md` and names no version at all, and the number is applied on
-   `$BASE` after the merge by `scripts/release.py run`. Nothing here stamps, assembles or
-   reserves anything, and `scripts/release_stamp.py` no longer exists — a document that tells
-   you to run it is stale.
+   **4a. Check that the branch carries its release note** (`changelog.d/<issue>.<kind>.md`, no
+   version number; the number is applied on `$BASE` after the merge).
 
    What is worth asking early is the cheaper question the CI job asks anyway, because finding
    out here costs a commit and finding out at the merge costs a cycle:
@@ -184,7 +182,7 @@ If you find yourself wanting this one to merge, that is not a missing flag — i
 
    Where the script *is* present: exit 2 names the paths that ship and the fragment to write,
    and the repair is to write it — one file, named after the issue, naming no version. Do not
-   satisfy it by writing in `CHANGELOG.md`: that no longer counts, and it is refused separately
+   satisfy it by writing in `CHANGELOG.md`: that does not count, and it is refused separately
    by `pre-push` and by the `generated release files are output` CI job. A branch confined to
    docs or tests passes in silence.
 

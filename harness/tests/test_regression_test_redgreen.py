@@ -63,16 +63,26 @@ HARNESS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HARNESS / "loops"))
 
 # The briefs that tell a fixer to write a regression test, and therefore owe it a
-# red/green step. `panel-review-pr.md` is deliberately absent: it lifts
-# `review-pr.md`'s SUB-AGENT BRIEF verbatim by design and single-sources it, so
-# requiring its own copy here would be requiring the duplication that file exists
-# to avoid. `fix-and-land.md` is absent for the same reason one level up — it runs
-# `/fix-issue` and `/review-pr` rather than briefing a fixer itself.
-FIX_BRIEFS = ("review-pr.md", "fix-issue.md", "fix-issue-here.md")
+# red/green step. `review-pr-brief.md` is the SUB-AGENT BRIEF that `/review-pr` and
+# `/panel-review-pr` both hand their fixer, so neither command carries a copy and
+# requiring one here would be requiring the duplication that file exists to avoid.
+# `fix-and-land.md` is absent for the same reason one level up — it runs `/fix-issue`
+# and `/review-pr` rather than briefing a fixer itself.
+FIX_BRIEFS = ("review-pr-brief.md", "fix-issue.md", "fix-issue-here.md")
 
 #: The one brief that is not a fix loop: `/panel` reviews and never fixes, so it is read to
 #: assert an ABSENCE rather than a behaviour.
 PANEL = "panel.md"
+
+#: Where each brief lives, by the bare name the tests key on. The slash commands sit in
+#: `harness/commands/`; the shared fixer brief is an on-demand doc under `harness/loops/docs/`,
+#: installed at `~/.claude/loops/docs/`, because no orchestrator needs it loaded.
+BRIEF_PATHS = {
+    "review-pr-brief.md": "harness/loops/docs/review-pr-brief.md",
+    "fix-issue.md": "harness/commands/fix-issue.md",
+    "fix-issue-here.md": "harness/commands/fix-issue-here.md",
+    PANEL: f"harness/commands/{PANEL}",
+}
 
 #: Every repo-root path this suite reads, declared in one place.
 #:
@@ -82,7 +92,7 @@ PANEL = "panel.md"
 #: runs it against a sandbox holding only what that check installs. A read nobody installed does
 #: not FAIL there, it ERRORS on a missing file — which is how #163 sat unnoticed, and #246, and
 #: #251, and this suite (#257). `_prose_sandbox` compares this set against the check's installs.
-READS = frozenset(f"harness/commands/{name}" for name in (*FIX_BRIEFS, PANEL))
+READS = frozenset(BRIEF_PATHS.values())
 
 
 def brief(name: str) -> Path:
@@ -91,18 +101,17 @@ def brief(name: str) -> Path:
     One accessor is the whole reason `READS` can be trusted: every read here comes through it,
     so this single assertion is what makes that set complete rather than a list somebody has to
     remember to update."""
-    rel = f"harness/commands/{name}"
-    # Note the shape of this accessor, and its limit: it takes a bare filename and hard-codes
-    # the briefs directory onto it, so it can only ever express a read inside
-    # `harness/commands/`. That is every filesystem read this suite makes — but it is not every
-    # dependency: the module also does `sys.path.insert` on `harness/loops` and imports
+    rel = BRIEF_PATHS.get(name, f"harness/commands/{name}")
+    # Note the shape of this accessor, and its limit: it takes a bare filename and resolves it
+    # through `BRIEF_PATHS`, so it can only ever express a read of a brief named there. That is
+    # every filesystem read this suite makes — but it is not every dependency: the module also does `sys.path.insert` on `harness/loops` and imports
     # panel_core, which no path gate can see, and which is why `harness/loops` is declared as a
     # TREE in `_prose_sandbox` rather than as a read here.
     assert rel in READS, (
         f"{rel!r} is read here but is not in READS, so flake.nix's prose-consistency-tests "
         f"check does not know to install it — where this read would error as a FileNotFoundError "
         f"rather than be asserted. Add it to READS and install it in that check.")
-    return HARNESS / "commands" / name
+    return HARNESS.parent / rel
 
 
 @pytest.fixture(scope="module")
@@ -141,7 +150,7 @@ def test_every_fix_writing_brief_asks_for_a_regression_test(briefs):
     rather than about the much larger thing that went missing.
 
     `\\s+` rather than a literal space: this is prose wrapped at 70-odd columns and
-    `review-pr.md` breaks the phrase across a newline. Matched with a plain space,
+    `review-pr-brief.md` breaks the phrase across a newline. Matched with a plain space,
     this test went red against the pre-#114 files — which is a premise test failing
     on the premise being true, and would have read as evidence the instruction was
     what it was measuring."""
@@ -249,16 +258,17 @@ def test_a_file_the_fix_added_is_captured_and_removed_correctly(briefs):
 
     `git diff` ignores untracked files, so without `git add -N` a fix spanning an edit
     and a new module is half-captured and the red run imports the new half. And a path
-    absent from HEAD cannot be restored by `git checkout HEAD --`, so the removal of an
-    added file is an `rm`. Codex flagged the first half; the second follows from it and
-    is the one that errors confusingly rather than silently."""
+    absent from HEAD cannot be restored by `git checkout HEAD --` (which dcg refuses in any
+    case), so the removal of an added file is either `git apply -R` on the captured patch,
+    which deletes it, or an `rm`. Codex flagged the first half; the second follows from it
+    and is the one that errors confusingly rather than silently."""
     for name, text in briefs.items():
         assert re.search(r"add -N", text), (
             f"{name} omits `git add -N`, so `git diff` ignores a file the fix ADDED "
             f"and the red run imports it — the fix is only half removed")
-        assert re.search(r"\brm\b", text), (
-            f"{name} does not say a file the fix ADDED comes out with `rm`; "
-            f"`git checkout HEAD --` cannot restore a path absent from HEAD")
+        assert re.search(r"apply -R|\brm\b", text), (
+            f"{name} does not say how a file the fix ADDED comes out (`git apply -R` "
+            f"or `rm`); `git checkout HEAD --` cannot restore a path absent from HEAD")
 
 
 def test_the_failure_has_to_be_the_assertion(briefs):
@@ -338,14 +348,14 @@ def test_review_pr_reports_the_redgreen_count(briefs):
     `/review-pr`'s fixer returns a fixed table and nothing else; a step with no line
     in it is a step whose omission is invisible. It sits beside `DB-backed`, which
     was added for the same reason."""
-    text = briefs["review-pr.md"]
+    text = briefs["review-pr-brief.md"]
     # Located, not indexed. `str.index` raising ValueError is a test that dies without
     # naming an assertion — the exact failure mode this whole file is about.
     marker = "## Review Summary"
-    assert marker in text, f"review-pr.md no longer has a `{marker}` block to check"
+    assert marker in text, f"review-pr-brief.md no longer has a `{marker}` block to check"
     table = text[text.index(marker):]
     assert re.search(r"Red/green", table, re.IGNORECASE), (
-        "review-pr.md's summary table has no Red/green line, so a fixer that "
+        "review-pr-brief.md's summary table has no Red/green line, so a fixer that "
         "skipped the step reports identically to one that did it")
 
 
@@ -402,10 +412,10 @@ def test_review_pr_asks_the_reviewer_to_read_tests_as_tests(briefs):
     Step 2's Completeness list asked only whether a test was ABSENT. #90's fixture
     was present and passing, so that question had nothing to say about it — the
     reviewer has to be told to ask whether a present test is load-bearing."""
-    text = briefs["review-pr.md"]
+    text = briefs["review-pr-brief.md"]
     assert re.search(r"still pass with the bug (put )?back|as \*\*tests\*\*|load-bearing",
                      text, re.IGNORECASE), (
-        "review-pr.md's review step asks only about MISSING tests; a test that would "
+        "review-pr-brief.md's review step asks only about MISSING tests; a test that would "
         "still pass with the bug restored is not a missing test")
 
 
@@ -419,17 +429,17 @@ def test_review_pr_asks_the_reviewer_to_read_comments_as_claims(briefs):
     Three assertions because the dimension is three things, and a brief carrying only the first
     is the one that quietly changes behaviour: the check, the severity rule that decides what a
     fix pass does about it, and the instruction to LOOK before declaring a claim unverifiable."""
-    section = _completeness(briefs["review-pr.md"])
+    section = _completeness(briefs["review-pr-brief.md"])
     assert re.search(r"comments?\b[^.]*\bclaims?\b", section, re.IGNORECASE), (
-        "review-pr.md's Completeness section asks for stale docs but never asks whether a "
+        "review-pr-brief.md's Completeness section asks for stale docs but never asks whether a "
         "comment the diff WROTE is true of the code beside it, which REVIEW_PROMPT has asked "
         "since #724")
     assert re.search(r"rests? on|leans on|depends on", section, re.IGNORECASE), (
-        "review-pr.md carries the check without the rule that prices it, so every false "
+        "review-pr-brief.md carries the check without the rule that prices it, so every false "
         "comment claim reads as the same severity — which is the blanket floor #724's first "
         "cut shipped and this one replaced")
     assert re.search(r"laborious|only then|before you decide", section, re.IGNORECASE), (
-        "review-pr.md never says that checking a structural claim is laborious rather than "
+        "review-pr-brief.md never says that checking a structural claim is laborious rather than "
         "impossible, so a reviewer declares one unverifiable without opening a file")
 
 
@@ -442,14 +452,14 @@ def test_review_pr_reports_the_claims_it_could_not_verify(briefs):
     the check and nowhere to report the uncertainty, while the PR body claimed parity. That
     residue is also what #724 defers its expensive half on, so a workflow that cannot record it
     cannot contribute to the count."""
-    summary = _summary_block(briefs["review-pr.md"])
+    summary = _summary_block(briefs["review-pr-brief.md"])
     assert re.search(r"unverified claims", summary, re.IGNORECASE), (
-        "review-pr.md's Completeness section asks the reviewer to check the diff's comment "
+        "review-pr-brief.md's Completeness section asks the reviewer to check the diff's comment "
         "claims, and its report format has no line for the ones it could not settle — so the "
         "uncertainty half of the dimension is asked for and cannot be reported")
     assert re.search(r"\bnone\b", _summary_field(summary, "Unverified claims"),
                      re.IGNORECASE), (
-        "review-pr.md's `Unverified claims` line does not spell its empty case, so a pass with "
+        "review-pr-brief.md's `Unverified claims` line does not spell its empty case, so a pass with "
         "nothing to declare reads identically to one that forgot the line — `Surface` above it "
         "writes `none` out for exactly this reason")
 

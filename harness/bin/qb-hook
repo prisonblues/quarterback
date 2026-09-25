@@ -243,6 +243,11 @@ _once() {   # _once <key>: true the first time only (no expiry) — dedupe by id
   [ -f "$mark" ] && return 1
   : > "$mark"; return 0
 }
+_unseen() {  # _unseen <key> <text>: true unless this exact <text> was already injected
+  # under <key>. A cadence limits how often an advisory fires, not whether it
+  # repeats; an unchanged note the session has already read is only noise.
+  _once "$1-$(printf '%s' "$2" | sha256sum | cut -c1-16)"
+}
 
 # ---- is this turn somebody declaring work? (#157) ---------------------------
 # A prompt is not a claim. The UserPromptSubmit block below publishes the turn
@@ -1292,7 +1297,7 @@ $root has $n entr(y/ies) on that one stack, and this repo has linked worktrees �
 
 $entries
 
-A pop or apply puts one of those into THIS tree, and a pop drops it from the stack as well. Where its files do not clash with yours it succeeds silently — and somebody else's uncommitted work is now in your tree, where a later 'git add -A' commits it under your name. That is #210, and it has taken two working trees on this fleet.
+A pop or apply puts one of those into THIS tree, and a pop drops it from the stack as well. Where its files do not clash with yours it succeeds silently — and somebody else's uncommitted work is now in your tree, where a later 'git add -A' commits it under your name.
 
 If you got here from a REFUSED 'git stash push': that refusal left your tree untouched and put nothing on the stack, so there is nothing of yours down there to get back.
 
@@ -1354,7 +1359,7 @@ _shared_tree_harm_guard() {   # _shared_tree_harm_guard <harm> <root>: `destroys
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names
 
-This stages or commits EVERYTHING uncommitted, and in a shared checkout you cannot tell your files from theirs — so it takes their half-finished work into your commit, under your message. That is board 3879: one agent's in-flight clash.py committed by another as 409bae0, with a message saying the work was not theirs. Nothing was destroyed and its author still lost it.
+This stages or commits EVERYTHING uncommitted, and in a shared checkout you cannot tell your files from theirs — so it takes their half-finished work into your commit, under your message. Nothing is destroyed, and its author still loses it.
 
 What to do instead, cheapest first:
   1. Work somewhere else: $(_take_a_worktree "$root")
@@ -1398,7 +1403,7 @@ If you have already settled it with them, put QB_ALLOW_SHARED_TREE=1 in front of
 
 $root has $n uncommitted change(s), and these agents are live in it right now: $names
 
-This command destroys uncommitted work, and in a shared checkout some of that work is theirs — that has now happened five times on this fleet, most recently tonight (board 6236/6241), where a hard reset here took a peer's in-flight review fixes.
+This command destroys uncommitted work, and in a shared checkout some of that work is theirs: a hard reset in a shared tree has already destroyed a peer's in-flight work on this fleet.
 
 What to do instead, cheapest first:
   1. Work somewhere else: $(_take_a_worktree "$root")
@@ -1551,6 +1556,7 @@ case "$EVENT" in
     # which is the only moment it saves a wasted build. Merged with the occupancy
     # note below into one injection.
     SEP=$'\n\n'; start_notes="$(_sync_note)"
+    [ -n "$start_notes" ] && { _unseen "sync-$sid" "$start_notes" || :; }
     # The mode next, and above the occupancy note on purpose: "several agents are
     # live in this repo" reads completely differently depending on whether this
     # repo expects them to share a tree, and the answer has to arrive first to
@@ -1633,7 +1639,7 @@ case "$EVENT" in
           start_notes="${start_notes#"${start_notes%%[![:space:]]*}"}"
           shared=$(jq -nr --arg c "${_wtroot:-$cwd}" --arg l "$sharers" --arg r "$_tree_remedy" \
             '"⚠️ quarterback: you are SHARING a working tree, not just a repo. Also in " + $c + ":\n" + $l
-              + "\nThis is the one kind of overlap that is not free. Their uncommitted edits are in the same files as yours, so anything you build or test here compiles their half-finished work as if it were yours, and `git reset --hard`, `git checkout --`, `git clean` and `git restore` destroy it outright, while `git commit -a` and `git add .` quietly take it into YOUR commit — that has happened five times on this fleet." + $r + " If you must stay, say so to them first — they cannot see you either."')
+              + "\nThis is the one kind of overlap that is not free. Their uncommitted edits are in the same files as yours, so anything you build or test here compiles their half-finished work as if it were yours, and `git reset --hard`, `git checkout --`, `git clean` and `git restore` destroy it outright, while `git commit -a` and `git add .` quietly take it into YOUR commit." + $r + " If you must stay, say so to them first — they cannot see you either."')
           start_notes="${start_notes:+$start_notes$SEP}$shared"
         fi
       fi
@@ -1725,15 +1731,16 @@ case "$EVENT" in
               + (if $top.last_post_id then ", re=" + ($top.last_post_id|tostring) else "" end)
               + ", summary=\"...\")."
           end' 2>/dev/null)
-      [ -n "$p" ] && notes="${notes:+$notes$SEP}$p"
+      [ -n "$p" ] && _unseen "discover-$sid" "$p" && notes="${notes:+$notes$SEP}$p"
     fi
 
     # (c) Stale checkout (v2.8): a peer published commits this checkout doesn't
     # have. Throttled per session — the SessionStart note covers the start, this
-    # catches a peer landing work mid-session, before we build on stale code.
+    # catches a peer landing work mid-session, before we build on stale code. An
+    # unchanged note is not re-injected (_unseen); a new count or commit is.
     if [ -n "$repo" ] && _throttle "sync-$sid" 300; then
       s=$(_sync_note)
-      [ -n "$s" ] && notes="${notes:+$notes$SEP}$s"
+      [ -n "$s" ] && _unseen "sync-$sid" "$s" && notes="${notes:+$notes$SEP}$s"
     fi
 
     if [ -n "$notes" ]; then

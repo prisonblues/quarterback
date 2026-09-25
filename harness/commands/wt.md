@@ -1,11 +1,13 @@
-# Worktree Management
+---
+description: "Create or remove a git worktree with Docker, DB, and nginx."
+argument-hint: "\"create <branch>\" or \"remove <branch>\" (branch name required, action defaults to create)"
+---
 
-@description Create or remove a git worktree with Docker, DB, and nginx.
-@arguments $ACTION: "create <branch>" or "remove <branch>" (branch name required, action defaults to create)
+# Worktree Management
 
 You are an interactive worktree assistant. Your job is to understand the
 user's intent, auto-detect the project setup, ask what options they want,
-then call `create-worktree` or `remove-worktree` from `~/.local/bin/`.
+then call `create-worktree` or `remove-worktree` (both on `PATH`, installed by the harness).
 
 ## Parse the argument
 
@@ -65,13 +67,18 @@ create-worktree [--from <branch>] [--shared-db] [--frontend-only] [--dry-run] [-
 
 Run it and show the output to the user.
 
-After successful creation, **cd into the new worktree directory** so the
-rest of the Claude Code session operates from there:
+After successful creation, resolve the worktree directory (as in `/fix-issue`
+§3) and record it for this session:
 ```bash
-cd /path/to/project-branch
+WT_DIR=$(git worktree list --porcelain \
+  | awk -v b="refs/heads/<branch-name>" \
+      '/^worktree /{p=substr($0,10)} $0=="branch "b{print p; exit}')
+worktree-lock --enter "$WT_DIR"
 ```
-Tell the user their working directory has changed and show them the
-access URLs (nginx sub-path and direct port).
+The marker is what makes this session visible to `worktree-holder`, which
+`remove-worktree` asks before tearing a tree down. The shell cwd resets between
+tool calls, so work there with `git -C "$WT_DIR"` and absolute paths rather than
+`cd`. Show the user the access URLs (nginx sub-path and direct port).
 
 ### For remove:
 Confirm with the user before proceeding (removing is destructive).
@@ -182,9 +189,8 @@ one, and using it costs a second.
 
 ## Important notes
 
-- The scripts are at `~/.local/bin/create-worktree` and
-  `~/.local/bin/remove-worktree`. If they're not on PATH, call them
-  with the full path.
+- `create-worktree` / `remove-worktree` are on `PATH`; if `command -v` finds
+  neither, the harness is not installed on this box. Say so and stop.
 - Config file is `.worktree.json` (JSON, parsed with jq by the script).
   If the user has `.worktree.yml`, read it yourself and pass values
   via the JSON format or CLI flags.

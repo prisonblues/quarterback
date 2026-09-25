@@ -603,8 +603,8 @@ whether another review will be needed — you cannot observe findings you have n
   work, end to end) · chore (nobody has to judge it — you can state the remedy exactly and
   something here is simply not permitted to perform it) · other (say which in the reason);
   and `needs_human_reason`, one line
-  saying what the person has to answer. A flag with no reason is discarded, and a flag is
-  a way OUT of work — reaching for it to end a review you find tedious is counted per seat.
+  saying what the person has to answer. A flag with no reason is discarded. Use it only when
+  a human genuinely has to decide, never as a way to finish a review early.
 
 {ci}
 {code}
@@ -852,8 +852,8 @@ comment restating the code beside it, a test asserting a tautology, a "just-in-c
 error handler for a case the types already rule out. Not at a lower severity, not "for
 consideration" — not raised at all.
 
-You are fallible and you BIAS TOWARDS RECOMMENDING CHANGES, and the cheapest recommendation to
-write is one that asks for more code. The bar for reporting is sound AND correct AND elegant. A
+The cheapest recommendation to write is one that asks for more code, so hold every proposed
+addition to this bar: sound AND correct AND elegant. A
 change that improves one of the three and not the others — or that degrades elegance to nominally
 improve correctness — leaves the codebase worse than it found it, and two out of three is a reason
 to look harder for the fix that gets all three, not a reason to report the two.
@@ -893,8 +893,8 @@ should know, say it in ONE `could_not_assess` phrase beginning "outside the chan
 otherwise leave it.
 
 A fix round is briefed from your findings, so a finding outside the change is an instruction
-to GROW the change — and the fix pass is where 63.7% of this loop's next-round findings came
-from (#165). Breadth across the dimensions below is still the job; breadth across the
+to GROW the change, and a grown fix is where most of the next round's findings come from.
+Breadth across the dimensions below is still the job; breadth across the
 repository is not.""",
              "callers, siblings, or parallel implementations this change BREAKS or leaves "
              "inconsistent with itself"),
@@ -1393,7 +1393,7 @@ coverage gap and none is a finding — they are how this checkout is built:
   REMOVED from this checkout on purpose, so that a PR cannot instruct its own reviewer.
   Their absence is not a finding and says nothing about the real repository.
 
-`could_not_assess` now means what you could not resolve WITH the code in front of you.
+`could_not_assess` means what you could not resolve with the code in front of you.
 """
 
 #: The other half of the same slot, and the reason it is prose. Every seat wants to go
@@ -1439,6 +1439,15 @@ the one thing you can do with a question the prompt does not answer, and it is h
 learns what to put in the prompt next time.
 """
 
+#: What a judge that was NOT handed the tree is told. Not NO_TOOLS_BRIEF: the judge
+#: is a claude seat, which keeps its default tools in an empty sandbox, and it has
+#: no `could_not_assess` to put a gap in.
+JUDGE_NO_CODE_BRIEF = """You have not been given this project's code. Your working directory is an
+EMPTY repository, not this project, so any tool you use finds nothing there: the reports, the
+coverage declarations, the CI result and the diff in this prompt are the whole of the evidence.
+Do not go looking, and do not guess at a path on the machine running this and ask to read it.
+"""
+
 JUDGE_PROMPT = """You are the lead reviewer ("master") making the FINAL call on review findings for
 a pull request diff, held to the standard "nothing left to improve". The reports below come from
 several independent reviewers (Claude, Codex, SonarCloud), listed ONE PER REVIEWER — so the same
@@ -1470,8 +1479,7 @@ flagged by only ONE reviewer MUST be marked real — never dismiss it because th
 Mark real=false ONLY when the issue is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
-Return ONLY a JSON object (no prose), with one `verdicts` entry per REAL-WORLD ISSUE,
-covering every report id:
+Return one `verdicts` entry per REAL-WORLD ISSUE, covering every report id, in this shape:
   {{"verdicts": [{{"id": "F01",
                   "members": [<the bracketed report NUMBERS merged into this issue, e.g. 0, 3>],
                   "real": true|false,
@@ -1528,6 +1536,43 @@ takes):
 <<<CODE_ACCESS_BRIEF>>>
 <<<RECURRENCE_BRIEF>>>{diff}
 """
+
+#: The judge's reply shape, passed to `claude -p --json-schema` so the CLI returns
+#: exactly one validated object. JUDGE_PROMPT still carries the field semantics;
+#: this carries only the structure. Items stay open to extra keys because the
+#: recurrence brief adds `premise` to each verdict on rounds that ask it.
+JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "verdicts": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "members": {"type": "array", "items": {"type": "integer"}},
+                "real": {"type": "boolean"},
+                "severity": {"type": "string", "enum": ["P1", "P2", "P3", "P4"]},
+                "file": {"type": "string"},
+                "line": {"type": ["integer", "null"]},
+                "synthesis": {"type": "string"},
+                "related": {"type": "array", "items": {"type": "string"}},
+                "reason": {"type": "string"},
+            },
+            "required": ["id", "members", "real", "severity", "synthesis", "reason"],
+        }},
+        "coverage_rulings": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "declarations": {"type": "array", "items": {"type": "integer"}},
+                "claim": {"type": "string"},
+                "resolvable_in_harness": {"type": "boolean"},
+                "reason": {"type": "string"},
+            },
+            "required": ["declarations", "claim", "resolvable_in_harness", "reason"],
+        }},
+        "coverage_note": {"type": "string"},
+    },
+    "required": ["verdicts", "coverage_rulings", "coverage_note"],
+}
 
 ASK_PROMPT = """You are answering ONE question about a system, as a point of order. This is NOT a
 code review: do not look for defects, do not suggest improvements, and do not report anything the
@@ -3442,7 +3487,7 @@ __all__ = [
     "CODE_ACCESS_BRIEF",
     "NO_TOOLS_BRIEF",
     "NO_TOOLS_RULE",
-    "JUDGE_PROMPT", "ASK_PROMPT", "Finding", "ReviewerRun",
+    "JUDGE_PROMPT", "JUDGE_SCHEMA", "JUDGE_NO_CODE_BRIEF", "ASK_PROMPT", "Finding", "ReviewerRun",
     "PanelResult", "sh", "load_repo_cfg", "review_refusal", "rules_record",
     "HARNESS_DIGEST_SCHEME", "HARNESS_GIT_TIMEOUT_S", "_harness_git",
     "_harness_digest", "_harness_checkout", "harness_identity", "_loops_dir",

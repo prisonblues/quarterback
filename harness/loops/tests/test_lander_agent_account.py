@@ -140,3 +140,28 @@ def test_a_failed_agent_that_left_edits_still_pushes_nothing(
     out = capsys.readouterr().out
     assert "agent FAILED" in out
     assert not any("push" in c for c in calls), "a failed run's edits stay put"
+
+
+def test_the_fixer_is_handed_the_failing_checks_log(monkeypatch, tmp_path):
+    """The fixer is edit-only and cannot fetch CI output itself, so the failed
+    run's log has to be in its prompt or it is fixing blind."""
+    seen = []
+    monkeypatch.setattr(lander, "head_commit_author", lambda repo, branch: "dependabot[bot]")
+    monkeypatch.setattr(subprocess, "run", stub_git([], staged_changes=False))
+    monkeypatch.setattr(lander, "failing_checks_log",
+                        lambda repo, branch: "ImportError: cannot import name 'x'")
+    monkeypatch.setattr(lander, "run_agent",
+                        lambda args, cwd=None: seen.append(args)
+                        or subprocess.CompletedProcess(args, 0, "nothing to fix", ""))
+    lander.fix_red(decision(), "acme/thing", str(tmp_path / "repo"), execute=True)
+
+    prompt = seen[0][2]
+    assert "ImportError: cannot import name 'x'" in prompt
+    assert "#7 in acme/thing" in prompt
+
+
+def test_a_failed_log_lookup_is_said_in_the_prompt_not_raised(monkeypatch):
+    def boom(cmd, **kwargs):
+        raise subprocess.CalledProcessError(1, cmd)
+    monkeypatch.setattr(subprocess, "run", boom)
+    assert "could not fetch" in lander.failing_checks_log("acme/thing", "dependabot/x")

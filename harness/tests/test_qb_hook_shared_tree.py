@@ -1014,7 +1014,7 @@ def test_a_commit_dash_a_in_a_shared_tree_is_refused_and_says_the_right_thing(sh
     reason = d["permissionDecisionReason"]
     assert "takes their half-finished work into your commit" in reason
     assert "destroys uncommitted work" not in reason
-    assert "3879" in reason
+    assert "its author still loses it" in reason
 
 
 def test_staging_everything_is_refused_and_naming_your_files_is_not(shared):

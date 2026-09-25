@@ -1317,37 +1317,25 @@ def adjudicate(clusters: list[list[Finding]], diff: str, model: str, pr: int,
             # The same slot, and it had been left the one empty one (#459). The
             # judge is a claude seat with `reads_code=False` here, so `claude_args`
             # pins nothing and it holds its full default toolset in an empty
-            # sandbox — the most tool-capable code-blind seat on the panel, and the
-            # one whose loss is worst, since a dead judge takes every finding
-            # through UNADJUDICATED. It gets told what its situation is like
-            # everything else.
-            prompt = prompt.replace(JUDGE_CODE_SLOT, NO_TOOLS_BRIEF)
+            # sandbox. Its brief says so, rather than the reviewers' "you have no
+            # tools", which is false for this seat.
+            prompt = prompt.replace(JUDGE_CODE_SLOT, JUDGE_NO_CODE_BRIEF)
         # #67's question, and the empty string on every round that has no earlier
         # round to ask it about — which keeps a round-1 prompt byte-identical to
         # the one it has always been. Replaced unconditionally, like the slot
         # above: an unswapped token would travel to the model as literal text.
         prompt = prompt.replace(JUDGE_RECURRENCE_SLOT, recurrence)
+        # `--json-schema`: the CLI validates the reply and prints only the object,
+        # so the judge cannot come back as prose around its verdicts. A judge that
+        # cannot be read takes every finding through `unjudged`, which is why it
+        # is the seat that most needs the guarantee.
         args = panel_seats.claude_args(model, str(uuid.uuid4()), reads_code=reads_code,
-                                      budget_usd=budget_usd if reads_code else None)
+                                      budget_usd=budget_usd if reads_code else None,
+                                      json_schema=panel_core.JUDGE_SCHEMA)
         out, err = panel_seats.run_cli(args, "judge", stdin_text=prompt, cwd=sandbox)
         if err:
             return unruled(err)
         parsed = panel_core.extract_json_value(out, "verdicts")
-        if parsed is None:
-            # The same one-shot reparse retry `review_llm` gets, and the judge
-            # needs it more. Agreement strictly ENLARGES the set of replies that
-            # resolve to None — an envelope plus a restatement of it, an envelope
-            # plus a self-authored illustration, any two candidates that read
-            # differently — so a failure that was rare under ranking now fires on
-            # ordinary model prose. The asymmetry was the expensive part: a
-            # reviewer that cannot be read costs one seat, a judge that cannot be
-            # read takes EVERY finding through `unjudged` and adds the "round was
-            # not adjudicated" veto. One more turn keeps the pessimistic rule
-            # without paying for it with the whole adjudication.
-            out2, err2 = panel_seats.run_cli(args, "judge", attempts=1, stdin_text=prompt,
-                                 cwd=sandbox)
-            if not err2:
-                parsed = panel_core.extract_json_value(out2, "verdicts")
     note, ruled = "", CoverageRuling()
     reply = parsed if isinstance(parsed, dict) else None
     if reply is not None:

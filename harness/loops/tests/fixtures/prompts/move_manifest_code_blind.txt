@@ -70,8 +70,8 @@ whether another review will be needed — you cannot observe findings you have n
   work, end to end) · chore (nobody has to judge it — you can state the remedy exactly and
   something here is simply not permitted to perform it) · other (say which in the reason);
   and `needs_human_reason`, one line
-  saying what the person has to answer. A flag with no reason is discarded, and a flag is
-  a way OUT of work — reaching for it to end a review you find tedious is counted per seat.
+  saying what the person has to answer. A flag with no reason is discarded. Use it only when
+  a human genuinely has to decide, never as a way to finish a review early.
 
 ${CI_BRIEF}
 YOU HAVE NO TOOLS, and what you are given here is the whole of it. You cannot

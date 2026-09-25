@@ -51,10 +51,13 @@ import panel_scope  # noqa: E402
 from test_panel_provenance import _compare, _panel_round  # noqa: E402
 from test_panel_reconstruct import _new_repo  # noqa: E402
 
-#: The repo root, for the two briefs. Four levels up: tests -> loops -> harness -> repo.
+#: The repo root, for the briefs. Four levels up: tests -> loops -> harness -> repo.
 REPO_ROOT = Path(__file__).resolve().parents[3]
-REVIEW_PR = REPO_ROOT / "harness/commands/review-pr.md"
+#: The fixer's brief, which `/review-pr` and `/panel-review-pr` both hand their fixer.
+REVIEW_PR_BRIEF = REPO_ROOT / "harness/loops/docs/review-pr-brief.md"
 PANEL_REVIEW_PR = REPO_ROOT / "harness/commands/panel-review-pr.md"
+#: Where `/panel-review-pr` §5 sends the orchestrator when a round names an excision.
+ROUND_STOP_DOC = REPO_ROOT / "harness/loops/docs/panel-round-stop.md"
 
 #: The anchor round's brief as `Baseline.fixed_findings` carries it: one sub-floor
 #: finding the fixer was sent to, and one blocking finding beside it. The pair is the
@@ -1115,7 +1118,7 @@ def test_the_fixers_brief_asks_for_a_seam_the_harness_can_actually_READ():
     commit body by the finding it answers" is what the brief said before this landed,
     and it does not say WHICH name — so a fixer quoting the title left a seam nothing
     could aim at."""
-    flat = " ".join(REVIEW_PR.read_text(encoding="utf-8").split())
+    flat = " ".join(REVIEW_PR_BRIEF.read_text(encoding="utf-8").split())
     assert "**Land each budgeted fix as its own commit, and name the finding in the " \
            "commit body.**" in flat
     # The id the report actually prints, and the key as the alternative.
@@ -1132,18 +1135,19 @@ def test_the_orchestrator_is_pointed_at_the_payload_rather_than_asked_to_derive_
     """The round now computes which fix answered which finding. A brief that still told
     the orchestrator to work it out from the commits would be asking for the guess the
     rule forbids — and would let the two answers disagree."""
-    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    flat = " ".join(ROUND_STOP_DOC.read_text(encoding="utf-8").split())
     assert "`round_stop.excision` is that answer" in flat
     assert "**run it**" in flat
     # Every field an orchestrator has to act on, named.
     for field in ("`count`", "`excise[]`", "`declined[]`", "`seams`", "`sub_floor`"):
         assert field in flat
     # The null is not evidence of anything, which is the one misreading that turns a
-    # blind round into a clean one.
-    assert "A `count: null` is not evidence that nothing was excisable" in flat
+    # blind round into a clean one. That sentence is in the command's own relay step.
+    relay = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "A `count: null` is not evidence that nothing was excisable" in relay
     # #558's gap, relayed rather than inherited.
     assert "What it does NOT price is what the excision destroys (#558)" in flat
-    assert "the sole coverage of the mechanism the PR existed to build" in flat
+    assert "`destroys` does not price the lost coverage" in flat
     # #692's unit, answered rather than left implicit: the excision costs no budget and
     # its churn is counted by every reading in the next round, that budget included.
     assert "**The excision's churn is churn, and `low_severity_fix_lines` counts it.**" \
@@ -1186,7 +1190,7 @@ def test_the_churn_question_is_ANSWERED_in_the_docs_and_not_left_implicit():
     assert "the excision IS charged to it" in readme
     assert "not charged to `low_severity_fix_lines`" not in readme
     assert "stated rather than closed" in readme
-    brief = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    brief = " ".join(ROUND_STOP_DOC.read_text(encoding="utf-8").split())
     assert "`low_severity_fix_lines` counts it" in brief
     assert "Do not charge it to `low_severity_fix_lines`" not in brief
     # And the two questions are named apart, because conflating them is how a

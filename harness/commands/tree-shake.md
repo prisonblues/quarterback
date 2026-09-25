@@ -1,7 +1,9 @@
-# Tree-shake — sweep worktree debris
+---
+description: "Clean up the detritus left after running many worktrees: orphan databases, stale port entries, leftover directories, orphan Docker containers, and orphan nginx blocks. Dry-run first, apply on confirm. Optionally tears down finished (merged) live worktrees properly."
+argument-hint: "(none) — operates on the current repo"
+---
 
-@description Clean up the detritus left after running many worktrees: orphan databases, stale port entries, leftover directories, orphan Docker containers, and orphan nginx blocks. Dry-run first, apply on confirm. Optionally tears down finished (merged) live worktrees properly.
-@arguments $ARGS: (none) — operates on the current repo
+# Tree-shake — sweep worktree debris
 
 You are a careful cleanup driver. The deterministic logic lives in the
 `prune-worktrees` and `remove-worktree` **scripts** — you drive them from this
@@ -100,8 +102,10 @@ them yourself against `git worktree list` before offering to apply anything:
 
 ```bash
 git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' | sort > /tmp/ts_live.txt
-# every path prune-worktrees called a leftover:
-comm -12 /tmp/ts_live.txt /tmp/ts_leftover.txt        # <-- MUST be empty
+# paste every path the dry-run listed under 'Leftover directories', one per line:
+printf '%s\n' <leftover paths> | sort > /tmp/ts_leftover.txt
+test -s /tmp/ts_leftover.txt || echo 'no leftovers listed'
+comm -12 /tmp/ts_live.txt /tmp/ts_leftover.txt        # must print nothing
 ```
 
 - **Any overlap → STOP.** A directory that is both "leftover" and a registered
@@ -119,13 +123,8 @@ comm -12 /tmp/ts_live.txt /tmp/ts_leftover.txt        # <-- MUST be empty
   false leftover poisons it too. If the leftover list was wrong, treat the
   container list as unproven as well.
 
-This step exists because the detector has been wrong in exactly this way: a
-`git worktree list --porcelain | grep -qxF ...` liveness check under
-`set -o pipefail` returned 141 (git killed by SIGPIPE when `grep -q`
-short-circuited on a match) *even when the match succeeded*, so live worktrees
-were classified as leftovers — non-deterministically, 12/18/20/21 of them on
-four consecutive dry-runs. Fixed in `prune-worktrees`, but keep verifying: this
-skill's job is to be the check on the script, not its megaphone.
+The detector has misclassified live worktrees as leftovers before, so this
+skill is the check on the script, not its megaphone.
 
 ### 2b. Sanity-check the orphan database list
 

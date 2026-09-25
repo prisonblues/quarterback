@@ -963,8 +963,8 @@ def test_the_brief_tells_the_fixer_to_multiply_rather_than_to_forecast():
     each line by the file it is in and whether it is a comment, and multiplies. The
     brief is the artifact that actually governs the fix pass, so the rule has to be IN
     it and not only in the dial's docstring."""
-    brief = (Path(__file__).resolve().parents[2]
-             / "commands" / "review-pr.md").read_text()
+    brief = (Path(__file__).resolve().parents[1]
+             / "docs" / "review-pr-brief.md").read_text()
     assert "cost = production_lines + weight x unrefereed_lines" in brief
     assert "nothing tests a test" in brief
     assert "not a judgement about worth" in brief

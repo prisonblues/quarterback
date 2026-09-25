@@ -1,7 +1,9 @@
-# Loops — Reviewer Panel
+---
+description: "Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate where the repo enables that seat) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults."
+argument-hint: "<pr ...> [repo] [--no-post] [--reviewers a,b]   (repo defaults to the cwd's repo)"
+---
 
-@description Run the multi-reviewer panel (Claude + Codex + Antigravity + master judge; SonarCloud hard gate where the repo enables that seat) on a PR and post the summary as a PR comment by default. Give it several PR numbers and each is panelled by its own sub-agent, in parallel. Panel members default to the repo's .harness-rules.sample; name them explicitly to run a subset or a single vendor. A repo with no rules file at all is REFUSED rather than reviewed on built-in defaults.
-@arguments $ARGS: <pr ...> [repo] [--no-post] [--reviewers a,b]   (repo defaults to the cwd's repo)
+# Loops — Reviewer Panel
 
 Run the reviewer panel over a pull request. Each reviewer (and the master judge)
 applies the **same exhaustive bar as `/review-pr`** — full Core / Completeness /
@@ -16,8 +18,8 @@ where the repo enables the `sonarqube` seat — the SonarCloud one.
 
 1. Parse `$ARGS`: **every** integer is a **PR number** — `12`, `#12`, `12,14` and `12 14 19` all
    parse; an optional non-numeric word (not a `--flag`) is the **repo** (default: the cwd's repo).
-   **Default is to post** the summary as a PR comment; pass `--post` only
-   when the user said `--no-post` (then omit it and skip the comment for a read-only run).
+   **Default is to post** the summary as a PR comment: pass `--post` unless the user said
+   `--no-post`, in which case omit it and skip the comment (a read-only run).
 2. **Panel members.** Default to the repo's `.harness-rules.sample` (narrowed by the box's own
    untracked `.harness-rules`) — pass no `--reviewers` at all. Pass it
    only when the user named who should review, in any phrasing ("just codex", "codex and antigravity",
@@ -76,12 +78,10 @@ where the repo enables the `sonarqube` seat — the SonarCloud one.
    run · posted?), and name any PR whose
    agent stopped early rather than letting the roll-up imply it was panelled.
 
-   **"The hard gate is clear" may only be said about a round that had one.** `sonarqube` is
-   `enabled: false` in this repo's rules and off in the harness defaults, and it is being switched
-   off across the fleet while the convergence work is proven — so most rounds have no SonarCloud
-   block, and an empty one would be a claim that a gate looked and found nothing. Read
-   `reviewers_ran`, and where the seat did not run say there was no gate rather than reporting a
-   clear one.
+   **"The hard gate is clear" may only be said about a round that had one.** Read
+   `reviewers_ran`; where `sonarqube` did not run, say there was no SonarCloud gate this round
+   rather than reporting a clear one — an empty block would claim a gate looked and found
+   nothing.
 
    **Two kinds of "skipped", and only one is a coverage gap.** A seat the repo has **configured
    off** is a decision somebody took: state it once as configuration if it is worth stating at all,
@@ -105,12 +105,8 @@ Notes:
   merges, and never offers to merge; pass `--no-post` for a silent read-only run. It reviews the
   PR **as it is now**: use `/panel-review-pr` when the fix that follows should itself be reviewed,
   which is what its rounds are for, and when the review should end with an offer to land.
-- `sonarqube` is off in the harness defaults and `enabled: false` in this repo's
-  `.harness-rules.sample`, and it is being switched off across the fleet while the convergence work
-  is proven. That is a temporary deactivation of a seat that comes back, not the removal of the
-  hard-gate concept: where a repo turns it on, its issues are a hard gate and MUST end up resolved.
-  Where it is off there is no gate on the round, and step 6 is where that has to be said rather
-  than implied.
+- Where a repo enables the `sonarqube` seat, its issues are a hard gate and must be resolved;
+  where it is off (the harness default), there is no gate on the round, and step 6 says so.
 - First run needs `op signin` once where that seat is on (the SonarCloud token then caches),
   `codex login` for the Codex reviewer, `agy` auth for the Antigravity one and `grok login` for the
   Grok one; missing reviewers are reported as skipped, not fatal.

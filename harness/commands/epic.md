@@ -1,7 +1,9 @@
-# Loops — Epic Driver
+---
+description: "Decompose an epic and work each issue: master triages doability + routes a model per issue → choose a landing model → worktree → /fix-issue → CI → panel → /review-pr → STOP at human merge."
+argument-hint: "<epic-number> [repo] [--execute] [--max-issues N] [--landing auto|integration|multi] [--integration-branch NAME] [--sub-pr-merge auto|gate] [--base BRANCH] [--model fable|opus|sonnet]"
+---
 
-@description Decompose an epic and work each issue: master triages doability + routes a model per issue → choose a landing model → worktree → /fix-issue → CI → panel → /review-pr → STOP at human merge.
-@arguments $ARGS: <epic-number> [repo] [--execute] [--max-issues N] [--landing auto|integration|multi] [--integration-branch NAME] [--sub-pr-merge auto|gate] [--base BRANCH] [--model fable|opus|sonnet]
+# Loops — Epic Driver
 
 Drive an epic's sub-issues through the per-issue pipeline.
 
@@ -25,7 +27,7 @@ haiku is deliberately not on the ladder) to implement it. The pick is passed to 
 and `/review-pr` via `--model`, shown as a column in the dry-run plan and a `model` field in
 `--json`; invalid or over-ceiling picks clamp to the ceiling. Sanity-check the routing in the
 dry-run — if a hard schema/engine issue got `sonnet`, override or re-run. Without `--model`,
-routing is off and implementers run on the CLI's saved default (the old behaviour).
+routing is off and implementers run on the CLI's saved default.
 
 ## Sub-issue discovery
 
@@ -51,9 +53,8 @@ suggestion:
   issue forks from a branch that already contains everything before it. This ff-only stacking keeps
   history — and alembic migration heads — linear by construction. With `--sub-pr-merge gate` each
   sub-PR is left for a human instead. At the end **you open ONE** `epic/<n>-<slug>` → base PR — the
-  single human merge gate. Best for **coupled / sequential** epics. This is the proven #859 "dolt"
-  pattern, now first-class in the tool rather than hand-driven by the master.
-- **`multi` → a PR per sub-issue.** Today's behavior: one branch + PR per sub-issue into base, each
+  single human merge gate. Best for **coupled / sequential** epics.
+- **`multi` → a PR per sub-issue.** One branch + PR per sub-issue into base, each
   reviewed and merged independently. Best for **genuinely independent** sub-issues.
 
 **How to decide:** trust the suggestion when the signals are clear (deps present, or a flat list

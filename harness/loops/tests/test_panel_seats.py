@@ -100,17 +100,16 @@ def test_the_reparse_RETRY_gets_a_sandbox_too(monkeypatch):
     assert all(c for c in seen)
 
 
-def test_the_judge_and_ITS_retry_run_in_a_sandbox(monkeypatch):
+def test_the_judge_runs_in_a_sandbox(monkeypatch):
     """The judge is a headless CLI with the same exposure, and the seat whose loss
     is worst — a judge that dies takes every finding through unadjudicated — so it
-    is the last place to leave depending on the caller's shell. Its reparse retry
-    is asserted for the same reason as the reviewer's."""
+    is the last place to leave depending on the caller's shell."""
     seen = []
     _record_cwds(monkeypatch, seen)
     monkeypatch.setattr(panel_core, "extract_json_value", lambda *a, **k: None)
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
     panel.adjudicate([[f]], "diff", "sonnet", 34)
-    assert len(seen) == 2, f"expected judge + reparse retry, got {len(seen)}"
+    assert len(seen) == 1, f"expected one judge call, got {len(seen)}"
     assert all(c for c in seen)
 
 
@@ -274,7 +273,7 @@ def test_the_judge_declares_its_sandbox_too(monkeypatch):
     monkeypatch.setattr(panel_core, "extract_json_value", lambda *a, **k: None)
     f = panel.Finding("claude", "P1", "a.py", 1, "title", "detail")
     panel.adjudicate([[f]], "diff", "sonnet", 34)
-    assert len(seen) == 2, f"expected judge + reparse retry, got {len(seen)}"
+    assert len(seen) == 1, f"expected one judge call, got {len(seen)}"
     assert all(e and e.get("QB_SANDBOX") == "1" for e in seen), seen
 
 

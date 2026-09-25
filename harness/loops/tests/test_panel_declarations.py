@@ -2070,36 +2070,39 @@ def test_echo_detection_wildcards_the_prompt_s_tokens_and_nothing_else():
     assert panel._quoted(1, 1) and not panel._quoted(2, 1)
 
 
-def test_the_judge_gets_the_same_one_shot_reparse_the_reviewers_get(monkeypatch):
-    """`review_llm` answers an unresolvable reply with a second CLI call before
-    degrading; `adjudicate` went straight to `unruled`. The asymmetry was the
-    expensive half: a reviewer that cannot be read costs one seat, a judge that
-    cannot be read takes EVERY finding through `unjudged` and vetoes the round.
-
-    Agreement strictly enlarges the set of replies that resolve to None — an
-    envelope plus a restatement, an envelope plus a self-authored illustration —
-    so a failure that was rare under ranking now fires on ordinary model prose.
-    One more turn keeps the pessimistic rule without paying the whole round for
-    it."""
-    ambiguous = ('{"verdicts": [{"id": "F01", "members": [0], "real": true, '
-                 '"synthesis": "the handle is never closed"}]}\n'
-                 '{"verdicts": [{"id": "F01", "members": [0], "real": false, '
-                 '"synthesis": "the handle is closed by the context manager"}]}')
+def test_the_judge_asks_the_cli_for_a_schema_validated_reply(monkeypatch):
+    """A judge that cannot be read takes EVERY finding through `unjudged` and
+    vetoes the round, so its reply shape is enforced by the CLI (`--json-schema`)
+    rather than requested in prose and scraped. One call, and the verdict it
+    returns is read."""
     settled = ('{"verdicts": [{"id": "F01", "members": [0], "real": true, '
-               '"synthesis": "the handle is never closed"}]}')
+               '"severity": "P2", "synthesis": "the handle is never closed", '
+               '"reason": "no close on the error path"}], '
+               '"coverage_rulings": [], "coverage_note": ""}')
     calls = []
 
     def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3, stdin_text=None,
                      on_output=None, replied=None, cwd=None):
-        calls.append(attempts)
-        return (ambiguous if len(calls) == 1 else settled), None
+        calls.append(args)
+        return settled, None
 
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
     monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
     leak = panel.Finding("codex", "P2", "a.py", 1, "leak", "")
     out, skip, _ = panel.adjudicate([[leak]], "diff", "", 34)
-    assert len(calls) == 2 and calls[1] == 1, "one extra attempt, not another three"
+    assert len(calls) == 1
+    schema = json.loads(calls[0][calls[0].index("--json-schema") + 1])
+    assert schema == panel_core.JUDGE_SCHEMA
     assert skip is None and [c.verdict for c in out] == ["confirmed"]
+
+
+def test_the_judge_schema_accepts_the_example_the_prompt_illustrates():
+    """The prompt's example and the schema describe one reply. A key the schema
+    requires that the prompt never shows is a reply the model cannot write."""
+    example = panel.SCHEMA_ECHOES["verdicts"]
+    assert set(panel_core.JUDGE_SCHEMA["required"]) <= set(example)
+    item = panel_core.JUDGE_SCHEMA["properties"]["verdicts"]["items"]
+    assert set(item["required"]) <= set(panel.SCHEMA_ITEMS["verdicts"])
 
 
 # ---- the whole round, end to end ------------------------------------------

@@ -94,8 +94,8 @@ real screen) · environment (does it work on the box it has to work on) · auth 
 path actually work, end to end) · other (a human judgement none of the five names — say which in
 the reason). Omit it when `doable` is true.
 
-Return ONLY JSON: {{"doable": true|false, "reason": "<one short line>", "model": "<tier>",
-"needs_human": "<class>"}}
+Answer with `doable`, `reason` (one short line), `model` (a tier from the list above) and, only
+when `doable` is false, `needs_human`.
 
 Issue #{n}: {title}
 
@@ -464,6 +464,26 @@ UNTRIAGED_CLASS = "environment"
 RULING_CLASS = "decision"
 
 
+#: The classes TRIAGE_PROMPT names for `needs_human`.
+TRIAGE_HUMAN_CLASSES = ["decision", "taste", "ui", "environment", "auth", "other"]
+
+
+def triage_schema(choices: list[str]) -> dict:
+    """The verdict shape, for `claude -p --json-schema`: the CLI validates the reply
+    and prints only the object, so a verdict cannot arrive wrapped in prose."""
+    tier = {"type": "string", "enum": choices} if choices else {"type": "string"}
+    return {
+        "type": "object",
+        "properties": {
+            "doable": {"type": "boolean"},
+            "reason": {"type": "string"},
+            "model": tier,
+            "needs_human": {"type": "string", "enum": TRIAGE_HUMAN_CLASSES},
+        },
+        "required": ["doable", "reason", "model"],
+    }
+
+
 def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str, str]:
     """Master decides whether a coding agent can actually implement this issue, and
     which model tier should implement it. The judge runs at `model` — the tier the
@@ -481,7 +501,11 @@ def triage(w: IssueWork, model: str) -> tuple[bool | None, str, str, str]:
     choices = allowed_models(model)
     prompt = TRIAGE_PROMPT.format(n=w.num, title=w.title, body=w.body[:6000],
                                   models=", ".join(choices) or "(default)")
-    args = ["claude", "-p", prompt] + (["--model", model] if model else [])
+    # A three-field classification: low effort, and a schema so the reply is the
+    # object and nothing else. The parse below still reads it the same way.
+    args = (["claude", "-p", prompt, "--effort", "low",
+             "--json-schema", json.dumps(triage_schema(choices), separators=(",", ":"))]
+            + (["--model", model] if model else []))
     # Every failure below silently skips the sub-issue on --execute, so the one
     # line the operator gets has to name a cause: the judge CLI can exit 0 having
     # printed nothing (a tool permission headless mode auto-denied, an unusable

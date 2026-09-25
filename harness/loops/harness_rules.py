@@ -157,8 +157,11 @@ AGY_EFFORTS = ("low", "medium", "high")
 # CLI validates the level before the turn starts, so a typo costs a startup
 # rather than a whole reviewer's turn — but only for the levels it knows.
 GROK_EFFORTS = ("low", "medium", "high", "xhigh")
+# claude takes `--effort`, and on current models it is the only control over how
+# deeply a seat thinks.
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 EFFORTS = {"codex": CODEX_EFFORTS, "pi": PI_EFFORTS, "antigravity": AGY_EFFORTS,
-           "grok": GROK_EFFORTS}
+           "grok": GROK_EFFORTS, "claude": CLAUDE_EFFORTS}
 
 # ------------------------------------------------------ SHADOW AND ENFORCE (#779)
 #
@@ -5487,9 +5490,7 @@ def mode_violation(mode: Mode, tree: Tree) -> str | None:
             f"`create-worktree <branch>`. Nothing stops another agent starting "
             f"here too, and when one does, whichever of you types `git reset`, "
             f"`git checkout --` or `git stash` destroys the other's uncommitted "
-            f"work with no warning and nothing to recover it from. That is not "
-            f"hypothetical: it happened here on 2026-08-17 and again on "
-            f"2026-08-25.")
+            f"work with no warning and nothing to recover it from.")
 
 
 def _qbdata_candidates() -> list[Path]:

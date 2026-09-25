@@ -45,6 +45,8 @@ import preland  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PANEL_REVIEW_PR = REPO_ROOT / "harness/commands/panel-review-pr.md"
+#: Where `/panel-review-pr` §5 sends the orchestrator when a round follows an integration.
+ROUND_STOP_DOC = REPO_ROOT / "harness/loops/docs/panel-round-stop.md"
 
 
 # ------------------------------------------------------------ the two halves agree
@@ -584,8 +586,11 @@ def test_a_null_dial_leaves_the_round_saying_the_reading_was_not_taken(monkeypat
 def test_the_orchestrator_is_told_what_the_two_readings_mean():
     """The skill is what an agent reads when a round comes back after an
     integration, and a `config_notes` line nobody is told to look for is a line
-    nobody reads."""
-    flat = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    nobody reads. The command names the trigger and the doc it sends the reader to; the
+    doc carries the two readings in full."""
+    command = " ".join(PANEL_REVIEW_PR.read_text(encoding="utf-8").split())
+    assert "follows an integration" in command and "panel-round-stop.md" in command
+    flat = " ".join(ROUND_STOP_DOC.read_text(encoding="utf-8").split())
     assert "distant_merge_lines" in flat
     assert "takes the DISTANT reading" in flat and "takes the INVOLVED reading" in flat
     assert "the earlier round STANDS" in flat
