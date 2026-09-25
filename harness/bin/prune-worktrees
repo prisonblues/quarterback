@@ -574,6 +574,7 @@ fi
 ORPHAN_NGINX=()
 NGINX_UNKNOWN=""
 NGINX_CONF_PATH=""
+# >>> nginx-scan (extracted verbatim by harness/tests/test_prune_worktrees_nginx.py)
 if [[ -n "$NGINX_CONFIG" && -f "$MAIN_REPO/$NGINX_CONFIG" ]]; then
     NGINX_CONF_PATH="$MAIN_REPO/$NGINX_CONFIG"
     # `grep` has three answers and only two of them agree: 1 is "no worktree
@@ -582,7 +583,19 @@ if [[ -n "$NGINX_CONFIG" && -f "$MAIN_REPO/$NGINX_CONFIG" ]]; then
     # both arrived as no lines. A file present but unreadable therefore said
     # `Orphan nginx blocks: none`, and `--remove-nginx` would go on to rewrite
     # the file it had just failed to read.
-    NGINX_MARKS=$(grep -oE '# WORKTREE-START:[^[:space:]]+' "$NGINX_CONF_PATH" 2>/dev/null)
+    #
+    # A MARKER IS A WHOLE LINE, and matching it mid-line invents worktrees. The
+    # header create-worktree writes above the blocks documents the format it
+    # uses — `# Format: # WORKTREE-START:<branch-name> ... # WORKTREE-END:...` —
+    # so an unanchored match reads the documentation as a block and reports a
+    # worktree literally named `<branch-name>`. That one is self-cancelling in
+    # the worst way: the stripper below compares the WHOLE remainder after the
+    # tag, which for the header is `<branch-name> ... # WORKTREE-END:...` and
+    # never equals the name, so `--remove-nginx` reported it removed, removed
+    # nothing, and offered it again on the next sweep — for ever. Anchoring
+    # both ends is what makes the two halves agree about what a block is.
+    NGINX_MARKS=$(grep -oE '^[[:space:]]*# WORKTREE-START:[^[:space:]]+[[:space:]]*$' \
+        "$NGINX_CONF_PATH" 2>/dev/null)
     if [[ $? -gt 1 ]]; then
         NGINX_UNKNOWN="$NGINX_CONF_PATH could not be read"
     else
@@ -590,9 +603,12 @@ if [[ -n "$NGINX_CONFIG" && -f "$MAIN_REPO/$NGINX_CONFIG" ]]; then
             [[ -z "$br" ]] && continue
             is_live_suffix "$br" && continue
             ORPHAN_NGINX+=("$br")
-        done < <(printf '%s\n' "$NGINX_MARKS" | sed 's/# WORKTREE-START://' | sort -u)
+        done < <(printf '%s\n' "$NGINX_MARKS" \
+            | sed -E 's/^[[:space:]]*# WORKTREE-START:([^[:space:]]+)[[:space:]]*$/\1/' \
+            | sort -u)
     fi
 fi
+# <<< nginx-scan
 
 # ============================================
 # 6. ORPHAN CLAIMS
