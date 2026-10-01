@@ -25,6 +25,7 @@ Run: pytest harness/tests
 """
 
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -51,7 +52,10 @@ TOOLS = ("git", "bash", "sh", "awk", "sed", "grep", "tr", "cat", "head", "tail",
          "curl", "gzip",
          # The worktree lock (#743): present here so the backup is exercised on
          # the locked path, which is the one a real teardown takes.
-         "flock", "sha256sum")
+         "flock", "sha256sum",
+         # Telling scaffolding from work: `stat` for the legacy mtime fallback,
+         # `cut` for the stamp's hash column.
+         "stat", "cut")
 
 
 def git(cwd, *args):
@@ -105,7 +109,8 @@ def run_remove(repo, tmp_path, *args, path_extra=(), **over):
 
 
 def backups(repo):
-    return sorted(repo.parent.glob("proj-fix-issue-43-backup-*.tar.gz"))
+    return sorted((repo.parent / "worktree-backups").glob(
+        "proj-fix-issue-43-backup-*.tar.gz"))
 
 
 def archived(repo):
@@ -403,3 +408,104 @@ def test_a_repo_declaring_neither_key_is_unaffected(repo, worktree, tmp_path):
 
     assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
     assert "models/weights.bin" in archived(repo)
+
+
+def test_the_backup_lands_in_its_own_directory(repo, worktree, tmp_path):
+    """Loose in the checkouts' parent, a few hundred archives buried the
+    directories anybody was actually looking for."""
+    (worktree / ".env").write_text("SECRET=1\n")
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert archived(repo) == {".env"}
+    assert not list(repo.parent.glob("*.tar.gz")), "an archive was left loose"
+
+
+def test_a_link_into_the_main_checkout_is_not_archived(repo, worktree, tmp_path):
+    """`.claude/settings.local.json -> ../../proj/...` holds no bytes of its own.
+
+    On lexray these links were the whole of most archives, so a worktree with
+    nothing to lose still wrote a tarball on every teardown.
+    """
+    (repo / "data").mkdir()
+    (repo / "data" / "blob.bin").write_text("main's\n")
+    (worktree / "data").symlink_to("../proj/data")
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert backups(repo) == []
+    assert "No backup needed" in proc.stdout
+    assert (repo / "data" / "blob.bin").read_text() == "main's\n"
+
+
+def test_a_link_pointing_elsewhere_is_still_archived(repo, worktree, tmp_path):
+    """Only a link back into the main checkout is known to lose nothing."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (worktree / "data").symlink_to(elsewhere)
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert "data" in archived(repo)
+
+
+CREATE = BIN / "create-worktree"
+
+
+def stamp(worktree):
+    """Run create-worktree's own stamp stanza against `worktree`, so the two
+    scripts are tested agreeing on the format rather than each against a copy."""
+    src = CREATE.read_text()
+    start, end = "# >>> provision-stamp", "# <<< provision-stamp"
+    assert start in src and end in src, (
+        "the provision-stamp markers are gone from create-worktree, so this suite "
+        "is asserting nothing — fix the markers rather than deleting the test")
+    block = src.split(start, 1)[1].split("\n", 1)[1].split(end, 1)[0]
+    script = f'set -euo pipefail\nWORKTREE_DIR="{worktree}"\n' + block
+    subprocess.run(["bash", "-c", script], check=True)
+
+
+def test_an_unedited_provisioned_env_is_not_archived(repo, worktree, tmp_path):
+    """Still byte-for-byte what create-worktree wrote: remade by the next one."""
+    (worktree / ".env").write_text("PORT=5690\n")
+    (worktree / "CLAUDE.local.md").write_text("# worktree\n")
+    stamp(worktree)
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert backups(repo) == []
+
+
+def test_a_hand_edited_provisioned_env_is_archived(repo, worktree, tmp_path):
+    """`.env` is the file people edit, which is why #805 kept it at all."""
+    (worktree / ".env").write_text("PORT=5690\n")
+    stamp(worktree)
+    (worktree / ".env").write_text("PORT=5690\nAPI_KEY=mine\n")
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert ".env" in archived(repo)
+
+
+def test_an_unstamped_tree_falls_back_to_the_port_file_mtime(repo, worktree,
+                                                             tmp_path):
+    """A tree made before the stamp: untouched since `.worktree-port` was
+    written is dropped, an edit made later is kept."""
+    (worktree / ".worktree-port").write_text("5690\n")
+    (worktree / "CLAUDE.local.md").write_text("# worktree\n")
+    (worktree / ".env").write_text("PORT=5690\nAPI_KEY=mine\n")
+    born = (worktree / ".worktree-port").stat().st_mtime
+    os.utime(worktree / "CLAUDE.local.md", (born + 5, born + 5))
+    os.utime(worktree / ".env", (born + 3600, born + 3600))
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    names = archived(repo)
+    assert ".env" in names, names
+    assert "CLAUDE.local.md" not in names, names

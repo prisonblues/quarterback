@@ -414,6 +414,47 @@ cfg_array() {
     fi
 }
 
+# A symlink back into the main checkout holds no bytes of its own: whatever it
+# points at is still there after the teardown. On lexray these were the whole
+# of most archives — `.claude/rules`, `.claude/settings.local.json`, `data` —
+# so a worktree with nothing to lose still produced a tarball every time.
+links_into_main() {
+    local target
+    [[ -L "$1" ]] || return 1
+    target=$(readlink -f -- "$1" 2>/dev/null) || return 1
+    [[ "$target" == "$MAIN_REPO_REAL" || "$target" == "$MAIN_REPO_REAL"/* ]]
+}
+
+# `.env` and `CLAUDE.local.md` are provisioned too, but they are the files
+# people hand-edit, so they are dropped only while they are still exactly what
+# create-worktree wrote. It records their sha256 in the worktree's own git dir
+# (PROVISION_STAMP), which goes away with the worktree and never shows in
+# `git status`.
+#
+# A tree made before that stamp existed falls back to mtime against
+# `.worktree-port`, which the same run writes after `.env` and just before
+# `CLAUDE.local.md`: no later than a minute past it means nobody has touched the
+# file since. Without either clue the file is archived, as before.
+PROVISION_STAMP=""
+PORT_MTIME=""
+
+unchanged_since_provisioning() {
+    local root="$1" path="$2" want have mtime
+    [[ -f "$root/$path" && ! -L "$root/$path" ]] || return 1
+    if [[ -f "$PROVISION_STAMP" ]]; then
+        want=$(awk -v p="$path" 'substr($0, 67) == p { print substr($0, 1, 64) }' \
+                   "$PROVISION_STAMP")
+        [[ -n "$want" ]] || return 1
+        have=$(sha256sum -- "$root/$path" 2>/dev/null | cut -c1-64)
+        [[ "$have" == "$want" ]]
+        return
+    fi
+    [[ "$path" == ".env" || "$path" == "CLAUDE.local.md" ]] || return 1
+    [[ -n "$PORT_MTIME" ]] || return 1
+    mtime=$(stat -c %Y -- "$root/$path" 2>/dev/null) || return 1
+    (( mtime <= PORT_MTIME + 60 ))
+}
+
 collect_dirty_files() {
     local root="$1" rec status path
     while IFS= read -r -d '' rec; do
@@ -438,6 +479,15 @@ collect_dirty_files() {
         # entries only, so an edit git is tracking survives wherever it sits.
         if [[ "$status" = "!!" ]] && is_provisioned "$path"; then
             continue
+        fi
+        # Untracked as well as ignored here: provisioning makes these whether
+        # or not the repo's .gitignore happens to cover them, and both tests
+        # below prove there is nothing to lose. A tracked path is never dropped.
+        if [[ "$status" = "!!" || "$status" = "??" ]]; then
+            if links_into_main "$root/${path%/}" \
+               || unchanged_since_provisioning "$root" "$path"; then
+                continue
+            fi
         fi
         # A deletion has no bytes to archive, and `tar -T` fails the WHOLE run on
         # one entry it cannot stat. Now that a failed backup aborts the teardown,
@@ -909,6 +959,10 @@ if [[ -d "$WORKTREE_DIR" ]]; then
         # either committed elsewhere or trivially regenerated, so the backup was
         # archiving the recoverable half and dropping the rest.
         PROVISIONED_LIST=$(provisioned_globs)
+        MAIN_REPO_REAL=$(readlink -f -- "$MAIN_REPO" 2>/dev/null || echo "$MAIN_REPO")
+        PROVISION_STAMP="$(git -C "$WORKTREE_DIR" rev-parse --absolute-git-dir \
+                               2>/dev/null)/qb-provisioned.sha256"
+        PORT_MTIME=$(stat -c %Y -- "$WORKTREE_DIR/.worktree-port" 2>/dev/null || true)
         DIRTY_FILES=$(git -C "$WORKTREE_DIR" status --porcelain --ignored 2>/dev/null || true)
         if [[ -n "$DIRTY_FILES" ]]; then
             FILE_LIST_FILE=$(mktemp "${TMPDIR:-/tmp}/remove-worktree-backup.XXXXXX" 2>/dev/null)
@@ -923,17 +977,28 @@ if [[ -d "$WORKTREE_DIR" ]]; then
             # itself contain a newline — which is the whole reason for -z.
             FILE_COUNT=$(tr -cd '\0' < "$FILE_LIST_FILE" | wc -c | tr -d ' ')
             if [[ "$FILE_COUNT" -gt 0 ]]; then
-                BACKUP="$(dirname "$MAIN_REPO")/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+                # One directory for all of them, beside the checkouts rather
+                # than among them: loose in the parent, a few hundred archives
+                # buried the directories anybody was actually looking for.
+                BACKUP_DIR="$(dirname "$MAIN_REPO")/worktree-backups"
+                if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
+                    rm -f "$FILE_LIST_FILE"
+                    die "Could not create $BACKUP_DIR for the backup.
+  Nothing has been deleted. Fix the directory, or re-run with --no-backup
+  if you have looked at $WORKTREE_DIR and do not want its contents."
+                fi
+                BACKUP="$BACKUP_DIR/${PROJECT}-${SAFE_NAME}-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
                 echo -e "${YELLOW}Uncommitted changes found, creating backup of dirty files...${NC}"
+                # Named, because a backup that quietly omits things is the
+                # other way to make one untrustworthy.
+                OMITTED="links into the main checkout, an unedited .env or CLAUDE.local.md"
                 if [[ -n "$PROVISIONED_LIST" ]]; then
-                    # Named, because a backup that quietly omits things is the
-                    # other way to make one untrustworthy.
                     # `paste -d` takes a LIST of delimiters and cycles
                     # through it, so `-d', '` joined the first pair with a comma
                     # and the next with a space: three entries read as two.
-                    echo "  omitting what create-worktree installs:" \
-                         "$(echo "$PROVISIONED_LIST" | paste -sd, - | sed 's/,/, /g')"
+                    OMITTED+=", $(echo "$PROVISIONED_LIST" | paste -sd, - | sed 's/,/, /g')"
                 fi
+                echo "  omitting what create-worktree installs: $OMITTED"
                 # A FAILED BACKUP ABORTS. This used to be `|| echo "Backup
                 # failed"` with no exit, so the recursive delete below ran
                 # anyway: the one teardown on which the backup matters was the
@@ -949,6 +1014,8 @@ if [[ -d "$WORKTREE_DIR" ]]; then
   Free some disk, or re-run with --no-backup if you have looked at the tree
   and do not want its contents."
                 fi
+            else
+                echo -e "${GREEN}No backup needed${NC} — only what create-worktree installed"
             fi
             rm -f "$FILE_LIST_FILE"
         fi

@@ -40,7 +40,8 @@ Record the branch (`git -C "$WT_DIR" branch --show-current`) and the
 
 Check the worktree explicitly (cwd is not it): `git -C "$WT_DIR" status --porcelain`.
 - **Any output → STOP.** The worktree has uncommitted or untracked changes;
-  removing it would discard them (only a best-effort tarball backup is kept).
+  removing it would discard them (only a best-effort tarball backup is kept,
+  in `worktree-backups/` beside the checkouts).
   Show the user the dirty files and tell them to commit, set aside with `qb-stash push`
   (per-worktree; `git stash` is refused here), or discard first,
   then re-run. Do **not** proceed automatically.
