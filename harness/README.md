@@ -5129,7 +5129,8 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `worker.{type,command,container_prefix,queue_env,queue_default}`,
 `nginx.{config,container,main_port,resolver,extra_proxy_headers}`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
-and the arrays `symlinks`, `copies`, `setup`, `reserved_names`, `gitignore_additions`.
+and the arrays `symlinks`, `copies`, `setup`, `reserved_names`, `gitignore_additions`,
+`backup_ignore`.
 
 **`copies` and `gitignore_additions` also tell `remove-worktree` what NOT to back up.**
 The teardown tarball is for what somebody would otherwise lose, and neither of these is
@@ -5143,6 +5144,18 @@ paths is archived like any other, and a `copies` path the **main checkout no lon
 holds** is archived too: the worktree's may be the last copy on the disk. `env.copy_from`
 is deliberately not excluded — `.env` carries the worktree's own port and database name,
 is the file people hand-edit, and is a few KB.
+
+**`backup_ignore` is the same exclusion for what the repo regenerates itself** — globs,
+ignored entries only, read by `remove-worktree` alone. A file the app writes at boot or a
+lockfile kept out of git on purpose comes back without create-worktree's help, and listing
+it here is what lets a teardown with nothing else in it write no tarball at all.
+
+Three more things are left out without being declared. An untracked or ignored **symlink
+that resolves into the main checkout** holds no bytes of its own. And the **`.env` and
+`CLAUDE.local.md` create-worktree wrote** are left out while they are unedited:
+create-worktree records their sha256 in the worktree's git dir (`qb-provisioned.sha256`),
+and an edited one is archived. A tree made before that stamp falls back to mtime against
+`.worktree-port`. Archives go in `worktree-backups/` beside the checkouts.
 
 ### `setup` — building a worktree its own environment
 

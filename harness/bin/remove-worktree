@@ -383,6 +383,10 @@ provisioned_globs() {
         echo "$c"
     done < <(cfg_array '.copies')
     cfg_array '.gitignore_additions'
+    # What the repo itself regenerates and says so: a file the app writes at
+    # boot (lexray's `apps/static/versions*.js`), a lockfile kept out of git on
+    # purpose (quarterback's `uv.lock`). create-worktree never reads this key.
+    cfg_array '.backup_ignore'
 }
 
 # Set once from provisioned_globs before the backup runs; empty for a repo that

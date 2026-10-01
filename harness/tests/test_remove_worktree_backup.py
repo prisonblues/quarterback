@@ -509,3 +509,27 @@ def test_an_unstamped_tree_falls_back_to_the_port_file_mtime(repo, worktree,
     names = archived(repo)
     assert ".env" in names, names
     assert "CLAUDE.local.md" not in names, names
+
+
+def test_backup_ignore_names_what_the_repo_regenerates(repo, worktree, tmp_path):
+    """lexray's app writes `apps/static/versions*.js` at boot; quarterback keeps
+    `uv.lock` out of git on purpose. Either alone was enough to write a tarball."""
+    (repo / ".worktree.json").write_text(json.dumps({
+        "project": "proj",
+        "backup_ignore": ["static/versions*.js", "uv.lock"],
+    }) + "\n")
+    (worktree / ".gitignore").write_text(".env\ndata/\nstatic/versions*.js\nuv.lock\n")
+    (worktree / "static").mkdir()
+    # Committed, as in the repos this is for: an edited `.gitignore` is a
+    # tracked change and is archived, and `static/` holds tracked files too.
+    (worktree / "static" / "app.js").write_text("// tracked\n")
+    assert git(worktree, "add", ".gitignore", "static/app.js").returncode == 0
+    assert git(worktree, "commit", "--quiet", "-m", "ignore").returncode == 0
+    (worktree / "static" / "versions.js").write_text("// generated\n")
+    (worktree / "static" / "versions-sw.js").write_text("// generated\n")
+    (worktree / "uv.lock").write_text("version = 1\n")
+
+    proc = run_remove(repo, tmp_path, "fix-issue-43")
+
+    assert not worktree.exists(), f"{proc.stdout}\n{proc.stderr}"
+    assert backups(repo) == []
