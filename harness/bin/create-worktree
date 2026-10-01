@@ -2358,6 +2358,21 @@ else
     echo -e "${GREEN}Nothing to quiet${NC}"
 fi
 
+# Fingerprint the generated files people may later hand-edit, so remove-worktree
+# can tell "still what we wrote" (nothing to back up) from "somebody's edit"
+# (archive it). Kept in the worktree's own git dir: invisible to `git status`,
+# and gone with the worktree. Best-effort — without it the teardown archives
+# them, which is the safe direction.
+# >>> provision-stamp (extracted by harness/tests/test_remove_worktree_backup.py)
+WT_GIT_DIR=$(git -C "$WORKTREE_DIR" rev-parse --absolute-git-dir 2>/dev/null || true)
+if [[ -n "$WT_GIT_DIR" ]]; then
+    for f in .env CLAUDE.local.md; do
+        [[ -f "$WORKTREE_DIR/$f" && ! -L "$WORKTREE_DIR/$f" ]] || continue
+        (cd "$WORKTREE_DIR" && sha256sum -- "$f")
+    done > "$WT_GIT_DIR/qb-provisioned.sha256" 2>/dev/null || true
+fi
+# <<< provision-stamp
+
 # ============================================
 # SUMMARY
 # ============================================

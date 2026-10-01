@@ -66,6 +66,12 @@
   ],
   "setup": ["uv sync --frozen"],
 
+  "_backup_ignore": [
+    "Globs remove-worktree leaves out of its teardown tarball: what the repo",
+    "regenerates itself, like a file the app writes at boot. Ignored entries only."
+  ],
+  "backup_ignore": ["apps/static/versions*.js"],
+
   "workspace": {
     "enabled": false
   }

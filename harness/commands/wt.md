@@ -165,7 +165,10 @@ original create-name while the branch changes. So:
   could leave a half-removed directory behind (the removal timeout was too
   short; fixed to 60s). A leftover dir is de-registered from git and safe to
   `rm -rf` directly — uncommitted work was already tarballed to
-  `<project>-<name>-backup-<timestamp>.tar.gz`.
+  `worktree-backups/<project>-<name>-backup-<timestamp>.tar.gz`, beside the
+  checkouts. What create-worktree installed (links into the main checkout, an
+  unedited `.env` / `CLAUDE.local.md`, `copies`, `gitignore_additions`) is left
+  out, so a tree holding nothing else gets no archive at all.
 - **Orphaned DB / port entry.** A worktree removed by an older script (or by a
   raw `git worktree remove`) can leave an orphan `<project>_<name>` database and
   a stale `.worktree-ports` line.
