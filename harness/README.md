@@ -640,8 +640,8 @@ on a dirty tree, and warns if the branch has never been pushed.
 
 Worktrees removed badly leave orphans: databases with no worktree, stale port entries,
 leftover directories, containers, nginx blocks. `/tree-shake` first offers to tear down
-*finished* worktrees properly (merged PRs), then dry-runs an orphan sweep and applies only
-what you confirm.
+*finished* worktrees properly — read off `prune-worktrees --finished`, below — then
+dry-runs an orphan sweep and applies only what you confirm.
 
 ### The worktree scripts
 
@@ -653,6 +653,56 @@ it is the only one that is dry-run by default.
 The commands are thin, guarded drivers over these. The scripts hold the deterministic
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model
 hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
+
+#### `--finished`: the prior question, answered by the script
+
+Every category the sweep reports is about a worktree that is already gone. The question
+before it — of the ones still registered, which can go? — lived until #685 only as prose in
+`/tree-shake`: four shell one-liners an agent re-derived each run, finished only with a human
+present to answer the question at the end. So it ran rarely. On 2026-09-06 one lexray
+checkout carried 78 registered worktrees, a PR merged in July among them, 12 GB of them
+under `.claude/worktrees` where Claude Code parks its subagent trees.
+
+`prune-worktrees --finished` is that classification as a script: three buckets, printed,
+nothing removed. `--porcelain` gives `/tree-shake` one tab-separated row per tree.
+
+```
+Finished (23):
+    /home/rich/source/lexray/.claude/worktrees/agent-a4a3072b5318df64e  [integration/fca-catchup]
+        PR #1343 merged
+        teardown: git worktree remove …   (not made by create-worktree: no containers, DB or port)
+In progress (42):
+    /home/rich/source/lexray-render-diff  [render-diff]
+        17 uncommitted or untracked paths
+Cannot verify (1):
+    /tmp/rd1657.Irjuha  [(detached)]
+        detached HEAD — no branch to judge
+```
+
+**The rule is wider than "PR merged", and by measurement it had to be.** On that checkout
+"merged" found one finished sibling in 29. The rest of what had landed, GitHub records as
+CLOSED: a head reachable from a long-lived integration branch that was not the PR's base
+(#700's `fca` case), or a closing comment saying `Superseded by #N` where #N merged — the
+rebase-and-reopen pattern, whose old patches are rewritten and so contained nowhere. And
+21 subagent trees had no PR at all, with tips sitting on a pushed feature branch. Each of
+those is *finished* here, because the question is loss and not tidiness: `remove-worktree`
+deletes only the local branch, and a tip reachable from any remote ref loses nothing.
+
+**Scope is every registered worktree.** The rest of this script is about `<project>-*`
+siblings, because those are what `create-worktree` makes and what its databases, ports and
+containers map to. The agent trees and the scratch trees are registered all the same, and
+each row says which teardown applies — `remove-worktree <create-name>` for a sibling,
+`git worktree remove` for a tree that was never given trappings to reverse.
+
+**`cannot-verify` is its own bucket and is never folded into the other two.** A `gh` that
+did not answer, a head SHA this repository has not fetched, a board that could not be asked,
+a detached HEAD: each is "no answer", and the doctrine from #244 and #735 is that no answer
+must not read as a clean one — here, "clean" means a directory deleted. A held tree is
+in-progress whatever its PR says, with the holder named.
+
+It earns an unattended *read* and nothing more. The confirmation step in `/tree-shake`
+stays, because the detector this replaces has been wrong in exactly the way that destroys
+work; a destructive flag beside `--finished` is refused rather than ignored.
 
 #### Every category has a fourth state: `NOT CHECKED`
 
