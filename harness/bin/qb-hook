@@ -824,8 +824,28 @@ _panefile=""
 _pane_resolve() { _panefile=$(qb_pane_file); return 0; }
 
 _remember_pane() {   # record THIS conversation as the one in this pane
+  local seatfile tmp agent
   [ -n "$_panefile" ] && printf '%s' "$sid" > "$_panefile" 2>/dev/null
   printf '%s' "$sid" > "$_sidfile" 2>/dev/null
+  if [ -n "${TMUX:-}" ] && [ -n "${TMUX_PANE:-}" ]; then
+    seatfile=$(tmux show-options -p -t "$TMUX_PANE" -qv @qb_seat_state_file 2>/dev/null) \
+      || seatfile=""
+    if [ -n "$seatfile" ]; then
+      mkdir -p "$(dirname -- "$seatfile")" 2>/dev/null || return 0
+      tmp="$seatfile.$$"
+      if [ -n "${CODEX_THREAD_ID:-${CODEX_SESSION_ID:-}}" ] \
+         && [ -z "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then
+        agent=codex
+      else
+        agent=claude
+      fi
+      {
+        printf 'agent=%s\n' "$agent"
+        printf 'session=%s\n' "$sid"
+        printf 'updated=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      } > "$tmp" 2>/dev/null && mv "$tmp" "$seatfile" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    fi
+  fi
   return 0
 }
 
