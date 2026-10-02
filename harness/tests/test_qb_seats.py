@@ -180,6 +180,7 @@ def screen(tmp_path):
         # back on.
         "QB_SEATS_TOP_EVERY": "0",
         "QB_SEATS_TOP_ANIMATE": "0",
+        "QB_SEATS_STATE_HOME": str(tmp_path / "seat-state"),
     }
 
     def _run(*args, name="t", exe=None):
@@ -295,6 +296,20 @@ def pane_id(run, label, name="t"):
         if line and line.split("\t")[1] == label:
             return line.split("\t")[0]
     return None
+
+
+def seat_state_files(run, name="t"):
+    """{seat number: durable state file} for the screen's seats."""
+    out = run.tmux("list-panes", "-t", f"{name}:seats", "-F",
+                   "#{@qb_seat}\t#{@qb_seat_state_file}").stdout
+    got = {}
+    for line in out.splitlines():
+        if not line:
+            continue
+        seat, path = line.split("\t")
+        if seat:
+            got[seat] = Path(path)
+    return got
 
 
 def border_label(run, pane, name="t"):
@@ -740,6 +755,65 @@ def test_a_screen_of_bare_shells_stays_that_way_when_a_seat_is_added(screen):
     screen("--add")
     assert len([n for _, n in panes(screen) if n]) == 2
     nothing_was_typed(screen, typed, 2)
+
+
+def test_each_seat_gets_a_durable_state_file(screen):
+    """The tmux option dies with the tmux server; the file is the part that
+    survives a Daedalus deallocation and lets a rebuilt screen know which
+    conversation belonged in which seat."""
+    screen("-n", "2", "--cmd", "")
+    files = seat_state_files(screen)
+    assert sorted(files) == ["1", "2"]
+    assert all(str(path).startswith(screen.env["QB_SEATS_STATE_HOME"]) for path in files.values())
+    assert files["1"] != files["2"], "two panes must not share one restore slot"
+
+
+def test_a_rebuilt_screen_resumes_each_claude_seat_from_its_own_state(screen):
+    """RED/GREEN for #817. After shutdown there are no panes and no tmux options
+    left, only the per-seat files on disk. Rebuilding the same screen must type
+    a per-seat resume command, not the ordinary initial command and not one global
+    last-session fallback."""
+    screen("-n", "2", "--cmd", "")
+    files = seat_state_files(screen)
+    screen("--kill")
+    files["1"].write_text("agent=claude\nsession=claude-seat-1\n")
+    files["2"].write_text("agent=claude\nsession=claude-seat-2\n")
+
+    typed = typing_shell(screen)
+    screen("-n", "2", "--cmd", "seat-stub fresh")
+    assert sorted(wait_for_log(typed, 2)) == [
+        "claude --resume claude-seat-1",
+        "claude --resume claude-seat-2",
+    ]
+
+
+def test_a_rebuilt_screen_resumes_a_codex_seat_with_codex_resume(screen):
+    """The durable record names the agent runtime, so Codex and Claude seats do
+    not collapse onto one resume spelling."""
+    screen("-n", "1", "--cmd", "")
+    [state] = seat_state_files(screen).values()
+    screen("--kill")
+    state.write_text("agent=codex\nsession=01a0fbbb-9dc3-7b92-9ab1-0604c503c27a\n")
+
+    typed = typing_shell(screen)
+    screen("-n", "1", "--cmd", "seat-stub fresh")
+    assert wait_for_log(typed, 1) == [
+        "codex resume 01a0fbbb-9dc3-7b92-9ab1-0604c503c27a"
+    ]
+
+
+def test_bare_shell_request_beats_an_old_restore_record(screen):
+    """A restore record says what WAS in the pane. `--cmd ''` says what this
+    invocation wants now, and plain shell panes must not be mistaken for agents
+    just because the same seat held one yesterday."""
+    screen("-n", "1", "--cmd", "")
+    [state] = seat_state_files(screen).values()
+    screen("--kill")
+    state.write_text("agent=claude\nsession=claude-seat-1\n")
+
+    typed = typing_shell(screen)
+    screen("-n", "1", "--cmd", "")
+    nothing_was_typed(screen, typed, 1)
 
 
 def test_an_added_seat_can_be_told_something_else(screen):
