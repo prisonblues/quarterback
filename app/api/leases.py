@@ -6,13 +6,14 @@ from typing import Literal, get_args
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import release_session_claims
 from app.api.subagents import active_subagents_by_session
 from app.auth import author, identify, reader
+from app.blob_gc import lock_blob_writes
 from app.db import get_session
 from app.identity import is_human, retire, same_machine
 from app.models.blob import Blob
@@ -145,6 +146,20 @@ async def _record_blob(
     ``fields`` carries optional metadata (device/cwd/title/recap); a None value is
     inserted but never overwrites an existing value on conflict.
     """
+    # The old pointer may already have been read by a peer. Give it 24 hours
+    # from supersession, rather than measuring grace from its original upload.
+    previous = select(SessionRecord.latest_blob).where(
+        SessionRecord.session == sess_key
+    ).scalar_subquery()
+    # Sessions can swap the same two hashes concurrently. Lock BOTH rows in a
+    # stable order before touching either, otherwise old->new creates a cycle.
+    shas = list((await session.scalars(
+        select(Blob.sha).where((Blob.sha == previous) | (Blob.sha == blob_sha))
+        .order_by(Blob.sha).with_for_update()
+    )).all())
+    await session.execute(
+        update(Blob).where(Blob.sha.in_(shas)).values(last_used_at=func.clock_timestamp())
+    )
     base = {"latest_blob": blob_sha, "holder": holder, "updated_at": now}
     set_ = {**base, **{k: v for k, v in fields.items() if v is not None}}
     await session.execute(
@@ -690,6 +705,7 @@ async def handoff(
     active = await _active_lease(session, body.session, now)
     if active is None or not same_machine(active.holder, holder):
         raise HTTPException(409, "you do not hold an active lease on this session")
+    await lock_blob_writes(session)
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
 
@@ -725,6 +741,7 @@ async def snapshot(
     active = await _active_lease(session, body.session, now)
     if active is None or not same_machine(active.holder, holder):
         raise HTTPException(409, "you do not hold an active lease on this session")
+    await lock_blob_writes(session)
     if await session.get(Blob, body.blob.lower()) is None:
         raise HTTPException(400, "unknown blob; PUT it to /blob/<sha> first")
     await _record_blob(session, body.session, body.blob.lower(), holder, {

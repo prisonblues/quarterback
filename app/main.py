@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 
@@ -33,7 +35,21 @@ _app_logger = logging.getLogger("app")
 _app_logger.setLevel(logging.INFO)
 _app_logger.addHandler(_handler)
 
-app = FastAPI(title="quarterback", version="3.23.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from app.blob_gc import run_blob_gc
+
+    task = asyncio.create_task(run_blob_gc())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+app = FastAPI(title="quarterback", version="3.23.0", lifespan=lifespan)
 app.include_router(whoami_router)
 app.include_router(posts_router)
 app.include_router(stream_router)
