@@ -269,6 +269,49 @@ a non-root user, remember to `group_add` whatever group owns them.
 volumes, confirm this one is actually matched — a board nobody backs up is a board that
 loses its history on the first bad restore.
 
+### Blob retention and disk reclamation
+
+The app collects unreachable blobs at startup and hourly, in batches of 100.
+It preserves every `sessions.latest_blob` and `posts.detail_ref`, including ended
+sessions. Unreferenced blobs are eligible after 24 hours without use. A re-PUT
+renews that clock without changing content or `created_at`; replacing a session
+pointer also gives the old blob 24 hours for peers that just read it. GET does
+not renew retention. There is no archive of older transcript versions.
+
+Apply migrations before starting the new app. Existing blobs receive a fresh
+24-hour grace period at migration time. Stop old app workers before enabling
+collection: all blob/reference writers must use the new GC coordination lock.
+The collector logs deleted counts and logical bytes; failures log and retry on
+the next hourly pass. Multiple new app workers safely share the database lock.
+
+The examples use the deployment services `quarterback` and `db` from §2
+(the repository's development compose file calls the database `postgres`).
+Inspect or run a pass manually in the deployed app container:
+
+```bash
+docker compose exec quarterback python -m app.blob_gc --dry-run
+docker compose exec quarterback python -m app.blob_gc
+```
+
+Deletion makes PostgreSQL space reusable. To return the existing TOAST bloat to
+the filesystem after the first cleanup, schedule downtime, take a backup, and
+ensure enough free disk for the rewrite. Stop the app (including its collector),
+then run against the deployed database:
+
+```bash
+docker compose stop quarterback
+docker compose exec db psql -U quarterback -d quarterback -c 'VACUUM (FULL, ANALYZE) blobs;'
+docker compose start quarterback
+```
+
+`VACUUM FULL` holds an exclusive table lock; never put it in the periodic job.
+A separately installed `pg_repack` is an alternative for deployments needing
+an online rewrite. Check database/TOAST size after reclamation, then add
+quarterback to the host's nightly `db_backups` `pg_dump` targets (the selfhost
+stack is maintained outside this repository). Verify a dump and restore before
+relying on that backup. No production cleanup or host backup changes are made
+by installing this source change.
+
 ---
 
 ## 5. Post-deploy verification

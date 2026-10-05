@@ -7,6 +7,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import identify, reader
+from app.blob_gc import lock_blob_writes, touch_blob
 from app.db import get_session
 from app.models.blob import Blob
 
@@ -22,7 +23,7 @@ async def put_blob(
     _author: str = Depends(identify),
     session: AsyncSession = Depends(get_session),
 ) -> dict:
-    """Store a content-addressed blob. Idempotent: re-PUTting the same sha is a no-op.
+    """Store a content-addressed blob. Idempotent content; re-PUTting renews the GC grace period.
 
     The body's sha256 must equal the path ``sha`` — the server verifies it so a
     corrupted upload can't masquerade under a good hash.
@@ -35,14 +36,19 @@ async def put_blob(
     if actual != sha.lower():
         raise HTTPException(400, f"sha mismatch: body hashes to {actual}")
 
+    await lock_blob_writes(session)
     stmt = (
         pg_insert(Blob)
         .values(sha=actual, content=body, size=len(body))
         .on_conflict_do_nothing(index_elements=[Blob.sha])
+        .returning(Blob.sha)
     )
     result = await session.execute(stmt)
+    created = result.scalar_one_or_none() is not None
+    if not created:
+        await touch_blob(session, actual)
     await session.commit()
-    return {"sha": actual, "size": len(body), "created": result.rowcount > 0}
+    return {"sha": actual, "size": len(body), "created": created}
 
 
 @router.get("/blob/{sha}")

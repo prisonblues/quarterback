@@ -24,3 +24,9 @@ class Blob(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # Refreshed on upload and when superseded, so a peer holding the old pointer
+    # gets a full grace period even if that transcript was created weeks ago.
+    last_used_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

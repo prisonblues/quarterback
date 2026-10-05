@@ -7,6 +7,7 @@ from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import author, optional_identity, reader
+from app.blob_gc import lock_blob_writes, touch_blob
 from app.db import get_session
 from app.identity import SELF, authored_clause, inbox_clause, is_human, resolve_alias
 from app.models.post import Post
@@ -160,6 +161,9 @@ async def create_post(
         recipient = writer
     elif recipient is not None:
         recipient, _ = await resolve_alias(session, recipient)
+    if body.detail_ref is not None:
+        await lock_blob_writes(session)
+        await touch_blob(session, body.detail_ref.lower())
     post = Post(
         author=writer,
         session=body.session,
