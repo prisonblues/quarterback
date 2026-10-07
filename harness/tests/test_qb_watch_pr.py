@@ -275,3 +275,33 @@ def test_check_names_cannot_inject_lines():
     pr = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
         "contexts": {"totalCount": 1, "nodes": [node]}}}}]}}  # fmt: skip
     assert "\n" not in w.parse_checks(pr)[0].name
+
+
+def test_a_status_context_passes_only_on_success():
+    def pr(state):
+        node = {"__typename": "StatusContext", "context": "sonar", "state": state,
+                "targetUrl": None, "isRequired": True}  # fmt: skip
+        return {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
+            "contexts": {"totalCount": 1, "nodes": [node]}}}}]}}  # fmt: skip
+
+    assert w.parse_checks(pr("SOMETHING_NEW"))[0].failed
+    assert w.parse_checks(pr("PENDING"))[0].pending
+    assert not w.parse_checks(pr("SUCCESS"))[0].failed
+
+
+def test_a_failed_comment_read_does_not_discard_the_status_news(monkeypatch):
+    status = {"repository": {"pullRequest": {
+        "state": "OPEN", "updatedAt": T2, "headRefOid": "bbbbbbb2", "mergeable": "CONFLICTING",
+        "comments": {"totalCount": 1}, "reviews": {"totalCount": 0},
+        "reviewThreads": {"totalCount": 0}, "commits": {"nodes": []},
+    }}}  # fmt: skip
+
+    def gh(query, *_):
+        if query is w.ACTIVITY_QUERY:
+            raise w.ReadFailed("timeout")
+        return status
+
+    monkeypatch.setattr(w, "gh_graphql", gh)
+    watch, report, _ = w.read_pass("o", "n", 1, seen(), set(), 10.0**9)
+    assert "the branch now conflicts with its base" in report.lines
+    assert watch.counts == ""  # not advanced: the comments are read again next pass

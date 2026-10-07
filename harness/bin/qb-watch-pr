@@ -89,7 +89,7 @@ query($owner: String!, $name: String!, $number: Int!) {
 # A finished check passes only on an explicit success; STALE and anything GitHub adds later
 # must not read as green.
 PASSED_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
-FAILED_STATES = {"FAILURE", "ERROR"}
+PENDING_STATES = {"PENDING", "EXPECTED"}
 
 
 class RateLimited(Exception):
@@ -186,7 +186,8 @@ def parse_checks(pr: dict) -> list[Check]:
             ))  # fmt: skip
         else:
             checks.append(Check(
-                clean(n["context"]), n["state"] in FAILED_STATES, n["state"] in {"PENDING", "EXPECTED"},
+                clean(n["context"]), n["state"] != "SUCCESS" and n["state"] not in PENDING_STATES,
+                n["state"] in PENDING_STATES,
                 bool(n["isRequired"]), clean(n["targetUrl"] or ""),
             ))  # fmt: skip
     return checks
@@ -334,7 +335,7 @@ def read_pass(*args, **kwargs) -> tuple[Watch, Report, str]:
     """`_read_pass`, with a response of an unexpected shape counted as a failed read."""
     try:
         return _read_pass(*args, **kwargs)
-    except (KeyError, TypeError, IndexError) as e:
+    except (KeyError, TypeError, IndexError, AttributeError) as e:
         raise ReadFailed(f"unexpected response shape: {e!r}") from e
 
 
@@ -356,9 +357,12 @@ def _read_pass(owner: str, name: str, number: int, watch: Watch | None, ignored:
     stale = now - base.read_at >= QUIET_REREAD_S
     remarks, overflow = None, False
     if not first and (counts != base.counts or stale):
-        activity = gh_graphql(ACTIVITY_QUERY, owner, name, number)
-        remarks = parse_remarks(activity)
-        overflow = windows_overflowed(activity, base.remarks_through)
+        try:
+            activity = gh_graphql(ACTIVITY_QUERY, owner, name, number)
+            remarks = parse_remarks(activity)
+            overflow = windows_overflowed(activity, base.remarks_through)
+        except (RateLimited, ReadFailed):
+            pass  # the status already read is still news; comments are tried again next pass
     nxt, report = evaluate(
         base, head_sha=pr["headRefOid"], checks=parse_checks(pr), mergeable=pr["mergeable"],
         remarks=remarks, ignored=ignored,
