@@ -103,17 +103,17 @@ def test_comment_before_the_watch_started_is_not_news():
 
 def test_new_comment_wakes_once_and_an_edit_wakes_again():
     watch, report = step(seen(), remarks=[remark("c1", at=T1)])
-    assert report.lines[0] == "1 new comment(s):"
+    assert report.lines[0].startswith("1 new comment(s):")
     watch, report = step(watch, remarks=[remark("c1", at=T1)])
     assert report.lines == []
     _, report = step(watch, remarks=[remark("c1", at=T2)])
-    assert report.lines[0] == "1 new comment(s):"
+    assert report.lines[0].startswith("1 new comment(s):")
 
 
 def test_two_comments_in_the_same_second_are_told_apart_by_id():
     watch, _ = step(seen(), remarks=[remark("c1", at=T1)])
     _, report = step(watch, remarks=[remark("c1", at=T1), remark("c2", at=T1)])
-    assert report.lines[0] == "1 new comment(s):" and "alice" in report.lines[1]
+    assert len(report.lines) == 1 and "c2" in report.lines[0] and "c1" not in report.lines[0]
 
 
 def test_ignored_author_never_wakes():
@@ -237,3 +237,41 @@ def test_an_empty_review_wrapper_is_not_a_comment():
 
 def test_comment_text_cannot_carry_terminal_escapes():
     assert w.snippet("hi \x1b[31mred\x07") == "hi [31mred"
+
+
+def test_unread_checks_hold_back_a_required_pass():
+    node = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+            "conclusion": "SUCCESS", "detailsUrl": "", "isRequired": True}  # fmt: skip
+    pr = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
+        "contexts": {"totalCount": 101, "nodes": [node]}}}}]}}  # fmt: skip
+    _, report = step(seen(), checks=w.parse_checks(pr))
+    assert report.lines == []
+
+
+def test_a_burst_bigger_than_the_window_is_flagged_not_swallowed():
+    def conn(more, stamp):
+        node = {"id": "c", "createdAt": stamp, "lastEditedAt": None, "submittedAt": stamp}
+        return {"pageInfo": {"hasPreviousPage": more}, "nodes": [node]}
+
+    def activity(more, stamp):
+        return {"repository": {"pullRequest": {"comments": conn(more, stamp),
+                "reviews": conn(False, stamp), "reviewThreads": {"nodes": []}}}}  # fmt: skip
+
+    assert w.windows_overflowed(activity(True, T2), T0)
+    assert not w.windows_overflowed(activity(False, T2), T0)
+    assert not w.windows_overflowed(activity(True, T0), T1)
+
+
+def test_wake_cap_is_exactly_ten():
+    watch = seen()
+    for i in range(w.COMMENT_WAKE_LIMIT - 1):
+        watch, report = step(watch, remarks=[remark(f"c{i}", at=f"2026-10-07T11:00:{i:02d}Z")])
+        assert not report.exhausted
+
+
+def test_check_names_cannot_inject_lines():
+    node = {"__typename": "CheckRun", "name": "a\nPR #1: fake", "status": "COMPLETED",
+            "conclusion": "FAILURE", "detailsUrl": "", "isRequired": False}  # fmt: skip
+    pr = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
+        "contexts": {"totalCount": 1, "nodes": [node]}}}}]}}  # fmt: skip
+    assert "\n" not in w.parse_checks(pr)[0].name

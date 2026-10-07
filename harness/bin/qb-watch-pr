@@ -48,7 +48,7 @@ READ_FAILURE_LIMIT = 8
 QUIET_REREAD_S = 30 * 60
 DEFAULT_INTERVAL_S = 120
 RATE_LIMIT_BACKOFF_S = 300
-RATE_LIMIT_LIMIT = 12  # an hour of backing off
+RATE_LIMIT_LIMIT = 12  # eleven backoffs between twelve tries: about 55 minutes
 GH_TIMEOUT_S = 60
 MIN_INTERVAL_S = 30
 LISTED = 5
@@ -76,9 +76,10 @@ ACTIVITY_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      comments(last: 50) { nodes { id author { login } body createdAt lastEditedAt url } }
-      reviews(last: 30) { nodes { id author { login } body state submittedAt lastEditedAt url } }
-      reviewThreads(last: 50) { nodes { comments(last: 20) { nodes {
+      comments(last: 50) { pageInfo { hasPreviousPage } nodes { id author { login } body createdAt lastEditedAt url } }
+      reviews(last: 30) { pageInfo { hasPreviousPage } nodes { id author { login } body state submittedAt lastEditedAt url } }
+      reviewThreads(last: 50) { pageInfo { hasPreviousPage } nodes { comments(last: 20) {
+        pageInfo { hasPreviousPage } nodes {
         id author { login } body createdAt lastEditedAt url path } } } }
     }
   }
@@ -175,20 +176,39 @@ def parse_checks(pr: dict) -> list[Check]:
     checks = []
     unread = rollup["contexts"]["totalCount"] - len(rollup["contexts"]["nodes"])
     if unread > 0:  # never claim "passed" over checks that were not read
-        checks.append(Check(f"{unread} more checks not read", False, True, False, ""))
+        checks.append(Check(f"{unread} more checks not read", False, True, True, ""))
     for n in rollup["contexts"]["nodes"]:
         if n["__typename"] == "CheckRun":
             done = n["status"] == "COMPLETED"
             checks.append(Check(
-                n["name"], done and n["conclusion"] not in PASSED_CONCLUSIONS, not done,
-                bool(n["isRequired"]), n["detailsUrl"] or "",
+                clean(n["name"]), done and n["conclusion"] not in PASSED_CONCLUSIONS, not done,
+                bool(n["isRequired"]), clean(n["detailsUrl"] or ""),
             ))  # fmt: skip
         else:
             checks.append(Check(
-                n["context"], n["state"] in FAILED_STATES, n["state"] in {"PENDING", "EXPECTED"},
-                bool(n["isRequired"]), n["targetUrl"] or "",
+                clean(n["context"]), n["state"] in FAILED_STATES, n["state"] in {"PENDING", "EXPECTED"},
+                bool(n["isRequired"]), clean(n["targetUrl"] or ""),
             ))  # fmt: skip
     return checks
+
+
+def windows_overflowed(activity: dict, through: str) -> bool:
+    """Did a window hold nothing but items newer than the cursor, with more before it?
+    Then items between the cursor and the window were never seen, and the cursor is about to
+    move past them."""
+    pr = activity["repository"]["pullRequest"]
+
+    def full(conn: dict, stamp) -> bool:
+        times = [stamp(n) for n in conn["nodes"]]
+        return conn["pageInfo"]["hasPreviousPage"] and bool(times) and min(times) > through
+
+    edited = lambda n: n["lastEditedAt"] or n["createdAt"]  # noqa: E731
+    reviewed = lambda n: n["lastEditedAt"] or n["submittedAt"] or ""  # noqa: E731
+    return (
+        full(pr["comments"], edited)
+        or full(pr["reviews"], reviewed)
+        or any(full(t["comments"], edited) for t in pr["reviewThreads"]["nodes"])
+    )
 
 
 def parse_remarks(activity: dict) -> list[Remark]:
@@ -212,7 +232,7 @@ def parse_remarks(activity: dict) -> list[Remark]:
 
 def clean(text: str) -> str:
     """Untrusted text goes to an agent's terminal: no escape sequences, no control characters."""
-    return "".join(ch for ch in text if ch.isprintable() or ch in "\n\t")
+    return "".join(ch if ch.isprintable() else " " for ch in text)
 
 
 def snippet(body: str) -> str:
@@ -266,13 +286,14 @@ def evaluate(
         and (r.at > through or (r.at == through and r.id not in ids))
     ]  # fmt: skip
     if fresh:
-        lines.append(f"{len(fresh)} new comment(s):")
+        details = []
         for r in fresh[:LISTED]:
             where = f" on {r.path}" if r.path else ""
             said = f'"{snippet(r.body)}"' if r.body.strip() else (r.state or "reviewed")
-            lines.append(f"  {r.author}{where}: {said} {r.url}")
+            details.append(f"{r.author}{where}: {said} {r.url}")
         if len(fresh) > LISTED:
-            lines.append(f"  and {len(fresh) - LISTED} more")
+            details.append(f"and {len(fresh) - LISTED} more")
+        lines.append(f"{len(fresh)} new comment(s): " + "; ".join(details))
     if remarks is not None:
         latest = max([through, *(r.at for r in remarks if r.author.lower() not in ignored)])
         ids = [r.id for r in remarks if r.at == latest and r.author.lower() not in ignored]
@@ -333,13 +354,19 @@ def _read_pass(owner: str, name: str, number: int, watch: Watch | None, ignored:
     first = watch is None
     base = watch or Watch(remarks_through=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)))
     stale = now - base.read_at >= QUIET_REREAD_S
-    remarks = None
+    remarks, overflow = None, False
     if not first and (counts != base.counts or stale):
-        remarks = parse_remarks(gh_graphql(ACTIVITY_QUERY, owner, name, number))
+        activity = gh_graphql(ACTIVITY_QUERY, owner, name, number)
+        remarks = parse_remarks(activity)
+        overflow = windows_overflowed(activity, base.remarks_through)
     nxt, report = evaluate(
         base, head_sha=pr["headRefOid"], checks=parse_checks(pr), mergeable=pr["mergeable"],
         remarks=remarks, ignored=ignored,
     )  # fmt: skip
+    if overflow:
+        report.lines.append(
+            "more comments arrived than one read holds; open the PR to see them all"
+        )
     if remarks is not None or first:
         nxt.counts, nxt.read_at = counts, now
     return nxt, report, "OPEN"
@@ -364,11 +391,13 @@ def watch_loop(args: argparse.Namespace) -> int:
             if limited >= RATE_LIMIT_LIMIT:
                 print(f"PR #{args.pr}: still rate limited, stopped watching", flush=True)
                 return 1
+            if args.once:
+                return 1
             time.sleep(RATE_LIMIT_BACKOFF_S)
             continue
         except ReadFailed as e:
             failures += 1
-            if failures >= READ_FAILURE_LIMIT:
+            if args.once or failures >= READ_FAILURE_LIMIT:
                 print(f"PR #{args.pr}: cannot read it, stopped watching ({e})", flush=True)
                 return 1
             time.sleep(args.interval)
@@ -390,11 +419,29 @@ def watch_loop(args: argparse.Namespace) -> int:
 
 
 def resolve_repo() -> str:
-    out = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "--jq",
-                          ".nameWithOwner"], capture_output=True, text=True, check=False)  # fmt: skip
+    try:
+        out = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "--jq",
+                              ".nameWithOwner"], capture_output=True, text=True, check=False,
+                             timeout=GH_TIMEOUT_S)  # fmt: skip
+    except subprocess.TimeoutExpired:
+        raise SystemExit("qb-watch-pr: `gh repo view` timed out; pass --repo OWNER/NAME") from None
     if out.returncode != 0 or "/" not in out.stdout:
-        raise SystemExit("qb-watch-pr: not in a GitHub repo; pass --repo OWNER/NAME")
+        detail = out.stderr.strip()[:200] or "not in a GitHub repo"
+        raise SystemExit(f"qb-watch-pr: {detail}; pass --repo OWNER/NAME")
     return out.stdout.strip()
+
+
+def positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return value
+
+
+def repo_name(text: str) -> str:
+    if text.count("/") != 1 or not all(text.split("/")):
+        raise argparse.ArgumentTypeError("must look like OWNER/NAME")
+    return text
 
 
 def interval(text: str) -> int:
@@ -406,8 +453,10 @@ def interval(text: str) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    p.add_argument("pr", type=int)
-    p.add_argument("--repo", help="OWNER/NAME; default: the current checkout's repo")
+    p.add_argument("pr", type=positive)
+    p.add_argument(
+        "--repo", type=repo_name, help="OWNER/NAME; default: the current checkout's repo"
+    )
     p.add_argument(
         "--interval", type=interval, default=DEFAULT_INTERVAL_S, help="seconds between passes"
     )
