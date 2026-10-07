@@ -5668,3 +5668,11 @@ Read these before adopting rather than after.
   a repo you care about.
 - **`prune-worktrees` is dry-run by default; the other two are not.** `remove-worktree`
   destroys on invocation.
+
+### `qb-watch-pr` — hear about a PR instead of polling it (#822)
+
+`qb-watch-pr <pr>` is meant for the Monitor tool: one line per change, silence otherwise. State
+lives in `~/.cache/qb-watch-pr/`, so a restart does not re-announce. The decisions are one pure
+function, `evaluate`, tested without GitHub in `harness/tests/test_qb_watch_pr.py`. It takes no
+automatic "ignore my own comments" filter, because every agent posts as the human's GitHub
+account; use `--ignore-author` for a bot.
