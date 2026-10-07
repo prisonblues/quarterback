@@ -10,7 +10,7 @@ The design is T3 Code's PR watcher (pingdotgg/t3code, orchestration-v2/pullReque
 cut down to a script:
 
 * **Two reads, not one.** Every pass is one cheap GraphQL query: head commit, check rollup,
-  mergeability, review decision and the comment counts. The comments themselves are read
+  mergeability and the comment counts. The comments themselves are read
   only when those counts or `updatedAt` moved, or after QUIET_REREAD_S, since an edit to a
   comment moves neither.
 * **A diff against what the agent was last told**, kept in a small file per PR, so a
@@ -48,20 +48,21 @@ READ_FAILURE_LIMIT = 8
 QUIET_REREAD_S = 30 * 60
 DEFAULT_INTERVAL_S = 120
 RATE_LIMIT_BACKOFF_S = 300
+RATE_LIMIT_LIMIT = 12  # an hour of backing off
+GH_TIMEOUT_S = 60
+MIN_INTERVAL_S = 30
 LISTED = 5
 SNIPPET = 160
 
 STATUS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!) {
-  viewer { login }
-  rateLimit { remaining resetAt }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      state isDraft updatedAt headRefOid mergeable reviewDecision baseRefName
+      state updatedAt headRefOid mergeable
       comments { totalCount }
       reviews { totalCount }
       reviewThreads { totalCount }
-      commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { nodes {
+      commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { totalCount nodes {
         __typename
         ... on CheckRun { name status conclusion detailsUrl isRequired(pullRequestNumber: $number) }
         ... on StatusContext { context state targetUrl isRequired(pullRequestNumber: $number) }
@@ -84,7 +85,9 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 """
 
-FAILED_CONCLUSIONS = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+# A finished check passes only on an explicit success; STALE and anything GitHub adds later
+# must not read as green.
+PASSED_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 FAILED_STATES = {"FAILURE", "ERROR"}
 
 
@@ -140,17 +143,28 @@ class Report:
 
 
 def gh_graphql(query: str, owner: str, name: str, number: int) -> dict:
-    proc = subprocess.run(
-        ["gh", "api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}",
-         "-F", f"name={name}", "-F", f"number={number}"],
-        capture_output=True, text=True, check=False,
-    )  # fmt: skip
-    text = f"{proc.stdout}\n{proc.stderr}"
-    if "rate limit" in text.lower() or "RATE_LIMITED" in text:
-        raise RateLimited(text.strip()[:200])
-    if proc.returncode != 0:
-        raise ReadFailed(text.strip()[:200])
-    return json.loads(proc.stdout)["data"]
+    """Run a query. Only the exit status, stderr and GraphQL `errors` say rate-limited:
+    stdout carries comment bodies and check names, which can say anything."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+             "-f", f"name={name}", "-F", f"number={number}"],
+            capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_S,
+        )  # fmt: skip
+    except subprocess.TimeoutExpired as e:
+        raise ReadFailed("gh timed out") from e
+    try:
+        body = json.loads(proc.stdout)
+    except ValueError:
+        body = {}
+    errors = body.get("errors") or []
+    if any(e.get("type") == "RATE_LIMITED" for e in errors) or (
+        proc.returncode != 0 and "rate limit" in proc.stderr.lower()
+    ):
+        raise RateLimited(proc.stderr.strip()[:200])
+    if proc.returncode != 0 or errors or not body.get("data"):
+        raise ReadFailed((proc.stderr.strip() or proc.stdout.strip())[:200])
+    return body["data"]
 
 
 def parse_checks(pr: dict) -> list[Check]:
@@ -159,11 +173,14 @@ def parse_checks(pr: dict) -> list[Check]:
     if rollup is None:
         return []
     checks = []
+    unread = rollup["contexts"]["totalCount"] - len(rollup["contexts"]["nodes"])
+    if unread > 0:  # never claim "passed" over checks that were not read
+        checks.append(Check(f"{unread} more checks not read", False, True, False, ""))
     for n in rollup["contexts"]["nodes"]:
         if n["__typename"] == "CheckRun":
             done = n["status"] == "COMPLETED"
             checks.append(Check(
-                n["name"], done and n["conclusion"] in FAILED_CONCLUSIONS, not done,
+                n["name"], done and n["conclusion"] not in PASSED_CONCLUSIONS, not done,
                 bool(n["isRequired"]), n["detailsUrl"] or "",
             ))  # fmt: skip
         else:
@@ -180,19 +197,26 @@ def parse_remarks(activity: dict) -> list[Remark]:
     threads = [c for t in pr["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]]
     for n in pr["comments"]["nodes"] + threads:
         remarks.append(Remark(
-            n["id"], (n["author"] or {}).get("login", "someone"),
-            n["lastEditedAt"] or n["createdAt"], n["body"], n["url"], n.get("path"),
+            n["id"], clean((n["author"] or {}).get("login", "someone")),
+            n["lastEditedAt"] or n["createdAt"], n["body"], n["url"], clean(n.get("path") or "") or None,
         ))  # fmt: skip
     for n in pr["reviews"]["nodes"]:
+        if n["state"] == "COMMENTED" and not n["body"].strip():
+            continue  # a wrapper for inline comments, which are listed on their own
         remarks.append(Remark(
-            n["id"], (n["author"] or {}).get("login", "someone"),
+            n["id"], clean((n["author"] or {}).get("login", "someone")),
             n["lastEditedAt"] or n["submittedAt"] or "", n["body"], n["url"], None, n["state"],
         ))  # fmt: skip
     return [r for r in remarks if r.at]
 
 
+def clean(text: str) -> str:
+    """Untrusted text goes to an agent's terminal: no escape sequences, no control characters."""
+    return "".join(ch for ch in text if ch.isprintable() or ch in "\n\t")
+
+
 def snippet(body: str) -> str:
-    text = " ".join(body.split())
+    text = " ".join(clean(body).split())
     return text if len(text) <= SNIPPET else f"{text[: SNIPPET - 3]}..."
 
 
@@ -212,6 +236,8 @@ def evaluate(
     passed = False if moved else watch.passed
     passed_names = [] if moved else list(watch.passed_names)
     news = moved and watch.head_sha is not None
+    if news:
+        lines.append(f"new commit {head_sha[:7]}")
 
     if checks:  # an empty list keeps the last state: a failed check read can look like it
         failed = [c for c in checks if c.failed]
@@ -283,11 +309,21 @@ def save_watch(path: Path, watch: Watch) -> None:
     tmp.replace(path)
 
 
-def read_pass(owner: str, name: str, number: int, watch: Watch | None, ignored: set[str],
+def read_pass(*args, **kwargs) -> tuple[Watch, Report, str]:
+    """`_read_pass`, with a response of an unexpected shape counted as a failed read."""
+    try:
+        return _read_pass(*args, **kwargs)
+    except (KeyError, TypeError, IndexError) as e:
+        raise ReadFailed(f"unexpected response shape: {e!r}") from e
+
+
+def _read_pass(owner: str, name: str, number: int, watch: Watch | None, ignored: set[str],
               now: float) -> tuple[Watch, Report, str]:  # fmt: skip
     """One pass. Returns the watch to save, what to print, and the PR's state."""
     data = gh_graphql(STATUS_QUERY, owner, name, number)
-    pr = data["repository"]["pullRequest"]
+    pr = (data.get("repository") or {}).get("pullRequest")
+    if pr is None:
+        raise ReadFailed(f"{owner}/{name}#{number} not found or not visible")
     if pr["state"] != "OPEN":
         return watch or Watch(), Report([]), pr["state"]
     counts = (
@@ -316,13 +352,18 @@ def watch_loop(args: argparse.Namespace) -> int:
     watch = load_watch(path)
     if watch is not None:
         watch.wakes = 0  # restarting is how you resume after the cap
-    failures = 0
+    failures = limited = 0
     while True:
         try:
             watch, report, state = read_pass(owner, name, args.pr, watch, ignored, time.time())
-            failures = 0
+            failures = limited = 0
         except RateLimited as e:
-            print(f"PR #{args.pr}: rate limited, backing off ({e})", file=sys.stderr, flush=True)
+            limited += 1
+            if limited == 1:
+                print(f"PR #{args.pr}: rate limited, backing off ({e})", flush=True)
+            if limited >= RATE_LIMIT_LIMIT:
+                print(f"PR #{args.pr}: still rate limited, stopped watching", flush=True)
+                return 1
             time.sleep(RATE_LIMIT_BACKOFF_S)
             continue
         except ReadFailed as e:
@@ -336,9 +377,9 @@ def watch_loop(args: argparse.Namespace) -> int:
             print(f"PR #{args.pr}: {state.lower()}, stopped watching", flush=True)
             path.unlink(missing_ok=True)
             return 0
-        save_watch(path, watch)
-        for line in report.lines:
+        for line in report.lines:  # told first: dying between the two repeats news, not loses it
             print(f"PR #{args.pr}: {line}", flush=True)
+        save_watch(path, watch)
         if report.exhausted:
             print(f"PR #{args.pr}: {COMMENT_WAKE_LIMIT} comment-only updates in a row, "
                   "stopped watching; rerun to resume", flush=True)  # fmt: skip
@@ -356,12 +397,19 @@ def resolve_repo() -> str:
     return out.stdout.strip()
 
 
+def interval(text: str) -> int:
+    value = int(text)
+    if value < MIN_INTERVAL_S:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_INTERVAL_S} seconds")
+    return value
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("pr", type=int)
     p.add_argument("--repo", help="OWNER/NAME; default: the current checkout's repo")
     p.add_argument(
-        "--interval", type=int, default=DEFAULT_INTERVAL_S, help="seconds between passes"
+        "--interval", type=interval, default=DEFAULT_INTERVAL_S, help="seconds between passes"
     )
     p.add_argument("--once", action="store_true", help="one pass, then exit")
     p.add_argument("--ignore-author", action="append", default=[], metavar="LOGIN",

@@ -11,8 +11,12 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
+import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "bin" / "qb-watch-pr"
 _loader = importlib.machinery.SourceFileLoader("qb_watch_pr", str(SCRIPT))
@@ -83,7 +87,7 @@ def test_no_required_checks_means_every_check_must_finish():
 def test_new_push_forgets_what_was_told_about_the_old_head():
     watch, _ = step(seen(), checks=[check("tests", failed=True)])
     _, report = step(watch, head="bbbbbbb2", checks=[check("tests", failed=True)])
-    assert len(report.lines) == 1
+    assert report.lines[0] == "new commit bbbbbbb" and len(report.lines) == 2
 
 
 def test_empty_check_list_keeps_the_last_state():
@@ -146,7 +150,7 @@ def test_check_news_resets_the_comment_wake_count():
 
 
 def test_parse_checks_reads_check_runs_and_status_contexts():
-    pr = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"nodes": [
+    pr = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {"totalCount": 2, "nodes": [
         {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "TIMED_OUT",
          "detailsUrl": "u", "isRequired": True},
         {"__typename": "StatusContext", "context": "sonar", "state": "PENDING",
@@ -154,3 +158,82 @@ def test_parse_checks_reads_check_runs_and_status_contexts():
     ]}}}}]}}  # fmt: skip
     ci, sonar = w.parse_checks(pr)
     assert ci.failed and ci.required and sonar.pending and not sonar.failed
+
+
+def fake_gh(monkeypatch, *, stdout="", stderr="", code=0):
+    def run(*_args, **_kwargs):
+        return subprocess.CompletedProcess([], code, stdout, stderr)
+
+    monkeypatch.setattr(w.subprocess, "run", run)
+
+
+def test_a_comment_that_says_rate_limit_is_not_a_rate_limit(monkeypatch):
+    # The P1 the panel found: scanning stdout put the watcher to sleep forever.
+    body = {"data": {"repository": {"note": "we hit the rate limit yesterday"}}}
+    fake_gh(monkeypatch, stdout=json.dumps(body))
+    assert w.gh_graphql("q", "o", "n", 1) == body["data"]
+
+
+def test_a_rate_limited_error_is_recognised_by_type_or_stderr(monkeypatch):
+    errors = {"errors": [{"type": "RATE_LIMITED", "message": "x"}]}
+    fake_gh(monkeypatch, stdout=json.dumps(errors))
+    with pytest.raises(w.RateLimited):
+        w.gh_graphql("q", "o", "n", 1)
+    fake_gh(monkeypatch, stderr="API rate limit exceeded", code=1)
+    with pytest.raises(w.RateLimited):
+        w.gh_graphql("q", "o", "n", 1)
+
+
+def test_other_failures_and_garbage_are_failed_reads(monkeypatch):
+    for kw in ({"stdout": "not json"}, {"stderr": "boom", "code": 1}, {"stdout": "{}"}):
+        fake_gh(monkeypatch, **kw)
+        with pytest.raises(w.ReadFailed):
+            w.gh_graphql("q", "o", "n", 1)
+
+
+def test_a_pull_request_that_is_not_there_is_a_failed_read(monkeypatch):
+    monkeypatch.setattr(w, "gh_graphql", lambda *a: {"repository": {"pullRequest": None}})
+    with pytest.raises(w.ReadFailed):
+        w.read_pass("o", "n", 1, None, set(), 0.0)
+
+
+def test_a_closed_pull_request_ends_the_watch(monkeypatch):
+    pr = {"repository": {"pullRequest": {"state": "MERGED"}}}
+    monkeypatch.setattr(w, "gh_graphql", lambda *a: pr)
+    assert w.read_pass("o", "n", 1, None, set(), 0.0)[2] == "MERGED"
+
+
+def test_a_stale_or_unknown_conclusion_is_not_a_pass():
+    def pr(conclusion):
+        node = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+                "conclusion": conclusion, "detailsUrl": "", "isRequired": True}  # fmt: skip
+        return {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
+            "contexts": {"totalCount": 1, "nodes": [node]}}}}]}}  # fmt: skip
+
+    assert w.parse_checks(pr("STALE"))[0].failed
+    assert not w.parse_checks(pr("SKIPPED"))[0].failed
+
+
+def test_checks_beyond_the_page_block_a_passed_claim():
+    node = {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED",
+            "conclusion": "SUCCESS", "detailsUrl": "", "isRequired": False}  # fmt: skip
+    pr = {"commits": {"nodes": [{"commit": {"statusCheckRollup": {
+        "contexts": {"totalCount": 101, "nodes": [node]}}}}]}}  # fmt: skip
+    _, report = step(seen(), checks=w.parse_checks(pr))
+    assert report.lines == []
+
+
+def test_an_empty_review_wrapper_is_not_a_comment():
+    def node(id, state, body):
+        return {"id": id, "author": {"login": "a"}, "body": body, "state": state, "url": "u",
+                "submittedAt": T1, "lastEditedAt": None}  # fmt: skip
+
+    activity = {"repository": {"pullRequest": {
+        "comments": {"nodes": []}, "reviewThreads": {"nodes": []},
+        "reviews": {"nodes": [node("r1", "COMMENTED", " "), node("r2", "APPROVED", "")]},
+    }}}  # fmt: skip
+    assert [r.id for r in w.parse_remarks(activity)] == ["r2"]
+
+
+def test_comment_text_cannot_carry_terminal_escapes():
+    assert w.snippet("hi \x1b[31mred\x07") == "hi [31mred"
