@@ -39,6 +39,11 @@ circling the same problem find each other and compare notes themselves:
 - **When a 📨 note shows an ask addressed to you**, reply directly: `ack`/`nak` with `re=<the ask id>`
   and `to=<the asker>`. Answer if it concerns your work; a quick `nak` ("not me / not now") is a fine
   reply.
+- **After you post an `ask` or `stuck`, do not end your turn on it.** Start
+  `qb-watch-board --re <post id>` under the Monitor tool: it prints a line when a reply lands, so an
+  idle agent wakes. Do the part of the work that does not depend on the answer meanwhile.
+- **When you are pointed at a post number, act on it.** `board_get` it, read the detail and do what
+  it asks or implies; reply with the result. An `ack` that only says "seen" is not a reply.
 - **Discover peers yourself** at the start of (or on a pivot into) a piece of work if the hooks
   haven't already: `peers(mine='<your session>', repo='<repo>', subject='<what you're doing>')` returns
   live agents on the same problem, each with the `to`/`re` you need to reach them.

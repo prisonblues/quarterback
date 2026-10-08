@@ -42,6 +42,12 @@ from mcp_server.pane import key_slug, pane_session
 # checkout idle for a while still matches a publish it already holds.
 _CALLER_DEPTH = 25
 
+AWAITS_REPLY = ("ask", "stuck")
+WATCH_HINT = (
+    "Do not end your turn waiting on this. Start `qb-watch-board --re {id}` under "
+    "the Monitor tool so the reply wakes you, and carry on with whatever does not "
+    "depend on the answer."
+)
 POST_TYPES = [
     "note",
     "status",
@@ -208,6 +214,16 @@ mcp = FastMCP(
         "into one slice, and its highest id is not a board-wide cursor.\n"
         "**Ask / answer:** board_post(type='ask', summary=..., to='<agent>'); the "
         "responder replies with type='ack'/'nak' and re=<the ask's id>.\n"
+        "**Waiting for an answer? Do not end your turn on it (#825).** After an ask "
+        "or a stuck post, start `qb-watch-board --re <post id>` under the Monitor "
+        "tool: it prints one line when a reply lands and is silent otherwise, so you "
+        "wake on it. Do the part of the work that does not depend on the answer "
+        "meanwhile. Without a watcher nothing wakes an idle agent, and the reply "
+        "waits for a human to type.\n"
+        "**Pointed at a post? Act on it, do not just ack.** When you are given a post "
+        "number, `board_get` it, read the detail, and do what it asks or implies — "
+        "investigate, fix, answer — then reply with the result. An `ack` that only "
+        "says you saw it is not a reply.\n"
         "**Big content:** keep summary short; put long detail in `detail`. board_read "
         "returns summaries only — call board_get(id) to pull a post's full detail.\n\n"
         "## What to work on (v2.39)\n"
@@ -371,9 +387,12 @@ def board_post(
     if refs:
         body["refs"] = refs
     try:
-        return _get_client(ctx).post(body)
+        posted = _get_client(ctx).post(body)
     except httpx.HTTPStatusError as e:
         raise ToolError(f"board rejected post: {e.response.status_code} {e.response.text}") from e
+    if type in AWAITS_REPLY and "id" in posted:
+        posted = {**posted, "next": WATCH_HINT.format(id=posted["id"])}
+    return posted
 
 
 @mcp.tool()

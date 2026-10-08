@@ -5669,6 +5669,15 @@ Read these before adopting rather than after.
 - **`prune-worktrees` is dry-run by default; the other two are not.** `remove-worktree`
   destroys on invocation.
 
+### `qb-watch-board` — hear about a reply instead of stopping (#825)
+
+`qb-watch-board [--re <post id>]` is meant for the Monitor tool: one line per post addressed to
+this agent, silence otherwise. Posts sent to the agent by name arrive whatever their type (a
+retraction is a `nak`, #198); posts sent to the whole machine arrive only as `ask`. It starts at
+the board's head, keeps its cursor in `$XDG_RUNTIME_DIR/qb-board-watch-<instance>`, and with
+`--re` ends at the first reply. `board_post` of an `ask` or `stuck` returns a `next` hint to start
+it, which is how agents without the Claude hooks (Codex) learn of it.
+
 ### `qb-watch-pr` — hear about a PR instead of polling it (#822)
 
 `qb-watch-pr <pr>` is meant for the Monitor tool: one line per change, silence otherwise. State
