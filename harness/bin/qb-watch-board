@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""qb-watch-board — say something only when the board has mail for this agent (#825).
+
+An agent posts an `ask` and ends its turn. The hooks that deliver replies fire because the
+agent is running, so a parked agent hears nothing until a human types. This is meant to
+run under the Monitor tool: it prints one line per new post addressed to this agent and is
+silent otherwise, so each line it prints is a reason to wake up.
+
+* **Addressed by name: every type.** A retraction is a `nak` or a `message`, never an
+  `ask`, and it is the reply with a deadline on it (#198). A peer chose you; that is the
+  whole signal.
+* **Broadcast to the machine: `ask` only.** A `finding` sent to a whole box must not wake
+  every agent on it.
+* **Starts at now.** The first pass reads the board's head from `X-Board-Head` and reports
+  nothing older. The cursor lives in a file per session, so a restart does not announce
+  everything again.
+* **`--re <id>` narrows the watch to replies in one thread.** The watch then ends on the
+  first reply, because that is what the agent was waiting for.
+* **A failed read is "wait".** Eight in a row end the watch, exit 1.
+
+Exits 0 on a timeout or after `--once`, 1 when the board cannot be read.
+
+Run: qb-watch-board [--re POST_ID] [--interval SECONDS] [--timeout MINUTES] [--once]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+DEFAULT_INTERVAL_S = 20
+MIN_INTERVAL_S = 10
+DEFAULT_TIMEOUT_MIN = 120
+READ_FAILURE_LIMIT = 8
+HTTP_TIMEOUT_S = 10
+SNIPPET = 160
+
+
+def key_slug(value: str) -> str:
+    """The rule `qb-hook` applies to an instance label, so both name one agent."""
+    return re.sub(r"^[._~-]+", "", re.sub(r"[^A-Za-z0-9._~-]", "-", value))[:40]
+
+
+def instance_key() -> str:
+    explicit = os.environ.get("QUARTERBACK_INSTANCE", "")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return key_slug(explicit or session[:8]) or key_slug(session[:8])
+
+
+def wanted(post: dict, me: set[str], thread: int | None) -> bool:
+    """Is this post worth waking for? Directed: any type. Broadcast: only an ask."""
+    if post.get("from") in me:
+        return False
+    if thread is not None and post.get("re") != thread:
+        return False
+    to = post.get("to") or ""
+    if "/" in to:
+        return True
+    return post.get("type") == "ask"
+
+
+def line(post: dict) -> str:
+    who = post.get("from") or "?"
+    summary = " ".join((post.get("summary") or "").split())
+    if len(summary) > SNIPPET:
+        summary = summary[: SNIPPET - 1] + "…"
+    reply = f' [reply board_post(type="ack", to="{who}", re={post["id"]})]'
+    return f"📨 #{post['id']} {post.get('type', '?')} from {who}: {summary}{reply}"
+
+
+def read_cursor(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def write_cursor(path: Path, value: int) -> None:
+    try:
+        path.write_text(str(value))
+    except OSError:
+        pass  # a lost cursor costs one repeated line, not the watch
+
+
+class Board:
+    def __init__(self, base_url: str, token: str, instance: str) -> None:
+        self.base_url, self.token, self.instance = base_url.rstrip("/"), token, instance
+
+    def read(self, params: dict) -> tuple[list[dict], int]:
+        """A page of the inbox and the board's head, from one request."""
+        url = f"{self.base_url}/board?{urllib.parse.urlencode(params)}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.token}"})
+        if self.instance:
+            req.add_header("X-Agent-Instance", self.instance)
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+            head = int(resp.headers.get("X-Board-Head") or 0)
+            return json.loads(resp.read().decode()), head
+
+
+def identities(board: Board) -> set[str]:
+    """This agent's name and permanent alias, so its own posts are never reported."""
+    req = urllib.request.Request(
+        f"{board.base_url}/whoami", headers={"Authorization": f"Bearer {board.token}"}
+    )
+    if board.instance:
+        req.add_header("X-Agent-Instance", board.instance)
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+        who = json.loads(resp.read().decode())
+    return {v for v in (who.get("agent"), who.get("alias")) if v}
+
+
+def pass_once(board: Board, cursor: int, me: set[str], thread: int | None) -> tuple[list[str], int]:
+    """One poll: the lines to print and the new cursor."""
+    posts, _ = board.read({"to": "@me", "since": cursor})
+    lines = [line(p) for p in posts if wanted(p, me, thread)]
+    newest = max([cursor, *(p["id"] for p in posts)])
+    return lines, newest
+
+
+def watch(board: Board, args: argparse.Namespace) -> int:
+    state = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"qb-board-watch-{board.instance}"
+    me = identities(board)
+    cursor = read_cursor(state)
+    if cursor is None:
+        _, cursor = board.read({"to": "@me", "limit": 1})
+        write_cursor(state, cursor)
+    deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
+    failures = 0
+    while True:
+        try:
+            lines, cursor = pass_once(board, cursor, me, args.re)
+            failures = 0
+        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
+            failures += 1
+            if failures >= READ_FAILURE_LIMIT:
+                print(f"qb-watch-board: board unreadable, giving up ({exc})", flush=True)
+                return 1
+            lines = []
+        else:
+            write_cursor(state, cursor)
+        for text in lines:
+            print(text, flush=True)
+        if args.once or (lines and args.re is not None):
+            return 0
+        if deadline is not None and time.monotonic() >= deadline:
+            return 0
+        time.sleep(args.interval)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description="Print a line when the board has mail for you.")
+    ap.add_argument("--re", type=int, help="only replies to this post id; stop at the first")
+    ap.add_argument("--interval", type=int, default=DEFAULT_INTERVAL_S)
+    ap.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_MIN,
+                    help="minutes before the watch ends (0 = never)")
+    ap.add_argument("--once", action="store_true", help="one pass, then exit")
+    args = ap.parse_args(argv)
+    args.interval = max(args.interval, MIN_INTERVAL_S)
+
+    from qbdata import resolve_config
+
+    cfg = resolve_config()
+    return watch(Board(cfg.base_url, cfg.token, instance_key()), args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
