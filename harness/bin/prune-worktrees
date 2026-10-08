@@ -24,14 +24,14 @@ set -uo pipefail
 # a sweep that could not run at all — an unreachable board, a Postgres container
 # that answered nothing, a docker daemon that is not up, a config file nothing
 # can read. A category with no answer is never reported as empty, and "Nothing to
-# prune. Clean." is printed only when all six were looked at. Every external read
+# prune. Clean." is printed only when all seven were looked at. Every external read
 # here captures its exit status before parsing what it produced, because through
 # a pipe or a process substitution that status goes nowhere and "the command
 # failed" arrives as "the command found nothing".
 #
 # Usage: prune-worktrees [options]
 #   (no flags)         Dry-run: report orphan DBs, ports, dirs, containers,
-#                      nginx blocks and board claims.
+#                      nginx blocks, board claims and bytecode caches.
 #   --prune, -y        Drop orphan DBs and rewrite .worktree-ports.
 #   --remove-dirs      `rm -rf` the leftover (de-registered) worktree dirs.
 #   --remove-containers  `docker rm -f` orphan per-worktree containers (matched
@@ -39,6 +39,8 @@ set -uo pipefail
 #                      stack, whose project has no worktree suffix).
 #   --remove-nginx     Strip orphan `# WORKTREE-START/END:<branch>` blocks from
 #                      the nginx config and restart nginx.
+#   --remove-pycache   `rm -rf` bytecode caches under $PYTHONPYCACHEPREFIX that
+#                      mirror a worktree directory which no longer exists.
 #                      --prune also hands back board claims taken by checkouts
 #                      that no longer exist (#337).
 #                      Each --remove-* flag is independent of --prune; combine
@@ -151,6 +153,7 @@ APPLY=false
 REMOVE_DIRS=false
 REMOVE_CONTAINERS=false
 REMOVE_NGINX=false
+REMOVE_PYCACHE=false
 CONFIG_FILE=""
 PROJECT_OVERRIDE=""
 
@@ -160,6 +163,7 @@ while [[ $# -gt 0 ]]; do
         --remove-dirs)       REMOVE_DIRS=true; shift ;;
         --remove-containers) REMOVE_CONTAINERS=true; shift ;;
         --remove-nginx)      REMOVE_NGINX=true; shift ;;
+        --remove-pycache)    REMOVE_PYCACHE=true; shift ;;
         --config)      [[ -z "${2:-}" ]] && die "--config requires a path"; CONFIG_FILE="$2"; shift 2 ;;
         --project)     [[ -z "${2:-}" ]] && die "--project requires a name"; PROJECT_OVERRIDE="$2"; shift 2 ;;
         # To the first blank line, not to a pinned line number: the header
@@ -171,7 +175,7 @@ done
 
 # Any --remove-* / --prune flag means we're in APPLY territory for that category.
 ANY_APPLY=false
-[[ "$APPLY" = true || "$REMOVE_DIRS" = true || "$REMOVE_CONTAINERS" = true || "$REMOVE_NGINX" = true ]] && ANY_APPLY=true
+[[ "$APPLY" = true || "$REMOVE_DIRS" = true || "$REMOVE_CONTAINERS" = true || "$REMOVE_NGINX" = true || "$REMOVE_PYCACHE" = true ]] && ANY_APPLY=true
 
 # ============================================
 # FIND REPO AND LOAD CONFIG
@@ -718,6 +722,47 @@ fi
 # <<< claim-sweep
 
 # ============================================
+# 7. ORPHAN BYTECODE CACHES
+# ============================================
+# >>> pycache-sweep (extracted verbatim by harness/tests/test_prune_worktrees_pycache.py)
+# With PYTHONPYCACHEPREFIX set, Python writes `.pyc` files under
+# `$PYTHONPYCACHEPREFIX/<absolute source path>/` instead of beside the source. That is
+# a cache keyed by checkout, and nothing ever keys it back out: removing a worktree
+# removes its sources and leaves its bytecode. A repo with a big dependency tree adds
+# a couple of hundred MB per worktree, so a box that churns worktrees fills its disk
+# with bytecode for trees that are gone — 183 dead checkouts and ~40G on the box that
+# found this, with every other category here reporting "none".
+#
+# Orphaned means the mirrored directory has no counterpart on disk. A checkout that
+# exists but is not a registered worktree is a leftover directory, and its cache goes
+# when the directory does (the next run), never before: the cache of a tree somebody
+# is still looking at is not debris. Scoped to `<project>` and `<project>-*` under the
+# repo's own parent, the same naming every other sweep here uses, so a run in one
+# project never reaches another's cache. Bytecode is regenerated on import, so this is
+# the one category whose removal costs nothing but a slower first run.
+#
+# Not set is not unknown: the prefix is how a host opts in, and a host that never did
+# has no cache to sweep. A prefix that is set but cannot be listed IS unknown.
+ORPHAN_PYCACHE=()
+PYCACHE_UNKNOWN=""
+if [[ -n "${PYTHONPYCACHEPREFIX:-}" ]]; then
+    PYCACHE_ROOT="${PYTHONPYCACHEPREFIX%/}$PARENT"
+    if [[ -d "$PYCACHE_ROOT" ]]; then
+        if ! PYCACHE_NAMES=$(find "$PYCACHE_ROOT" -mindepth 1 -maxdepth 1 -type d \
+                \( -name "$PROJECT" -o -name "$PROJECT-*" \) -printf '%f\n' 2>/dev/null); then
+            PYCACHE_UNKNOWN="$PYCACHE_ROOT could not be listed"
+        else
+            while IFS= read -r name; do
+                [[ -z "$name" ]] && continue
+                [[ -e "$PARENT/$name" ]] && continue
+                ORPHAN_PYCACHE+=("$PYCACHE_ROOT/$name")
+            done <<< "$PYCACHE_NAMES"
+        fi
+    fi
+fi
+# <<< pycache-sweep
+
+# ============================================
 # REPORT
 # ============================================
 # Print a labelled section. Args after the count are the items (may be zero).
@@ -754,6 +799,7 @@ report "Leftover directories" ""                    "${#LEFTOVER_DIRS[@]}"     "
 report "Orphan containers"    "$CONTAINERS_UNKNOWN" "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]:-}"
 report "Orphan nginx blocks"  "$NGINX_UNKNOWN"      "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
 report "Orphan board claims"  "$CLAIMS_UNKNOWN"     "${#ORPHAN_CLAIMS[@]}"     "${ORPHAN_CLAIMS[@]:-}"
+report "Orphan bytecode caches" "$PYCACHE_UNKNOWN"  "${#ORPHAN_PYCACHE[@]}"    "${ORPHAN_PYCACHE[@]:-}"
 if [[ ${#PROTECTED_DBS[@]} -gt 0 ]]; then
     echo -e "${YELLOW}Protected by .database.protect — not counted as orphans (${#PROTECTED_DBS[@]}):${NC}"
     printf '    %s\n' "${PROTECTED_DBS[@]}"
@@ -769,7 +815,8 @@ fi
 echo ""
 
 TOTAL=$(( ${#ORPHAN_DBS[@]} + ${#STALE_PORTS[@]} + ${#LEFTOVER_DIRS[@]} \
-        + ${#ORPHAN_CONTAINERS[@]} + ${#ORPHAN_NGINX[@]} + ${#ORPHAN_CLAIMS[@]} ))
+        + ${#ORPHAN_CONTAINERS[@]} + ${#ORPHAN_NGINX[@]} + ${#ORPHAN_CLAIMS[@]} \
+        + ${#ORPHAN_PYCACHE[@]} ))
 # The categories that produced no answer, named for the two lines below. "Clean."
 # is a statement about all six, so a run that looked at four of them cannot make
 # it — that sentence is precisely what a caller quotes back as "the sweep ran and
@@ -784,6 +831,7 @@ note_unchecked "$PORTS_UNKNOWN"      "stale port entries"
 note_unchecked "$CONTAINERS_UNKNOWN" "orphan containers"
 note_unchecked "$NGINX_UNKNOWN"      "orphan nginx blocks"
 note_unchecked "$CLAIMS_UNKNOWN"     "board claims"
+note_unchecked "$PYCACHE_UNKNOWN"    "orphan bytecode caches"
 
 if [[ "$TOTAL" -eq 0 ]]; then
     if [[ -n "$UNCHECKED" ]]; then
@@ -811,6 +859,8 @@ if [[ "$ANY_APPLY" != true ]]; then
         echo -e "  Re-run with ${CYAN}--remove-containers${NC} to force-remove the orphan containers."
     [[ ${#ORPHAN_NGINX[@]} -gt 0 ]] && \
         echo -e "  Re-run with ${CYAN}--remove-nginx${NC} to strip the orphan nginx blocks and restart nginx."
+    [[ ${#ORPHAN_PYCACHE[@]} -gt 0 ]] && \
+        echo -e "  Re-run with ${CYAN}--remove-pycache${NC} to delete the orphan bytecode caches."
     exit 0
 fi
 
@@ -957,6 +1007,21 @@ if [[ "$REMOVE_NGINX" = true && ${#ORPHAN_NGINX[@]} -gt 0 && -n "$NGINX_CONF_PAT
     fi
 elif [[ "$REMOVE_NGINX" != true && ${#ORPHAN_NGINX[@]} -gt 0 ]]; then
     echo -e "  ${YELLOW}left ${#ORPHAN_NGINX[@]} orphan nginx block(s) (use --remove-nginx)${NC}"
+fi
+
+# Remove orphan bytecode caches (--remove-pycache)
+if [[ "$REMOVE_PYCACHE" = true ]]; then
+    for d in "${ORPHAN_PYCACHE[@]:-}"; do
+        [[ -z "$d" ]] && continue
+        err=$(rm -rf -- "$d" 2>&1)
+        if [[ ! -d "$d" ]]; then
+            echo -e "  ${GREEN}removed bytecode cache: $d${NC}"
+        else
+            echo -e "  ${YELLOW}could not remove bytecode cache: $d${NC}${err:+ — ${err%%$'\n'*}}"
+        fi
+    done
+elif [[ ${#ORPHAN_PYCACHE[@]} -gt 0 ]]; then
+    echo -e "  ${YELLOW}left ${#ORPHAN_PYCACHE[@]} orphan bytecode cache(s) (use --remove-pycache)${NC}"
 fi
 
 echo ""
