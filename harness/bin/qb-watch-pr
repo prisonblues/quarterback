@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""qb-watch-pr — say something only when a pull request changes (#822).
+
+An agent opens a PR and then hears nothing: red CI, a reviewer's comment or a merge
+conflict sits there until it thinks to look, and looking by hand re-reads the whole PR
+every time. This is meant to run under the Monitor tool. It prints one line per change
+and is silent otherwise, so each line it prints is a reason to wake up.
+
+The design is T3 Code's PR watcher (pingdotgg/t3code, orchestration-v2/pullRequestWatch.ts),
+cut down to a script:
+
+* **Two reads, not one.** Every pass is one cheap GraphQL query: head commit, check rollup,
+  mergeability and the comment counts. The comments themselves are read
+  only when those counts or `updatedAt` moved, or after QUIET_REREAD_S, since an edit to a
+  comment moves neither.
+* **A diff against what the agent was last told**, kept in a small file per PR, so a
+  restart does not announce everything again.
+* **A failed check is reported the moment it fails.** A check that never finishes, such as
+  an advisory review bot, cannot hold the news back.
+* **"Passed" waits for the checks the base branch requires** (every check if none are).
+* **An edited comment is new activity**, so a bot that rewrites one summary comment wakes
+  you. `--ignore-author` silences accounts. There is no automatic "my own comments" filter:
+  every agent here posts as the same GitHub account as the human, so one would swallow
+  the human's comments too.
+* **Mergeability UNKNOWN keeps the old answer.** GitHub is still computing after a push.
+* **Ten comment-only wakes in a row stop the watch**, so a chatty bot cannot loop an agent
+  that replies to it. Any check, conflict or push news resets the count.
+* **A rate limit is "wait", not "failed".** Other read failures end the watch after eight.
+
+Exits 0 when the PR merges or closes or the comment cap is hit, 1 when it cannot be read.
+
+Run: qb-watch-pr <pr> [--repo OWNER/NAME] [--interval SECONDS] [--once] [--ignore-author LOGIN]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+
+COMMENT_WAKE_LIMIT = 10
+READ_FAILURE_LIMIT = 8
+QUIET_REREAD_S = 30 * 60
+DEFAULT_INTERVAL_S = 120
+RATE_LIMIT_BACKOFF_S = 300
+RATE_LIMIT_LIMIT = 12  # eleven backoffs between twelve tries: about 55 minutes
+GH_TIMEOUT_S = 60
+MIN_INTERVAL_S = 30
+LISTED = 5
+SNIPPET = 160
+
+STATUS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state updatedAt headRefOid mergeable
+      comments { totalCount }
+      reviews { totalCount }
+      reviewThreads { totalCount }
+      commits(last: 1) { nodes { commit { statusCheckRollup { state contexts(first: 100) { totalCount nodes {
+        __typename
+        ... on CheckRun { name status conclusion detailsUrl isRequired(pullRequestNumber: $number) }
+        ... on StatusContext { context state targetUrl isRequired(pullRequestNumber: $number) }
+      } } } } } }
+    }
+  }
+}
+"""
+
+ACTIVITY_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(last: 50) { pageInfo { hasPreviousPage } nodes { id author { login } body createdAt lastEditedAt url } }
+      reviews(last: 30) { pageInfo { hasPreviousPage } nodes { id author { login } body state submittedAt lastEditedAt url } }
+      reviewThreads(last: 50) { pageInfo { hasPreviousPage } nodes { comments(last: 20) {
+        pageInfo { hasPreviousPage } nodes {
+        id author { login } body createdAt lastEditedAt url path } } } }
+    }
+  }
+}
+"""
+
+# A finished check passes only on an explicit success; STALE and anything GitHub adds later
+# must not read as green.
+PASSED_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+PENDING_STATES = {"PENDING", "EXPECTED"}
+
+
+class RateLimited(Exception):
+    pass
+
+
+class ReadFailed(Exception):
+    pass
+
+
+@dataclass
+class Check:
+    name: str
+    failed: bool
+    pending: bool
+    required: bool
+    url: str
+
+
+@dataclass
+class Remark:
+    id: str
+    author: str
+    at: str  # createdAt, or lastEditedAt when later: an edit is new activity
+    body: str
+    url: str
+    path: str | None = None
+    state: str | None = None
+
+
+@dataclass
+class Watch:
+    """What the agent has been told. Compared, never trusted to be current."""
+
+    head_sha: str | None = None
+    failed: list[str] = field(default_factory=list)
+    passed: bool = False
+    passed_names: list[str] = field(default_factory=list)
+    remarks_through: str = ""
+    remark_ids: list[str] = field(default_factory=list)
+    conflicting: bool = False
+    wakes: int = 0
+    # Read bookkeeping, kept here so a restart does not re-read what it just read.
+    counts: str = ""
+    read_at: float = 0.0
+
+
+@dataclass
+class Report:
+    lines: list[str]
+    exhausted: bool = False
+
+
+def gh_graphql(query: str, owner: str, name: str, number: int) -> dict:
+    """Run a query. Only the exit status, stderr and GraphQL `errors` say rate-limited:
+    stdout carries comment bodies and check names, which can say anything."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+             "-f", f"name={name}", "-F", f"number={number}"],
+            capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_S,
+        )  # fmt: skip
+    except subprocess.TimeoutExpired as e:
+        raise ReadFailed("gh timed out") from e
+    try:
+        body = json.loads(proc.stdout)
+    except ValueError:
+        body = {}
+    errors = body.get("errors") or []
+    if any(e.get("type") == "RATE_LIMITED" for e in errors) or (
+        proc.returncode != 0 and "rate limit" in proc.stderr.lower()
+    ):
+        raise RateLimited(proc.stderr.strip()[:200])
+    if proc.returncode != 0 or errors or not body.get("data"):
+        raise ReadFailed((proc.stderr.strip() or proc.stdout.strip())[:200])
+    return body["data"]
+
+
+def parse_checks(pr: dict) -> list[Check]:
+    nodes = pr["commits"]["nodes"]
+    rollup = nodes[0]["commit"]["statusCheckRollup"] if nodes else None
+    if rollup is None:
+        return []
+    checks = []
+    unread = rollup["contexts"]["totalCount"] - len(rollup["contexts"]["nodes"])
+    if unread > 0:  # never claim "passed" over checks that were not read
+        checks.append(Check(f"{unread} more checks not read", False, True, True, ""))
+    for n in rollup["contexts"]["nodes"]:
+        if n["__typename"] == "CheckRun":
+            done = n["status"] == "COMPLETED"
+            checks.append(Check(
+                clean(n["name"]), done and n["conclusion"] not in PASSED_CONCLUSIONS, not done,
+                bool(n["isRequired"]), clean(n["detailsUrl"] or ""),
+            ))  # fmt: skip
+        else:
+            checks.append(Check(
+                clean(n["context"]), n["state"] != "SUCCESS" and n["state"] not in PENDING_STATES,
+                n["state"] in PENDING_STATES,
+                bool(n["isRequired"]), clean(n["targetUrl"] or ""),
+            ))  # fmt: skip
+    return checks
+
+
+def windows_overflowed(activity: dict, through: str) -> bool:
+    """Did a window hold nothing but items newer than the cursor, with more before it?
+    Then items between the cursor and the window were never seen, and the cursor is about to
+    move past them."""
+    pr = activity["repository"]["pullRequest"]
+
+    def full(conn: dict, stamp) -> bool:
+        times = [stamp(n) for n in conn["nodes"]]
+        return conn["pageInfo"]["hasPreviousPage"] and bool(times) and min(times) > through
+
+    edited = lambda n: n["lastEditedAt"] or n["createdAt"]  # noqa: E731
+    reviewed = lambda n: n["lastEditedAt"] or n["submittedAt"] or ""  # noqa: E731
+    return (
+        full(pr["comments"], edited)
+        or full(pr["reviews"], reviewed)
+        or any(full(t["comments"], edited) for t in pr["reviewThreads"]["nodes"])
+    )
+
+
+def parse_remarks(activity: dict) -> list[Remark]:
+    pr = activity["repository"]["pullRequest"]
+    remarks = []
+    threads = [c for t in pr["reviewThreads"]["nodes"] for c in t["comments"]["nodes"]]
+    for n in pr["comments"]["nodes"] + threads:
+        remarks.append(Remark(
+            n["id"], clean((n["author"] or {}).get("login", "someone")),
+            n["lastEditedAt"] or n["createdAt"], n["body"], n["url"], clean(n.get("path") or "") or None,
+        ))  # fmt: skip
+    for n in pr["reviews"]["nodes"]:
+        if n["state"] == "COMMENTED" and not n["body"].strip():
+            continue  # a wrapper for inline comments, which are listed on their own
+        remarks.append(Remark(
+            n["id"], clean((n["author"] or {}).get("login", "someone")),
+            n["lastEditedAt"] or n["submittedAt"] or "", n["body"], n["url"], None, n["state"],
+        ))  # fmt: skip
+    return [r for r in remarks if r.at]
+
+
+def clean(text: str) -> str:
+    """Untrusted text goes to an agent's terminal: no escape sequences, no control characters."""
+    return "".join(ch if ch.isprintable() else " " for ch in text)
+
+
+def snippet(body: str) -> str:
+    text = " ".join(clean(body).split())
+    return text if len(text) <= SNIPPET else f"{text[: SNIPPET - 3]}..."
+
+
+def evaluate(
+    watch: Watch,
+    *,
+    head_sha: str,
+    checks: list[Check],
+    mergeable: str,
+    remarks: list[Remark] | None,
+    ignored: set[str],
+) -> tuple[Watch, Report]:
+    """Compare the PR with what the agent was told. Pure: every behaviour lives here."""
+    lines: list[str] = []
+    moved = head_sha != watch.head_sha
+    failed_names = [] if moved else list(watch.failed)
+    passed = False if moved else watch.passed
+    passed_names = [] if moved else list(watch.passed_names)
+    news = moved and watch.head_sha is not None
+    if news:
+        lines.append(f"new commit {head_sha[:7]}")
+
+    if checks:  # an empty list keeps the last state: a failed check read can look like it
+        failed = [c for c in checks if c.failed]
+        new_failed = [c for c in failed if c.name not in failed_names]
+        if new_failed:
+            news = True
+            lines.append("checks failed: " + ", ".join(
+                f"{c.name} {c.url}".strip() for c in new_failed[:LISTED]
+            ) + (f" and {len(new_failed) - LISTED} more" if len(new_failed) > LISTED else ""))  # fmt: skip
+        failed_names = [c.name for c in failed]  # a rerun that fails again is reported again
+        required = [c for c in checks if c.required]
+        gate = required or checks
+        passed_now = all(not c.pending and not c.failed for c in gate)
+        gate_names = [c.name for c in gate]
+        grew = bool(required) and any(n not in passed_names for n in gate_names)
+        if passed_now and (not passed or grew):
+            news = True
+            kind = "required checks" if required else "checks"
+            lines.append(f"all {len(gate)} {kind} passed on {head_sha[:7]}")
+        passed, passed_names = passed_now, gate_names if passed_now else []
+
+    through, ids = watch.remarks_through, list(watch.remark_ids)
+    fresh = [
+        r for r in remarks or []
+        if r.author.lower() not in ignored
+        and (r.at > through or (r.at == through and r.id not in ids))
+    ]  # fmt: skip
+    if fresh:
+        details = []
+        for r in fresh[:LISTED]:
+            where = f" on {r.path}" if r.path else ""
+            said = f'"{snippet(r.body)}"' if r.body.strip() else (r.state or "reviewed")
+            details.append(f"{r.author}{where}: {said} {r.url}")
+        if len(fresh) > LISTED:
+            details.append(f"and {len(fresh) - LISTED} more")
+        lines.append(f"{len(fresh)} new comment(s): " + "; ".join(details))
+    if remarks is not None:
+        latest = max([through, *(r.at for r in remarks if r.author.lower() not in ignored)])
+        ids = [r.id for r in remarks if r.at == latest and r.author.lower() not in ignored]
+        through = latest
+
+    if mergeable == "CONFLICTING" and not watch.conflicting:
+        news = True
+        lines.append("the branch now conflicts with its base")
+    conflicting = watch.conflicting if mergeable == "UNKNOWN" else mergeable == "CONFLICTING"
+
+    comments_only = bool(fresh) and not news
+    wakes = (0 if news else watch.wakes) + (1 if comments_only else 0)
+    nxt = Watch(head_sha, failed_names, passed, passed_names, through, ids, conflicting, wakes,
+                watch.counts, watch.read_at)  # fmt: skip
+    return nxt, Report(lines, exhausted=comments_only and wakes >= COMMENT_WAKE_LIMIT)
+
+
+def state_path(repo: str, number: int) -> Path:
+    base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "qb-watch-pr" / f"{repo.replace('/', '__')}__{number}.json"
+
+
+def load_watch(path: Path) -> Watch | None:
+    try:
+        return Watch(**json.loads(path.read_text()))
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def save_watch(path: Path, watch: Watch) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(asdict(watch)))
+    tmp.replace(path)
+
+
+def read_pass(*args, **kwargs) -> tuple[Watch, Report, str]:
+    """`_read_pass`, with a response of an unexpected shape counted as a failed read."""
+    try:
+        return _read_pass(*args, **kwargs)
+    except (KeyError, TypeError, IndexError, AttributeError) as e:
+        raise ReadFailed(f"unexpected response shape: {e!r}") from e
+
+
+def _read_pass(owner: str, name: str, number: int, watch: Watch | None, ignored: set[str],
+              now: float) -> tuple[Watch, Report, str]:  # fmt: skip
+    """One pass. Returns the watch to save, what to print, and the PR's state."""
+    data = gh_graphql(STATUS_QUERY, owner, name, number)
+    pr = (data.get("repository") or {}).get("pullRequest")
+    if pr is None:
+        raise ReadFailed(f"{owner}/{name}#{number} not found or not visible")
+    if pr["state"] != "OPEN":
+        return watch or Watch(), Report([]), pr["state"]
+    counts = (
+        f"{pr['updatedAt']} {pr['comments']['totalCount']} {pr['reviews']['totalCount']} "
+        f"{pr['reviewThreads']['totalCount']}"
+    )
+    first = watch is None
+    base = watch or Watch(remarks_through=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)))
+    stale = now - base.read_at >= QUIET_REREAD_S
+    remarks, overflow = None, False
+    if not first and (counts != base.counts or stale):
+        try:
+            activity = gh_graphql(ACTIVITY_QUERY, owner, name, number)
+            remarks = parse_remarks(activity)
+            overflow = windows_overflowed(activity, base.remarks_through)
+        except (RateLimited, ReadFailed):
+            pass  # the status already read is still news; comments are tried again next pass
+    nxt, report = evaluate(
+        base, head_sha=pr["headRefOid"], checks=parse_checks(pr), mergeable=pr["mergeable"],
+        remarks=remarks, ignored=ignored,
+    )  # fmt: skip
+    if overflow:
+        report.lines.append(
+            "more comments arrived than one read holds; open the PR to see them all"
+        )
+    if remarks is not None or first:
+        nxt.counts, nxt.read_at = counts, now
+    return nxt, report, "OPEN"
+
+
+def watch_loop(args: argparse.Namespace) -> int:
+    owner, name = args.repo.split("/")
+    path = state_path(args.repo, args.pr)
+    ignored = {a.lower() for a in args.ignore_author}
+    watch = load_watch(path)
+    if watch is not None:
+        watch.wakes = 0  # restarting is how you resume after the cap
+    failures = limited = 0
+    while True:
+        try:
+            watch, report, state = read_pass(owner, name, args.pr, watch, ignored, time.time())
+            failures = limited = 0
+        except RateLimited as e:
+            limited += 1
+            if limited == 1:
+                print(f"PR #{args.pr}: rate limited, backing off ({e})", flush=True)
+            if limited >= RATE_LIMIT_LIMIT:
+                print(f"PR #{args.pr}: still rate limited, stopped watching", flush=True)
+                return 1
+            if args.once:
+                return 1
+            time.sleep(RATE_LIMIT_BACKOFF_S)
+            continue
+        except ReadFailed as e:
+            failures += 1
+            if args.once or failures >= READ_FAILURE_LIMIT:
+                print(f"PR #{args.pr}: cannot read it, stopped watching ({e})", flush=True)
+                return 1
+            time.sleep(args.interval)
+            continue
+        if state != "OPEN":
+            print(f"PR #{args.pr}: {state.lower()}, stopped watching", flush=True)
+            path.unlink(missing_ok=True)
+            return 0
+        for line in report.lines:  # told first: dying between the two repeats news, not loses it
+            print(f"PR #{args.pr}: {line}", flush=True)
+        save_watch(path, watch)
+        if report.exhausted:
+            print(f"PR #{args.pr}: {COMMENT_WAKE_LIMIT} comment-only updates in a row, "
+                  "stopped watching; rerun to resume", flush=True)  # fmt: skip
+            return 0
+        if args.once:
+            return 0
+        time.sleep(args.interval)
+
+
+def resolve_repo() -> str:
+    try:
+        out = subprocess.run(["gh", "repo", "view", "--json", "nameWithOwner", "--jq",
+                              ".nameWithOwner"], capture_output=True, text=True, check=False,
+                             timeout=GH_TIMEOUT_S)  # fmt: skip
+    except subprocess.TimeoutExpired:
+        raise SystemExit("qb-watch-pr: `gh repo view` timed out; pass --repo OWNER/NAME") from None
+    if out.returncode != 0 or "/" not in out.stdout:
+        detail = out.stderr.strip()[:200] or "not in a GitHub repo"
+        raise SystemExit(f"qb-watch-pr: {detail}; pass --repo OWNER/NAME")
+    return out.stdout.strip()
+
+
+def positive(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return value
+
+
+def repo_name(text: str) -> str:
+    if text.count("/") != 1 or not all(text.split("/")):
+        raise argparse.ArgumentTypeError("must look like OWNER/NAME")
+    return text
+
+
+def interval(text: str) -> int:
+    value = int(text)
+    if value < MIN_INTERVAL_S:
+        raise argparse.ArgumentTypeError(f"must be at least {MIN_INTERVAL_S} seconds")
+    return value
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("pr", type=positive)
+    p.add_argument(
+        "--repo", type=repo_name, help="OWNER/NAME; default: the current checkout's repo"
+    )
+    p.add_argument(
+        "--interval", type=interval, default=DEFAULT_INTERVAL_S, help="seconds between passes"
+    )
+    p.add_argument("--once", action="store_true", help="one pass, then exit")
+    p.add_argument("--ignore-author", action="append", default=[], metavar="LOGIN",
+                   help="do not wake for this account's comments (repeatable)")  # fmt: skip
+    args = p.parse_args()
+    args.repo = args.repo or resolve_repo()
+    return watch_loop(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

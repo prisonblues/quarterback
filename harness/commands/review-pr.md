@@ -160,6 +160,11 @@ checkout's claim on an *issue* and the work is not finished, leave it: that clai
 covers the branch, not this pass, and §4 and the worktree teardown are where it goes
 back.
 
+**If the fixer pushed, watch the new head rather than polling it:** run
+`qb-watch-pr <n>` under the Monitor tool (see `fix-issue.md` §10) and act on what it
+reports. It is silent until a check fails, the required checks pass, someone comments, or
+the branch conflicts.
+
 Show the user the sub-agent's summary table verbatim, then state plainly: the
 branch it pushed to, whether all checks passed, and anything it flagged as
 **unverified**. If the sub-agent failed or stopped early, report exactly where

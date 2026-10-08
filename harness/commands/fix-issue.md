@@ -532,6 +532,17 @@ cached `gh pr list --head <branch>` (5 min TTL, refreshed in the background), so
 a PR opened by hand or picked up by a later session still appears within a few
 minutes — the marker just makes it instant and survives `gh` being unavailable.
 
+**Watch the PR; do not poll it.** Start the watcher under the Monitor tool and carry on:
+```bash
+qb-watch-pr "$PR_NUMBER"          # Monitor, persistent; one line per change, silent otherwise
+```
+Each line it prints is news: a check failed (reported the moment it fails, not when the slow
+bots finish), the required checks passed, someone commented or edited a comment, or the
+branch now conflicts. Act on it, push, and it keeps watching the new head. It stops itself
+when the PR merges or closes, or after ten comment-only updates in a row (rerun it to resume).
+Pass `--ignore-author <login>` for a bot whose comments are noise. Never replace it with a
+`gh pr checks` loop: every pass of that re-reads the whole PR.
+
 ## 11. Comment on issue
 
 Post a summary comment on the issue linking to the PR:
