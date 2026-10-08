@@ -62,13 +62,14 @@ finished worktrees.
 ## 2. Dry-run the orphan sweep
 
 Run `prune-worktrees` with **no flags** (dry-run) and show the user the full
-report verbatim. It reports six categories:
+report verbatim. It reports seven categories:
 - Orphan databases
 - Stale port entries
 - Leftover directories
 - Orphan containers
 - Orphan nginx blocks
 - Orphan board claims
+- Orphan bytecode caches (`$PYTHONPYCACHEPREFIX` entries for worktree dirs that no longer exist; regenerable)
 
 If it says "Nothing to prune. Clean.", report that and stop — you're done.
 
@@ -146,10 +147,11 @@ The flags map to categories:
 - `--remove-dirs` — `rm -rf` the leftover directories
 - `--remove-containers` — `docker rm -f` the orphan containers
 - `--remove-nginx` — strip the orphan nginx blocks and restart nginx
+- `--remove-pycache` — `rm -rf` the orphan bytecode caches
 
 Default to applying **everything the dry-run found**:
 ```bash
-prune-worktrees --prune --remove-dirs --remove-containers --remove-nginx
+prune-worktrees --prune --remove-dirs --remove-containers --remove-nginx --remove-pycache
 ```
 …but if the user only wants some categories, pass just those flags. Show the
 command before running it.

@@ -656,7 +656,7 @@ hand-rolling `docker rm` / `dropdb` / `rm -rf` is not.
 
 #### Every category has a fourth state: `NOT CHECKED`
 
-`prune-worktrees` reports six categories, and each of them could come back two ways: none,
+`prune-worktrees` reports seven categories, and each of them could come back two ways: none,
 or a list. The third is the one that took until #735 to exist:
 
 ```
@@ -714,8 +714,8 @@ Three consequences, and the last is the one a caller quotes:
   same treatment: its `awk … && mv` chain was followed by an unconditional "removed nginx
   block", so under no `-e` a rewrite that never happened still reported as one — and nginx was
   then restarted to pick up a config nothing had changed.
-- **`Nothing to prune. Clean.` is a statement about all six categories**, so a run that
-  looked at four of them does not print it, and names the ones it could not look at instead.
+- **`Nothing to prune. Clean.` is a statement about all seven categories**, so a run that
+  looked at fewer than seven does not print it, and names the ones it could not look at instead.
   That sentence is precisely what a caller reads as "the sweep ran and found nothing".
 
 **A category that does not apply is not unknown**, and keeping those apart is what stops the
