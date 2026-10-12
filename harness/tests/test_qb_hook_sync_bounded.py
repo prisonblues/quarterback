@@ -31,8 +31,10 @@ pytestmark = pytest.mark.skipif(
 
 def _repo(path: Path) -> None:
     path.mkdir()
-    run = lambda *a: subprocess.run(["git", "-C", str(path), *a], check=True,
-                                    capture_output=True)
+
+    def run(*a: str) -> None:
+        subprocess.run(["git", "-C", str(path), *a], check=True, capture_output=True)
+
     run("init", "-q")
     run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
         "--allow-empty", "-m", "x")
