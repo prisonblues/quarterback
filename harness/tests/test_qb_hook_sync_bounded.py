@@ -26,7 +26,8 @@ REAL_GIT = shutil.which("git")
 SLEEP = shutil.which("sleep")  # absolute: the sandbox PATH has no sleep
 
 pytestmark = pytest.mark.skipif(
-    REAL_GIT is None or shutil.which("jq") is None, reason="needs git and jq")
+    REAL_GIT is None or shutil.which("jq") is None, reason="needs git and jq"
+)
 
 
 def _repo(path: Path) -> None:
@@ -36,8 +37,7 @@ def _repo(path: Path) -> None:
         subprocess.run(["git", "-C", str(path), *a], check=True, capture_output=True)
 
     run("init", "-q")
-    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
-        "--allow-empty", "-m", "x")
+    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x")
 
 
 @pytest.fixture
