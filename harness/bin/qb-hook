@@ -971,7 +971,10 @@ _ask_note() {   # _ask_note [midturn] — echo the note for undelivered asks, or
 _sync_note() {   # echo the board's advice for THIS checkout, or nothing
   [ -n "$repo" ] && [ -n "$cwd" ] || return 0
   local top have state dirty ahead behind
-  top=$(git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
+  # Every git call here is bounded: on a /mnt/c (WSL 9p) checkout `git status`
+  # can sit in D state for a minute+, and this runs on every UserPromptSubmit.
+  # A timeout fails open — no note this turn rather than a hung prompt.
+  top=$(timeout 3 git -C "$cwd" rev-parse --show-toplevel 2>/dev/null) || return 0
   # "what I have": recent SHAs, newest first. Sending our own history means the
   # answer is about us whether or not this machine ever ran report_git.
   #
@@ -985,11 +988,15 @@ _sync_note() {   # echo the board's advice for THIS checkout, or nothing
   # anything of MIN_SHA (7) or longer, so ten times the history costs about
   # 3.7kB of query string against the old 1kB, well inside any URL limit, and
   # 12 hex digits is far past collision range for a repo this size.
-  have=$(git -C "$top" log -n250 --abbrev=12 --format=%h 2>/dev/null | paste -sd, -)
+  have=$(timeout 3 git -C "$top" log -n250 --abbrev=12 --format=%h 2>/dev/null | paste -sd, -)
   [ -n "$have" ] || return 0
-  dirty=$([ -n "$(git -C "$top" status --porcelain --untracked-files=no 2>/dev/null)" ] \
-          && echo true || echo false)
-  state=$(git -C "$top" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)
+  # dirty is omitted (unknown) when status times out, not reported as clean.
+  if out=$(timeout 3 git -C "$top" status --porcelain --untracked-files=no 2>/dev/null); then
+    [ -n "$out" ] && dirty=true || dirty=false
+  else
+    dirty=
+  fi
+  state=$(timeout 3 git -C "$top" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null)
   behind=$(printf '%s' "$state" | cut -f1); ahead=$(printf '%s' "$state" | cut -f2)
 
   # branch is omitted when detached rather than sent empty — an empty value is a
@@ -997,7 +1004,7 @@ _sync_note() {   # echo the board's advice for THIS checkout, or nothing
   curl -sS --max-time 4 "${_auth[@]}" -G "$BASE/sync" \
     --data-urlencode "repo=$repo" ${branch:+--data-urlencode "branch=$branch"} \
     --data-urlencode "path=$top" --data-urlencode "have=$have" \
-    --data-urlencode "dirty=$dirty" \
+    ${dirty:+--data-urlencode "dirty=$dirty"} \
     ${behind:+--data-urlencode "behind=$behind"} ${ahead:+--data-urlencode "ahead=$ahead"} \
     2>/dev/null \
   | jq -r 'if .advice then "⬇️ quarterback: " + .advice else empty end' 2>/dev/null \
