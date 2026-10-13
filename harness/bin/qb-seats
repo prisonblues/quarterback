@@ -1353,6 +1353,62 @@ type_into() {
   tmux send-keys -t "$pane" C-m
 }
 
+state_home() {
+  if [ -n "${QB_SEATS_STATE_HOME:-}" ]; then
+    printf '%s' "$QB_SEATS_STATE_HOME"
+  elif [ -n "${XDG_STATE_HOME:-}" ]; then
+    printf '%s/quarterback/seats' "$XDG_STATE_HOME"
+  elif [ -n "${HOME:-}" ]; then
+    printf '%s/.local/state/quarterback/seats' "$HOME"
+  else
+    printf '%s/quarterback/seats' "${XDG_RUNTIME_DIR:-/tmp}"
+  fi
+}
+
+screen_state_dir() {
+  local key
+  key=$(printf '%s\t%s' "$REPO" "$SESSION" | sha256sum | cut -c1-32)
+  printf '%s/%s' "$(state_home)" "$key"
+}
+
+seat_state_file() {   # <seat number>
+  printf '%s/seat-%s.env' "$(screen_state_dir)" "$1"
+}
+
+seat_state_field() {   # <file> <field>
+  [ -r "$1" ] || return 0
+  awk -F= -v key="$2" '$1 == key { sub(/^[^=]*=/, ""); print; exit }' "$1" 2>/dev/null
+}
+
+safe_resume_id() {
+  case "$1" in
+    ''|*[!A-Za-z0-9._~-]*) return 1 ;;
+  esac
+  return 0
+}
+
+restore_cmd_for_seat() {   # <seat number>
+  local file agent session
+  file=$(seat_state_file "$1")
+  agent=$(seat_state_field "$file" agent)
+  session=$(seat_state_field "$file" session)
+  safe_resume_id "$session" || return 1
+  case "$agent" in
+    claude) printf 'claude --resume %s' "$session" ;;
+    codex)  printf 'codex resume %s' "$session" ;;
+    *)      return 1 ;;
+  esac
+}
+
+stamp_seat() {   # <pane id> <seat number>
+  local dir file
+  dir=$(screen_state_dir)
+  mkdir -p "$dir" 2>/dev/null || true
+  file=$(seat_state_file "$2")
+  tmux set-option -p -t "$1" @qb_seat "$2"
+  tmux set-option -p -t "$1" @qb_seat_state_file "$file"
+}
+
 # Start a seat by TYPING its command into the pane's shell.
 #
 # This looks like the lazy option and is in fact the only correct one. The pane
@@ -1382,10 +1438,11 @@ type_into() {
 # The pane is built either way — the line is the only difference between a seat
 # with an agent in it and a seat without one.
 start_seat() {
-  local pane=$1 enter=1
+  local pane=$1 seat=$2 enter=1 cmd
   [ -n "$INITIAL_CMD" ] || return 0
+  cmd=$(restore_cmd_for_seat "$seat") || cmd=$INITIAL_CMD
   [ "$STAGED" -eq 1 ] && enter=0
-  type_into "$pane" "$INITIAL_CMD" "$enter"
+  type_into "$pane" "$cmd" "$enter"
 }
 
 # WHAT A SEAT IS TOLD, in precedence order, and every layer is an explicit answer
@@ -1829,10 +1886,10 @@ if [ "$ACTION" = add ]; then
   dash_was=""
   [ -z "$dash" ] || dash_was=$(tmux display-message -p -t "$dash" '#{pane_width}')
   pane=$(tmux split-window -h -P -F '#{pane_id}' -t "$first_seat" -c "$REPO")
-  tmux set-option -p -t "$pane" @qb_seat "$next"
+  stamp_seat "$pane" "$next"
   tmux select-layout -t "$pane" -E 2>/dev/null || true
   [ -z "$dash_was" ] || dash_resize "$dash_was"
-  start_seat "$pane"
+  start_seat "$pane" "$next"
   printf '%s: added seat %s to %s\n' "$PROG" "$next" "$SESSION"
   exit 0
 fi
@@ -2025,7 +2082,7 @@ row_of() {                      # how many seats go in the top row
 TOP=$(row_of)
 
 first=$(tmux list-panes -t "$SESSION_ID:seats" -F '#{pane_id}')
-tmux set-option -p -t "$first" @qb_seat 1
+stamp_seat "$first" 1
 
 # Split off the pane just made, not off $first: a split lands to the RIGHT of
 # its target, so splitting $first every time builds 1,5,4,3,2 across the row.
@@ -2035,7 +2092,7 @@ i=2
 last=$first
 while [ "$i" -le "$TOP" ]; do   # the rest of the top row
   last=$(tmux split-window -h -P -F '#{pane_id}' -t "$last" -c "$REPO")
-  tmux set-option -p -t "$last" @qb_seat "$i"
+  stamp_seat "$last" "$i"
   i=$((i + 1))
 done
 tmux select-layout -t "$first" -E 2>/dev/null || true
@@ -2044,12 +2101,12 @@ if [ "$SEATS" -gt "$TOP" ]; then
   # -f: a full-width split off the top row, which is the second ROW rather than a
   # third column of the first one.
   second=$(tmux split-window -v -f -P -F '#{pane_id}' -t "$first" -c "$REPO")
-  tmux set-option -p -t "$second" @qb_seat "$i"
+  stamp_seat "$second" "$i"
   i=$((i + 1))
   last=$second
   while [ "$i" -le "$SEATS" ]; do
     last=$(tmux split-window -h -P -F '#{pane_id}' -t "$last" -c "$REPO")
-    tmux set-option -p -t "$last" @qb_seat "$i"
+    stamp_seat "$last" "$i"
     i=$((i + 1))
   done
   tmux select-layout -t "$second" -E 2>/dev/null || true
@@ -2137,7 +2194,7 @@ fi
 # Every seat gets the same line — see the header on why that is the design and not
 # an omission. `n` is read and unused: seat_panes prints the number beside the pane
 # and the number is no longer part of what a seat is told.
-while read -r pane _; do start_seat "$pane"; done < <(seat_panes)
+while read -r pane n; do start_seat "$pane" "$n"; done < <(seat_panes)
 
 # awk rather than `head -1`, which would close the pipe under `set -o pipefail`
 # and abort the script on SIGPIPE just as the screen finished building.
