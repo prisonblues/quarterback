@@ -4705,7 +4705,15 @@ def dial_matches(vocabulary: dict[str, dict], typed: str,
 #: ``agent`` is the CONVERSATION in the pane (`@qb_session`), where ``session`` is
 #: the tmux session the pane is in. Two different things one word away from each
 #: other, so both are spelled out wherever they are read.
-SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "agent")
+SEAT_FIELDS = ("pane", "seat", "session", "window", "command", "path", "agent", "wname")
+# The window a parked seat sits in (`qb-seat-key park`, #517). Its name is the only thing
+# on the pane that says so, and it is how the dashboard tells ◌ from –.
+PARKED_WINDOW = "qb-hidden"
+
+
+def seat_parked(seat: dict) -> bool:
+    """Is this seat out of sight (`qb-seat-key park`)? Its pane is in the holding window."""
+    return seat.get("wname") == PARKED_WINDOW
 
 
 def tmux_seats() -> tuple[list[dict], str | None]:
@@ -4755,7 +4763,8 @@ def tmux_seats() -> tuple[list[dict], str | None]:
         return [], None
     fmt = "\t".join("#{%s}" % f for f in
                     ("pane_id", "@qb_seat", "session_name", "window_index",
-                     "pane_current_command", "pane_current_path", "@qb_session"))
+                     "pane_current_command", "pane_current_path", "@qb_session",
+                     "window_name"))
     try:
         got = subprocess.run(["tmux", "list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=5)
@@ -4771,6 +4780,9 @@ def tmux_seats() -> tuple[list[dict], str | None]:
     seats = []
     for line in got.stdout.splitlines():
         parts = line.split("\t")
+        # An older tmux_seats fixture, or a shim, answers without the window name.
+        if len(parts) == len(SEAT_FIELDS) - 1:
+            parts.append("")
         if len(parts) != len(SEAT_FIELDS) or not parts[1]:
             continue
         seats.append(dict(zip(SEAT_FIELDS, parts)))

@@ -1477,15 +1477,15 @@ async def _drive_scope() -> list[str]:
 
         # NARROW: this project's rows, the unattributable row kept, no repo cell.
         # Asserted on the `what` cell, which is the one the dropped column widened.
-        # dot ✕ who state stage what ttl — `what` is index 5.
-        shown = sorted(row[5] for row in agent_rows(agents))
+        # dot ✕ – who state stage what ttl — `what` is index 6.
+        shown = sorted(row[6] for row in agent_rows(agents))
         if shown != ["#261 ours", "? nowhere", "here"]:
             failures.append(f"narrow AGENTS holds {shown}, not this repo's row, the "
                             "one the board could not attribute — marked, because the "
                             "cell that used to say so is the cell this view drops — "
                             "and the claim nobody answers for")
-        if len(agents.columns) != 7:
-            failures.append(f"narrow AGENTS has {len(agents.columns)} columns, not 7")
+        if len(agents.columns) != 8:
+            failures.append(f"narrow AGENTS has {len(agents.columns)} columns, not 8")
         if "1 elsewhere" not in titles["agents"]:
             failures.append(f"narrow AGENTS does not say what it hid: {titles['agents']!r}")
         if "1 elsewhere" not in titles["work"]:
@@ -1506,12 +1506,12 @@ async def _drive_scope() -> list[str]:
         # Three agents and the two claims neither of them answers for.
         if len(agent_rows(agents)) != 5:
             failures.append(f"the wide view holds {len(agent_rows(agents))} rows, not 5")
-        if len(agents.columns) != 8:
-            failures.append(f"the wide view has {len(agents.columns)} columns, not 8")
+        if len(agents.columns) != 9:
+            failures.append(f"the wide view has {len(agents.columns)} columns, not 9")
         if "elsewhere" in titles["agents"] or "elsewhere" in titles["work"]:
             failures.append(f"the wide view still claims to hide rows: {titles}")
         # The claim keeps its repo where two watched repos could share a number.
-        keys = [row[6] for row in agent_rows(agents)]
+        keys = [row[7] for row in agent_rows(agents)]
         if "quarterback#261 ours" not in keys:
             failures.append(f"the wide view's claim rows read {keys}")
         if "all repos" not in _text(app.query_one("#head")):
@@ -1551,7 +1551,7 @@ async def _drive_stage() -> list[str]:
         agents = app.query_one("#agents")
         # dot ✕ who state stage … — and minus the ＋, which is a control rather
         # than an agent and has no stage to report.
-        return [_cells(agents, i)[4] for i in range(agents.row_count - 1)]
+        return [_cells(agents, i)[5] for i in range(agents.row_count - 1)]
 
 
 #: A queue with one of each shape that matters: a row review can act on, and a
@@ -3155,7 +3155,7 @@ def _seat_labels(app, seats):
     app.render_seats(seats)
     # Minus the ＋, which render_seats appends as a row of its own so the panel can
     # be driven by the mouse alone. It is not a seat and has no label to assert on.
-    return [row[2] for row in written[:len(seats)]]
+    return [row[3] for row in written[:len(seats)]]
 
 
 def test_one_screen_calls_a_pane_what_the_bar_and_the_border_call_it():
@@ -5178,3 +5178,29 @@ def test_both_lines_that_enumerate_the_clicks_name_the_new_one():
     assert "▥" in hint, hint
     assert "▥" in keys, keys
     assert "v " in keys and "read it here" in keys, keys
+
+
+def test_a_seat_row_carries_a_park_icon_and_a_parked_seat_a_circle():
+    app_module = _load_app()
+    qd = app_module.qd
+    assert qd.seat_parked({"wname": qd.PARKED_WINDOW}) is True
+    assert qd.seat_parked({"wname": "seats"}) is False
+    assert qd.seat_parked({}) is False
+    # An older answer without the window name still parses, as not parked.
+    assert app_module.Dash.PARK_COLUMN == 2 and app_module.Dash.VERB_COLUMN == 1
+
+
+def test_clicking_the_park_icon_parks_and_any_click_on_a_parked_seat_unparks():
+    app_module = _load_app()
+    qd = app_module.qd
+    app = app_module.Dash.__new__(app_module.Dash)
+    clicks: list[str] = []
+    app.run_seat_click = lambda tag, session: clicks.append(f"{tag}@{session}")
+    app.click_agent = lambda a: clicks.append("agent")
+    app.jump_pane = lambda s: clicks.append("jump")
+    showing = {"seat": "2", "session": "s", "wname": "seats"}
+    parked = {"seat": "3", "session": "s", "wname": qd.PARKED_WINDOW}
+    app.dispatch_agent({"kind": "seat", "seat": showing, "agent": None}, "seat", app.PARK_COLUMN)
+    app.dispatch_agent({"kind": "seat", "seat": parked, "agent": None}, "seat", 3)
+    app.dispatch_agent({"kind": "seat", "seat": showing, "agent": None}, "seat", 3)
+    assert clicks == ["park2@s", "unpark3@s", "jump"], clicks

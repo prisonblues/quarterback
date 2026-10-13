@@ -1145,6 +1145,13 @@ class Dash(App):
     # `dispatch_agent` never sees this number.
     READ_COLUMN = 2
 
+    # THE PARK ICON, on AGENTS only, straight after the ✕ — the same pair the tmux
+    # seat bar draws on a seat's cell, one click to put the seat out of sight and one
+    # to close it (#517). A parked seat shows ◌ here and the same click brings it
+    # back. Its number is 2 for the reason READ_COLUMN is: AGENTS never reaches
+    # `dispatch_work`, so the two tables do not collide.
+    PARK_COLUMN = 2
+
     def __init__(self, interval: float = 4.0, gh_interval: float = 90.0,
                  plan_interval: float = 15.0, scope: qd.Scope | None = None,
                  repo: str | None = None) -> None:
@@ -1424,7 +1431,7 @@ class Dash(App):
             # `stage` goes between `state` and the toggling repo cell: it is a
             # fixed column, so it must sit ABOVE the one that comes and goes for
             # the same reason the action icon does (#262).
-            ("#agents", ("", "✕", "who", "state", "stage", *repo, "what", "ttl")),
+            ("#agents", ("", "✕", "–", "who", "state", "stage", *repo, "what", "ttl")),
             # `kind` before the repo cell for the same reason, and it is the
             # column that makes one table legible where four panels needed none:
             # `iss` and `pr` were the panel you were looking at (#272).
@@ -1978,6 +1985,10 @@ class Dash(App):
                 # looking ✕ on either would be the "drawn takeable, refused one by
                 # one" this dashboard has spent three issues removing.
                 Text("✕", style="bold red") if seat else Text("✕", style="grey30"),
+                # – parks a showing seat, ◌ brings a parked one back. Dim on a row
+                # with no pane to park, for the ✕'s reason.
+                (Text("◌" if qd.seat_parked(row["seat"]) else "–", style="bold yellow")
+                 if seat else Text("–", style="grey30")),
                 Text(qd.clip(row["who"], 13),
                      style="bold green" if seat else
                      ("bold" if row["agent"] is not None else "yellow")),
@@ -2003,7 +2014,7 @@ class Dash(App):
         # dispatch_row has something to look up — a row key with nothing behind it
         # is dropped on the floor.
         blank = [Text("")] * (1 if self.scope.column else 0)
-        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"),
+        add_key = table.add_row(Text(""), Text("＋", style="bold cyan"), Text(""),
                                 Text("add seat", style="cyan"),
                                 Text(""), Text(""), *blank, Text(""), Text(""),
                                 key="seat:add").value
@@ -2549,6 +2560,12 @@ class Dash(App):
         if kind == "seat" and column == self.VERB_COLUMN:
             self.close_seat(row["seat"])
             return
+        if kind == "seat" and (column == self.PARK_COLUMN
+                               or qd.seat_parked(row["seat"])):
+            # ANY click on a parked seat brings it back: its pane is alive in the
+            # holding window, and jump_pane would carry the client there instead.
+            self.park_seat(row["seat"])
+            return
         if row.get("agent") is not None:
             self.click_agent(row["agent"])
         elif row.get("seat") is not None:
@@ -2682,6 +2699,20 @@ class Dash(App):
             return
         self.seat_click(f"kill{seat['seat']}", session,
                         f"close seat {seat['seat']}? the agent in it goes too")
+
+    def park_seat(self, seat: dict) -> None:
+        """– parks a showing seat and ◌ brings it back; the agent never stops.
+
+        Not confirmed, for the reason `action_expand` is not: nothing is killed and
+        the same click undoes it. The geometry is qb-seat-key's, reached through
+        qb-seat-click like every other seat verb (#517).
+        """
+        session = seat.get("session")
+        if not session:
+            self.say("that seat has no session — refresh and try again")
+            return
+        verb = "unpark" if qd.seat_parked(seat) else "park"
+        self.run_seat_click(f"{verb}{seat['seat']}", session)
 
     def add_seat(self) -> None:
         if self.seats_error:
