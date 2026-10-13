@@ -885,18 +885,20 @@ unpark_seat() {   # <n>
 }
 
 # THE SEAT BAR IS A SECOND STATUS LINE, and it is only wanted when the dash is not
-# already saying the same thing. With the dash in the row it lists every seat and
-# the fleet, so the bar is one line of height spent repeating it; with the dash
-# hidden or expanded the bar is the only thing that says seats exist, and its
-# dash chip is the way back. A PARKED seat also keeps the bar up: its cell is the
-# only mark that the seat exists, and a screen that hid the bar would lose it.
-# Only a screen that has a dash can lose the bar at all. Called after every verb
-# that changes one of those three facts.
+# already saying the same thing. With the dash in the row it lists every seat —
+# parked ones too, with a ◌ — so the bar is one line of height spent repeating it;
+# with the dash hidden or expanded the bar is the only thing that says seats exist,
+# and its dash chip is the way back. Called after every verb that moves the dash.
+#
+# NOT AFTER PARK AND UNPARK, which kept the bar up while a seat was parked and so
+# resized the window by a row on every click: every pane, the dash included,
+# redrew a line shorter or taller each time a seat was hidden or shown. With the
+# dash showing a parked seat is already on screen, and the height stays put.
 sync_bar() {
   [ -n "$(tmux show-options -t "$SID:" -qv @qb_bar)" ] || return 0
   local want=2 d
   d=$(dash_pane)
-  if [ -n "$d" ] && in_row "$d" && [ -z "$(parked_list)" ]; then want=on; fi
+  if [ -n "$d" ] && in_row "$d"; then want=on; fi
   tmux set-option -t "$SID:" status "$want"
 }
 
@@ -961,4 +963,4 @@ case "$ACTION" in
   # about it.
   *) exit 0 ;;
 esac
-case "$ACTION" in dash|expand|park*|unpark*) sync_bar ;; esac
+case "$ACTION" in dash|expand) sync_bar ;; esac

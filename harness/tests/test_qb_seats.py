@@ -4258,13 +4258,19 @@ def test_the_seat_bar_is_given_back_while_the_dash_is_in_the_row(screen):
     assert status_lines(screen) == "1"
 
 
-def test_a_parked_seat_keeps_the_bar_up_even_with_the_dash_showing(screen):
+def test_parking_a_seat_does_not_change_the_window_height(screen):
+    """With the dash showing, a parked seat is listed there with a ◌, so the bar
+    stays down — bringing it up on every park resized every pane, the dash
+    included, by a row, which read as the dash jumping on each click."""
     screen.env["QB_SEATS_DASH"] = DASH_STUB
     screen("-n", "3")
+    height = geometry(screen)[pane_id(screen, "dash")][3]
     seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
-    assert status_lines(screen) == "2", "its cell is the only mark it exists"
+    assert status_lines(screen) == "1"
+    assert geometry(screen)[pane_id(screen, "dash")][3] == height, "the dash was resized"
     seat_key(screen, "unpark", "t")
     assert status_lines(screen) == "1"
+    assert geometry(screen)[pane_id(screen, "dash")][3] == height
 
 
 def test_a_screen_with_no_dash_always_has_the_bar(screen):
