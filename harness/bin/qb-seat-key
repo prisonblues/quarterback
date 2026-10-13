@@ -663,8 +663,7 @@ nudge_dash() {   # nudge_dash <+|->
 # `t` and `d` made plural, and the three things that are not the same once there
 # can be N of them:
 #
-#   * STATE IS PER SEAT. `@qb_parked_seat_<n>` is `<pane> <anchor> <mode> <size>
-#     <widths>` and `@qb_parked` is the numbers in the order they were parked, which
+#   * STATE IS PER SEAT. `@qb_parked_seat_<n>` is `<pane> <anchor> <mode> <size>` and `@qb_parked` is the numbers in the order they were parked, which
 #     is what a bare `unpark` pops from. Parked is a property of one SCREEN: the
 #     agent keeps its process, its lease, its claims and its board presence, and
 #     nothing here calls qb-end. A parked seat is still a live row in the dash.
@@ -744,18 +743,35 @@ fallback_anchor() {   # <n>
       } END { if (lo != "") print lo, "after"; else if (hi != "") print hi, "before" }'
 }
 
-# Every window-wide row spread evenly and the dash put back, qb-seat-click's reflow
-# for the same reason: -E re-equalises the dash along with the seats.
-reflow_even() {
-  local survivor dash was=""
-  survivor=$(first_seat)
-  [ -n "$survivor" ] || return 0
-  dash=$(dash_pane)
-  if [ -n "$dash" ] && in_row "$dash"; then
-    was=$(tmux display-message -p -t "$dash" '#{pane_width}')
-  fi
-  tmux select-layout -t "$survivor" -E 2>/dev/null || true
-  [ -z "$was" ] || tmux resize-pane -t "$dash" -x "$was" 2>/dev/null || true
+# EACH ROW OF SEATS SPREAD EVENLY, BY HAND, and not with `select-layout -E`. That
+# evens every pane in the window including the dash, which then takes its 78
+# columns back from whichever seat sits beside it: measured, a five-seat screen
+# came out 48, 47, 47, 16 after one park, and 48, 47, 47, 14, 1 after the unpark
+# that followed. Here the dash is not touched at all. A row's span (first seat's
+# left edge to last seat's right edge) is conserved by both the break and the
+# join, so it is divided between the seats in it, borders paid for, and the last
+# seat takes whatever the others leave — which is why it is the one not resized.
+#
+# NOT THE WIDTHS RECORDED AT PARK TIME, which this used to reassert when the seat
+# came back in the order it left: the terminal can be resized in between, and a
+# recorded 60 into a window that is now narrower is a seat squeezed for nothing.
+even_rows() {
+  tmux list-panes -t "$SID:seats" \
+      -F '#{pane_top} #{pane_left} #{pane_width} #{pane_id} #{@qb_seat}' \
+    | awk 'NF == 5' | sort -k1,1n -k2,2n \
+    | awk '
+        function flush(  i, span, share) {
+          if (n < 2) return
+          span = left[n - 1] + w[n - 1] - left[0]
+          share = int((span - (n - 1)) / n)
+          for (i = 0; i < n - 1; i++) print id[i], share
+        }
+        $1 != cur { flush(); cur = $1; n = 0 }
+        { id[n] = $4; left[n] = $2; w[n] = $3; n++ }
+        END { flush() }' \
+    | while read -r id share; do
+        tmux resize-pane -t "$id" -x "$share" 2>/dev/null || true
+      done
 }
 
 # The bar's parked cells, written to the session. A number whose pane has gone is
@@ -776,7 +792,7 @@ parked_refresh() {
 }
 
 park_seat() {   # <pane id>
-  local p=$1 n visible anchor mode size widths state
+  local p=$1 n visible anchor mode size state
   n=$(tmux show-options -p -t "$p" -qv @qb_seat 2>/dev/null) || n=""
   [ -n "$n" ] || die "that pane is not a seat"
   in_row "$p" || die "seat $n is not in the row — it may be parked already"
@@ -790,22 +806,26 @@ park_seat() {   # <pane id>
     after|before) size=$(tmux display-message -p -t "$p" '#{pane_width}') ;;
     *)            size=$(tmux display-message -p -t "$p" '#{pane_height}') ;;
   esac
-  # Read BEFORE the break — hide_pane's reason, which is that afterwards the seat's
-  # columns have already gone to a neighbour.
-  widths=$(pane_widths)
   tmux break-pane -d -s "$p" -t "$SID:" -n "$HOLDING" \
     || die "park: tmux would not break seat $n out"
-  tmux set-option -t "$SID:" "@qb_parked_seat_$n" "$p $anchor $mode $size $widths"
+  # THE NUMBER LIVES ON THE PANE BORDER, and the border is a WINDOW option set on
+  # `seats` — so a pane broken out to a window of its own arrives with no label at
+  # all, and looking at a parked seat shows an agent with no name on it. Copied from
+  # the seat window rather than written out again, so the two cannot drift.
+  tmux set-option -w -t "$p" pane-border-status top 2>/dev/null || true
+  tmux set-option -w -t "$p" pane-border-format \
+    "$(tmux show-options -wv -t "$SID:seats" pane-border-format 2>/dev/null)" 2>/dev/null || true
+  tmux set-option -t "$SID:" "@qb_parked_seat_$n" "$p $anchor $mode $size"
   tmux set-option -t "$SID:" @qb_parked "$(printf '%s %s' "$(parked_list)" "$n" | xargs)"
-  reflow_even
+  even_rows
   parked_refresh
 }
 
 unpark_seat() {   # <n>
-  local n=$1 state p anchor mode size widths last where
+  local n=$1 state p anchor mode size where
   state=$(parked_state "$n")
   [ -n "$state" ] || die "seat $n is not parked"
-  read -r p anchor mode size widths <<<"$state"
+  read -r p anchor mode size <<<"$state"
   if ! pane_exists "$p"; then
     tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
     parked_refresh
@@ -854,14 +874,10 @@ unpark_seat() {   # <n>
     tmux join-pane "${flags[@]}" -s "$p" -t "$anchor" \
       || die "unpark: tmux would not put seat $n back"
   fi
-  last=$(parked_list | awk '{ print $NF }')
   tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
   tmux set-option -t "$SID:" @qb_parked \
     "$(parked_list | tr ' ' '\n' | awk -v n="$n" '$1 != n' | xargs)"
-  # THE RECORDED WIDTHS ARE ONLY TRUE FOR THE SEAT PARKED LAST: they were read with
-  # every seat parked before it still in the row. Back in any other order they
-  # describe a row that no longer exists, so that is spread evenly instead.
-  if [ "$last" = "$n" ] && [ -n "$widths" ]; then restore_widths "$widths"; else reflow_even; fi
+  even_rows
   parked_refresh
   # THE CURSOR GOES TO THE SEAT, unlike `t` and `d`: pressing this is asking for
   # that agent, so the jump key and the cell click are also the un-hide.

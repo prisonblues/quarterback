@@ -4007,7 +4007,13 @@ def test_unparking_puts_the_seat_back_between_its_neighbours(screen):
     assert seat_key(screen, "unpark", "t").returncode == 0
     assert seat_panes_in_row(screen) == ["1", "2", "3"]
     after = geometry(screen)
-    assert after == before, "the row came back to a different shape"
+    # Within a column: the row is divided afresh, and the remainder lands on the last
+    # seat where the build gave it to the first.
+    assert after.keys() == before.keys()
+    for pid, (left, top, width, height) in before.items():
+        assert abs(after[pid][2] - width) <= 1 and abs(after[pid][0] - left) <= 2, \
+            f"{pid}: {before[pid]} became {after[pid]}"
+        assert after[pid][1] == top and after[pid][3] == height
     assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_parked").stdout.strip() == ""
     assert "range=user|unpark" not in bar(screen)
 
@@ -4092,3 +4098,77 @@ def test_every_showing_seat_has_a_park_cell_and_clicking_it_parks(screen):
     assert "range=user|unpark2" in bar(screen)
     assert click(screen, "unpark2", "t").returncode == 0
     assert seat_panes_in_row(screen) == ["1", "2", "3"]
+
+
+def row_widths(run, name="t"):
+    """{top: [seat widths left to right]} — seats only, the dash and tape excluded."""
+    g = geometry(run, name)
+    rows = {}
+    for pid, n in panes(run, name):
+        if n:
+            left, top, width, _ = g[pid]
+            rows.setdefault(top, []).append((left, width))
+    return {top: [w for _, w in sorted(v)] for top, v in rows.items()}
+
+
+def assert_even(widths, what):
+    assert max(widths) - min(widths) <= 2, f"{what}: seats are {widths}"
+
+
+def test_seats_are_even_after_a_park_and_after_an_unpark_in_either_order(screen):
+    """Measured before this was fixed: with a dash beside the row, `select-layout -E`
+    re-equalised the dash too and it took its columns back from the last seat — a
+    five-seat screen came out 48, 47, 47, 16 after one park and a 1-column seat
+    after the unpark."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "5")
+    dash_before = geometry(screen)[pane_id(screen, "dash")][2]
+    for n in ("2", "4"):
+        assert seat_key(screen, "park", "t", seat_pane_of(screen, n)).returncode == 0
+        (row,) = row_widths(screen).values()
+        assert_even(row, f"after parking {n}")
+    for n in ("2", "4"):                       # parked 2 then 4; back 2 then 4
+        assert seat_key(screen, f"unpark{n}", "t").returncode == 0
+        (row,) = row_widths(screen).values()
+        assert_even(row, f"after unparking {n}")
+    assert geometry(screen)[pane_id(screen, "dash")][2] == dash_before, "the dash moved"
+
+
+def test_a_two_row_screen_stays_even_in_each_row(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "6")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "5"))
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    for top, row in row_widths(screen).items():
+        assert_even(row, f"row at {top} with 2 and 5 parked")
+    seat_key(screen, "unpark", "t")
+    seat_key(screen, "unpark", "t")
+    rows = row_widths(screen)
+    assert sorted(len(r) for r in rows.values()) == [3, 3], rows
+    for top, row in rows.items():
+        assert_even(row, f"row at {top} after both came back")
+
+
+def test_a_seat_comes_back_to_the_window_it_is_now_not_the_one_it_left(screen):
+    """The widths recorded when a seat was parked describe a terminal that may since
+    have been resized, so none are recorded: the row is divided afresh."""
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    screen.tmux("resize-window", "-t", "=t:seats", "-x", "150")
+    assert seat_key(screen, "unpark", "t").returncode == 0
+    (row,) = row_widths(screen).values()
+    assert_even(row, "after a resize while parked")
+    assert min(row) > 30, row
+
+
+def test_a_parked_seat_still_shows_its_number_where_it_is_parked(screen):
+    """The border label is a window option on `seats`, so a pane broken out into the
+    holding window used to arrive with none — an agent on screen with no number."""
+    screen("-n", "3")
+    pane = seat_pane_of(screen, "2")
+    seat_key(screen, "park", "t", pane)
+    shown = screen.tmux("display-message", "-p", "-t", pane,
+                        "#{T:pane-border-format}").stdout
+    assert "seat 2" in shown, shown
+    assert screen.tmux("show-options", "-wv", "-t", pane,
+                       "pane-border-status").stdout.strip() == "top"
