@@ -4172,3 +4172,33 @@ def test_a_parked_seat_still_shows_its_number_where_it_is_parked(screen):
     assert "seat 2" in shown, shown
     assert screen.tmux("show-options", "-wv", "-t", pane,
                        "pane-border-status").stdout.strip() == "top"
+
+
+def test_a_parked_seat_keeps_its_place_on_the_bar_and_swaps_its_icon(screen):
+    screen("-n", "3")
+    def names(line):
+        seen = []
+        for m in re.finditer(r"range=user\|(seat|unpark)(\d)", line):
+            if m.group(2) not in seen:
+                seen.append(m.group(2))
+        return seen
+    assert names(bar(screen)) == ["1", "2", "3"]
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    line = bar(screen)
+    assert names(line) == ["1", "2", "3"], f"seat 2 moved: {line}"
+    assert "range=user|park2" not in line and "range=user|kill2" not in line, line
+    assert "range=user|unpark2" in line and "◌" in line
+    assert "range=user|park1" in line and "range=user|kill1" in line
+    seat_key(screen, "unpark", "t")
+    line = bar(screen)
+    assert "◌" not in line and "range=user|park2" in line
+
+
+def test_the_icons_of_a_seat_share_a_chip(screen):
+    screen("-n", "2")
+    line = bar(screen)
+    park = line.index("range=user|park1")
+    kill = line.index("range=user|kill1")
+    between = line[park:kill]
+    assert "bg=colour238" in line[park:kill + 60], line
+    assert "bg=colour235" not in between, "something breaks the chip between – and ✕"

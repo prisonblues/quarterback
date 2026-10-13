@@ -676,8 +676,9 @@ nudge_dash() {   # nudge_dash <+|->
 #     neighbour row, not a full-width row, because `-f` would put it under the tape.
 #   * THE BAR LOSES THE CELL WITH THE PANE. `#{P:…}` walks the current window, so a
 #     parked seat's cell would vanish and nothing on screen would say it exists. The
-#     bar carries `#{@qb_parked_bar}`, rendered here, one dim cell per parked seat
-#     whose click is `unpark<n>`.
+#     bar has a slot per seat NUMBER (see seat_bar), which draws a dim cell with a ◌
+#     in the parked seat's own place when `@qb_parked_seat_<n>` is set; its click is
+#     `unpark<n>`.
 #
 # THE LAST VISIBLE SEAT IS REFUSED. first_seat() is the join target the tape and the
 # dash rejoin beside, and a screen with every seat parked would leave `t` and `d`
@@ -774,21 +775,20 @@ even_rows() {
       done
 }
 
-# The bar's parked cells, written to the session. A number whose pane has gone is
-# dropped here, so the cell for a seat whose process died does not outlive it.
+# A number whose pane has gone is dropped, so the bar's parked slot for a seat
+# whose process died does not outlive it. The bar itself is drawn by tmux from
+# `@qb_parked_seat_<n>` — there is no rendered cell to keep in step.
 parked_refresh() {
-  local n kept="" bar="" p
+  local n kept="" p
   for n in $(parked_list); do
     read -r p _ <<<"$(parked_state "$n")"
     if [ -n "${p:-}" ] && pane_exists "$p"; then
       kept="$kept $n"
-      bar="$bar#[range=user|unpark$n]#[fg=colour248]#[bg=colour235] ◌ seat $n #[fg=colour109]#[bg=colour235]#[norange] "
     else
       tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
     fi
   done
   tmux set-option -t "$SID:" @qb_parked "${kept# }"
-  tmux set-option -t "$SID:" @qb_parked_bar "$bar"
 }
 
 park_seat() {   # <pane id>

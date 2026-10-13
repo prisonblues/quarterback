@@ -709,18 +709,35 @@ key_hint() {
 # over it, so without a fill the cells are islands in the theme's green. fill
 # paints the line the bar's own colour first.
 seat_bar() {
-  local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]"
-  printf '%s' \
-"#[fill=$BAR_BG]"\
-'#[align=left]'\
-'#{P:#{?@qb_seat,'\
-'#[range=user|seat#{@qb_seat}]'"#{?pane_active,$(seat_state_style active),$(seat_state_style idle)}"\
-" seat #{@qb_seat} $ground#[norange]"\
-"#[range=user|park#{@qb_seat}]#[fg=colour179]#[bg=$BAR_BG] – $ground#[norange]"\
-"#[range=user|kill#{@qb_seat}]#[fg=colour210]#[bg=$BAR_BG] ✕ $ground#[norange] "\
-',}}'\
+  local ground="#[fg=$BAR_FG]#[bg=$BAR_BG]" chip=colour238 n out
+  out="#[fill=$BAR_BG]#[align=left]"
+  # ONE SLOT PER SEAT NUMBER, in number order, and not one loop over the panes.
+  # `#{P:...}` walks the current window, so a parked seat's pane is not in it and
+  # its cell used to be appended at the END of the bar — a seat that moved to the
+  # back the moment it was hidden, which read as a different seat (#517). Each
+  # slot is a LIVE cell for the pane wearing that number, or — if that number is
+  # parked — a dim cell in the same place. The two cannot both draw: the live one
+  # is skipped for a parked number, which is what keeps the parked pane's own
+  # window (where it is the only pane) from drawing the seat twice.
+  #
+  # THE – / ◌ AND THE ✕ SHARE A CHIP, a lighter ground behind both, so the pair
+  # reads as the controls of the seat beside it. The – parks it; on a parked seat
+  # the same slot is a ◌ and clicking it, or the name, brings the seat back. A
+  # parked seat has no ✕: closing is for a seat that is showing.
+  n=1
+  while [ "$n" -le "$MAX_SEATS" ]; do
+    out="$out#{P:#{?#{&&:#{==:#{@qb_seat},$n},#{==:#{@qb_parked_seat_$n},}},"\
+"#[range=user|seat$n]#{?pane_active,$(seat_state_style active),$(seat_state_style idle)}"\
+" seat $n $ground#[norange]"\
+"#[range=user|park$n]#[fg=colour179]#[bg=$chip] – #[norange]"\
+"#[range=user|kill$n]#[fg=colour217]#[bg=$chip] ✕ #[norange]$ground ,}}"\
+"#{?@qb_parked_seat_$n,"\
+"#[range=user|unpark$n]#[fg=colour248]#[bg=$BAR_BG] seat $n #[norange]"\
+"#[range=user|unpark$n]#[fg=colour250]#[bg=$chip] ◌ #[norange]$ground ,}"
+    n=$((n + 1))
+  done
+  printf '%s' "$out"\
 "#[range=user|add]#[fg=colour108]#[bg=$BAR_BG] ＋ seat $ground#[norange]"\
-'#{@qb_parked_bar}'\
 "$(key_hint)"
 }
 
