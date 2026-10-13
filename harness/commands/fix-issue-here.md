@@ -190,14 +190,19 @@ docstrings, update them now — part of the fix, not a follow-up.
 Read CI config (`.github/workflows/`) and the Makefile for what the project
 runs; those override fallbacks. Then:
 1. **Build** — compile/bundle.
-2. **Test** — full suite; iterate until green; fix the wrong side (code or
-   test), never skip.
+2. **Test** — the **selective** run (testmon behind `make test`, `--changed`,
+   `nx affected`, whatever the project has) plus your new test files by path;
+   iterate until green; fix the wrong side (code or test), never skip. Run the
+   full suite only if there is no selection mechanism, the selective run says
+   it fell back to everything, or the change is genuinely cross-cutting. CI and
+   the protected-branch pre-push still run it before anything lands.
+   `fix-issue.md` step 7 "Which tests" has the full rule.
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** — if the project uses it.
 5. **Codegen sync** — if CI has `git diff --exit-code` checks, regenerate.
 
 **DB-backed tests:** if the change touches DB-facing code and the fast suite
-excludes DB tests, run the DB-backed target too (against your current local DB —
+excludes DB tests, run the DB-backed tests for the affected area too (against your current local DB —
 remember there's no isolated copy here). If you can't, say so and flag those
 paths **unverified**.
 
