@@ -2116,6 +2116,7 @@ class Dash(App):
         self.say(f"filtered to {self.repo_filter}" if self.repo_filter
                  else "showing every repo")
         self.render_agents()
+        self.render_work()
 
     def work_action(self, row: dict) -> tuple[str, str | None]:
         """``('⚖', 'panel')`` — the icon this row's verb column wears, and what a
@@ -2248,6 +2249,11 @@ class Dash(App):
             self.held, self.scope, self.backlog,
             blockers=(self.blockers or {}).get("blockers"),
             waiting_only=self.waiting)
+        # THE CHIP BAR'S FILTER APPLIES TO THIS TABLE TOO. It narrowed the agents
+        # and left the PRs on the launch scope, so clicking a repo's chip showed
+        # that repo's agents beside another repo's work. The same `only_repo` the
+        # agents use, so one chip means one repo on every panel it sits above.
+        rows = qd.only_repo(rows, self.repo_filter)
         # ASKED ONCE FOR THE WHOLE TABLE and carried into the signature, so a
         # `gh-dash` installed while this was running lights its column up on the
         # next tick rather than at the next restart — and forty rows cost one walk

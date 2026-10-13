@@ -4722,6 +4722,7 @@ def test_the_same_chip_is_the_on_and_the_off_switch():
     enough to clip the bar it is the one that gets clipped."""
     app = _wide(_dash())
     app.render_agents = lambda: None
+    app.render_work = lambda: None
     app.filter_repo("lexray")
     assert app.repo_filter == "lexray"
     app.filter_repo("lexray")
@@ -4807,6 +4808,17 @@ def test_a_tmux_that_failed_does_not_send_a_pane_to_a_window_instead(monkeypatch
         app_module.qd.tmux_seats = real
     assert not windowed, "a failed query was read as a screen with no seats"
     assert said and "cannot reach tmux" in said[0], said
+
+
+def test_a_chip_redraws_the_work_table_as_well_as_the_agents():
+    """The chip narrowed AGENTS and left WORK on the launch scope, so clicking
+    `lexray` showed lexray's agents beside another repo's PRs."""
+    app = _wide(_dash())
+    calls: list[str] = []
+    app.render_agents = lambda: calls.append("agents")
+    app.render_work = lambda: calls.append("work")
+    app.filter_repo("lexray")
+    assert calls == ["agents", "work"]
 
 
 def test_the_bar_hiding_takes_the_filter_with_it():
