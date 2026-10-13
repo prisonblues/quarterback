@@ -766,7 +766,7 @@ parked_refresh() {
     read -r p _ <<<"$(parked_state "$n")"
     if [ -n "${p:-}" ] && pane_exists "$p"; then
       kept="$kept $n"
-      bar="$bar#[range=user|unpark$n]#[fg=colour244]#[bg=colour235] ◌ seat $n #[fg=colour109]#[bg=colour235]#[norange] "
+      bar="$bar#[range=user|unpark$n]#[fg=colour248]#[bg=colour235] ◌ seat $n #[fg=colour109]#[bg=colour235]#[norange] "
     else
       tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
     fi

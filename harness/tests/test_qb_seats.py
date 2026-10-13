@@ -4079,3 +4079,16 @@ def test_the_park_keys_are_bound_and_on_the_menu(screen):
     screen("-n", "2")
     table = qb_table(screen)
     assert action_of(table["p"]) == "park" and action_of(table["u"]) == "unpark"
+
+
+def test_every_showing_seat_has_a_park_cell_and_clicking_it_parks(screen):
+    screen("-n", "3")
+    line = bar(screen)
+    for n in (1, 2, 3):
+        assert f"range=user|park{n}" in line, f"seat {n} has nothing to click to park it"
+    done = click(screen, "park2", "t")
+    assert done.returncode == 0, done.stderr
+    assert seat_panes_in_row(screen) == ["1", "3"]
+    assert "range=user|unpark2" in bar(screen)
+    assert click(screen, "unpark2", "t").returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]

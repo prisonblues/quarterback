@@ -716,6 +716,7 @@ seat_bar() {
 '#{P:#{?@qb_seat,'\
 '#[range=user|seat#{@qb_seat}]'"#{?pane_active,$(seat_state_style active),$(seat_state_style idle)}"\
 " seat #{@qb_seat} $ground#[norange]"\
+"#[range=user|park#{@qb_seat}]#[fg=colour179]#[bg=$BAR_BG] – $ground#[norange]"\
 "#[range=user|kill#{@qb_seat}]#[fg=colour210]#[bg=$BAR_BG] ✕ $ground#[norange] "\
 ',}}'\
 "#[range=user|add]#[fg=colour108]#[bg=$BAR_BG] ＋ seat $ground#[norange]"\

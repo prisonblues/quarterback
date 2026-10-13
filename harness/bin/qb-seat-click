@@ -239,6 +239,18 @@ case "$range" in
     tmux kill-pane -t "$pane"
     reflow
     ;;
+  park*)
+    # The – on a showing seat's cell. Same hand-over as the unpark cell below; no
+    # confirmation, because parking is as reversible as an act gets (#517).
+    n=$(seat_number "${range#park}") || exit 0
+    need_sid
+    key=$(tmux show-options -v -t "$sid:" @qb_key_bin 2>/dev/null || true)
+    [ -n "$key" ] || key=$(command -v qb-seat-key 2>/dev/null || true)
+    [ -n "$key" ] || die "qb-seat-key is not on PATH and the session did not record it"
+    if ! why=$("$key" "park$n" "$session" 2>&1 >/dev/null); then
+      die "${why:-qb-seat-key park failed}"
+    fi
+    ;;
   unpark*)
     # A parked seat's cell on the bar. The geometry lives in qb-seat-key, for the
     # reason `expand` below gives, and is reached the same way.
