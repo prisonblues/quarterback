@@ -218,6 +218,12 @@ case "$range" in
     need_sid
     pane=$(seat_pane "$n")
     [ -n "$pane" ] || die "seat $n has no pane"
+    # A PARKED SEAT IS BROUGHT BACK, not selected: its pane is alive in the holding
+    # window, and select-window would carry the client there. This makes the jump
+    # key and the bar's cell the un-hide as well (#517).
+    if tmux show-options -v -t "$sid:" @qb_parked 2>/dev/null | tr ' ' '\n' | grep -qx "$n"; then
+      exec "$0" "unpark$n" "$session"
+    fi
     # The window too: the bar stays on screen when another window is current, so
     # the cell you clicked may name a seat that is not being displayed.
     tmux select-window -t "$pane"
@@ -232,6 +238,18 @@ case "$range" in
     end_agent "$pane"
     tmux kill-pane -t "$pane"
     reflow
+    ;;
+  unpark*)
+    # A parked seat's cell on the bar. The geometry lives in qb-seat-key, for the
+    # reason `expand` below gives, and is reached the same way.
+    n=$(seat_number "${range#unpark}") || exit 0
+    need_sid
+    key=$(tmux show-options -v -t "$sid:" @qb_key_bin 2>/dev/null || true)
+    [ -n "$key" ] || key=$(command -v qb-seat-key 2>/dev/null || true)
+    [ -n "$key" ] || die "qb-seat-key is not on PATH and the session did not record it"
+    if ! why=$("$key" "unpark$n" "$session" 2>&1 >/dev/null); then
+      die "${why:-qb-seat-key unpark failed}"
+    fi
     ;;
   expand)
     # THE ⛶ ON THE TOP LINE, and it does not implement anything: the dash's verbs

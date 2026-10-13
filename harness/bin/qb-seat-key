@@ -6,8 +6,12 @@
 # Actions:
 #   add              add a seat to this screen
 #   close            close the seat the key was pressed in (the caller confirms)
-#   seatN            jump to seat N
-#   tape             show or hide the tape
+#   seatN            jump to seat N (a parked one is brought back first)
+#   park[N]          put a seat out of sight — the one the key was pressed in,
+#                    or seat N — without touching its agent (#517)
+#   unpark[N]        bring a parked seat back beside its old neighbour: seat N,
+#                    or the one parked last
+#   tape           show or hide the tape
 #   dash             show or hide the dash
 #   expand           the dash to a window of its own, and back again
 #   fit              put the dash back to the width the screen asked for
@@ -142,9 +146,11 @@ if [ "$ACTION" = guide ]; then
 
     a        add a seat
     x        close this seat (asks — the agent in it goes too)
-    1 … 9    jump to that seat
+    1 … 9    jump to that seat (a parked one returns)
+    p        park this seat — out of sight, still running
+    u        bring back the seat parked last (or click its cell)
 
-    t        show or hide the tape (the board along the bottom)
+    t      show or hide the tape (the board along the bottom)
     d        show or hide the dash (the fleet down the right)
     z        the dash full screen, and back
     =        the dash back to the width the screen asked for
@@ -653,7 +659,240 @@ nudge_dash() {   # nudge_dash <+|->
   tmux set-option -p -t "$p" @qb_dash_width "$now"
 }
 
+# ---- parking a seat (#517) ---------------------------------------------------
+# `t` and `d` made plural, and the three things that are not the same once there
+# can be N of them:
+#
+#   * STATE IS PER SEAT. `@qb_parked_seat_<n>` is `<pane> <anchor> <mode> <size>
+#     <widths>` and `@qb_parked` is the numbers in the order they were parked, which
+#     is what a bare `unpark` pops from. Parked is a property of one SCREEN: the
+#     agent keeps its process, its lease, its claims and its board presence, and
+#     nothing here calls qb-end. A parked seat is still a live row in the dash.
+#   * A SEAT HAS NO CANONICAL PLACE, where the tape and the dash replay the build
+#     order. So the place is recorded: the seat directly left of it in its row (it
+#     comes back `after` that one), else directly right (`before`), else — alone in
+#     its row — one in the nearest other row (`below`/`above`). Neighbours, rather
+#     than a row number, so a screen grown by `--add` since is still read right.
+#     The known edge: a seat alone in its row comes back splitting ONE cell of its
+#     neighbour row, not a full-width row, because `-f` would put it under the tape.
+#   * THE BAR LOSES THE CELL WITH THE PANE. `#{P:…}` walks the current window, so a
+#     parked seat's cell would vanish and nothing on screen would say it exists. The
+#     bar carries `#{@qb_parked_bar}`, rendered here, one dim cell per parked seat
+#     whose click is `unpark<n>`.
+#
+# THE LAST VISIBLE SEAT IS REFUSED. first_seat() is the join target the tape and the
+# dash rejoin beside, and a screen with every seat parked would leave `t` and `d`
+# refusing for want of one.
+#
+# SERIALISED, because every binding is `run-shell -b` and two presses interleave
+# (#457). flock and not a tmux wait-for lock: the kernel drops it when the process
+# dies, where a wait-for lock outlives a SIGKILLed holder and wedges the key.
+locked() {
+  command -v flock >/dev/null 2>&1 || return 0
+  local lock=${XDG_RUNTIME_DIR:-/tmp}/qb-seat-key-${SID#\$}.lock
+  { exec 9>"$lock"; } 2>/dev/null || return 0
+  flock -w 5 9 || die "another park or unpark on this screen is still running"
+}
+
+parked_list() { tmux show-options -v -t "$SID:" @qb_parked 2>/dev/null || true; }
+parked_state() { tmux show-options -v -t "$SID:" "@qb_parked_seat_$1" 2>/dev/null || true; }
+
+visible_seat() {   # <n> — its pane, if it is in the row
+  tmux list-panes -t "$SID:seats" -F '#{pane_id} #{@qb_seat}' \
+    | awk -v want="$1" '$2 != "" && $2 == want { print $1; exit }'
+}
+
+in_row() {   # <pane id> — is it in the seat window right now
+  tmux list-panes -t "$SID:seats" -F '#{pane_id}' \
+    | awk -v want="$1" '$1 == want { found = 1 } END { exit !found }'
+}
+
+# `|` separates the fields because @qb_seat is empty for most panes and awk's
+# default splitter collapses runs of whitespace — the tape_pane note, again.
+seat_anchor() {   # <pane id> → `<anchor pane> <after|before|below|above>`
+  tmux list-panes -t "$SID:seats" \
+      -F '#{pane_id}|#{@qb_seat}|#{pane_top}|#{pane_left}' \
+    | awk -F'|' -v me="$1" '
+        { id[NR]=$1; seat[NR]=$2; top[NR]=$3+0; left[NR]=$4+0
+          if ($1 == me) { mt = top[NR]; ml = left[NR] } }
+        END {
+          bl = -1; nl = -1
+          for (i = 1; i <= NR; i++) {
+            if (id[i] == me || seat[i] == "") continue
+            if (top[i] == mt) {
+              if (left[i] < ml && left[i] > bl) { bl = left[i]; b = id[i] }
+              if (left[i] > ml && (nl < 0 || left[i] < nl)) { nl = left[i]; nx = id[i] }
+            } else {
+              d = top[i] - mt; if (d < 0) d = -d
+              if (v == "" || d < vd) { vd = d; v = id[i]; vm = (top[i] < mt) ? "below" : "above" }
+            }
+          }
+          if (b != "") print b, "after"
+          else if (nx != "") print nx, "before"
+          else if (v != "") print v, vm
+        }'
+}
+
+# Where a seat goes when the neighbour it was recorded beside is itself parked or
+# gone: the nearest LOWER visible seat, else the lowest — which keeps the numbers
+# reading left to right, the property the build loop already pays a comment for.
+fallback_anchor() {   # <n>
+  tmux list-panes -t "$SID:seats" -F '#{pane_id} #{@qb_seat}' \
+    | awk -v n="$1" '$2 != "" {
+        if ($2 + 0 < n + 0 && (lo == "" || $2 + 0 > lon + 0)) { lo = $1; lon = $2 }
+        if (hi == "" || $2 + 0 < hin + 0) { hi = $1; hin = $2 }
+      } END { if (lo != "") print lo, "after"; else if (hi != "") print hi, "before" }'
+}
+
+# Every window-wide row spread evenly and the dash put back, qb-seat-click's reflow
+# for the same reason: -E re-equalises the dash along with the seats.
+reflow_even() {
+  local survivor dash was=""
+  survivor=$(first_seat)
+  [ -n "$survivor" ] || return 0
+  dash=$(dash_pane)
+  if [ -n "$dash" ] && in_row "$dash"; then
+    was=$(tmux display-message -p -t "$dash" '#{pane_width}')
+  fi
+  tmux select-layout -t "$survivor" -E 2>/dev/null || true
+  [ -z "$was" ] || tmux resize-pane -t "$dash" -x "$was" 2>/dev/null || true
+}
+
+# The bar's parked cells, written to the session. A number whose pane has gone is
+# dropped here, so the cell for a seat whose process died does not outlive it.
+parked_refresh() {
+  local n kept="" bar="" p
+  for n in $(parked_list); do
+    read -r p _ <<<"$(parked_state "$n")"
+    if [ -n "${p:-}" ] && pane_exists "$p"; then
+      kept="$kept $n"
+      bar="$bar#[range=user|unpark$n]#[fg=colour244]#[bg=colour235] ◌ seat $n #[fg=colour109]#[bg=colour235]#[norange] "
+    else
+      tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
+    fi
+  done
+  tmux set-option -t "$SID:" @qb_parked "${kept# }"
+  tmux set-option -t "$SID:" @qb_parked_bar "$bar"
+}
+
+park_seat() {   # <pane id>
+  local p=$1 n visible anchor mode size widths state
+  n=$(tmux show-options -p -t "$p" -qv @qb_seat 2>/dev/null) || n=""
+  [ -n "$n" ] || die "that pane is not a seat"
+  in_row "$p" || die "seat $n is not in the row — it may be parked already"
+  visible=$(tmux list-panes -t "$SID:seats" -F '#{@qb_seat}' | awk 'NF' | wc -l)
+  [ "$visible" -gt 1 ] \
+    || die "that is the last seat showing — park another, or close it with x"
+  state=$(seat_anchor "$p") || state=""
+  read -r anchor mode <<<"$state"
+  if [ -z "$anchor" ]; then anchor=$(first_seat); mode=after; fi
+  case "$mode" in
+    after|before) size=$(tmux display-message -p -t "$p" '#{pane_width}') ;;
+    *)            size=$(tmux display-message -p -t "$p" '#{pane_height}') ;;
+  esac
+  # Read BEFORE the break — hide_pane's reason, which is that afterwards the seat's
+  # columns have already gone to a neighbour.
+  widths=$(pane_widths)
+  tmux break-pane -d -s "$p" -t "$SID:" -n "$HOLDING" \
+    || die "park: tmux would not break seat $n out"
+  tmux set-option -t "$SID:" "@qb_parked_seat_$n" "$p $anchor $mode $size $widths"
+  tmux set-option -t "$SID:" @qb_parked "$(printf '%s %s' "$(parked_list)" "$n" | xargs)"
+  reflow_even
+  parked_refresh
+}
+
+unpark_seat() {   # <n>
+  local n=$1 state p anchor mode size widths last where
+  state=$(parked_state "$n")
+  [ -n "$state" ] || die "seat $n is not parked"
+  read -r p anchor mode size widths <<<"$state"
+  if ! pane_exists "$p"; then
+    tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
+    parked_refresh
+    die "parked seat $n is gone — nothing to bring back"
+  fi
+  # The recorded neighbour is only a place while it is itself in the row.
+  if [ -z "$anchor" ] || ! in_row "$anchor"; then
+    where=$(fallback_anchor "$n")
+    [ -n "$where" ] || die "this screen has no seat to put seat $n back beside"
+    read -r anchor mode <<<"$where"
+    size=""
+  fi
+  # THE ROW IS THE RECORDED NEIGHBOUR'S, AND THE POSITION IN IT IS BY NUMBER. Seats
+  # parked in turn can each have been recorded beside the same neighbour — park 2
+  # then 3 and both say "after 1" — and bringing them back in any order would
+  # then stack them in the order they returned. Within the row the numbers decide,
+  # which is the left-to-right property the build loop already pays a comment for.
+  if [ "$mode" = after ] || [ "$mode" = before ]; then
+    where=$(tmux list-panes -t "$SID:seats" \
+        -F '#{pane_id}|#{@qb_seat}|#{pane_top}|#{pane_left}' \
+      | awk -F'|' -v n="$n" -v a="$anchor" '
+          { id[NR]=$1; seat[NR]=$2; top[NR]=$3; if ($1 == a) at = $3 }
+          END {
+            for (i = 1; i <= NR; i++) {
+              if (seat[i] == "" || top[i] != at) continue
+              if (seat[i] + 0 < n + 0 && (lo == "" || seat[i] + 0 > lon + 0)) { lo = id[i]; lon = seat[i] }
+              if (hi == "" || seat[i] + 0 < hin + 0) { hi = id[i]; hin = seat[i] }
+            }
+            if (lo != "") print lo, "after"; else if (hi != "") print hi, "before"
+          }')
+    [ -z "$where" ] || read -r anchor mode <<<"$where"
+  fi
+  local -a flags
+  case "$mode" in
+    after)  flags=(-h) ;;
+    before) flags=(-h -b) ;;
+    below)  flags=(-v) ;;
+    above)  flags=(-v -b) ;;
+    *)      flags=(-h) ;;
+  esac
+  # With the recorded size first and without it if tmux says the neighbour is too
+  # small to give it up — a seat back at a different width beats a seat not back.
+  if [ -n "$size" ] && tmux join-pane "${flags[@]}" -l "$size" -s "$p" -t "$anchor" 2>/dev/null; then
+    :
+  else
+    tmux join-pane "${flags[@]}" -s "$p" -t "$anchor" \
+      || die "unpark: tmux would not put seat $n back"
+  fi
+  last=$(parked_list | awk '{ print $NF }')
+  tmux set-option -t "$SID:" -u "@qb_parked_seat_$n"
+  tmux set-option -t "$SID:" @qb_parked \
+    "$(parked_list | tr ' ' '\n' | awk -v n="$n" '$1 != n' | xargs)"
+  # THE RECORDED WIDTHS ARE ONLY TRUE FOR THE SEAT PARKED LAST: they were read with
+  # every seat parked before it still in the row. Back in any other order they
+  # describe a row that no longer exists, so that is spread evenly instead.
+  if [ "$last" = "$n" ] && [ -n "$widths" ]; then restore_widths "$widths"; else reflow_even; fi
+  parked_refresh
+  # THE CURSOR GOES TO THE SEAT, unlike `t` and `d`: pressing this is asking for
+  # that agent, so the jump key and the cell click are also the un-hide.
+  tmux select-pane -t "$p" 2>/dev/null || true
+}
+
 case "$ACTION" in
+  park)
+    locked
+    if [ -n "$PANE" ]; then park_seat "$PANE"; else die "no pane recorded for the key"; fi
+    ;;
+  park[0-9]*)
+    n=${ACTION#park}
+    case "$n" in ''|*[!0-9]*) die "'$ACTION' names no seat" ;; esac
+    locked
+    p=$(visible_seat "$n")
+    [ -n "$p" ] || die "seat $n is not showing"
+    park_seat "$p"
+    ;;
+  unpark)
+    locked
+    n=$(parked_list | awk '{ print $NF }')
+    [ -n "$n" ] || die "no seat is parked"
+    unpark_seat "$n"
+    ;;
+  unpark[0-9]*)
+    n=${ACTION#unpark}
+    case "$n" in ''|*[!0-9]*) die "'$ACTION' names no seat" ;; esac
+    locked
+    unpark_seat "$n"
+    ;;
   add)
     run_out "add a seat" "$(beside_me qb-seat-click)" add "$SESSION"
     ;;

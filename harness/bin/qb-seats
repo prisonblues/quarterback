@@ -254,7 +254,9 @@ that is not a trade you want.
 
 The qb key is the keyboard half of the same thing, and it is a key table rather
 than a menu key: $KEY_DEFAULT then \`a\` adds a seat, \`x\` closes this one, \`1\`-\`9\` jump,
-\`t\` and \`d\` hide and show the tape and the dash, \`=\` \`>\` \`<\` size the dash, \`K\`
+\`p\` parks this seat out of sight and \`u\` brings the last one back (a parked seat keeps
+running; its dim cell on the bar brings it back too), \`t\` and \`d\` hide and show the
+tape and the dash, \`=\` \`>\` \`<\` size the dash, \`K\`
 kills the screen and \`?\` explains it. Anything else opens a menu carrying the
 same keys, so the shortcut is learnt from the thing it replaces. The binding is
 server-wide, so it is gated on this being a screen and falls through to the key
@@ -717,6 +719,7 @@ seat_bar() {
 "#[range=user|kill#{@qb_seat}]#[fg=colour210]#[bg=$BAR_BG] ✕ $ground#[norange] "\
 ',}}'\
 "#[range=user|add]#[fg=colour108]#[bg=$BAR_BG] ＋ seat $ground#[norange]"\
+'#{@qb_parked_bar}'\
 "$(key_hint)"
 }
 
@@ -1005,6 +1008,8 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
   # tmux's own popups do.
   printf '%s\n' \
     "a|add a seat|run-shell -b \"$d add $here\"" \
+    "p|park this seat (the agent keeps running)|run-shell -b \"$d park $here\"" \
+    "u|bring back the seat parked last|run-shell -b \"$d unpark $here\"" \
     "x|close this seat|confirm-before -p 'close this seat — the agent in it goes too (y/n) ' \"run-shell -b \\\"$dd close $here\\\"\"" \
     "t|show or hide the tape|run-shell -b \"$d tape $here\"" \
     "d|show or hide the dash|run-shell -b \"$d dash $here\"" \
@@ -1016,7 +1021,7 @@ qb_actions() {   # <qb-seat-key path> <qb-seats path>
     "s|the screens that are up|display-popup -w 76 -h 16 \"$k list\"" \
     "||" \
     "K|kill this screen|confirm-before -p 'kill this screen — every agent on it goes too (y/n) ' \"run-shell -b \\\"$dd kill $here\\\"\"" \
-    "?|these keys, in full|display-popup -w 72 -h 28 \"$d guide\""
+    "?|these keys, in full|display-popup -w 72 -h 32 \"$d guide\""
   # NO `$here` ON THE GUIDE. `display-popup` does not format-expand its command —
   # measured on 3.6a, where the popup was handed the literal `#{session_id}` — so
   # the guide asks tmux which session it is in instead. `display-message -p` with
@@ -1331,9 +1336,8 @@ seat_panes() {
 # up: `break-pane -d` into a holding window is how the qb key hides the tape and the
 # dash today, and #517 is about doing exactly that to a seat.
 #
-# It costs nothing today, because nothing parks a seat yet. It stops the lowest-free
-# rule below from handing a new seat the number of a parked one the moment something
-# does — which the old max+1 rule was accidentally immune to, and which would put two
+# It stops the lowest-free rule below from handing a new seat the number of a parked
+# one, which `qb-seat-key park` (#517) now makes possible — which the old max+1 rule was accidentally immune to, and which would put two
 # panes on one number where the ✕, the jump and the restore all take the first match.
 seat_panes_anywhere() {
   tmux list-panes -s -t "$SESSION_ID" -F '#{pane_id} #{@qb_seat}' \

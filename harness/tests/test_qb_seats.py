@@ -3974,3 +3974,108 @@ def test_a_broken_pace_command_costs_the_note_and_not_the_screen(screen):
     _pace_stub(screen, "exit 127\n")
     assert screen("-n", "1").returncode == 0
     assert len([p for p in panes(screen) if p[1]]) == 1
+
+
+# ---- parking a seat (#517) ---------------------------------------------------
+
+def seat_panes_in_row(run, name="t"):
+    return sorted(n for _, n in panes(run, name) if n)
+
+
+def seat_pane_of(run, n, name="t"):
+    return next(pid for pid, num in panes(run, name) if num == n)
+
+
+def test_parking_a_seat_takes_it_out_of_the_row_and_keeps_the_agent(screen):
+    screen("-n", "3")
+    pane = seat_pane_of(screen, "2")
+    assert seat_key(screen, "park", "t", pane).returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "3"]
+    # Still on the screen, still alive, still wearing its number.
+    anywhere = screen.tmux("list-panes", "-s", "-t", "=t:", "-F",
+                           "#{pane_id} #{@qb_seat} #{pane_dead}").stdout
+    assert f"{pane} 2 0" in anywhere, anywhere
+    assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_parked").stdout.strip() == "2"
+    assert "range=user|unpark2" in bar(screen), "nothing on the bar says seat 2 exists"
+
+
+def test_unparking_puts_the_seat_back_between_its_neighbours(screen):
+    screen("-n", "3")
+    before = geometry(screen)
+    pane = seat_pane_of(screen, "2")
+    seat_key(screen, "park", "t", pane)
+    assert seat_key(screen, "unpark", "t").returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+    after = geometry(screen)
+    assert after == before, "the row came back to a different shape"
+    assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_parked").stdout.strip() == ""
+    assert "range=user|unpark" not in bar(screen)
+
+
+def test_seats_come_back_in_number_order_whatever_order_they_return_in(screen):
+    screen("-n", "4")
+    for n in ("2", "3"):
+        assert seat_key(screen, "park", "t", seat_pane_of(screen, n)).returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "4"]
+    for n in ("2", "3"):                       # the order they were NOT parked in
+        assert seat_key(screen, f"unpark{n}", "t").returncode == 0
+    left_to_right = [num for _, num in sorted(
+        ((geometry(screen)[pid][0], num) for pid, num in panes(screen) if num))]
+    assert left_to_right == ["1", "2", "3", "4"], left_to_right
+
+
+def test_the_last_visible_seat_is_refused(screen):
+    screen("-n", "2")
+    assert seat_key(screen, "park", "t", seat_pane_of(screen, "1")).returncode == 0
+    before = geometry(screen)
+    refused = seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    assert refused.returncode == 1 and "last seat" in refused.stderr, refused.stderr
+    assert geometry(screen) == before, "a refused park moved something"
+
+
+def test_a_parked_seats_number_is_not_handed_to_a_new_seat(screen):
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    screen("--add")
+    assert seat_panes_in_row(screen) == ["1", "3", "4"]
+
+
+def test_parking_leaves_the_tape_and_dash_toggles_working(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "1"))
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert pane_id(screen, "tape") and pane_id(screen, "dash")
+
+
+def test_the_jump_to_a_parked_seat_brings_it_back(screen):
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    done = seat_key(screen, "seat2", "t")
+    assert done.returncode == 0, done.stderr
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+    assert screen.tmux("display-message", "-p", "-t", "=t:", "#{@qb_seat}").stdout.strip() == "2"
+
+
+def test_clicking_a_parked_cell_brings_it_back(screen):
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "3"))
+    done = click(screen, "unpark3", "t")
+    assert done.returncode == 0, done.stderr
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+
+
+def test_unparking_what_is_not_parked_says_so(screen):
+    screen("-n", "2")
+    for action in ("unpark", "unpark2"):
+        done = seat_key(screen, action, "t")
+        assert done.returncode == 1 and "parked" in done.stderr, (action, done.stderr)
+
+
+def test_the_park_keys_are_bound_and_on_the_menu(screen):
+    screen("-n", "2")
+    table = qb_table(screen)
+    assert action_of(table["p"]) == "park" and action_of(table["u"]) == "unpark"
