@@ -2641,12 +2641,31 @@ class Dash(App):
         else:
             self.run_seat_click(tag, session)
 
+    @staticmethod
+    def seat_click_bin(session: str) -> str:
+        """The qb-seat-click THIS SCREEN was built with, else the one on PATH.
+
+        The screen records its dispatcher as `@qb_key_bin` for exactly this: PATH's
+        harness and the screen's can differ across a rollout, and an older
+        qb-seat-click meeting a range it does not know does nothing and exits 0 — the
+        park icon did precisely that, "done" and no seat moved (#484's failure, one
+        surface along). qb-seat-click sits beside qb-seat-key in every install.
+        """
+        try:
+            key = subprocess.run(["tmux", "show-options", "-v", "-t", f"{session}:",
+                                  "@qb_key_bin"], capture_output=True, text=True,
+                                 timeout=5).stdout.strip()
+        except Exception:                          # noqa: BLE001
+            key = ""
+        beside = os.path.join(os.path.dirname(key), "qb-seat-click") if key else ""
+        return beside if beside and os.access(beside, os.X_OK) else "qb-seat-click"
+
     def run_seat_click(self, tag: str, session: str) -> None:
         if not os.environ.get("TMUX"):
             self.say(f"not inside tmux — nothing to click: qb-seat-click {tag}")
             return
         try:
-            done = subprocess.run(["qb-seat-click", tag, session],
+            done = subprocess.run([self.seat_click_bin(session), tag, session],
                                   capture_output=True, text=True, timeout=30)
         except Exception as exc:                   # noqa: BLE001
             self.say(f"could not run qb-seat-click ({type(exc).__name__})")

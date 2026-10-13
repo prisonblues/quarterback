@@ -5204,3 +5204,18 @@ def test_clicking_the_park_icon_parks_and_any_click_on_a_parked_seat_unparks():
     app.dispatch_agent({"kind": "seat", "seat": parked, "agent": None}, "seat", 3)
     app.dispatch_agent({"kind": "seat", "seat": showing, "agent": None}, "seat", 3)
     assert clicks == ["park2@s", "unpark3@s", "jump"], clicks
+
+
+def test_the_dash_clicks_with_the_qb_seat_click_its_screen_was_built_with(tmp_path, monkeypatch):
+    """An older qb-seat-click meeting `park2` does nothing and exits 0, so the park
+    icon said "done" and no seat moved. The screen records its dispatcher and the
+    click lives beside it."""
+    app_module = _load_app()
+    mine = tmp_path / "qb-seat-click"
+    mine.write_text("#!/bin/sh\n")
+    mine.chmod(0o755)
+    ran = SimpleNamespace(stdout=f"{tmp_path}/qb-seat-key\n", returncode=0)
+    monkeypatch.setattr(app_module.subprocess, "run", lambda *a, **k: ran)
+    assert app_module.Dash.seat_click_bin("seats-x") == str(mine)
+    ran.stdout = ""                                  # a screen that recorded nothing
+    assert app_module.Dash.seat_click_bin("seats-x") == "qb-seat-click"
