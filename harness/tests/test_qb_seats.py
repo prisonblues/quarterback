@@ -4236,3 +4236,38 @@ def test_a_screen_with_no_dash_has_no_dash_chip(screen):
     screen.env["QB_SEATS_DASH"] = ""
     screen("-n", "2")
     assert "range=user|dash" not in bar(screen) and "range=user|expand" not in bar(screen)
+
+
+def status_lines(run, name="t"):
+    # tmux says `on` for one line and `2` for two; one is the number of lines here.
+    got = run.tmux("show-options", "-v", "-t", f"={name}:", "status").stdout.strip()
+    return "1" if got == "on" else got
+
+
+def test_the_seat_bar_is_given_back_while_the_dash_is_in_the_row(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    assert status_lines(screen) == "1", "the dash is showing, so the bar is redundant"
+    assert seat_key(screen, "dash", "t").returncode == 0           # hide it
+    assert status_lines(screen) == "2", "the bar is the way back and must be up"
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert status_lines(screen) == "1"
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert status_lines(screen) == "2", "an expanded dash is not in the row"
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert status_lines(screen) == "1"
+
+
+def test_a_parked_seat_keeps_the_bar_up_even_with_the_dash_showing(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    assert status_lines(screen) == "2", "its cell is the only mark it exists"
+    seat_key(screen, "unpark", "t")
+    assert status_lines(screen) == "1"
+
+
+def test_a_screen_with_no_dash_always_has_the_bar(screen):
+    screen.env["QB_SEATS_DASH"] = ""
+    screen("-n", "2")
+    assert status_lines(screen) == "2"

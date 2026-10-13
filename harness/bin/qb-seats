@@ -2163,6 +2163,11 @@ if [ -n "$DASH_CMD" ]; then
   # never attaches at all — a screen built by a script or a unit, read over ssh
   # later.
   dash_resize
+  # THE SECOND STATUS LINE IS ONLY FOR A SCREEN WHOSE DASH IS NOT SHOWING. A fresh
+  # screen's dash is in the row, saying everything the seat bar would, so the bar's
+  # line is given back; qb-seat-key's sync_bar brings it up the moment the dash is
+  # hidden or a seat is parked, and takes it down again after.
+  [ "${QB_SEATS_BAR:-1}" = 0 ] || tmux set-option -t "$SESSION_ID:" status on
 fi
 
 # The commands go in last, once every pane exists and its shell has had the time it

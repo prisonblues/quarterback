@@ -884,6 +884,22 @@ unpark_seat() {   # <n>
   tmux select-pane -t "$p" 2>/dev/null || true
 }
 
+# THE SEAT BAR IS A SECOND STATUS LINE, and it is only wanted when the dash is not
+# already saying the same thing. With the dash in the row it lists every seat and
+# the fleet, so the bar is one line of height spent repeating it; with the dash
+# hidden or expanded the bar is the only thing that says seats exist, and its
+# dash chip is the way back. A PARKED seat also keeps the bar up: its cell is the
+# only mark that the seat exists, and a screen that hid the bar would lose it.
+# Only a screen that has a dash can lose the bar at all. Called after every verb
+# that changes one of those three facts.
+sync_bar() {
+  [ -n "$(tmux show-options -t "$SID:" -qv @qb_bar)" ] || return 0
+  local want=2 d
+  d=$(dash_pane)
+  if [ -n "$d" ] && in_row "$d" && [ -z "$(parked_list)" ]; then want=on; fi
+  tmux set-option -t "$SID:" status "$want"
+}
+
 case "$ACTION" in
   park)
     locked
@@ -945,3 +961,4 @@ case "$ACTION" in
   # about it.
   *) exit 0 ;;
 esac
+case "$ACTION" in dash|expand|park*|unpark*) sync_bar ;; esac
