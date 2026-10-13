@@ -239,6 +239,17 @@ case "$range" in
     tmux kill-pane -t "$pane"
     reflow
     ;;
+  dash)
+    # The dash's – / ◌ on the bar: hide it, or show it. qb-seat-key's `dash` is the
+    # toggle, reached the way `expand` below reaches its own verb.
+    need_sid
+    key=$(tmux show-options -v -t "$sid:" @qb_key_bin 2>/dev/null || true)
+    [ -n "$key" ] || key=$(command -v qb-seat-key 2>/dev/null || true)
+    [ -n "$key" ] || die "qb-seat-key is not on PATH and the session did not record it"
+    if ! why=$("$key" dash "$session" 2>&1 >/dev/null); then
+      die "${why:-qb-seat-key dash failed}"
+    fi
+    ;;
   park*)
     # The – on a showing seat's cell. Same hand-over as the unpark cell below; no
     # confirmation, because parking is as reversible as an act gets (#517).

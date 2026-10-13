@@ -736,6 +736,23 @@ seat_bar() {
 "#[range=user|unpark$n]#[fg=colour250]#[bg=$chip] ◌ #[norange]$ground ,}"
     n=$((n + 1))
   done
+  # THE DASH GETS THE SAME TREATMENT, after the seats: a name and a chip. Showing,
+  # the chip is – (hide) and ⛶ (full screen); hidden, a dim name and ◌ (show);
+  # expanded, ⛶ alone, which is its own way back. Skipped on a screen with no dash
+  # at all. Both ranges are qb-seat-key verbs through qb-seat-click, because the
+  # geometry lives there. The live cell is skipped while the dash is hidden or
+  # expanded, which is what stops the expanded window — where the dash is the one
+  # pane — drawing it twice.
+  out="$out#{P:#{?#{&&:#{==:#{@qb_label},dash},#{==:#{@qb_hidden_dash},}},"\
+"#[range=user|dash]#[fg=$BAR_FG]#[bg=$BAR_BG] dash #[norange]"\
+"#[range=user|dash]#[fg=colour179]#[bg=$chip] – #[norange]"\
+"#[range=user|expand]#[fg=colour179]#[bg=$chip] ⛶ #[norange]$ground ,}}"\
+"#{?#{&&:#{!=:#{@qb_hidden_dash},},#{==:#{@qb_dash_expanded},}},"\
+"#[range=user|dash]#[fg=colour248]#[bg=$BAR_BG] dash #[norange]"\
+"#[range=user|dash]#[fg=colour250]#[bg=$chip] ◌ #[norange]$ground ,}"\
+"#{?#{!=:#{@qb_dash_expanded},},"\
+"#[range=user|expand]#[fg=colour248]#[bg=$BAR_BG] dash #[norange]"\
+"#[range=user|expand]#[fg=colour250]#[bg=$chip] ⛶ #[norange]$ground ,}"
   printf '%s' "$out"\
 "#[range=user|add]#[fg=colour108]#[bg=$BAR_BG] ＋ seat $ground#[norange]"\
 "$(key_hint)"

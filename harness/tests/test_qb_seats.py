@@ -4202,3 +4202,37 @@ def test_the_icons_of_a_seat_share_a_chip(screen):
     between = line[park:kill]
     assert "bg=colour238" in line[park:kill + 60], line
     assert "bg=colour235" not in between, "something breaks the chip between – and ✕"
+
+
+def test_the_dash_has_a_chip_on_the_bar_that_hides_and_shows_it(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    line = bar(screen)
+    assert line.count("range=user|dash") == 2 and "range=user|expand" in line, line
+    assert "◌" not in line
+    assert click(screen, "dash", "t").returncode == 0
+    assert pane_id(screen, "dash") is None or "dash" not in [
+        n for _, n in panes(screen) if n], "the dash is still in the row"
+    line = bar(screen)
+    assert "◌" in line and "range=user|dash" in line, line
+    assert click(screen, "dash", "t").returncode == 0
+    line = bar(screen)
+    assert "◌" not in line and line.count("range=user|dash") == 2, line
+
+
+def test_an_expanded_dash_is_not_drawn_twice_and_its_chip_is_the_way_back(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert seat_key(screen, "expand", "t").returncode == 0
+    line = bar(screen)
+    # Name and chip are two ranges of ONE cell: twice means drawn once.
+    assert line.count("range=user|expand") == 2 and "range=user|dash]" not in line, line
+    assert click(screen, "expand", "t").returncode == 0
+    line = bar(screen)
+    assert line.count("range=user|dash") == 2 and line.count("range=user|expand") == 1, line
+
+
+def test_a_screen_with_no_dash_has_no_dash_chip(screen):
+    screen.env["QB_SEATS_DASH"] = ""
+    screen("-n", "2")
+    assert "range=user|dash" not in bar(screen) and "range=user|expand" not in bar(screen)
