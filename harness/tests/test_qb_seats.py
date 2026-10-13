@@ -4271,3 +4271,23 @@ def test_a_screen_with_no_dash_always_has_the_bar(screen):
     screen.env["QB_SEATS_DASH"] = ""
     screen("-n", "2")
     assert status_lines(screen) == "2"
+
+
+def test_the_dash_keeps_its_width_when_the_seat_beside_it_is_parked(screen):
+    """The seat touching the dash is the one whose columns tmux could hand to it.
+    Park every seat in turn from the dash side and back: the dash never moves and
+    what is left is spread evenly."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "4")
+    dash = pane_id(screen, "dash")
+    want = geometry(screen)[dash][2]
+    for n in ("4", "3", "2"):
+        assert seat_key(screen, "park", "t", seat_pane_of(screen, n)).returncode == 0
+        assert geometry(screen)[dash][2] == want, f"the dash moved when {n} was parked"
+        (row,) = row_widths(screen).values()
+        assert_even(row, f"after parking {n}")
+    for _ in range(3):
+        assert seat_key(screen, "unpark", "t").returncode == 0
+        assert geometry(screen)[dash][2] == want, "the dash moved on an unpark"
+        (row,) = row_widths(screen).values()
+        assert_even(row, "after an unpark")
