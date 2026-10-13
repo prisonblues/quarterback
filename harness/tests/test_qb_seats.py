@@ -3974,3 +3974,326 @@ def test_a_broken_pace_command_costs_the_note_and_not_the_screen(screen):
     _pace_stub(screen, "exit 127\n")
     assert screen("-n", "1").returncode == 0
     assert len([p for p in panes(screen) if p[1]]) == 1
+
+
+# ---- parking a seat (#517) ---------------------------------------------------
+
+def seat_panes_in_row(run, name="t"):
+    return sorted(n for _, n in panes(run, name) if n)
+
+
+def seat_pane_of(run, n, name="t"):
+    return next(pid for pid, num in panes(run, name) if num == n)
+
+
+def test_parking_a_seat_takes_it_out_of_the_row_and_keeps_the_agent(screen):
+    screen("-n", "3")
+    pane = seat_pane_of(screen, "2")
+    assert seat_key(screen, "park", "t", pane).returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "3"]
+    # Still on the screen, still alive, still wearing its number.
+    anywhere = screen.tmux("list-panes", "-s", "-t", "=t:", "-F",
+                           "#{pane_id} #{@qb_seat} #{pane_dead}").stdout
+    assert f"{pane} 2 0" in anywhere, anywhere
+    assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_parked").stdout.strip() == "2"
+    assert "range=user|unpark2" in bar(screen), "nothing on the bar says seat 2 exists"
+
+
+def test_unparking_puts_the_seat_back_between_its_neighbours(screen):
+    screen("-n", "3")
+    before = geometry(screen)
+    pane = seat_pane_of(screen, "2")
+    seat_key(screen, "park", "t", pane)
+    assert seat_key(screen, "unpark", "t").returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+    after = geometry(screen)
+    # Within a column: the row is divided afresh, and the remainder lands on the last
+    # seat where the build gave it to the first.
+    assert after.keys() == before.keys()
+    for pid, (left, top, width, height) in before.items():
+        assert abs(after[pid][2] - width) <= 1 and abs(after[pid][0] - left) <= 2, \
+            f"{pid}: {before[pid]} became {after[pid]}"
+        assert after[pid][1] == top and after[pid][3] == height
+    assert screen.tmux("show-options", "-v", "-t", "=t:", "@qb_parked").stdout.strip() == ""
+    assert "range=user|unpark" not in bar(screen)
+
+
+def test_seats_come_back_in_number_order_whatever_order_they_return_in(screen):
+    screen("-n", "4")
+    for n in ("2", "3"):
+        assert seat_key(screen, "park", "t", seat_pane_of(screen, n)).returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "4"]
+    for n in ("2", "3"):                       # the order they were NOT parked in
+        assert seat_key(screen, f"unpark{n}", "t").returncode == 0
+    left_to_right = [num for _, num in sorted(
+        ((geometry(screen)[pid][0], num) for pid, num in panes(screen) if num))]
+    assert left_to_right == ["1", "2", "3", "4"], left_to_right
+
+
+def test_the_last_visible_seat_is_refused(screen):
+    screen("-n", "2")
+    assert seat_key(screen, "park", "t", seat_pane_of(screen, "1")).returncode == 0
+    before = geometry(screen)
+    refused = seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    assert refused.returncode == 1 and "last seat" in refused.stderr, refused.stderr
+    assert geometry(screen) == before, "a refused park moved something"
+
+
+def test_a_parked_seats_number_is_not_handed_to_a_new_seat(screen):
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    screen("--add")
+    assert seat_panes_in_row(screen) == ["1", "3", "4"]
+
+
+def test_parking_leaves_the_tape_and_dash_toggles_working(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "1"))
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert seat_key(screen, "tape", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert pane_id(screen, "tape") and pane_id(screen, "dash")
+
+
+def test_the_jump_to_a_parked_seat_brings_it_back(screen):
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    done = seat_key(screen, "seat2", "t")
+    assert done.returncode == 0, done.stderr
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+    assert screen.tmux("display-message", "-p", "-t", "=t:", "#{@qb_seat}").stdout.strip() == "2"
+
+
+def test_clicking_a_parked_cell_brings_it_back(screen):
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "3"))
+    done = click(screen, "unpark3", "t")
+    assert done.returncode == 0, done.stderr
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+
+
+def test_unparking_what_is_not_parked_says_so(screen):
+    screen("-n", "2")
+    for action in ("unpark", "unpark2"):
+        done = seat_key(screen, action, "t")
+        assert done.returncode == 1 and "parked" in done.stderr, (action, done.stderr)
+
+
+def test_the_park_keys_are_bound_and_on_the_menu(screen):
+    screen("-n", "2")
+    table = qb_table(screen)
+    assert action_of(table["p"]) == "park" and action_of(table["u"]) == "unpark"
+
+
+def test_every_showing_seat_has_a_park_cell_and_clicking_it_parks(screen):
+    screen("-n", "3")
+    line = bar(screen)
+    for n in (1, 2, 3):
+        assert f"range=user|park{n}" in line, f"seat {n} has nothing to click to park it"
+    done = click(screen, "park2", "t")
+    assert done.returncode == 0, done.stderr
+    assert seat_panes_in_row(screen) == ["1", "3"]
+    assert "range=user|unpark2" in bar(screen)
+    assert click(screen, "unpark2", "t").returncode == 0
+    assert seat_panes_in_row(screen) == ["1", "2", "3"]
+
+
+def row_widths(run, name="t"):
+    """{top: [seat widths left to right]} — seats only, the dash and tape excluded."""
+    g = geometry(run, name)
+    rows = {}
+    for pid, n in panes(run, name):
+        if n:
+            left, top, width, _ = g[pid]
+            rows.setdefault(top, []).append((left, width))
+    return {top: [w for _, w in sorted(v)] for top, v in rows.items()}
+
+
+def assert_even(widths, what):
+    assert max(widths) - min(widths) <= 2, f"{what}: seats are {widths}"
+
+
+def test_seats_are_even_after_a_park_and_after_an_unpark_in_either_order(screen):
+    """Measured before this was fixed: with a dash beside the row, `select-layout -E`
+    re-equalised the dash too and it took its columns back from the last seat — a
+    five-seat screen came out 48, 47, 47, 16 after one park and a 1-column seat
+    after the unpark."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "5")
+    dash_before = geometry(screen)[pane_id(screen, "dash")][2]
+    for n in ("2", "4"):
+        assert seat_key(screen, "park", "t", seat_pane_of(screen, n)).returncode == 0
+        (row,) = row_widths(screen).values()
+        assert_even(row, f"after parking {n}")
+    for n in ("2", "4"):                       # parked 2 then 4; back 2 then 4
+        assert seat_key(screen, f"unpark{n}", "t").returncode == 0
+        (row,) = row_widths(screen).values()
+        assert_even(row, f"after unparking {n}")
+    assert geometry(screen)[pane_id(screen, "dash")][2] == dash_before, "the dash moved"
+
+
+def test_a_two_row_screen_stays_even_in_each_row(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "6")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "5"))
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    for top, row in row_widths(screen).items():
+        assert_even(row, f"row at {top} with 2 and 5 parked")
+    seat_key(screen, "unpark", "t")
+    seat_key(screen, "unpark", "t")
+    rows = row_widths(screen)
+    assert sorted(len(r) for r in rows.values()) == [3, 3], rows
+    for top, row in rows.items():
+        assert_even(row, f"row at {top} after both came back")
+
+
+def test_a_seat_comes_back_to_the_window_it_is_now_not_the_one_it_left(screen):
+    """The widths recorded when a seat was parked describe a terminal that may since
+    have been resized, so none are recorded: the row is divided afresh."""
+    screen("-n", "3")
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    screen.tmux("resize-window", "-t", "=t:seats", "-x", "150")
+    assert seat_key(screen, "unpark", "t").returncode == 0
+    (row,) = row_widths(screen).values()
+    assert_even(row, "after a resize while parked")
+    assert min(row) > 30, row
+
+
+def test_a_parked_seat_still_shows_its_number_where_it_is_parked(screen):
+    """The border label is a window option on `seats`, so a pane broken out into the
+    holding window used to arrive with none — an agent on screen with no number."""
+    screen("-n", "3")
+    pane = seat_pane_of(screen, "2")
+    seat_key(screen, "park", "t", pane)
+    shown = screen.tmux("display-message", "-p", "-t", pane,
+                        "#{T:pane-border-format}").stdout
+    assert "seat 2" in shown, shown
+    assert screen.tmux("show-options", "-wv", "-t", pane,
+                       "pane-border-status").stdout.strip() == "top"
+
+
+def test_a_parked_seat_keeps_its_place_on_the_bar_and_swaps_its_icon(screen):
+    screen("-n", "3")
+    def names(line):
+        seen = []
+        for m in re.finditer(r"range=user\|(seat|unpark)(\d)", line):
+            if m.group(2) not in seen:
+                seen.append(m.group(2))
+        return seen
+    assert names(bar(screen)) == ["1", "2", "3"]
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    line = bar(screen)
+    assert names(line) == ["1", "2", "3"], f"seat 2 moved: {line}"
+    assert "range=user|park2" not in line and "range=user|kill2" not in line, line
+    assert "range=user|unpark2" in line and "◌" in line
+    assert "range=user|park1" in line and "range=user|kill1" in line
+    seat_key(screen, "unpark", "t")
+    line = bar(screen)
+    assert "◌" not in line and "range=user|park2" in line
+
+
+def test_the_icons_of_a_seat_share_a_chip(screen):
+    screen("-n", "2")
+    line = bar(screen)
+    park = line.index("range=user|park1")
+    kill = line.index("range=user|kill1")
+    between = line[park:kill]
+    assert "bg=colour238" in line[park:kill + 60], line
+    assert "bg=colour235" not in between, "something breaks the chip between – and ✕"
+
+
+def test_the_dash_has_a_chip_on_the_bar_that_hides_and_shows_it(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    line = bar(screen)
+    assert line.count("range=user|dash") == 2 and "range=user|expand" in line, line
+    assert "◌" not in line
+    assert click(screen, "dash", "t").returncode == 0
+    assert pane_id(screen, "dash") is None or "dash" not in [
+        n for _, n in panes(screen) if n], "the dash is still in the row"
+    line = bar(screen)
+    assert "◌" in line and "range=user|dash" in line, line
+    assert click(screen, "dash", "t").returncode == 0
+    line = bar(screen)
+    assert "◌" not in line and line.count("range=user|dash") == 2, line
+
+
+def test_an_expanded_dash_is_not_drawn_twice_and_its_chip_is_the_way_back(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "2")
+    assert seat_key(screen, "expand", "t").returncode == 0
+    line = bar(screen)
+    # Name and chip are two ranges of ONE cell: twice means drawn once.
+    assert line.count("range=user|expand") == 2 and "range=user|dash]" not in line, line
+    assert click(screen, "expand", "t").returncode == 0
+    line = bar(screen)
+    assert line.count("range=user|dash") == 2 and line.count("range=user|expand") == 1, line
+
+
+def test_a_screen_with_no_dash_has_no_dash_chip(screen):
+    screen.env["QB_SEATS_DASH"] = ""
+    screen("-n", "2")
+    assert "range=user|dash" not in bar(screen) and "range=user|expand" not in bar(screen)
+
+
+def status_lines(run, name="t"):
+    # tmux says `on` for one line and `2` for two; one is the number of lines here.
+    got = run.tmux("show-options", "-v", "-t", f"={name}:", "status").stdout.strip()
+    return "1" if got == "on" else got
+
+
+def test_the_seat_bar_is_given_back_while_the_dash_is_in_the_row(screen):
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    assert status_lines(screen) == "1", "the dash is showing, so the bar is redundant"
+    assert seat_key(screen, "dash", "t").returncode == 0           # hide it
+    assert status_lines(screen) == "2", "the bar is the way back and must be up"
+    assert seat_key(screen, "dash", "t").returncode == 0
+    assert status_lines(screen) == "1"
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert status_lines(screen) == "2", "an expanded dash is not in the row"
+    assert seat_key(screen, "expand", "t").returncode == 0
+    assert status_lines(screen) == "1"
+
+
+def test_parking_a_seat_does_not_change_the_window_height(screen):
+    """With the dash showing, a parked seat is listed there with a ◌, so the bar
+    stays down — bringing it up on every park resized every pane, the dash
+    included, by a row, which read as the dash jumping on each click."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "3")
+    height = geometry(screen)[pane_id(screen, "dash")][3]
+    seat_key(screen, "park", "t", seat_pane_of(screen, "2"))
+    assert status_lines(screen) == "1"
+    assert geometry(screen)[pane_id(screen, "dash")][3] == height, "the dash was resized"
+    seat_key(screen, "unpark", "t")
+    assert status_lines(screen) == "1"
+    assert geometry(screen)[pane_id(screen, "dash")][3] == height
+
+
+def test_a_screen_with_no_dash_always_has_the_bar(screen):
+    screen.env["QB_SEATS_DASH"] = ""
+    screen("-n", "2")
+    assert status_lines(screen) == "2"
+
+
+def test_the_dash_keeps_its_width_when_the_seat_beside_it_is_parked(screen):
+    """The seat touching the dash is the one whose columns tmux could hand to it.
+    Park every seat in turn from the dash side and back: the dash never moves and
+    what is left is spread evenly."""
+    screen.env["QB_SEATS_DASH"] = DASH_STUB
+    screen("-n", "4")
+    dash = pane_id(screen, "dash")
+    want = geometry(screen)[dash][2]
+    for n in ("4", "3", "2"):
+        assert seat_key(screen, "park", "t", seat_pane_of(screen, n)).returncode == 0
+        assert geometry(screen)[dash][2] == want, f"the dash moved when {n} was parked"
+        (row,) = row_widths(screen).values()
+        assert_even(row, f"after parking {n}")
+    for _ in range(3):
+        assert seat_key(screen, "unpark", "t").returncode == 0
+        assert geometry(screen)[dash][2] == want, "the dash moved on an unpark"
+        (row,) = row_widths(screen).values()
+        assert_even(row, "after an unpark")
