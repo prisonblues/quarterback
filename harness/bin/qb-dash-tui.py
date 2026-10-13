@@ -1000,6 +1000,9 @@ class Dash(App):
        a 78-column pane on a control that cannot change anything. */
     #chips { height: 1; background: $surface; }
     #chips.empty { display: none; }
+    /* Hidden below two screens, like the chips: one screen is the one you are in. */
+    #screens { height: 1; background: $surface; }
+    #screens.empty { display: none; }
     #detail { height: auto; min-height: 1; padding: 0 1; background: $panel;
               color: $text-muted; }
     .title { height: 1; padding: 0 1; background: $boost; color: $accent; }
@@ -1193,6 +1196,10 @@ class Dash(App):
         #: What the bar was last drawn from — see render_chips for why it is not
         #: redrawn on every tick.
         self.chip_sig: tuple | None = None
+        #: The other seat screens on this tmux server, and what the bar was last
+        #: drawn from (see render_screens).
+        self.screens: list[dict] = []
+        self.screens_sig: tuple | None = None
         # session id -> the board's live agent, which is the id the pane carries
         # as `@qb_session`. One key and no narrowing: it was (machine, scope, seat
         # number) while a pane could only be identified through the agent's name,
@@ -1328,6 +1335,10 @@ class Dash(App):
         # reports the column that was hit. A second click mechanism would be a
         # second place for "what did they click" to be got wrong.
         yield ClickTable(id="chips", cursor_type="none", show_header=False)
+        # Every seat screen on this server, so a shell opened in another repo after
+        # a dropped link can still find the one it lost. One row, one column per
+        # screen, for the reason the chips are.
+        yield ClickTable(id="screens", cursor_type="none", show_header=False)
         # A PANEL PER TABLE, and the pairing is structural rather than visual: a
         # grid places cells, so a title loose in the container is a cell of its
         # own and lands in a different column from the table it names. Wrapping
@@ -1466,6 +1477,7 @@ class Dash(App):
     def refresh_seats(self) -> None:
         seats, err = qd.tmux_seats()
         self.call_from_thread(self.render_seats, seats, err)
+        self.call_from_thread(self.render_screens, qd.tmux_screens())
 
     @work(thread=True, exclusive=True, group="limits")
     def refresh_limits(self) -> None:
@@ -2089,6 +2101,75 @@ class Dash(App):
                  else qd.repo_colour(name))
             for name in chips], key="chips")
 
+    def render_screens(self, screens: list[dict]) -> None:
+        """One clickable cell per seat screen; clicking one switches this client to it.
+
+        Hidden below two screens: a lone screen is the one you are in. The current
+        screen is drawn highlighted and clicking it does nothing. Rebuilt only when
+        what it shows changes, for the reason render_chips gives.
+        """
+        self.screens = screens if len(screens) > 1 else []
+        table = self.query_one("#screens", ClickTable)
+        table.set_class(len(screens) < 2, "empty")
+        if len(screens) < 2:
+            self.screens_sig = None
+            return
+        sig = tuple((s["name"], s["seats"], s["current"]) for s in screens)
+        if sig == self.screens_sig and table.row_count:
+            return
+        self.screens_sig = sig
+        table.clear(columns=True)
+        # KEYED BY NAME, so a click resolves to what the column IS, not a position.
+        for s in screens:
+            table.add_column(s["name"], key=s["name"])
+        table.add_row(*[
+            Text(f" {s['name']} ·{s['seats']} ",
+                 style="bold black on cyan" if s["current"] else "bold")
+            for s in screens], key="screens")
+
+    def screen_clicked(self, column: int | None) -> None:
+        if column is None:
+            return
+        table = self.query_one("#screens", ClickTable)
+        columns = table.ordered_columns
+        if not 0 <= column < len(columns):
+            return
+        name = str(columns[column].key.value)
+        current = next((s["current"] for s in self.screens if s["name"] == name), False)
+        if current:
+            self.say(f"already in {name}")
+            return
+        self.switch_screen(name)
+
+    def seats_bin(self) -> str:
+        """The qb-seats beside the qb-seat-click this screen was built with, else PATH's."""
+        beside = os.path.join(os.path.dirname(self.seat_click_bin(self.session_id())),
+                              "qb-seats")
+        return beside if os.access(beside, os.X_OK) else "qb-seats"
+
+    def session_id(self) -> str:
+        try:
+            return subprocess.run(["tmux", "display-message", "-p", "#{session_id}"],
+                                  capture_output=True, text=True,
+                                  timeout=5).stdout.strip()
+        except Exception:                          # noqa: BLE001
+            return ""
+
+    def switch_screen(self, name: str) -> None:
+        """Move this tmux client to another seat screen: `qb-seats resume NAME`,
+        which inside tmux is a switch-client and resolves the name the way `list`
+        does, so a name tmux mangled still works."""
+        try:
+            done = subprocess.run([self.seats_bin(), "resume", name],
+                                  capture_output=True, text=True, timeout=30)
+        except Exception as exc:                   # noqa: BLE001
+            self.say(f"could not run qb-seats ({type(exc).__name__})")
+            return
+        if done.returncode:
+            self.say(qd.clip(done.stderr.strip() or f"qb-seats resume {name} failed", 120))
+        else:
+            self.say(f"switched to {name}")
+
     def chip_clicked(self, column: int | None) -> None:
         """Which chip a click on the bar landed on, read off the WIDGET.
 
@@ -2517,6 +2598,9 @@ class Dash(App):
         # record there, and every other row does.
         if key == "chips":
             self.chip_clicked(column)
+            return
+        if key == "screens":
+            self.screen_clicked(column)
             return
         """What a click does, by what the row IS rather than by which table it is in.
 

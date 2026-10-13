@@ -4795,6 +4795,49 @@ def tmux_seats() -> tuple[list[dict], str | None]:
                                         int(s["seat"]) if s["seat"].isdigit() else 0)), None
 
 
+def tmux_screens() -> list[dict]:
+    """Every seat screen on this tmux server, the one we are sitting in marked.
+
+    A screen is a session with at least one pane carrying `@qb_seat` — the same
+    test `qb-seats list` applies, and for the same reason: the name is whatever
+    the user typed. Each is ``{name, seats, path, current}``.
+
+    This exists because `qb-seats` with no arguments reattaches to the screen for
+    the repo you are STANDING IN, so a shell opened in another repo after a
+    dropped link builds a fresh screen and leaves the old one running unseen. The
+    dashboard is where you land either way, so it is where the other screens have
+    to show.
+
+    Empty outside tmux and on any failure: this is a convenience bar, and a bar
+    that cannot be drawn is hidden, not an error on the panel.
+    """
+    if not os.environ.get("TMUX"):
+        return []
+    try:
+        got = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{session_id}\t#{session_attached}\t#{@qb_seat}\t#{session_path}"
+             "\t#{session_name}"],
+            capture_output=True, text=True, timeout=5)
+        me = subprocess.run(["tmux", "display-message", "-p", "#{session_id}"],
+                            capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:                              # noqa: BLE001
+        return []
+    if got.returncode != 0:
+        return []
+    screens: dict[str, dict] = {}
+    for line in got.stdout.splitlines():
+        # The name is last and may itself contain a tab: take the rest of the line.
+        parts = line.split("\t", 4)
+        if len(parts) != 5 or not parts[2]:
+            continue
+        sid, _att, _seat, path, name = parts
+        s = screens.setdefault(sid, {"name": name, "seats": 0, "path": path,
+                                     "current": sid == me})
+        s["seats"] += 1
+    return sorted(screens.values(), key=lambda s: s["name"])
+
+
 # ---- claude code's own limits ------------------------------------------------
 #
 # The seats all bill to ONE subscription, so the ceiling every one of them is

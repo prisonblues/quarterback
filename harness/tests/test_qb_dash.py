@@ -5231,3 +5231,65 @@ def test_the_dash_clicks_with_the_qb_seat_click_its_screen_was_built_with(tmp_pa
     assert app_module.Dash.seat_click_bin("seats-x") == str(mine)
     ran.stdout = ""                                  # a screen that recorded nothing
     assert app_module.Dash.seat_click_bin("seats-x") == "qb-seat-click"
+
+
+# ---- the screens bar ---------------------------------------------------------
+
+
+def _screens_run(monkeypatch, panes: str, me: str = "$1"):
+    sys.path.insert(0, str(BIN))
+    import qbdata as qd
+
+    def fake(argv, **kw):
+        if argv[:2] == ["tmux", "display-message"]:
+            return SimpleNamespace(stdout=me + "\n", returncode=0, stderr="")
+        return SimpleNamespace(stdout=panes, returncode=0, stderr="")
+    monkeypatch.setattr(qd.subprocess, "run", fake)
+    monkeypatch.setenv("TMUX", "/tmp/x,1,0")
+    return qd
+
+
+def test_tmux_screens_lists_only_sessions_with_seats_and_marks_the_current(monkeypatch):
+    qd = _screens_run(monkeypatch, "\n".join([
+        "$1\t1\t1\t/r/quarterback\tseats-quarterback",
+        "$1\t1\t2\t/r/quarterback\tseats-quarterback",
+        "$1\t1\t\t/r/quarterback\tseats-quarterback",        # the board pane: no seat
+        "$2\t0\t1\t/r/lexray\tseats-lexray",
+        "$3\t1\t\t/home/rich\twork",                          # no seat: not a screen
+    ]))
+    assert qd.tmux_screens() == [
+        {"name": "seats-lexray", "seats": 1, "path": "/r/lexray", "current": False},
+        {"name": "seats-quarterback", "seats": 2, "path": "/r/quarterback", "current": True},
+    ]
+
+
+def test_tmux_screens_is_empty_outside_tmux(monkeypatch):
+    qd = _screens_run(monkeypatch, "$1\t1\t1\t/r\tx")
+    monkeypatch.delenv("TMUX")
+    assert qd.tmux_screens() == []
+
+
+def test_clicking_another_screen_resumes_it_and_the_current_one_does_nothing(monkeypatch):
+    app_module = _load_app()
+    app = app_module.Dash.__new__(app_module.Dash)
+    ran: list[list[str]] = []
+    said: list[str] = []
+    app.say = said.append
+    app.seats_bin = lambda: "qb-seats"
+    app.screens = [{"name": "a", "seats": 1, "current": True},
+                   {"name": "b b", "seats": 2, "current": False}]
+    monkeypatch.setattr(app_module.subprocess, "run",
+                        lambda argv, **k: (ran.append(argv),
+                                           SimpleNamespace(returncode=0, stderr=""))[1])
+
+    class Col:
+        def __init__(self, k): self.key = SimpleNamespace(value=k)
+    app.query_one = lambda *a, **k: SimpleNamespace(
+        ordered_columns=[Col("a"), Col("b b")])
+    app.screen_clicked(0)
+    assert ran == []
+    app.screen_clicked(1)
+    assert ran == [["qb-seats", "resume", "b b"]], ran     # one argv item: the name has a space
+    app.screen_clicked(None)
+    app.screen_clicked(7)
+    assert len(ran) == 1
