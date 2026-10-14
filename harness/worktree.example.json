@@ -58,6 +58,13 @@
 
   "symlinks": [".venv", ".claude", "CLAUDE.md"],
 
+  "_seed": [
+    "Files COPIED (never symlinked) from the source checkout into a new worktree,",
+    "e.g. pytest-testmon data so the first selective test run is not a full one.",
+    "A file the source lacks is skipped with one line. Opt-in; absent = nothing."
+  ],
+  "seed": [".testmondata"],
+
   "_setup": [
     "Shell commands run IN the worktree, after symlinks/copies and before Docker.",
     "Drop '.venv' from symlinks and use this instead when branches disagree about",
