@@ -935,6 +935,12 @@ while IFS= read -r line; do
     [[ -n "$line" ]] && COPIES+=("$line")
 done < <(cfg_array '.copies')
 
+# Files seeded from the source checkout (opt-in `seed`): COPIED, never linked.
+SEED=()
+while IFS= read -r line; do
+    [[ -n "$line" ]] && SEED+=("$line")
+done < <(cfg_array '.seed')
+
 # Commands run IN the new worktree once its files are in place. The reason this
 # exists: a project whose worktrees need their own environment rather than a
 # symlink to the main checkout's had no way to build one — the tool could
@@ -1165,6 +1171,11 @@ if [[ "$DRY_RUN" = true ]]; then
     if [[ ${#COPIES[@]} -gt 0 ]]; then
         local_step=$((local_step + 1))
         echo -e "  $local_step. Copy: ${COPIES[*]}"
+    fi
+
+    if [[ ${#SEED[@]} -gt 0 ]]; then
+        local_step=$((local_step + 1))
+        echo -e "  $local_step. Seed (copy from source checkout): ${SEED[*]}"
     fi
 
     if [[ ${#SETUP_COMMANDS[@]} -gt 0 ]]; then
@@ -1760,6 +1771,33 @@ else
         fi
     done
 fi
+
+# ============================================
+# STEP: Seed
+# ============================================
+# Opt-in `seed`: files copied from the source checkout so the worktree starts
+# warm -- pytest-testmon's `.testmondata`, so the first selective `make test`
+# is not a full run. A COPY, never a symlink: SQLite shared by concurrent runs
+# corrupts. `cp -L` so a link in the source is copied as the bytes it names.
+# An absent file is one line and the run continues; it is never an error.
+# >>> seed
+if [[ ${#SEED[@]} -gt 0 ]]; then
+    step "Seeding from the source checkout..."
+    for item in "${SEED[@]}"; do
+        if [[ -f "$MAIN_REPO/$item" ]]; then
+            mkdir -p "$(dirname "$WORKTREE_DIR/$item")"
+            rm -f "$WORKTREE_DIR/$item"
+            if cp -L "$MAIN_REPO/$item" "$WORKTREE_DIR/$item"; then
+                echo -e "  ${GREEN}$item${NC} seeded (copy)"
+            else
+                echo -e "  ${YELLOW}$item could not be copied, continuing without it${NC}"
+            fi
+        else
+            echo -e "  ${YELLOW}seed: $item not in the source checkout, continuing without it${NC}"
+        fi
+    done
+fi
+# <<< seed
 
 # ============================================
 # STEP: Setup commands
