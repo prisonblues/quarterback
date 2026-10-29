@@ -5129,7 +5129,7 @@ Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `worker.{type,command,container_prefix,queue_env,queue_default}`,
 `nginx.{config,container,main_port,resolver,extra_proxy_headers}`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
-and the arrays `symlinks`, `copies`, `setup`, `reserved_names`, `gitignore_additions`,
+and the arrays `symlinks`, `copies`, `setup`, `seed`, `reserved_names`, `gitignore_additions`,
 `backup_ignore`.
 
 **`copies` and `gitignore_additions` also tell `remove-worktree` what NOT to back up.**
@@ -5156,6 +5156,18 @@ that resolves into the main checkout** holds no bytes of its own. And the **`.en
 create-worktree records their sha256 in the worktree's git dir (`qb-provisioned.sha256`),
 and an edited one is archived. A tree made before that stamp falls back to mtime against
 `.worktree-port`. Archives go in `worktree-backups/` beside the checkouts.
+
+### `seed` — starting a worktree warm
+
+`"seed": [".testmondata"]` copies each listed file from the source checkout into the new
+worktree, after `copies` and before `setup`. It exists for pytest-testmon: a worktree with
+no `.testmondata` cannot select tests, so its first `make test` runs the whole fast suite.
+Seeded from the source checkout, the first run selects against the fork point.
+
+It is a **copy, never a symlink** (`cp -L`): concurrent runs sharing one SQLite file
+corrupt it. A file the source does not hold prints one yellow line and provisioning
+continues. The key is opt-in; absent, nothing changes. `remove-worktree` leaves seeded
+paths out of the teardown tarball (ignored entries only, as for `copies`).
 
 ### `setup` — building a worktree its own environment
 
