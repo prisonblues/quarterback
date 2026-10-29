@@ -45,8 +45,8 @@ HOOK = BIN / "qb-hook"
 #: this hook can reach is reachable only when a test put it there.
 HOOK_TOOLS = ("jq", "curl", "git", "timeout", "sed", "grep", "sort", "tr", "cat",
               "date", "stat", "basename", "dirname", "cut", "sha256sum", "bash",
-              "sh", "mktemp", "tail", "head", "python3", "rm", "printf", "env",
-              "uname", "wc", "awk", "id", "readlink", "paste")
+              "sh", "mktemp", "tail", "head", "python3", "rm", "mkdir", "mv",
+              "printf", "env", "uname", "wc", "awk", "id", "readlink", "paste")
 
 # jq and curl are not incidental: the hook exits 0 without either, so a sandbox
 # missing one would run every test below against a hook that no-op'd and report
