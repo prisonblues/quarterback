@@ -190,7 +190,7 @@ docstrings, update them now — part of the fix, not a follow-up.
 Read CI config (`.github/workflows/`) and the Makefile for what the project
 runs; those override fallbacks. Then:
 1. **Build** — compile/bundle.
-2. **Test** — full suite; iterate until green; fix the wrong side (code or
+2. **Test** — the project's selecting target (e.g. `make test`) or the specific test files — never the whole suite where the repo separates the two; CI and the nightly own the full run; iterate until green; fix the wrong side (code or
    test), never skip.
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** — if the project uses it.
