@@ -573,7 +573,7 @@ turns one line's symptom into an edit across the group's files.
 
 You keep step 4's verification, the full-diff re-read, the commit and the push.
 Never delegate those: parallel fixes meet at seams nobody checked, so the whole
-combined diff still has to be read and the whole suite still has to go green
+combined diff still has to be read and the tests that cover the combined diff still have to go green
 under your eye. If a group agent fails or returns short, fix its findings
 yourself — the bar does not move because you delegated.
 
@@ -824,7 +824,7 @@ if the script isn't there.
 
 Read CI config + Makefile to find what the project runs, then:
 1. **Build** (if applicable).
-2. **Test** — full suite; iterate until green; fix the wrong side (code or
+2. **Test** — the project's selecting target (e.g. `make test`) or the specific test files — never the whole suite where the repo separates the two; CI and the nightly own the full run; iterate until green; fix the wrong side (code or
    test), never skip.
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** (if used).

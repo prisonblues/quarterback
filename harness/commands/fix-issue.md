@@ -60,7 +60,7 @@ Write an implementation plan. List:
 - Risks and how you'll mitigate them
 
 The worktree always gets its own database copy, and this skill passes no DB
-flag. Step 7 runs the full suite and its teardown truncates the database, so
+flag. Step 7 runs the tests and its teardown truncates the database, so
 sharing the main one is never safe here.
 
 ## 3. Get an isolated worktree — provision, reuse or inherit — then verify it
@@ -364,7 +364,7 @@ the project runs. These override fallbacks.
 ### Run quality pipeline
 
 1. **Build** — compile or bundle.
-2. **Test** — full suite. Iterate until green. If a test fails,
+2. **Test** — the project's selecting target (e.g. `make test`) or the specific test files — never the whole suite where the repo separates the two; CI and the nightly own the full run. Iterate until green. If a test fails,
    fix the code or the test (whichever is wrong), don't skip it.
 3. **Lint and format** — fix all issues. Don't disable rules.
 4. **Type check** — if the project uses type checking, run it.
