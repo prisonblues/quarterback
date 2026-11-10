@@ -60,8 +60,9 @@ Write an implementation plan. List:
 - Risks and how you'll mitigate them
 
 The worktree always gets its own database copy, and this skill passes no DB
-flag. Step 7 runs the tests and its teardown truncates the database, so
-sharing the main one is never safe here.
+flag. Step 7's test runs, selective or full, go through the suite's teardown,
+which truncates the database, and a selective run can still fall back to
+everything. So sharing the main one is never safe here.
 
 ## 3. Get an isolated worktree — provision, reuse or inherit — then verify it
 
@@ -364,8 +365,11 @@ the project runs. These override fallbacks.
 ### Run quality pipeline
 
 1. **Build** — compile or bundle.
-2. **Test** — the project's selecting target (e.g. `make test`) or the specific test files — never the whole suite where the repo separates the two; CI and the nightly own the full run. Iterate until green. If a test fails,
-   fix the code or the test (whichever is wrong), don't skip it.
+2. **Test** — the **selective** run (the project's selecting target, e.g.
+   `make test`) plus your new and touched test files by path — never the whole
+   suite where the repo separates the two. Iterate until green. If a test
+   fails, fix the code or the test (whichever is wrong), don't skip it. See
+   "Which tests" below.
 3. **Lint and format** — fix all issues. Don't disable rules.
 4. **Type check** — if the project uses type checking, run it.
 5. **Codegen sync** — if CI has `git diff --exit-code` checks,
@@ -373,6 +377,46 @@ the project runs. These override fallbacks.
 
 If a tool is not installed, install it if possible. Only skip
 with a note if installation isn't feasible.
+
+### Which tests: selective by default, the full suite once at integration
+
+Run what your change can reach, not everything. If the project has a
+selective target, use it: an affected-tests run such as pytest-testmon behind
+`make test`, `--changed`/`--onlyChanged`, `nx affected`, or whatever the
+Makefile and CI call it. Run your new and touched test files by path as well,
+which the red/green step already does. On an ordinary change that takes
+seconds, where the full suite takes tens of minutes and, with several
+worktrees on one box, contends for the same cores.
+
+Run the **full** suite only when one of these holds:
+- the project has **no** selection mechanism;
+- the selective run's own output says it **fell back to everything** (a change
+  to shared fixtures, test config, migrations or lockfiles, which no per-test
+  record can see through). Let it run, since that is the tool telling you the
+  change is broad;
+- the change is genuinely cross-cutting (a framework or worker-model swap, or a
+  refactor touching many call sites) and you judge selection can't be trusted.
+
+**Bound for an integration branch** — `--base` names one (a wave or epic
+branch such as `integration/v22`, `batch/*`), or you are one of several
+parallel fixes an epic or fan-out driver is integrating together, or you were
+told to defer: run **only** the selective set and the tests you touched. Never
+the full suite and never the whole DB-backed suite, whatever the list above
+says. They run **once**, when the integration branch is prepared for promotion
+to the default branch, which is also the only place cross-PR interactions show
+up. Say in the PR body that the full and DB suites are deferred to promotion.
+
+**Point the selection at your base.** A selective target usually diffs
+against the default branch, so on a branch forked from an integration branch
+every commit the integration branch carries counts as changed, and the
+"selective" run widens to roughly everything. That is not the tool saying your
+change is broad; it is the wrong comparison. Pass the base the project's way:
+in lexray, `LEXRAY_TEST_BASE=<remote>/<base> make test`. If the project has no
+way to set it, run your touched test files by path and say so.
+
+The full suite still runs before anything reaches the default branch: on the
+promotion PR, in the nightly, and in the protected-branch pre-push hook where
+the project has one. Selection here changes *when* it runs, not *whether*.
 
 ### Database-backed tests (when the change touches the DB)
 
@@ -382,11 +426,15 @@ A green fast suite then says **nothing** about code that reads or writes the DB.
 
 So if the change touches any DB-facing code — models/schema, migrations, ORM
 queries (`Model.query`, `session.get`, `select(...)`), session/transaction
-handling, or DB-backed routes/tasks — you **must** also run the project's
-DB-backed suite, not just the fast one. Find the dedicated target (e.g.
-`make test-db`, a `database`/`integration` marker, or a tox/CI env that
-provisions a real database) and run it against a live local database. If you
-cannot run it, say so explicitly and flag the DB paths as **unverified**.
+handling, or DB-backed routes/tasks — you **must** also run DB-backed tests,
+not just the fast ones. Find the dedicated target (e.g. `make test-db`, a
+`database`/`integration` marker, or a tox/CI env that provisions a real
+database) and run the DB tests **for the affected area** (by path or marker
+selection) against a live local database. Run the whole DB suite only on the
+same conditions as the full suite above, and never for a change bound for an
+integration branch.
+If you cannot run the affected DB tests, say so explicitly and flag the DB
+paths as **unverified**.
 
 ## 8. Self-review
 

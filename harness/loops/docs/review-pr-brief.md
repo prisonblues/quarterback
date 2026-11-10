@@ -824,7 +824,7 @@ if the script isn't there.
 
 Read CI config + Makefile to find what the project runs, then:
 1. **Build** (if applicable).
-2. **Test** — the project's selecting target (e.g. `make test`) or the specific test files — never the whole suite where the repo separates the two; CI and the nightly own the full run; iterate until green; fix the wrong side (code or
+2. **Test** — the project's selecting target (e.g. `make test`) or the specific test files — never the whole suite where the repo separates the two; CI and the nightly own the full run. Point the selection at the PR's base (in lexray `LEXRAY_TEST_BASE=<remote>/<base> make test`): against the default branch, a PR into an integration branch selects nearly everything. Iterate until green; fix the wrong side (code or
    test), never skip.
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** (if used).
@@ -897,9 +897,11 @@ stops happening.
 **DB-backed tests:** if the diff touches DB-facing code (models/schema,
 migrations, ORM queries, session/transaction handling, DB-backed routes/tasks),
 the fast suite often **excludes** DB tests and proves nothing about them. Find
-and run the DB-backed target against a live local DB (migrate the test DB to
-head first). If you can't, say so explicitly and flag those paths **unverified**
-— don't imply the fast suite covered them.
+and run the DB-backed tests **for the affected area** (by path or marker) against
+a live local DB (migrate the test DB to head first). Never the whole DB suite for
+a PR into an integration branch: that runs once, at promotion. If you can't, say
+so explicitly and flag those paths **unverified** — don't imply the fast suite
+covered them.
 
 Install missing tools if feasible; only skip with a note if not.
 
