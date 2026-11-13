@@ -26,13 +26,13 @@ after). A reading argued over for several rounds is often one failing test. The
 panel's seats stay shell-less (#92) because they read PR heads that may not be the
 reader's own; that reason does not apply to a builder reviewing their own tree.
 `--no-exec` gives the panel's read-only seat instead, and `--network` opens the
-sandbox's network for a DB-backed test. `--shard` splits the read by area across parallel calls,
-which shortens the serial chain instead of finding one path per round. `--design`
+sandbox's network for a DB-backed test. `--shard` splits the read by area: in parallel for the shell-less seat, one at
+a time for seats that run code (they share the tree and its test DB). It shortens the serial chain instead of finding one path per round. `--design`
 reviews a design note instead of the diff, for the design round invariant-heavy work
 starts with — and the classes it records carry over into the code rounds.
 
 Exit codes: 0 clean (converged, nothing to fix) · 1 findings to fix, round again ·
-2 codex unavailable or unusable (best-effort callers skip) · 3 ledger not written ·
+2 codex unavailable or unusable (best-effort callers skip) · 3 ledger unreadable or not written ·
 4 budget spent without convergence (owner decides) · 5 structural fix owed.
 
 Usage:
@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -143,10 +144,24 @@ def material(base: str, design: str) -> tuple[str, str]:
         return (f"the design note {design} (no code yet — review the DESIGN: invariants, "
                 "races, ordering, what each path may see)", Path(design).read_text())
     merge_base = git("merge-base", base, "HEAD").strip()
-    diff = git("diff", merge_base)
+    diff = git("diff", merge_base) + untracked_diff()
     if not diff.strip():
         raise SystemExit(f"codex_round: no changes against {base} — nothing to review")
     return f"a code change (diff against {base})", f"Diff:\n{diff}"
+
+
+def untracked_diff() -> str:
+    """New files the builder has not added yet, as diffs: `git diff` leaves them out,
+    and a new module is often most of the change."""
+    top = git("rev-parse", "--show-toplevel").strip()
+    out = []
+    for name in git("ls-files", "--others", "--exclude-standard", "-z",
+                    cwd=top).split("\0"):
+        if name:
+            out.append(subprocess.run(
+                ["git", "diff", "--no-index", "--", os.devnull, name], cwd=top,
+                capture_output=True, text=True, check=False).stdout)
+    return "".join(out)
 
 
 def build_prompt(what: str, text: str, ledger: dict, wave: list[dict],
@@ -167,7 +182,10 @@ def parse_reply(text: str) -> dict | None:
         reply = json.loads(text[start:end + 1])
     except ValueError:
         return None
-    if not isinstance(reply, dict):
+    # Both arrays are the reply. `{}` or an error object is not an empty review —
+    # read as one, it would converge the round on nothing.
+    if not (isinstance(reply, dict) and isinstance(reply.get("violations"), list)
+            and isinstance(reply.get("new_classes"), list)):
         return None
     return {"violations": [v for v in reply.get("violations") or []
                            if isinstance(v, dict)],
@@ -184,8 +202,13 @@ def exec_args(model: str, effort: str, reply_file: Path, network: bool) -> list[
     the test it suspects would fail settles in one round what a reading argues about
     for several. `workspace-write` bounds writes to the worktree and the temp dir;
     the network stays off unless the caller asks (a DB-backed test needs it)."""
+    # Apps and plugins off as on the panel seat: an app is a network channel with
+    # credentials (the GitHub connector), which the sandbox's network switch does
+    # not close.
     args = ["codex", "exec", "-s", "workspace-write",
             "-c", 'web_search="disabled"',
+            "-c", "features.apps=false",
+            "-c", "features.plugins=false",
             "-c", f"sandbox_workspace_write.network_access={str(network).lower()}"]
     if model:
         args += ["--model", model]
@@ -195,8 +218,12 @@ def exec_args(model: str, effort: str, reply_file: Path, network: bool) -> list[
 
 
 def tree_state(top: str) -> str:
-    """What the worktree looks like, to catch a seat that edited it."""
-    return git("status", "--porcelain=v1", "-uall", cwd=top) + git("diff", cwd=top)
+    """What the worktree looks like, to catch a seat that edited it — the files, and
+    the index, HEAD and stash a commit, an add or a stash would move."""
+    return "\0".join([git("rev-parse", "HEAD", cwd=top),
+                      git("status", "--porcelain=v1", "-uall", cwd=top),
+                      git("diff", cwd=top), git("diff", "--cached", cwd=top),
+                      git("stash", "list", cwd=top)])
 
 
 def run_codex(prompt: str, model: str, effort: str, top: str = "",
@@ -290,21 +317,31 @@ def _seat() -> tuple[str, str, int | None, int | None]:
     return str(codex.get("model") or ""), str(codex.get("effort") or ""), strikes, rounds
 
 
+def positive(text: str) -> int:
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a whole number >= 1")
+    return value
+
+
 def _parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="codex_round.py", description=__doc__.split(
         "\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--base", default="", help="ref to diff against (default origin/HEAD)")
     ap.add_argument("--ledger", default="", help="class ledger (default: per worktree, "
                     "under the worktree's git dir)")
-    ap.add_argument("--round", type=int, default=None, dest="round_no",
+    ap.add_argument("--round", type=positive, default=None, dest="round_no",
                     help="default: one past the ledger's last round")
     ap.add_argument("--design", default="", metavar="FILE",
                     help="review this design note instead of the diff")
     ap.add_argument("--shard", default="", help="comma list of "
-                    f"{','.join(SHARDS)}, or 'all': one parallel call per area")
+                    f"{','.join(SHARDS)}, or 'all': one call per area")
     ap.add_argument("--wave", action="append", default=[], metavar="PATH",
                     help="another PR's ledger from the same wave (repeatable)")
-    ap.add_argument("--class-rounds", type=int, default=None, dest="class_rounds",
+    ap.add_argument("--class-rounds", type=positive, default=None, dest="class_rounds",
                     help="override the round budget — the owner's call")
     ap.add_argument("--no-exec", action="store_true", dest="no_exec",
                     help="the panel's read-only, shell-less seat instead of one that may "
@@ -330,11 +367,12 @@ def shards_of(spec: str) -> list[str]:
 
 def ask_seats(prompts: list[str], model: str, effort: str, top: str,
               network: bool) -> list[dict | None]:
-    """Run every shard in parallel. With ``top`` set the seats run in the worktree,
-    and a tree they changed is reported — the rule they were given is not trusted
-    to have held."""
+    """Run every shard. With ``top`` set the seats run in the worktree, ONE AT A TIME:
+    they share its files, its build output and its test database, so parallel seats
+    running tests would race each other. A tree they changed is reported — the rule
+    they were given is not trusted to have held."""
     before = tree_state(top) if top else ""
-    with ThreadPoolExecutor(max_workers=len(prompts)) as pool:
+    with ThreadPoolExecutor(max_workers=1 if top else len(prompts)) as pool:
         replies = list(pool.map(lambda p: run_codex(p, model, effort, top, network),
                                 prompts))
     if top and tree_state(top) != before:
@@ -366,10 +404,12 @@ def main(argv: list[str] | None = None) -> int:
         rounds = args.class_rounds
     ledger_path = args.ledger or default_ledger()
     ledger, problems = pc.load_ledger(ledger_path)
+    if pc.refuse_unusable(problems, "codex_round"):
+        return pc.LEDGER_FAILED_EXIT
     wave, more = pc.load_wave(args.wave)
-    for p in problems + more:
+    for p in more:
         print(f"codex_round: {p}", file=sys.stderr)
-    round_no = args.round_no or pc.last_round(ledger) + 1
+    round_no = args.round_no if args.round_no is not None else pc.last_round(ledger) + 1
     refusal = pc.budget_refusal(ledger, round_no, strikes, rounds)
     if refusal:
         print(refusal, file=sys.stderr)
@@ -390,6 +430,7 @@ def main(argv: list[str] | None = None) -> int:
         print("codex_round: no usable reply from codex — skipped", file=sys.stderr)
         return UNAVAILABLE_EXIT
     found = apply_replies(ledger, [r for r in replies if r], round_no, strikes)
+    pc.mark_round(ledger, round_no)
     write_failed = pc.save_ledger(ledger_path, ledger)
     state = pc.round_state(ledger, round_no, strikes, rounds)
     print_round(args, round_no, ledger_path, ledger, state, found, answered, len(prompts))

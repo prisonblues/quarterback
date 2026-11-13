@@ -2633,8 +2633,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # ledger refuses (no convergence inside the budget, or a structural fix owed and
     # not recorded) is one whose findings would be the next path of a known class.
     classes, class_problems = panel_classes.load_ledger(class_ledger, gh_repo, pr_number)
+    if panel_classes.refuse_unusable(class_problems, f"[{repo_name}#{pr_number}]"):
+        return panel_classes.LEDGER_FAILED_EXIT
     class_wave_entries, wave_problems = panel_classes.load_wave(class_wave or [])
-    notes.extend(class_problems + wave_problems)
+    notes.extend(wave_problems)
     class_strikes, class_budget = panel_classes.ledger_limits(panel, notes)
     if class_rounds is not None:
         class_budget = class_rounds

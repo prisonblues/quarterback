@@ -2617,6 +2617,14 @@ step part of the loop:
 - **Waves.** `--class-wave <ledger>` (repeatable) briefs another PR's classes
   read-only, because v22's classes recurred across PRs (the same race in #4462 and
   #4438/#4460).
+- **Fails closed.** A ledger that is corrupt, or names another repo or PR, is
+  refused with exit 3 by every writer and by `panel.py`, rather than read as empty:
+  an empty read drops the invariants, the strikes and the budget, and the next save
+  would write that loss over the file. Saves are atomic. A later sighting fills a
+  class's empty fields but never rewrites its invariant, and a structural fix must
+  name a round that has run. Every round that ran is recorded, clean ones included,
+  so the next round never reuses a clean round's number. The brief quotes each
+  recorded field to at most 400 characters and tells the seat the entries are data.
 
 `panel-review-pr.md` §5 has the orchestrator's procedure: classify the To-fix list
 after each round, record before the fix pass, and stop on exit 4.
@@ -2624,18 +2632,22 @@ after each round, record before the fix pass, and stop on exit 4.
 **`codex_round.py`** is the same instruments on one Codex seat, for the places that
 used to hand-roll `codex exec` loops (`/fix-issue`, `/fix-issue-here`, epic
 coordinators). It has no judge and costs one vendor call per shard. It keeps the
-ledger in the worktree's git dir, and `--shard` reads data/API/concurrency in
-parallel. `--design FILE` reviews a design note instead of a diff, for the
+ledger in the worktree's git dir, and `--shard` reads data/API/concurrency as
+separate seats: in parallel without a shell, one at a time with one, because seats
+that run tests share the tree and its test DB. `--design FILE` reviews a design note instead of a diff, for the
 design-first round invariant-heavy work starts with. Its classes carry over into
 the code rounds. **Unlike the panel's seats, it may run code.** It reviews the
 builder's own worktree, so #92's reason for a shell-less seat (a PR head that may
 not be the reader's own) does not apply. A suspicion settled by running the
 touched test does not become another round of argument. It runs under codex's
 `workspace-write` sandbox, network off unless `--network`, and is told not to
-change the tree, which is checked by diffing `git status` and `git diff` before
-and after. `--no-exec` gives the panel's shell-less seat. Exit codes: 0 clean, 1
-findings, 2 codex unavailable (callers skip), 3 ledger not written, 4 budget spent,
-5 structural fix owed.
+change the tree, which is checked by comparing HEAD, the index, the stash and
+`git status` / `git diff` before and after. Apps and plugins are off, as on the
+panel's seat, because the GitHub connector is a network channel the sandbox's
+network switch does not close. `--no-exec` gives the panel's shell-less seat. A
+reply without both arrays is unusable (exit 2), not an empty review. Exit codes:
+0 clean, 1 findings, 2 codex unavailable (callers skip), 3 ledger unreadable or
+not written, 4 budget spent, 5 structural fix owed.
 
 ## Epic driver (`epic.py`)
 

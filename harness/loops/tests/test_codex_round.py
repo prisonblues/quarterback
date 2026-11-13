@@ -2,6 +2,7 @@
 rule and the round budget, in place of the hand-rolled `codex exec` loops that had none.
 """
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,8 +32,14 @@ def test_a_reply_with_no_object_is_none(text):
 
 
 def test_junk_entries_in_a_reply_are_dropped():
-    reply = cr.parse_reply('{"violations": [1, {"class": "k"}], "new_classes": "x"}')
+    reply = cr.parse_reply('{"violations": [1, {"class": "k"}], "new_classes": ["x"]}')
     assert reply == {"violations": [{"class": "k"}], "new_classes": []}
+
+
+@pytest.mark.parametrize("text", ["{}", '{"status": "error"}',
+                                  '{"violations": [], "new_classes": "x"}'])
+def test_a_reply_without_both_arrays_is_not_an_empty_review(text):
+    assert cr.parse_reply(text) is None
 
 
 # ---------------------------------------------------------------- recording a round
@@ -203,3 +210,82 @@ def test_the_json_report_carries_the_state(round_env, capsys):
     cr.main(["--ledger", ledger, "--json"])
     out = json.loads(capsys.readouterr().out)
     assert out["state"]["round"] == 1 and out["shards"] == 1
+
+
+# ------------------------------------------------- what the first Codex round found
+
+@pytest.fixture
+def repo(tmp_path, monkeypatch):
+    def run(*argv):
+        subprocess.run(["git", *argv], cwd=tmp_path, check=True, capture_output=True)
+    run("init", "-q", "-b", "main")
+    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+        "-m", "base")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path, run
+
+
+def test_a_new_file_not_yet_added_is_in_the_material(repo):
+    top, _ = repo
+    (top / "new_module.py").write_text("def f():\n    return 1\n")
+    _, text = cr.material("HEAD", "")
+    assert "new_module.py" in text and "return 1" in text
+
+
+def test_a_seat_that_committed_is_caught(repo):
+    top, run = repo
+    before = cr.tree_state(str(top))
+    run("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+        "-m", "seat")
+    assert cr.tree_state(str(top)) != before
+
+
+def test_executing_seats_take_the_worktree_one_at_a_time(monkeypatch):
+    import threading
+    import time
+    live, peak, lock = [0], [0], threading.Lock()
+
+    def seat(*a):
+        with lock:
+            live[0] += 1
+            peak[0] = max(peak[0], live[0])
+        time.sleep(0.05)
+        with lock:
+            live[0] -= 1
+        return {"violations": [], "new_classes": []}
+    monkeypatch.setattr(cr, "run_codex", seat)
+    monkeypatch.setattr(cr, "tree_state", lambda top: "same")
+    cr.ask_seats(["a", "b", "c"], "", "", "/repo", False)
+    assert peak[0] == 1
+    cr.ask_seats(["a", "b", "c"], "", "", "", False)
+    assert peak[0] == 3
+
+
+def test_the_executing_seat_has_no_apps_or_plugins(tmp_path):
+    argv = cr.exec_args("", "", tmp_path / "r.txt", network=True)
+    assert "features.apps=false" in argv and "features.plugins=false" in argv
+
+
+@pytest.mark.parametrize("flag", ["--round", "--class-rounds"])
+@pytest.mark.parametrize("value", ["0", "-1", "x"])
+def test_a_round_or_budget_below_one_is_refused(flag, value):
+    with pytest.raises(SystemExit):
+        cr._parser().parse_args([flag, value])
+
+
+def test_a_clean_round_is_counted_so_the_next_gets_its_own_number(round_env):
+    ledger, replies, _ = round_env
+    replies.append({"violations": [], "new_classes": [RESOLVER]})
+    cr.main(["--ledger", ledger])
+    replies.append({"violations": [], "new_classes": []})
+    cr.main(["--ledger", ledger])
+    saved, _ = pc.load_ledger(ledger)
+    assert pc.last_round(saved) == 2
+
+
+def test_an_unreadable_ledger_stops_the_round_and_is_left_alone(round_env, capsys):
+    ledger, replies, asked = round_env
+    Path(ledger).write_text("{not json")
+    replies.append({"violations": [], "new_classes": []})
+    assert cr.main(["--ledger", ledger]) == pc.LEDGER_FAILED_EXIT
+    assert asked == [] and Path(ledger).read_text() == "{not json"

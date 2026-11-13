@@ -30,8 +30,9 @@ before you commit.
 - **Remembers.** The class ledger lives in the worktree's git dir (one per worktree,
   never in the tree). Round 2 onward checks the recorded invariants instead of
   hunting afresh, and only a genuinely new class counts as news.
-- **Shards.** `--shard all` reads data/DB, API/visibility and concurrency in parallel,
-  which shortens the serial chain for a large diff.
+- **Shards.** `--shard all` reads data/DB, API/visibility and concurrency as separate seats,
+  so each goes deep on one area. Seats that run code take the tree one at a time,
+  because they share its files and its test DB; `--no-exec` seats run in parallel.
 - **Reads the wave.** `--wave <ledger>` adds another PR's classes, read-only, for
   epic work where one race shows up in several PRs.
 
@@ -44,6 +45,6 @@ before you commit.
 | 5 | **two strikes**: a class now seen on a second path | do not patch the path. Make the class impossible by construction, then `python3 ~/.claude/loops/panel_classes.py structural --ledger <path> --round <n> --class <key> --how … --enforcement … --guard-test …` |
 | 4 | **budget spent**: `review_panel.class_ledger.rounds` (3) rounds each found a new class | stop. Report the open classes and their structural options; the owner decides. `--class-rounds N` is their override, not yours |
 | 2 | codex absent or no usable reply | skip; it never blocks |
-| 3 | the ledger could not be written | fix the path and re-run |
+| 3 | the ledger could not be read as it stands, or could not be written | nothing ran and the file was left as it was. Fix or move it; never delete it to get past this, which wipes the strike counts and the budget |
 
 A round where a shard gave no reply says `PARTIAL` and is never reported clean.

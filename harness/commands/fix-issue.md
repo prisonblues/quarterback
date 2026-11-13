@@ -522,13 +522,14 @@ when settling a finding needs the database. The exit code says what you do next:
 | 5 | **two strikes**: a class is now seen on a second path | do NOT patch this path too. Make the class impossible by construction (a required argument, one gate plus a static guard, a type, a DB constraint), then record it: `python3 ~/.claude/loops/panel_classes.py structural --ledger <the path it printed> --round <n> --class <key> --how "…" --enforcement "…" --guard-test "…"` |
 | 4 | **budget spent**: 3 rounds that each found a new class | STOP. Put the open classes and their structural options in your final report and the PR body. The owner decides; there is no round 4 by default |
 | 2 | codex absent or gave no usable reply | skip it silently, it never blocks |
+| 3 | the ledger is unreadable, or could not be written | fix or move the file; do not delete it, which wipes the strikes and the budget |
 
 Every finding comes classified: the class, its invariant, the enforcement that
 would make it impossible, the guard test, and every instance and path the reviewer
 found. **Fix the whole class, not the instance named**: the instance list is
 there so one fix closes all of them. Rounds after the first are handed the class
 ledger and check that the recorded invariants hold everywhere, instead of hunting
-afresh. For a large diff, `--shard all` splits the read into parallel
+afresh. For a large diff, `--shard all` splits the read into
 data/API/concurrency reviewers rather than finding one path per round.
 
 Fold genuine bugs Codex flags into your fixes — don't dismiss one just because
