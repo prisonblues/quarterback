@@ -265,7 +265,12 @@ qb_pane_key() {   # echo <cli pid>-<socket mtime>, or nothing if we own no pane
   case "$base" in *.sock) ;; *) return 0 ;; esac
   owner=${base%.sock}
   case "$owner" in ''|*[!0-9]*) return 0 ;; esac
-  mtime=$(stat -c %Y "$sock" 2>/dev/null) || return 0
+  # Truncated whole seconds, the integer pane.py takes from `st_mtime_ns // 10**9`.
+  # `date -r`, not `stat -c %Y`: uutils' stat (coreutils on Ubuntu 26.04, so CI's
+  # `ubuntu-latest`) goes through a float and ROUNDS an mtime within ~100ns of the
+  # next second up — `%Y` and `%.9Y` alike — which is pane.py's float bug arriving
+  # from the other side. `date -r FILE +%s` truncates under both GNU and uutils.
+  mtime=$(date -r "$sock" +%s 2>/dev/null) || return 0
   case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
   [ -d "/proc/$owner" ] || return 0
   # Compared as STRINGS, never as numbers: `0123` and `123` are different panes

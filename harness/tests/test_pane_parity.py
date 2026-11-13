@@ -309,8 +309,10 @@ def test_the_sockets_mtime_is_part_of_the_key(socket_dir):
     # The rows that matter, and the reason `int(st.st_mtime)` is not good enough.
     # `st_mtime` is a float; float64 spacing at 1.7e9 is about 238ns, so an mtime
     # this close to the next second rounds UP and Python names a file one second
-    # later than bash does. Measured: ns=…999999999 gives `stat -c %Y`
-    # 1700000000 and `int(st_mtime)` 1700000001.
+    # later than bash does. Measured: ns=…999999999 gives `int(st_mtime)`
+    # 1700000001. The bash half has the same trap: uutils' `stat -c %Y` (CI's
+    # Ubuntu 26.04 coreutils) rounds these rows up too, which is how they went red
+    # on `ubuntu-latest` while passing on GNU boxes; qb-env reads `date -r` now.
     999_999_900,
     999_999_999,
 ])
