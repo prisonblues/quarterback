@@ -78,6 +78,8 @@ set +e
 RED=''; GREEN=''; YELLOW=''; NC=''
 CLEANUP_WARNINGS=()
 warn_cleanup() { CLEANUP_WARNINGS+=("$1"); echo "WARNED: $1"; }
+REMOVED=()
+removed() { REMOVED+=("$1"); echo "REMOVED: $1"; }
 """
 
 
