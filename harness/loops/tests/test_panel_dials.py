@@ -1489,18 +1489,20 @@ def test_no_scope_slot_survives_into_a_reviewers_prompt(scope):
     brief = panel_core.reviewer_brief(scope)
     for slot in (panel_core.REVIEWER_SCOPE_SLOT, panel_core.RELATED_CODE_SLOT):
         assert slot not in brief, f"{slot} was never substituted for scope {scope!r}"
-    # `NEXT_DOOR_SLOT` and `REFUTED_SLOT` are the third and fourth tokens and are
-    # deliberately NOT swapped here: `panel.prompt_for` fills both AFTER its
-    # `.format`, because each block is built from model-authored text — finding
-    # titles (#508) and refutation reasons (#773) — and a brace in one would
-    # otherwise be read as a format field. So the assertion for them is the
-    # opposite of the two above: each must still be present, or its fill lands
-    # nowhere and no round is any the wiser.
+    # `NEXT_DOOR_SLOT`, `REFUTED_SLOT` and `CLASSES_SLOT` are the third, fourth and
+    # fifth tokens and are deliberately NOT swapped here: `panel.prompt_for` fills
+    # them AFTER its `.format`, because each block is built from model- or
+    # fixer-authored text — finding titles (#508), refutation reasons (#773) and
+    # class invariants (#836) — and a brace in one would otherwise be read as a
+    # format field. So the assertion for them is the opposite of the two above: each
+    # must still be present, or its fill lands nowhere and no round is any the wiser.
     assert panel_core.NEXT_DOOR_SLOT in brief
     assert panel_core.REFUTED_SLOT in brief
+    assert panel_core.CLASSES_SLOT in brief
     survivors = (brief.replace("<<<CODE_ACCESS_BRIEF>>>", "")
                       .replace(panel_core.NEXT_DOOR_SLOT, "")
-                      .replace(panel_core.REFUTED_SLOT, ""))
+                      .replace(panel_core.REFUTED_SLOT, "")
+                      .replace(panel_core.CLASSES_SLOT, ""))
     assert "<<<" not in survivors
 
 

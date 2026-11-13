@@ -33,6 +33,13 @@ Review for:
 - Related code: callers, siblings, or parallel implementations that should change to stay consistent
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
 
+WHOLE CLASSES, NOT INSTANCES. For every defect you report, name its CLASS — what every place
+with this defect has in common — and before you write the finding, enumerate EVERY other instance
+of that class in the change and EVERY path that reaches it. Put them in the finding's `detail`
+after "Class:" and "Instances:", one file:line per instance with the path that reaches it. A
+review that reports one path per round does not converge: the fix closes the path it was told
+about and the next round finds the next one.
+
 Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
 logic flaws, a false comment claim the correctness argument rests on) · P3 should fix (style,
 naming, simplifications, a false comment claim nothing rests on) · P4 polish (minor consistency).

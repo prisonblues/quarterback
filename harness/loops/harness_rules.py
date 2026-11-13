@@ -1593,6 +1593,16 @@ DEFAULTS: dict = {
         # what any cap below 3 does to the three rungs BELOW this key: it returns them
         # to annotations on a round that was ending anyway.
         "max_rounds": 6,
+        # #836's class ledger (`panel_classes`). `strikes` is the two-strike rule: the
+        # sighting of one defect CLASS on its second distinct path means the next fix
+        # must make the class impossible by construction, and "fix this path too" is
+        # refused. `rounds` is the budget measured in convergence rather than cost: a
+        # round that recorded a NEW class has not converged, and once that has gone on
+        # for this many rounds the next one is refused and the owner decides. Both read
+        # per key, `null` switches either off, and neither binds a cycle that passes no
+        # ledger. Lex-Ray v22 is the evidence: 107 Codex rounds, every non-converging
+        # loop ending only when somebody noticed its findings were one class.
+        "class_ledger": {"strikes": 2, "rounds": 3},
         # #78's reserved matters — the decisions the process must not take on its
         # own — of which exactly one is implemented: `premise_repeated` (#84).
         #

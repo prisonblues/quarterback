@@ -99,7 +99,7 @@ in
       default = [
         "panel" "panel-review-pr" "review-pr"
         "epic" "lander" "loops" "fix-and-land" "fix-and-review"
-        "fix-issue" "fix-issue-here" "get-involved"
+        "fix-issue" "fix-issue-here" "get-involved" "codex-round"
         "wt" "drop-worktree" "tree-shake"
       ];
       description = ''

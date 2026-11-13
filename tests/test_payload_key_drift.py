@@ -188,6 +188,7 @@ DROPPED_BY_DESIGN = frozenset({
     "context_chars",        # chars prepared ALONGSIDE the target under increment scope
     "pr_chars",             # the whole PR's size, whatever this round reviewed (#298)
     "timing",               # #192's wall-clock block
+    "class_ledger",         # #836: the ledger's standing; the ledger file is the record
     "local_suite",          # #548's record of what stood in for CI
     "ci_failing",           # which checks were red; `ci_status` is the stored verdict
     "ci_unrunnable",        # #628, null on every round that did not establish it
