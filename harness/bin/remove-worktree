@@ -28,6 +28,10 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        for a lock a dead process left behind — the refusal says
 #                        when that is what it is looking at. Look with
 #                        `fuser -v <the lockfile it names>` first (#743)
+#
+# Exit 2: nothing of that worktree is in this repository — no directory, no
+# registration, no branch, no port entry, no nginx block — so nothing was
+# removed (#808). Usually the shell is in a different checkout.
 
 # ============================================
 # COLORS & HELPERS
@@ -667,6 +671,54 @@ if [[ -d "$WORKTREE_DIR" ]]; then
 fi
 
 # ============================================
+# IS ANY OF IT HERE AT ALL?
+# ============================================
+# MAIN_REPO is whatever checkout the shell is in, and the branch name is the only
+# argument, so run from the wrong repo this looks for `<that project>-<branch>`,
+# finds nothing at every step, and used to end on "Cleanup complete" over a
+# worktree that was still registered, on disk, with its containers up, its
+# database present and its claim held (#808: three teardowns in one loop whose
+# `cd` had moved the shell). A teardown that removed nothing is not a completed
+# one, so that case is refused, naming the repo it searched.
+#
+# A missing directory alone is NOT that case: a tree deleted by hand still leaves
+# its registration, its branch, its port entry and its nginx block, and cleaning
+# those up is exactly what this is for. So it refuses only when none of them is
+# here either. A database alone is not looked for (that needs docker);
+# `prune-worktrees` is what sweeps an orphaned one.
+leftovers() {
+    if git worktree list --porcelain 2>/dev/null \
+           | grep -qxF "worktree $WORKTREE_DIR"; then
+        echo "a registered worktree at $WORKTREE_DIR"
+    fi
+    if git show-ref --verify --quiet "refs/heads/$BRANCH_NAME"; then
+        echo "the branch $BRANCH_NAME"
+    fi
+    if [[ -f "$MAIN_REPO/.worktree-ports" ]] && awk -F: -v flat="$SAFE_NAME" \
+           '{ n = $2; gsub("/", "-", n); if (n == flat) found = 1 } END { exit !found }' \
+           "$MAIN_REPO/.worktree-ports"; then
+        echo "a port entry"
+    fi
+    if [[ -n "$NGINX_CONFIG" && -f "$MAIN_REPO/$NGINX_CONFIG" ]] \
+       && nginx_block_present "$MAIN_REPO/$NGINX_CONFIG" "$SAFE_NAME"; then
+        echo "an nginx block"
+    fi
+}
+if [[ ! -d "$WORKTREE_DIR" ]]; then
+    LEFTOVERS=$(leftovers)
+    if [[ -z "$LEFTOVERS" ]]; then
+        echo -e "${RED}Error: no worktree '$BRANCH_NAME' in $MAIN_REPO${NC}" >&2
+        echo "  Looked for the directory $WORKTREE_DIR, a worktree registered on" >&2
+        echo "  refs/heads/$BRANCH_NAME, that branch, a port entry and an nginx block," >&2
+        echo "  and found none of them. Nothing was removed. If the worktree belongs to" >&2
+        echo "  another repository, run this from inside that one." >&2
+        exit 2
+    fi
+    echo -e "${YELLOW}No worktree directory at $WORKTREE_DIR — removing what is left:${NC}"
+    sed 's/^/  - /' <<<"$LEFTOVERS"
+fi
+
+# ============================================
 # TAKE THE LOCK
 # ============================================
 # First, and before anything is read: everything below is a decision made from a
@@ -904,8 +956,10 @@ else
         NGINX_CONTAINER=$(detect_nginx_container)
     fi
     if [[ -n "$NGINX_CONTAINER" ]]; then
-        docker restart "$NGINX_CONTAINER" 2>/dev/null && echo -e "${GREEN}Done${NC}" \
-            || echo -e "${YELLOW}Could not restart nginx${NC}"
+        # A warning, not a note: the block is gone from the file but the running
+        # nginx still serves it until it restarts.
+        docker restart "$NGINX_CONTAINER" >/dev/null 2>&1 && echo -e "${GREEN}Done${NC}" \
+            || warn_cleanup "could not restart nginx ($NGINX_CONTAINER) — it still serves the removed block"
     else
         echo -e "${YELLOW}Nginx container not found${NC}"
     fi
@@ -1074,7 +1128,14 @@ if [[ -d "$WORKTREE_DIR" ]]; then
     git worktree prune 2>/dev/null || true
 fi
 
-echo -e "${GREEN}Done${NC}"
+# Checked, not assumed: the delete above is silent, and it fails against files
+# a container wrote as root. "Done" over a directory that is still there is
+# #808's defect in this step's own words.
+if [[ -d "$WORKTREE_DIR" ]]; then
+    warn_cleanup "worktree directory $WORKTREE_DIR is still there (files it could not delete — root-owned, from a container? \`prune-worktrees --remove-dirs\` carries the sudo hint)"
+else
+    echo -e "${GREEN}Done${NC}"
+fi
 
 # ============================================
 # STEP 5: Drop database
@@ -1179,7 +1240,7 @@ elif git worktree list 2>/dev/null | grep -qF "[$DEL_BRANCH]"; then
 elif git branch -d "$DEL_BRANCH" 2>/dev/null || git branch -D "$DEL_BRANCH" 2>/dev/null; then
     echo -e "${GREEN}Branch deleted: $DEL_BRANCH${NC}"
 else
-    echo -e "${YELLOW}Could not delete branch: $DEL_BRANCH${NC}"
+    warn_cleanup "could not delete branch: $DEL_BRANCH"
 fi
 
 # ============================================
