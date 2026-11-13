@@ -122,14 +122,16 @@ def pane_key() -> str | None:
         # NANOSECONDS, integer-divided — never `int(st.st_mtime)`. `st_mtime` is a
         # float, and float64 spacing at 1.7e9 is about 238ns, so an mtime within
         # roughly 100ns of the next second ROUNDS UP: measured, ns=…000999999999
-        # gives `stat -c %Y`=1700000000 and `int(st_mtime)`=1700000001, and the
+        # gives `date -r … +%s`=1700000000 and `int(st_mtime)`=1700000001, and the
         # two halves then name different files. One in ~8 million sockets, which
         # is exactly the kind of odds that turns up once and is never reproduced.
+        # (qb-env's half had the same bug through uutils' `stat -c %Y`, which is
+        # why it reads `date -r` now.)
         mtime = os.stat(sock).st_mtime_ns // 10**9
     except OSError:
         return None
     # A negative second is refused rather than reconciled: `//` floors, so it
-    # would agree with `stat -c %Y` — but the bash half tests the string for
+    # would agree with `date -r … +%s` — but the bash half tests the string for
     # digits and a `-` is not one, so it declines. Agreeing to decline is the
     # parity that matters, and a socket dated before 1970 is not one this CLI
     # just created.
