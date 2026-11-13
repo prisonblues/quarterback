@@ -421,3 +421,40 @@ def test_a_panel_round_with_an_unreadable_ledger_is_refused(monkeypatch, tmp_pat
     code = panel.run("board", 34, post=False, json_file=str(tmp_path / "r.json"),
                      record=False, round_no=2, max_rounds=6, class_ledger=str(path))
     assert code == pc.LEDGER_FAILED_EXIT and prompts == []
+
+
+def test_a_clean_round_between_two_does_not_spend_the_budget():
+    ledger = pc.new_ledger()
+    pc.record(ledger, "class number one of a kind", 1, "a.py", invariant="holds")
+    pc.mark_round(ledger, 2)
+    pc.record(ledger, "class number three of a kind", 3, "c.py", invariant="holds")
+    assert not pc.round_state(ledger, 3, 2, 3)["over"]
+    pc.record(ledger, "class number four of a kind", 4, "d.py", invariant="holds")
+    assert pc.round_state(ledger, 4, 2, 3)["over"]
+
+
+def test_a_dismissed_class_owes_nothing_and_is_briefed_as_ruled_out():
+    ledger = ledger_with("a.py:10", "b.py:20")
+    pc.record_dismissal(ledger, RESOLVER, 1, "the viewer is implied by the session")
+    assert not pc.is_owed(ledger["classes"][0], 2)
+    assert pc.budget_refusal(ledger, 2, 2, 3) == ""
+    brief = pc.ledger_brief(ledger)
+    assert "RULED OUT" in brief and "implied by the session" in brief
+    assert f"  invariant: {INVARIANT}" not in brief
+
+
+def test_a_dismissal_needs_a_reason_and_a_round_that_ran():
+    ledger = ledger_with("a.py:10")
+    with pytest.raises(ValueError, match="--why"):
+        pc.record_dismissal(ledger, RESOLVER, 1, " ")
+    with pytest.raises(ValueError, match="has not run"):
+        pc.record_dismissal(ledger, RESOLVER, 5, "not real")
+
+
+def test_the_cli_dismisses_a_class_and_it_survives_the_file(cli):
+    cli("record", "--round", "1", "--class", RESOLVER, "--path", "a.py:1",
+        "--invariant", INVARIANT)
+    cli("record", "--round", "1", "--class", RESOLVER, "--path", "b.py:2")
+    assert cli("status", "--round", "1") == pc.STRUCTURAL_OWED_EXIT
+    assert cli("dismiss", "--round", "1", "--class", RESOLVER, "--why", "not real") == 0
+    assert cli("status", "--round", "1") == 1

@@ -521,6 +521,7 @@ when settling a finding needs the database. The exit code says what you do next:
 | 1 | findings (new classes, or violations of recorded invariants) | fix them, then run it again |
 | 5 | **two strikes**: a class is now seen on a second path | do NOT patch this path too. Make the class impossible by construction (a required argument, one gate plus a static guard, a type, a DB constraint), then record it: `python3 ~/.claude/loops/panel_classes.py structural --ledger <the path it printed> --round <n> --class <key> --how "…" --enforcement "…" --guard-test "…"` |
 | 4 | **budget spent**: 3 rounds that each found a new class | STOP. Put the open classes and their structural options in your final report and the PR body. The owner decides; there is no round 4 by default |
+| 5, but the class is not a defect | the rule has nothing to fix | record why: `python3 ~/.claude/loops/panel_classes.py dismiss --ledger <path> --round <n> --class <key> --why "…"`, and list each dismissal in the PR body |
 | 2 | codex absent or gave no usable reply | skip it silently, it never blocks |
 | 3 | the ledger is unreadable, or could not be written | fix or move the file; do not delete it, which wipes the strikes and the budget |
 

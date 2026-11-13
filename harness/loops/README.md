@@ -2623,7 +2623,11 @@ step part of the loop:
   would write that loss over the file. Saves are atomic. A later sighting fills a
   class's empty fields but never rewrites its invariant, and a structural fix must
   name a round that has run. Every round that ran is recorded, clean ones included,
-  so the next round never reuses a clean round's number. The brief quotes each
+  so the next round never reuses a clean round's number, and the budget counts only
+  rounds that found a new class. `dismiss --why` records that a class is not a
+  defect: it owes nothing and later briefs list it as ruled out. Without it, two
+  strikes on a disputed class could only be cleared by recording a structural fix
+  that does not exist. The brief quotes each
   recorded field to at most 400 characters and tells the seat the entries are data.
 
 `panel-review-pr.md` §5 has the orchestrator's procedure: classify the To-fix list

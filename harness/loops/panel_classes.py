@@ -25,9 +25,11 @@ Three rules are built on it:
    ``owed``, and the CLI exits :data:`STRUCTURAL_OWED_EXIT`, 5). "Fix this path too" is
    refused; the fix is accepted once it is recorded with ``--structural``. A sighting
    on a path the structural fix did not close re-opens the debt — the "impossible"
-   claim was false.
+   claim was false. A class the builder finds is not a defect is recorded with
+   ``dismiss`` and a reason: it owes nothing, and later rounds are told it is ruled out.
 3. **A budget measured in convergence.** A round converges when it records no new
-   class. After ``class_ledger.rounds`` rounds without that, the next round is refused
+   class. After ``class_ledger.rounds`` rounds without that (a clean round in between
+   spends nothing), the next round is refused
    (:func:`budget_refusal`) and the owner decides between the structural options
    :func:`report` lists. No round 4 by default.
 
@@ -40,6 +42,7 @@ Usage:
         [--invariant ..] [--enforcement ..] [--guard-test ..] [--finding KEY]
     panel_classes.py structural --ledger L --round N --class NAME|KEY --how ..
         [--enforcement ..] [--guard-test ..]
+    panel_classes.py dismiss --ledger L --round N --class NAME|KEY --why ..
     panel_classes.py status --ledger L --round N
     panel_classes.py brief --ledger L [--wave OTHER ...]
 """
@@ -146,11 +149,15 @@ def _clean_entry(entry: object) -> dict | None:
             and _round(structural.get("round")) is not None
             and enforcement.strip() and guard_test.strip()):
         structural = None
+    dismissed = entry.get("dismissed")
+    if not (isinstance(dismissed, dict) and str(dismissed.get("why") or "").strip()
+            and _round(dismissed.get("round")) is not None):
+        dismissed = None
     name = " ".join(str(entry["name"]).split())
     return {"key": class_key(name), "name": name,
             "invariant": str(entry.get("invariant") or ""),
             "enforcement": enforcement, "guard_test": guard_test,
-            "sightings": sightings, "structural": structural}
+            "sightings": sightings, "structural": structural, "dismissed": dismissed}
 
 
 def load_ledger(path: str, repo: str = "", pr: int | None = None
@@ -256,7 +263,7 @@ def is_owed(entry: dict, limit: int | None) -> bool:
     Owed from the ``limit``-th distinct path until a structural fix is recorded, and
     owed AGAIN when a sighting is recorded after that fix on a path not seen before
     it: a class that was "impossible by construction" and then turned up was not."""
-    if limit is None or strikes(entry) < limit:
+    if entry.get("dismissed") or limit is None or strikes(entry) < limit:
         return False
     fix = entry.get("structural")
     if not fix:
@@ -293,7 +300,7 @@ def record(ledger: dict, name: str, round_no: int, path: str, *,
                              f"held everywhere, rules out {name!r}")
         entry = {"key": class_key(name), "name": name, "invariant": "",
                  "enforcement": "", "guard_test": "", "sightings": [],
-                 "structural": None}
+                 "structural": None, "dismissed": None}
         ledger.setdefault("classes", []).append(entry)
     # A later sighting FILLS a field nobody recorded; it never rewrites one. The
     # invariant is what every later round is checked against, so a restatement in a
@@ -343,6 +350,25 @@ def record_structural(ledger: dict, name: str, round_no: int, how: str, *,
     return {"key": entry["key"], "name": entry["name"], "structural": True}
 
 
+def record_dismissal(ledger: dict, name: str, round_no: int, why: str) -> dict:
+    """Record that a class is NOT a defect, and why.
+
+    Without it a class the builder disputes can only be cleared by recording a
+    structural fix that does not exist, and two strikes on it block every later round.
+    A dismissed class owes nothing and is briefed as ruled out, with the reason, so a
+    reviewer does not report it again without a run that shows it is real."""
+    entry = find_class(ledger, name)
+    if entry is None:
+        raise ValueError(f"no class {name!r} in the ledger")
+    if not why.strip():
+        raise ValueError("--why: say why this is not a defect, in one sentence")
+    if _round(round_no) is None or round_no > last_round(ledger):
+        raise ValueError(f"round {round_no} has not run (the ledger's last is "
+                         f"{last_round(ledger)})")
+    entry["dismissed"] = {"why": " ".join(why.split()), "round": round_no}
+    return {"key": entry["key"], "name": entry["name"], "dismissed": True}
+
+
 def first_round(entry: dict) -> int:
     return min(s["round"] for s in entry["sightings"])
 
@@ -372,6 +398,8 @@ def round_state(ledger: dict, round_no: int, strikes_limit: int | None,
     seen = [e for e in classes if any(s["round"] == round_no for s in e["sightings"])]
     owed = [e for e in classes if is_owed(e, strikes_limit)]
     converged = not new
+    # Rounds WITHOUT convergence, counted: a clean round in between spends nothing.
+    unconverged = len({first_round(e) for e in classes if first_round(e) <= round_no})
     return {"round": round_no, "classes": len(classes),
             "new": [e["key"] for e in new],
             "seen": [e["key"] for e in seen],
@@ -379,7 +407,7 @@ def round_state(ledger: dict, round_no: int, strikes_limit: int | None,
             "converged": converged,
             "strikes_limit": strikes_limit, "rounds_limit": rounds_limit,
             "over": bool(rounds_limit is not None and not converged
-                         and round_no >= rounds_limit)}
+                         and unconverged >= rounds_limit)}
 
 
 def options(entry: dict) -> str:
@@ -390,8 +418,8 @@ def options(entry: dict) -> str:
 
 
 def _open_classes(ledger: dict, strikes_limit: int | None) -> list[dict]:
-    return [e for e in ledger.get("classes") or []
-            if not e.get("structural") or is_owed(e, strikes_limit)]
+    return [e for e in ledger.get("classes") or [] if not e.get("dismissed")
+            and (not e.get("structural") or is_owed(e, strikes_limit))]
 
 
 def budget_refusal(ledger: dict, round_no: int, strikes_limit: int | None,
@@ -445,10 +473,12 @@ def _class_lines(entry: dict, origin: str = "") -> list[str]:
 def ledger_brief(ledger: dict, wave: list[dict] | None = None) -> str:
     """The reviewer's closed list, or "" when there is nothing recorded — so a cycle
     with no ledger sends a prompt byte-identical to the one it always sent."""
-    own = ledger.get("classes") or []
-    keys = {e["key"] for e in own}
+    every = ledger.get("classes") or []
+    own = [e for e in every if not e.get("dismissed")]
+    ruled_out = [e for e in every if e.get("dismissed")]
+    keys = {e["key"] for e in every}
     others = [e for e in wave or [] if e["key"] not in keys]
-    if not own and not others:
+    if not every and not others:
         return ""
     lines = [LEDGER_HEADING, "",
              "Earlier rounds classified their findings into the defect classes below. "
@@ -466,6 +496,12 @@ def ledger_brief(ledger: dict, wave: list[dict] | None = None) -> str:
              ""]
     for e in own:
         lines.extend(_class_lines(e))
+    if ruled_out:
+        lines += ["", "RULED OUT — the builder found these are not defects. Do not "
+                  "report one again unless a run you made shows it is real:"]
+        for e in ruled_out:
+            lines.append(f"- [class {e['key']}] {_quoted(e['name'])}: "
+                         f"{_quoted(e['dismissed']['why'])}")
     if others:
         lines += ["", "Recorded on OTHER pull requests of the same wave — the same "
                   "invariants apply here:"]
@@ -593,6 +629,21 @@ def _cmd_structural(args, gh_repo) -> int:
     return 0
 
 
+def _cmd_dismiss(args, gh_repo) -> int:
+    ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
+    if refuse_unusable(problems, "panel_classes"):
+        return LEDGER_FAILED_EXIT
+    try:
+        verdict = record_dismissal(ledger, args.cls, args.round, args.why)
+    except ValueError as e:
+        raise SystemExit(f"panel_classes dismiss: {e}")
+    if save_ledger(args.ledger, ledger):
+        return LEDGER_FAILED_EXIT
+    print(json.dumps(verdict) if args.json else
+          f"dismissed [{verdict['key']}] {verdict['name']}")
+    return 0
+
+
 def _cmd_status(args, strikes_limit, rounds_limit, gh_repo) -> int:
     ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
     if refuse_unusable(problems, "panel_classes"):
@@ -643,6 +694,11 @@ def _parser() -> argparse.ArgumentParser:
     st.add_argument("--enforcement", default="")
     st.add_argument("--guard-test", default="", dest="guard_test")
 
+    dis = sub.add_parser("dismiss", help="record that a class is not a defect")
+    common(dis)
+    dis.add_argument("--class", dest="cls", required=True, metavar="NAME|KEY")
+    dis.add_argument("--why", required=True)
+
     status = sub.add_parser("status", help="convergence and budget after a round")
     common(status)
 
@@ -667,12 +723,14 @@ def main(argv: list[str] | None = None) -> int:
         print(ledger_brief(ledger, wave), end="")
         return 0
     strikes_limit, rounds_limit, gh_repo = _limits_for(args.repo)
-    if args.cmd in ("record", "structural") and args.round is None:
+    if args.cmd in ("record", "structural", "dismiss") and args.round is None:
         raise SystemExit(f"{args.cmd} needs --round — the round whose findings it answers")
     if args.cmd == "record":
         return _cmd_record(args, strikes_limit, gh_repo)
     if args.cmd == "structural":
         return _cmd_structural(args, gh_repo)
+    if args.cmd == "dismiss":
+        return _cmd_dismiss(args, gh_repo)
     return _cmd_status(args, strikes_limit, rounds_limit, gh_repo)
 
 
