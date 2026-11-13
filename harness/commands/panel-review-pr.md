@@ -986,7 +986,13 @@ python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes
 - **`panel_classes.py status --ledger … --round <r>`** gives the cycle's standing:
   0 converged (this round recorded no new class), 1 not converged, 5 a structural
   fix owed, 4 **budget spent**. The budget is `review_panel.class_ledger.rounds`
-  (3) rounds in a row without convergence.
+  (3) rounds that each recorded a new class; a clean round in between spends
+  nothing.
+- **A class that is not a defect is dismissed, not patched.** When re-examination
+  shows a recorded class is a false positive, record why:
+  `panel_classes.py dismiss --ledger … --pr <pr> --round <r> --class <key> --why "…"`.
+  It owes nothing after that, and later rounds are briefed that it was ruled out.
+  Relay each dismissal in §6, because it is a judgement the owner should see.
 - **On 4, stop the cycle.** Relay the open classes and the structural options the
   report lists in §6, as a decision for the owner. There is no round 4 by default.
   The owner goes on with `--class-rounds N` on the next round, which is their
