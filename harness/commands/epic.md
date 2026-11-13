@@ -82,6 +82,33 @@ trunk stays a human step regardless.
    in reply` / `bad verdict: malformed JSON`). Stderr is never blamed for a run that replied, since
    a judge's warm-up chatter is not why its answer was unusable. Untriaged issues are also skipped
    on `--execute`, like blocked ones, so that reason is the only account of why one was passed over.
+## Wave kickoff — settle these before `--execute` (#836)
+
+Lex-Ray v22 (59 PRs in 3.6 days, up to 6 agents at once) lost most of its time to
+things a kickoff would have settled. Present this list with the dry-run plan and get
+the user's answers before executing:
+
+- **Design-first list.** Name every sub-issue touching concurrency, a ledger or log of
+  record, caching, visibility or a migration. Each one starts with a design note and a
+  design round (`codex_round.py --design <note>`, `fix-issue.md` step 2) before any
+  code. v22's design-first items converged; its 27-round loop did not.
+- **Production constraints.** Write down, once for the wave, the prod DB pool size,
+  what CI does not have (models, services), and the managed-DB permissions. Every
+  sub-issue's plan is checked against them.
+- **Migration-head queue.** Order the migration-bearing sub-issues and run them one
+  at a time. Integration mode's ff-only stacking keeps heads linear by construction.
+  In `multi` mode, the next migration PR forks only once the previous one has merged.
+  In v22 each migration PR re-parented 2 to 3 times, at about one CI cycle each.
+- **One owner per race or class.** When two sub-issues hit the same race or defect
+  class, one agent owns it, claimed on the board, and the other waits on it: two v22
+  agents fixed the same race in parallel. Pass each sub-PR's class ledger to the
+  others' rounds with `--class-wave` so a recurring class is briefed as one.
+- **Light wave CI, a nightly integration DB run.** Sub-PRs run the selective set
+  (`fix-issue.md` "Which tests"). The full and DB suites run nightly against the
+  integration branch and once at promotion.
+- **Heavy runs on the heavy box.** Simulations, DB builds and full suites go to zeus
+  (32 cores), not to a saturated dev box; stop worktree workers no test needs.
+
 4. If the user asked to `--execute`: this **creates branches/worktrees, runs `/fix-issue` +
    `/review-pr`, and opens PRs**. It is gated on `loops.issue_executor` in the repo's `.harness-rules.sample` and uses
    `headless_permission_mode`. **Confirm with the user and check prerequisites first**, then run

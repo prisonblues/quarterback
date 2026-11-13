@@ -59,6 +59,35 @@ Write an implementation plan. List:
 - Related code that needs to change for consistency
 - Risks and how you'll mitigate them
 
+### Design round first, for invariant-heavy work
+
+If the issue involves **concurrency, a ledger or log of record, caching,
+visibility (who may see what), or a migration**, write a short design note
+before any code. Keep it to a page: the invariants, every path that reaches the
+guarded state, and how each invariant will be enforced. Review it with a design
+round before you write code:
+
+```bash
+python3 ~/.claude/loops/codex_round.py --design <note.md>   # same exit codes as step 8
+```
+
+Iterate on the note until the round converges (exit 0). The classes the design
+round records are in the same ledger the code rounds read, so the code rounds
+verify the design's invariants instead of rediscovering them. On Lex-Ray v22 the
+work done this way converged in 4 to 8 design rounds, and its code rounds then
+found implementation slips, not design holes. The work done without it ran 27
+rounds on one design (#836).
+
+### Check the production constraints up front
+
+Write down, in the plan, the constraints the code will run under that a test
+box does not share. Each of these cost Lex-Ray v22 a round it did not need:
+- the production **DB pool size** (one design needed three connections where
+  prod has 1+1);
+- what is **absent in CI** (an NLP model that is not installed there made
+  verdicts depend on load order);
+- **managed-DB permissions** (what the migration user may and may not do).
+
 The worktree always gets its own database copy, and this skill passes no DB
 flag. Step 7's test runs, selective or full, go through the suite's teardown,
 which truncates the database, and a selective run can still fall back to
@@ -266,6 +295,12 @@ Every fix needs tests. Not optional. Not "if time permits".
 Look at the existing test style and follow it. Name tests
 descriptively: what scenario, what expected outcome.
 
+**A mock must have the real signature.** Use `autospec=True` (or
+`create_autospec`) for anything standing in for code under change. A
+`lambda *a, **_kw:` or `MagicMock()` stand-in accepts any call, so a production
+call with the wrong arguments passes the test and crashes in prod. That exact
+failure shipped on Lex-Ray v22.
+
 ### Red/green — prove each regression test would have caught the bug
 
 A test written alongside its fix has never run against the broken
@@ -378,6 +413,18 @@ the project runs. These override fallbacks.
 If a tool is not installed, install it if possible. Only skip
 with a note if installation isn't feasible.
 
+**Every test file you touched runs in full, DB-marked tests included.** A
+selective run or a marker exclusion may narrow the rest of the suite, but never
+a file you edited: on Lex-Ray v22 the "selected" subset repeatedly skipped the
+DB tests in the very file that changed. Run each touched file by path, with any
+`-m "not database"` style exclusion removed.
+
+**Heavy compute stays off the dev box.** Long simulations, big DB builds and
+full-suite runs belong on the fleet's heavy box (zeus, 32 cores), not on a
+saturated laptop or daedalus (8 cores). If you start a worktree's background
+worker or container for a test, **stop it when no test needs it**. One left
+running burned 4 cores for hours.
+
 ### Which tests: selective by default, the full suite once at integration
 
 Run what your change can reach, not everything. If the project has a
@@ -450,22 +497,42 @@ Check for:
 - Documentation staleness
 - Related code outside your diff that should also change
 
-### Second opinion: Codex (best-effort, never blocks)
+### Second opinion: a Codex round (best-effort, never blocks)
 
-If the `codex` CLI is available, run it as an **independent** reviewer over your
-diff — a different model catches what you miss:
+Your self-review above comes first and is yours. The second opinion is a
+**different reviewer** — never the builder reviewing itself again. Run it with
+the Codex round command, not a hand-rolled `codex exec` loop: the hand-rolled
+loop has no brakes, and on Lex-Ray v22 it is where most of 107 Codex rounds went,
+each finding one more path to a class an earlier round had already found (#836).
 
 ```bash
-command -v codex >/dev/null && \
-  git diff <remote>/<base>...HEAD | \
-  codex exec "Review this diff for REAL defects only (correctness, security,
-  error handling, broken edge cases — not style). List each as file:line + a one-
-  line description. Be concise." 2>/dev/null || true
+cd "$WT_DIR" && python3 ~/.claude/loops/codex_round.py --base <remote>/<base>
 ```
 
+It runs **one** Codex seat in this worktree, and the seat **may run code**: the
+touched tests, a snippet, a query against this worktree's database. A suspicion
+settled by a failing run does not come back as another round of argument. It is
+told not to change the tree, and a tree it changed is reported. Add `--network`
+when settling a finding needs the database. The exit code says what you do next:
+
+| Exit | Meaning | Do |
+|---|---|---|
+| 0 | converged: no new class, nothing to fix | carry on |
+| 1 | findings (new classes, or violations of recorded invariants) | fix them, then run it again |
+| 5 | **two strikes**: a class is now seen on a second path | do NOT patch this path too. Make the class impossible by construction (a required argument, one gate plus a static guard, a type, a DB constraint), then record it: `python3 ~/.claude/loops/panel_classes.py structural --ledger <the path it printed> --round <n> --class <key> --how "…" --enforcement "…" --guard-test "…"` |
+| 4 | **budget spent**: 3 rounds that each found a new class | STOP. Put the open classes and their structural options in your final report and the PR body. The owner decides; there is no round 4 by default |
+| 2 | codex absent or gave no usable reply | skip it silently, it never blocks |
+
+Every finding comes classified: the class, its invariant, the enforcement that
+would make it impossible, the guard test, and every instance and path the reviewer
+found. **Fix the whole class, not the instance named**: the instance list is
+there so one fix closes all of them. Rounds after the first are handed the class
+ledger and check that the recorded invariants hold everywhere, instead of hunting
+afresh. For a large diff, `--shard all` splits the read into parallel
+data/API/concurrency reviewers rather than finding one path per round.
+
 Fold genuine bugs Codex flags into your fixes — don't dismiss one just because
-you didn't spot it. Drop only clear false positives or pure nits. If `codex` is
-absent, not logged in, or errors, skip it silently — it never blocks.
+you didn't spot it. Drop only clear false positives or pure nits.
 
 Rank findings P1-P4 for the summary. Fix every P1-P3 unless
 re-examination shows it is a false positive; take a P4 only when it

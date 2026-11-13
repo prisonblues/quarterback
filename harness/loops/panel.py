@@ -102,6 +102,7 @@ from datetime import UTC
 # makes "where is the ceiling checked" answerable with one grep, and a bare
 # `check(...)` in this file would read like one of the dozen local helpers.
 import panel_caps  # noqa: F401
+import panel_classes  # noqa: F401
 import panel_core  # noqa: F401
 import panel_preflight  # noqa: F401
 
@@ -1718,6 +1719,9 @@ def _payload_defaults() -> dict:
         # round's `timing.finished_at`, so a payload that carries a zero rather
         # than a null hands the next round a left-hand end that never happened.
         "timing": None,
+        # #836's class-ledger block. None: no ledger was passed, or the run never
+        # reached the point where the ledger is read.
+        "class_ledger": None,
         "changed_lines": 0,
         # The PR's file list, not this round's. Under #41 a later round reviews
         # only the increment, so the round's files narrow while the PR's
@@ -2421,7 +2425,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # #716's control arm, and last for the same reason: both flags below `retract`
         # are named at the one call site, so their order here carries no meaning and
         # neither can be swallowed by a positional caller.
-        no_history: bool = False) -> int:
+        no_history: bool = False,
+        # #836's class ledger, last and named at the call site for the reason above.
+        class_ledger: str = "",
+        class_wave: list[str] | None = None,
+        class_rounds: int | None = None) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -2620,6 +2628,26 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     local_timeout = local_suite_timeout(trusted)
     premises, premise_problems = load_premises(premise_file, gh_repo, pr_number)
     notes.extend(premise_problems)
+    # #836's class ledger — READ here, written only by `panel_classes.py`, on the
+    # premise register's rule. The budget check runs before any API call: a round the
+    # ledger refuses (no convergence inside the budget, or a structural fix owed and
+    # not recorded) is one whose findings would be the next path of a known class.
+    classes, class_problems = panel_classes.load_ledger(class_ledger, gh_repo, pr_number)
+    class_wave_entries, wave_problems = panel_classes.load_wave(class_wave or [])
+    notes.extend(class_problems + wave_problems)
+    class_strikes, class_budget = panel_classes.ledger_limits(panel, notes)
+    if class_rounds is not None:
+        class_budget = class_rounds
+    if class_ledger:
+        class_refusal = panel_classes.budget_refusal(classes, round_no, class_strikes,
+                                                     class_budget)
+        if class_refusal:
+            print(f"[{repo_name}#{pr_number}] round {round_no} refused — no panel ran.\n"
+                  f"{class_refusal}", file=sys.stderr)
+            owed = panel_classes.round_state(classes, round_no - 1, class_strikes,
+                                             class_budget)
+            return (panel_classes.BUDGET_EXIT if owed["over"]
+                    else panel_classes.STRUCTURAL_OWED_EXIT)
 
     # A repo that configured no review does not get one. Before `gh pr view`, and
     # before the --reviewers check below it, because this refusal is about the repo
@@ -4519,6 +4547,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if refuted:
         notes.append(refuted_note(refutations))
 
+    class_brief = ("" if pre.verdict == "manifest"
+                   else panel_classes.ledger_brief(classes, class_wave_entries))
+    if class_brief:
+        notes.append(f"the seats were handed the class ledger ({len(classes['classes'])} "
+                     "class(es) on this PR) and asked to verify its invariants rather "
+                     "than hunt (#836)")
+
     def prompt_for(budget: int | None, reads_code: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
         # `fit_argv_budget` takes this as a single-arg render, and antigravity is
@@ -4576,7 +4611,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                         # literal token where this repo's own diff quotes it. The
                         # template carries it once, immediately after `NEXT_DOOR_SLOT`
                         # and ahead of `{diff}`, so the first occurrence is the slot.
-                        ).replace(REFUTED_SLOT, refuted, 1)
+                        ).replace(REFUTED_SLOT, refuted, 1
+                        # #836's closed list, on the same two rules: after the render
+                        # because a fixer typed it, and bounded to the first occurrence.
+                        ).replace(CLASSES_SLOT, class_brief, 1)
 
     # `agy` is the only reviewer whose prompt must travel in argv, so it is the
     # only one the kernel can veto. Clamp it to what execve will carry and say
@@ -7581,6 +7619,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # read straight back out of it by the NEXT round's `load_baseline` as the
         # left-hand end of that round's fix phase.
         "timing": timing,
+        # #836's ledger as this round found it: where the PREVIOUS round left the
+        # cycle (converged, owed, over budget) and whether the seats were briefed
+        # from it. Null for a cycle that passes no ledger. `--json` only, like
+        # `timing` — the board ingest drops it.
+        "class_ledger": ({
+            "path": class_ledger, "briefed": bool(class_brief),
+            "classes": len(classes["classes"]),
+            "previous_round": (panel_classes.round_state(
+                classes, round_no - 1, class_strikes, class_budget)
+                if round_no > 1 else None),
+        } if class_ledger else None),
         # The commit reviewed: the NEXT round anchors its increment on it, and
         # provenance measures its fix range to it. One key, because two would be
         # one fact with two chances to disagree.
@@ -9697,6 +9746,20 @@ def main() -> int:
                          "When the brake fires these are the keys to pass to the next "
                          "round's --escalated, which is how a braked premise reaches "
                          "the stop rule. --premise only")
+    ap.add_argument("--class-ledger", metavar="PATH", default="", dest="class_ledger",
+                    help="#836: the PR's class ledger, written by panel_classes.py. "
+                         "Rounds are briefed from it (verify the recorded invariants; "
+                         "report only violations and NEW classes), and a round is "
+                         "refused when the budget is spent without convergence or a "
+                         "structural fix is owed")
+    ap.add_argument("--class-wave", action="append", default=[], metavar="PATH",
+                    dest="class_wave",
+                    help="another PR's ledger from the same wave, read-only, so a "
+                         "class recurring across PRs is briefed here too. Repeatable")
+    ap.add_argument("--class-rounds", type=int, default=None, metavar="N",
+                    dest="class_rounds",
+                    help="override review_panel.class_ledger.rounds for this run — the "
+                         "owner's decision to go past the budget")
     ap.add_argument("--scope", choices=ROUND_SCOPES, default="auto",
                     help="what a round past the first REVIEWS. increment: the "
                          "commits since the last round's head, with the rest of the "
@@ -9759,7 +9822,11 @@ def main() -> int:
                                    ("--premise-for", bool(args.premise_for)),
                                    ("--premise-decidable",
                                     args.premise_decidable is not None),
-                                   ("--max-rounds", args.max_rounds is not None)) if used]
+                                   ("--max-rounds", args.max_rounds is not None),
+                                   ("--class-ledger", bool(args.class_ledger)),
+                                   ("--class-wave", bool(args.class_wave)),
+                                   ("--class-rounds", args.class_rounds is not None)
+                                   ) if used]
         if wrong:
             raise SystemExit(f"--ask does not take {', '.join(wrong)}: an ask is one "
                              "question to the seats, not a round — there is no diff to "
@@ -9801,7 +9868,11 @@ def main() -> int:
                                    ("--declined", bool(args.declined)),
                                    ("--retract", bool(args.retract)),
                                    ("--assessed", bool(args.assessed)),
-                                   ("--assessed-by", bool(args.assessed_by))) if used]
+                                   ("--assessed-by", bool(args.assessed_by)),
+                                   ("--class-ledger", bool(args.class_ledger)),
+                                   ("--class-wave", bool(args.class_wave)),
+                                   ("--class-rounds", args.class_rounds is not None)
+                                   ) if used]
         if wrong:
             raise SystemExit(
                 f"--premise does not take {', '.join(wrong)}: declaring a premise is a "
@@ -9842,6 +9913,12 @@ def main() -> int:
     if args.pr is None:
         raise SystemExit("--pr is required — or pass --ask to challenge one premise "
                          "instead of reviewing a PR")
+    if (args.class_wave or args.class_rounds is not None) and not args.class_ledger:
+        raise SystemExit("--class-wave and --class-rounds belong to --class-ledger — "
+                         "without this PR's ledger there is no budget to override and "
+                         "nothing for another PR's classes to be read beside")
+    if args.class_rounds is not None and args.class_rounds < 1:
+        raise SystemExit("--class-rounds: at least one round has to run")
     for flag, given in (("--context", bool(args.context)),
                         ("--asker", args.asker is not None)):
         if given:
@@ -9946,7 +10023,9 @@ def main() -> int:
                args.narrowed, args.acknowledge, args.declined, args.premise_file,
                args.new_cycle, no_pr_claim=args.no_pr_claim,
                retract=args.retract, assessed=args.assessed,
-               assessed_by=args.assessed_by, no_history=args.no_history)
+               assessed_by=args.assessed_by, no_history=args.no_history,
+               class_ledger=args.class_ledger, class_wave=args.class_wave,
+               class_rounds=args.class_rounds)
 
 
 if __name__ == "__main__":

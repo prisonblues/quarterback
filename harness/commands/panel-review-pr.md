@@ -943,6 +943,60 @@ closed in §4d, on the same terms and for the same reason — once, inherited fr
 and omitting it holds the PR on a question somebody has already answered. Add
 `--assessed-by NAME` when the measuring was somebody else's.
 
+### The class ledger: rounds that converge (#836)
+
+A round's findings are **locations**. Most cycles that do not converge are one
+**class** of defect found one path per round. Lex-Ray v22 ran 107 Codex rounds,
+and every loop that would not converge ended only when somebody noticed this by
+hand. So the cycle keeps a ledger of classes beside the premise register, and
+every round reads it:
+
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r> --max-rounds <N> \
+    --baseline … --json-file /tmp/tmp.AbC123/r<r>.json \
+    --class-ledger /tmp/tmp.AbC123/classes.json [--class-wave <another PR's ledger> …]
+```
+
+Pass it from round 1. Later rounds are briefed from it: the seats verify each
+recorded invariant everywhere and report only violations and genuinely **new**
+classes. A new instance of a recorded class is a violation, not a new finding.
+`--class-wave` adds the ledgers of the other PRs of an epic wave, read-only,
+because v22's classes recurred across PRs.
+
+**After each round, before the fix pass, classify the To-fix list.** This is your
+job, not the fixer's, for the premise brake's reason: you are the reader with
+every round in front of you. Record each finding against its class, the same
+class for every finding that shares a cause:
+
+```
+python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes.json \
+    --pr <pr> --round <r> --class "<what every instance has in common>" \
+    --path "<file:line, or the route that reaches it>" --finding <key> \
+    --invariant "<what, held everywhere, rules it out>" \
+    [--enforcement "<how it is made impossible>"] [--guard-test "<what keeps it so>"]
+```
+
+- **Exit 5 is the two-strike rule.** The class is now seen on a second path, so
+  the fix pass must make it impossible by construction (a required argument, one
+  gate plus a static guard, a type, a constraint), and "fix this path too" is
+  refused. Tell the fixer that in §4's brief, for that class, and once the fix
+  exists record it with
+  `panel_classes.py structural --class <key> --how … --enforcement … --guard-test …`.
+  A structural fix that is really a redesign is step 3a's escalation.
+- **`panel_classes.py status --ledger … --round <r>`** gives the cycle's standing:
+  0 converged (this round recorded no new class), 1 not converged, 5 a structural
+  fix owed, 4 **budget spent**. The budget is `review_panel.class_ledger.rounds`
+  (3) rounds in a row without convergence.
+- **On 4, stop the cycle.** Relay the open classes and the structural options the
+  report lists in §6, as a decision for the owner. There is no round 4 by default.
+  The owner goes on with `--class-rounds N` on the next round, which is their
+  call, not the loop's.
+
+`panel.py` enforces the same two exits on its own: given a ledger, it **refuses
+to run** a round while the budget is spent (exit 4) or a structural fix is owed
+(exit 5). It prints why and writes no payload, and no panel ran. Never relay
+that as a clean round.
+
 ### Do not rewrite the branch between rounds (#500)
 
 A rebase or force-push between rounds disarms provenance, recurrence and `--scope
