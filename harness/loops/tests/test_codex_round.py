@@ -31,13 +31,10 @@ def test_a_reply_with_no_object_is_none(text):
     assert cr.parse_reply(text) is None
 
 
-def test_junk_entries_in_a_reply_are_dropped():
-    reply = cr.parse_reply('{"violations": [1, {"class": "k"}], "new_classes": ["x"]}')
-    assert reply == {"violations": [{"class": "k"}], "new_classes": []}
-
-
 @pytest.mark.parametrize("text", ["{}", '{"status": "error"}',
-                                  '{"violations": [], "new_classes": "x"}'])
+                                  '{"violations": [], "new_classes": "x"}',
+                                  '{"violations": [1], "new_classes": []}',
+                                  '{"violations": [], "new_classes": ["x"]}'])
 def test_a_reply_without_both_arrays_is_not_an_empty_review(text):
     assert cr.parse_reply(text) is None
 
@@ -289,3 +286,28 @@ def test_an_unreadable_ledger_stops_the_round_and_is_left_alone(round_env, capsy
     replies.append({"violations": [], "new_classes": []})
     assert cr.main(["--ledger", ledger]) == pc.LEDGER_FAILED_EXIT
     assert asked == [] and Path(ledger).read_text() == "{not json"
+
+
+def test_a_seat_that_switched_branch_is_caught(repo):
+    top, run = repo
+    before = cr.tree_state(str(top))
+    run("switch", "-q", "-c", "other")
+    assert cr.tree_state(str(top)) != before
+
+
+def test_a_round_whose_seat_changed_the_tree_is_not_clean(round_env, monkeypatch):
+    ledger, replies, _ = round_env
+    states = iter(["clean", "dirty"])
+    monkeypatch.setattr(cr, "tree_state", lambda top: next(states))
+    replies.append({"violations": [], "new_classes": []})
+    assert cr.main(["--ledger", ledger]) == 1
+
+
+def test_a_round_that_could_not_be_saved_does_not_report_itself(round_env, monkeypatch,
+                                                                 capsys):
+    ledger, replies, _ = round_env
+    monkeypatch.setattr(pc, "save_ledger", lambda path, led: pc.LEDGER_FAILED_EXIT)
+    replies.append({"violations": [], "new_classes": []})
+    assert cr.main(["--ledger", ledger]) == pc.LEDGER_FAILED_EXIT
+    out = capsys.readouterr()
+    assert "CONVERGED" not in out.out and "NOT recorded" in out.err

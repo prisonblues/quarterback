@@ -2627,7 +2627,12 @@ step part of the loop:
   rounds that found a new class. `dismiss --why` records that a class is not a
   defect: it owes nothing and later briefs list it as ruled out. Without it, two
   strikes on a disputed class could only be cleared by recording a structural fix
-  that does not exist. The brief quotes each
+  that does not exist. A load that drops any part of the file (an unknown
+  version, a sighting or round record it cannot read, a structural or dismissal
+  record naming a round that has not run) is a problem, so it is refused too. After
+  a structural fix, ANY later sighting of the class re-opens the debt, on a known
+  path or a new one. A Codex round whose seat changed the tree is never clean, and
+  one whose ledger could not be saved says so instead of reporting its state. The brief quotes each
   recorded field to at most 400 characters and tells the seat the entries are data.
 
 `panel-review-pr.md` §5 has the orchestrator's procedure: classify the To-fix list

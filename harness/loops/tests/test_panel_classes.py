@@ -101,13 +101,14 @@ def test_a_recorded_structural_fix_clears_the_debt():
     assert not pc.is_owed(ledger["classes"][0], 2)
 
 
-def test_a_new_path_after_the_structural_fix_reopens_the_debt():
-    """"Impossible by construction" that then turns up on a new path was not."""
-    ledger = ledger_with("a.py:10", "b.py:20")
-    pc.record_structural(ledger, RESOLVER, 1, "required kwarg",
-                         enforcement="kw-only viewer", guard_test="AST walk")
-    assert not pc.record(ledger, RESOLVER, 2, "a.py:10")["owed"]
-    assert pc.record(ledger, RESOLVER, 2, "mcp/read.py:7")["owed"]
+def test_any_sighting_after_the_structural_fix_reopens_the_debt():
+    """"Impossible by construction" that then turns up again was not — on a new path
+    or on one the fix was meant to have closed."""
+    for path in ("mcp/read.py:7", "a.py:10"):
+        ledger = ledger_with("a.py:10", "b.py:20")
+        pc.record_structural(ledger, RESOLVER, 1, "required kwarg",
+                             enforcement="kw-only viewer", guard_test="AST walk")
+        assert pc.record(ledger, RESOLVER, 2, path)["owed"]
 
 
 # ------------------------------------------------------------- convergence + budget
@@ -458,3 +459,37 @@ def test_the_cli_dismisses_a_class_and_it_survives_the_file(cli):
     assert cli("status", "--round", "1") == pc.STRUCTURAL_OWED_EXIT
     assert cli("dismiss", "--round", "1", "--class", RESOLVER, "--why", "not real") == 0
     assert cli("status", "--round", "1") == 1
+
+
+@pytest.mark.parametrize("mutate, says", [
+    (lambda raw: raw.update(version=999), "version 999"),
+    (lambda raw: raw["classes"][0]["sightings"].append({"round": "x", "path": "p"}),
+     "sighting with no round"),
+    (lambda raw: raw.update(rounds=[1, "bad"]), "not a round number"),
+    (lambda raw: raw["classes"][0].update(
+        structural={"how": "h", "round": 99}, enforcement="e", guard_test="g"),
+     "has not run"),
+])
+def test_a_ledger_that_lost_part_of_itself_is_a_problem(tmp_path, mutate, says):
+    raw = ledger_with("a.py:10", "b.py:20")
+    mutate(raw)
+    path = tmp_path / "classes.json"
+    path.write_text(json.dumps(raw))
+    ledger, problems = pc.load_ledger(str(path))
+    assert any(says in p for p in problems)
+    assert not ledger["classes"] or ledger["classes"][0]["structural"] is None
+
+
+def test_a_wave_ledger_that_is_not_there_is_a_problem(tmp_path):
+    _, problems = pc.load_wave([str(tmp_path / "gone.json")])
+    assert "does not exist" in problems[0]
+
+
+def test_the_brief_drops_control_bytes_and_bounds_the_class_count():
+    ledger = pc.new_ledger()
+    pc.record(ledger, RESOLVER, 1, "a.py\x00\x1b[2J", invariant=INVARIANT)
+    for n in range(60):
+        pc.record(ledger, f"distinct class {n} {'q' * n}", 1, "x.py", invariant="holds")
+    brief = pc.ledger_brief(ledger)
+    assert "\x00" not in brief and "\x1b" not in brief
+    assert f"(+{61 - pc.BRIEF_CLASSES_MAX} more" in brief

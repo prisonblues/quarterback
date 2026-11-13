@@ -187,10 +187,10 @@ def parse_reply(text: str) -> dict | None:
     if not (isinstance(reply, dict) and isinstance(reply.get("violations"), list)
             and isinstance(reply.get("new_classes"), list)):
         return None
-    return {"violations": [v for v in reply.get("violations") or []
-                           if isinstance(v, dict)],
-            "new_classes": [c for c in reply.get("new_classes") or []
-                            if isinstance(c, dict)]}
+    items = reply["violations"] + reply["new_classes"]
+    if not all(isinstance(i, dict) for i in items):
+        return None
+    return {"violations": reply["violations"], "new_classes": reply["new_classes"]}
 
 
 def exec_args(model: str, effort: str, reply_file: Path, network: bool) -> list[str]:
@@ -220,7 +220,9 @@ def exec_args(model: str, effort: str, reply_file: Path, network: bool) -> list[
 def tree_state(top: str) -> str:
     """What the worktree looks like, to catch a seat that edited it — the files, and
     the index, HEAD and stash a commit, an add or a stash would move."""
-    return "\0".join([git("rev-parse", "HEAD", cwd=top),
+    branch = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=top,
+                            capture_output=True, text=True, check=False).stdout
+    return "\0".join([branch, git("rev-parse", "HEAD", cwd=top),
                       git("status", "--porcelain=v1", "-uall", cwd=top),
                       git("diff", cwd=top), git("diff", "--cached", cwd=top),
                       git("stash", "list", cwd=top)])
@@ -366,20 +368,22 @@ def shards_of(spec: str) -> list[str]:
 
 
 def ask_seats(prompts: list[str], model: str, effort: str, top: str,
-              network: bool) -> list[dict | None]:
+              network: bool) -> tuple[list[dict | None], bool]:
     """Run every shard. With ``top`` set the seats run in the worktree, ONE AT A TIME:
     they share its files, its build output and its test database, so parallel seats
-    running tests would race each other. A tree they changed is reported — the rule
-    they were given is not trusted to have held."""
+    running tests would race each other. A tree they changed is reported, and the
+    second value says so: the rule they were given is not trusted to have held, and a
+    round whose seat changed what it read is never clean."""
     before = tree_state(top) if top else ""
     with ThreadPoolExecutor(max_workers=1 if top else len(prompts)) as pool:
         replies = list(pool.map(lambda p: run_codex(p, model, effort, top, network),
                                 prompts))
-    if top and tree_state(top) != before:
+    changed = bool(top) and tree_state(top) != before
+    if changed:
         print("codex_round: WARNING — the seat CHANGED the worktree (it was told not "
               "to). Inspect `git status` / `git diff` before you commit anything.",
               file=sys.stderr)
-    return replies
+    return replies, changed
 
 
 def print_round(args, round_no: int, ledger_path: str, ledger: dict, state: dict,
@@ -424,17 +428,21 @@ def main(argv: list[str] | None = None) -> int:
     if not shutil.which("codex"):
         print("codex_round: codex is not installed — skipped", file=sys.stderr)
         return UNAVAILABLE_EXIT
-    replies = ask_seats(prompts, model, effort, top, args.network)
+    replies, changed = ask_seats(prompts, model, effort, top, args.network)
     answered = sum(1 for r in replies if r)
     if not answered:
         print("codex_round: no usable reply from codex — skipped", file=sys.stderr)
         return UNAVAILABLE_EXIT
     found = apply_replies(ledger, [r for r in replies if r], round_no, strikes)
     pc.mark_round(ledger, round_no)
-    write_failed = pc.save_ledger(ledger_path, ledger)
+    if pc.save_ledger(ledger_path, ledger):
+        print(f"codex_round: round {round_no} ran but was NOT recorded — its findings "
+              "are above; fix the ledger path and run the round again", file=sys.stderr)
+        print("\n".join(found), file=sys.stderr)
+        return pc.LEDGER_FAILED_EXIT
     state = pc.round_state(ledger, round_no, strikes, rounds)
     print_round(args, round_no, ledger_path, ledger, state, found, answered, len(prompts))
-    return write_failed or exit_code(state, found, answered < len(prompts))
+    return exit_code(state, found, answered < len(prompts) or changed)
 
 
 if __name__ == "__main__":
