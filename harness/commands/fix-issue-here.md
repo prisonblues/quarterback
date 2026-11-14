@@ -196,7 +196,10 @@ runs; those override fallbacks. Then:
    the whole suite where the repo separates the two, and never the full or
    DB-backed suites for a change bound for an integration branch: those run
    once, when that branch is promoted. `fix-issue.md` step 7 "Which tests" has
-   the full rule.
+   the full rule. **Every test file you touched runs in full, DB-marked tests
+   included** — selection narrows the rest of the suite, never a file you edited.
+   Mocks of code under change use `autospec`, so a wrong-argument call fails here
+   rather than in prod.
 3. **Lint + format** — fix all; don't disable rules.
 4. **Type check** — if the project uses it.
 5. **Codegen sync** — if CI has `git diff --exit-code` checks, regenerate.
@@ -212,14 +215,21 @@ Read your full diff as if blocking someone else's merge: correctness, boundaries
 error handling, security, test-coverage gaps, naming/dead code, doc staleness,
 related code that should also change.
 
-**Second opinion — Codex (best-effort, never blocks).** If `codex` is on PATH:
+**Second opinion — a Codex round (best-effort, never blocks).** A different
+reviewer, never the builder again, and never a hand-rolled `codex exec` loop,
+which has no brakes (#836):
 ```bash
-command -v codex >/dev/null && git diff | \
-  codex exec "Review this diff for REAL defects only (correctness, security,
-  error handling, broken edge cases — not style). file:line + one line each.
-  Concise." 2>/dev/null || true
+python3 ~/.claude/loops/codex_round.py
 ```
-Fold genuine bugs in; drop only clear false positives. Skip silently if absent.
+One Codex seat that may run the touched tests and snippets in this checkout. It
+classifies every finding into a class with an invariant, an enforcement and a
+guard test, and lists every instance: fix the whole class. Exit 0 converged · 1 fix
+and run again · 5 **two strikes**: make the class impossible by construction and
+record it with `panel_classes.py structural` instead of patching this path too ·
+4 **budget spent**: stop, report the open classes, the owner decides · 2 codex
+unavailable, skip silently. `fix-issue.md` step 8 has the full table, and its step 2
+covers the design round to run first for concurrency, ledger, caching,
+visibility or migration work.
 
 **Before you fix a finding, write one line naming who consumes the code the fix
 would change** — the callers, and where that code reaches a response or a stored

@@ -110,7 +110,8 @@ def rendered(refuted: str, scope: str = "diff") -> str:
             .format(n=1, repo="acme/app", base="main", ci="CI: green",
                     diff="DIFF", code="CODE")
             .replace(panel_core.NEXT_DOOR_SLOT, "")
-            .replace(panel_core.REFUTED_SLOT, refuted))
+            .replace(panel_core.REFUTED_SLOT, refuted)
+            .replace(panel_core.CLASSES_SLOT, ""))
 
 
 def found(**over) -> panel.Finding:

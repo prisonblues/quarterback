@@ -101,8 +101,10 @@ def rendered(next_door: str, scope: str = "diff") -> str:
             # closure. Emptied here rather than left standing: every assertion below
             # is about what #508 does to the prompt, and a raw `<<<REFUTED>>>` in the
             # rendering would fail them all for a reason that has nothing to do with
-            # next-door hints. The refutation block has its own file.
-            .replace(panel_core.REFUTED_SLOT, ""))
+            # next-door hints. The refutation block has its own file, and #836's
+            # class ledger, emptied for the same reason, has `test_panel_classes`.
+            .replace(panel_core.REFUTED_SLOT, "")
+            .replace(panel_core.CLASSES_SLOT, ""))
 
 
 # ---- the off path, and the byte-identical prompt ---------------------------

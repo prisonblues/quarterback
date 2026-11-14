@@ -820,6 +820,16 @@ if the script isn't there.
   review and it is a human's call. Report it in those words and stop, rather than
   escalating item by item.
 
+**Fix the class, not the instance.** Where the findings are several paths to one
+defect (the same missing argument, the same unguarded read), the fix is the one that
+makes the defect impossible by construction: a required argument, one gate plus a
+static guard, a type, a constraint. Patching each path is not that fix. When the
+orchestrator keeps a class ledger (`/panel-review-pr`, `codex_round.py`), a class found
+in a later round on a path its first round did not list is **owed** a structural fix: `panel_classes.py record` exits 5, and
+"fix this path too" is refused. Make the class impossible, then record how with
+`panel_classes.py structural` (#836). If that is a redesign, it is step 3a's
+escalation, not your call.
+
 #### 4. Verify
 
 Read CI config + Makefile to find what the project runs, then:
@@ -902,6 +912,13 @@ a live local DB (migrate the test DB to head first). Never the whole DB suite fo
 a PR into an integration branch: that runs once, at promotion. If you can't, say
 so explicitly and flag those paths **unverified** — don't imply the fast suite
 covered them.
+
+**Every test file you touched runs in full, DB-marked tests included.** Selection
+narrows the rest of the suite, never a file you edited. On Lex-Ray v22 the "selected"
+subset kept skipping the DB tests in the very file that had changed (#836). And a mock
+of code under change carries the real signature (`autospec=True` /
+`create_autospec`): a `**_kw` stand-in accepts any call, so a wrong-argument production
+call passes the test and crashes in prod. That shipped on v22.
 
 Install missing tools if feasible; only skip with a note if not.
 

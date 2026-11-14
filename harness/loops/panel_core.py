@@ -670,6 +670,15 @@ NEXT_DOOR_HEADING = "CONFIRMED NEXT DOOR — context, not findings"
 #: trailing newline, so an empty fill leaves no blank paragraph behind.
 REFUTED_SLOT = "<<<REFUTED>>>"
 
+#: Where #836's class ledger lands in the reviewer's brief — the closed list later
+#: rounds verify (:func:`panel_classes.ledger_brief`). A literal token on
+#: :data:`NEXT_DOOR_SLOT`'s terms: the block carries class names and invariants a
+#: fixer typed, so it is swapped AFTER `.format`, bounded to one occurrence, and is
+#: the empty string for any cycle that passes no ledger — that prompt is
+#: byte-identical to the one it always sent. AFTER the refutation block, because
+#: the ledger is the round's instruction and should be the last thing read before it.
+CLASSES_SLOT = "<<<CLASSES>>>"
+
 #: The heading of a rendered refutation block. A constant for
 #: :data:`NEXT_DOOR_HEADING`'s reason: the renderer and the test that asserts the
 #: block says what it is have to agree about the words.
@@ -815,7 +824,7 @@ master judge filters false positives; your job is breadth, not triage.
 
 <<<REVIEWER_SCOPE>>>
 
-<<<NEXT_DOOR>>><<<REFUTED>>>Review for:
+<<<NEXT_DOOR>>><<<REFUTED>>><<<CLASSES>>>Review for:
 - Correctness: logic bugs, off-by-ones, race conditions, boundary conditions, null/None handling
 - Security: injection, auth bypass, secrets in code, path traversal, SSRF, unsafe deserialization
 - Error handling: swallowed errors, missing validation, silent failures, unhelpful messages
@@ -840,6 +849,13 @@ master judge filters false positives; your job is breadth, not triage.
   material cannot settle, after you have looked, and never for one you did not open a file about
 - Related code: <<<RELATED_CODE>>>
 - Craft: naming, complexity, dead code, redundant conditions, project-convention/style breaks, DRY
+
+WHOLE CLASSES, NOT INSTANCES. For every defect you report, name its CLASS — what every place
+with this defect has in common — and before you write the finding, enumerate EVERY other instance
+of that class in the change and EVERY path that reaches it. Put them in the finding's `detail`
+after "Class:" and "Instances:", one file:line per instance with the path that reaches it. A
+review that reports one path per round does not converge: the fix closes the path it was told
+about and the next round finds the next one.
 
 Severity: P1 blocks merge (correctness/security) · P2 important (error handling, test gaps,
 logic flaws, a false comment claim the correctness argument rests on) · P3 should fix (style,
@@ -3474,7 +3490,7 @@ __all__ = [
     # #773's refutation memory, exported on the same terms as #508's block above:
     # `panel.py` star-imports this module, so every name it calls as a plain global
     # has to be listed or the round renders an unswapped token into a prompt.
-    "REFUTED_SLOT", "REFUTED_HEADING", "_REFUTED_BRIEF", "REFUTED_MAX",
+    "REFUTED_SLOT", "CLASSES_SLOT", "REFUTED_HEADING", "_REFUTED_BRIEF", "REFUTED_MAX",
     "REFUTED_TITLE_CHARS", "REFUTED_REASON_CHARS",
     "refuted_rows", "_refutation_line", "refuted_brief", "refuted_note",
     "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
