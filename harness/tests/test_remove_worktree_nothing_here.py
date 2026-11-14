@@ -63,6 +63,14 @@ def run_with(repo_dir, args, tmp_path, fakes: dict[str, str]):
         env=_path_sandbox.sandbox_env(tmp_path, fake_dir, tools=TOOLS))
 
 
+def complete(proc) -> bool:
+    """A clean teardown that removed something: exit 0 and no warning. Asserted
+    rather than the exit code alone, because a warning also exits 0 and would
+    let a broken `removed()` pass for a working one."""
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return "Cleanup complete" in proc.stdout
+
+
 def registered(repo_dir, path) -> bool:
     out = git(repo_dir, "worktree", "list", "--porcelain").stdout
     return f"worktree {path}" in out.splitlines()
@@ -104,29 +112,56 @@ def test_only_a_registration_left_is_pruned(repo, tmp_path):
     subprocess.run(["rm", "-r", "-f", str(wt)], check=True)
     git(repo, "branch", "-D", "fix/issue-43")  # the branch is not the signal here
 
-    proc = run_remove(repo, "fix-issue-43", tmp_path)
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert not registered(repo, wt)
+    assert complete(proc) and not registered(repo, wt)
 
 
-def test_only_a_branch_left_is_deleted_under_its_slash_spelling(repo, tmp_path):
-    """The create-name is the branch flattened, so `fix-issue-43` finds `fix/issue-43`
-    with no directory to read the branch from."""
+def test_only_a_branch_left_is_deleted(repo, tmp_path):
     git(repo, "branch", "fix/issue-43")
 
-    proc = run_remove(repo, "fix-issue-43", tmp_path)
+    proc = run_with(repo, ["fix/issue-43"], tmp_path, NOTHING_HELD)
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "fix/issue-43" not in branches(repo)
+    assert complete(proc) and "fix/issue-43" not in branches(repo)
+
+
+def test_a_flattened_name_never_deletes_a_branch_it_did_not_name(repo, tmp_path):
+    """#841 round 2's P1: a lookup from `fix-issue-43` to `fix/issue-43` deleted a
+    branch with unpushed commits, past the post-PR guard, which only ever guards
+    the branch a live directory names. With no directory there is no such guard,
+    so the argument is the only branch the teardown may touch."""
+    git(repo, "checkout", "--quiet", "-b", "fix/issue-43")
+    (repo / "work.txt").write_text("unpushed\n")
+    git(repo, "add", "work.txt")
+    git(repo, "commit", "--quiet", "-m", "unpushed work")
+    git(repo, "checkout", "--quiet", "wip/current")
+
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
+
+    assert "fix/issue-43" in branches(repo)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+
+
+def test_a_teardown_does_not_prune_another_worktrees_registration(repo, tmp_path):
+    """Prune is repo-wide. Another tree whose directory is briefly missing (an
+    unmounted volume) keeps its registration through an unrelated teardown."""
+    other = add_worktree(repo, "feat-elsewhere", "feat/elsewhere")
+    parked = other.with_name(other.name + ".unmounted")
+    other.rename(parked)
+    git(repo, "branch", "fix/issue-43")
+    try:
+        run_with(repo, ["fix/issue-43"], tmp_path, NOTHING_HELD)
+        assert registered(repo, other)
+    finally:
+        parked.rename(other)
 
 
 def test_only_a_port_entry_left_is_dropped(repo, tmp_path):
     (repo / ".worktree-ports").write_text("5698:fix/issue-43\n5699:other\n")
 
-    proc = run_remove(repo, "fix-issue-43", tmp_path)
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert complete(proc)
     assert (repo / ".worktree-ports").read_text() == "5699:other\n"
 
 
@@ -147,13 +182,33 @@ def test_a_claim_that_was_not_held_is_not_something_removed(repo, tmp_path,
 
 
 def test_only_containers_left_are_removed(repo, tmp_path):
-    proc = run_with(repo, ["fix-issue-43"], tmp_path, {"docker": '''
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": '''
 case "$1" in
   ps) echo "proj-fix-issue-43" ;;
   rm) exit 0 ;;
 esac'''})
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert complete(proc)
+
+
+def test_the_real_qb_release_saying_nothing_is_held_still_ends_in_exit_2(tmp_path,
+                                                                          other_repo):
+    """Against the REAL tool, not a fake of it: its "nothing to release" paths print
+    no JSON at all, which a fake that always prints some never shows. A branch
+    naming no issue takes one of them without needing a board."""
+    proc = subprocess.run(
+        [str(REMOVE), "wip-notes"], cwd=other_repo, capture_output=True, text=True,
+        env=_path_sandbox.sandbox_env(tmp_path, tools=(*TOOLS, "python3")))
+    assert "names no issue" in proc.stderr, proc.stdout + proc.stderr
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+
+
+def test_a_claim_answer_that_cannot_be_read_is_a_warning(repo, tmp_path, other_repo):
+    """Exit 0 from qb-release with output this cannot parse says nothing about
+    whether a claim went, so it is neither "removed" nor nothing."""
+    proc = run_with(other_repo, ["fix-issue-43"], tmp_path,
+                    {"qb-release": "echo 'not json'"})
+    assert proc.returncode == 0 and "WITH WARNINGS" in proc.stdout
 
 
 def test_a_kept_branch_is_not_something_removed(repo, tmp_path):

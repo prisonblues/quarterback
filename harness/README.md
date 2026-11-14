@@ -651,9 +651,8 @@ allocates a port. `remove-worktree` reverses it. `prune-worktrees` is the orphan
 it is the only one that is dry-run by default.
 
 `remove-worktree` resolves the repo from the shell's checkout, and the branch name is its only
-argument. Each step records what it actually removed. When every step ran and none removed
-anything (no directory, registration, containers, nginx block, database, branch, port entry or
-claim), it exits 2 and names the repo it searched, rather than ending on "Cleanup complete"
+argument. Each step records what it actually removed. When every step ran, none removed
+anything and none warned, it exits 2 and names the repo it searched, rather than ending on "Cleanup complete"
 (#808). It decides from the steps, not from a list checked beforehand, so a tree deleted by hand
 still has its leftovers cleaned, including a claim `qb-reconcile` sends you here to hand back.
 A directory the delete could not remove, a registration prune could not clear, a branch it could
