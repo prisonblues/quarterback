@@ -51,7 +51,14 @@ Usage:
         [--github OWNER/NAME]
     panel_classes.py defer --ledger L --round N --class NAME|KEY --rule RULE --issue N
     panel_classes.py status --ledger L --round N
+    panel_classes.py mark --payload ROUND.json
     panel_classes.py brief --ledger L [--wave OTHER ...]
+
+Every command that takes --round also takes --payload, the round's own `--json-file`
+payload: its `class_ledger` block names the ledger round, the PR and the ledger path,
+so the orchestrator never maps a panel round to a ledger round by hand (#846). The
+two numberings differ on purpose — `--new-cycle` restarts the panel at round 1 and
+the ledger never restarts — and `--payload` is what keeps them from drifting.
 """
 from __future__ import annotations
 
@@ -833,6 +840,52 @@ def _cmd_defer(args, gh_repo) -> int:
     return 0
 
 
+def _cmd_mark(args, gh_repo) -> int:
+    """Record that a round ran. Run after EVERY round, clean ones included: a clean
+    round records no sighting, so without this the next round would reuse its
+    number. Idempotent."""
+    ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
+    if refuse_unusable(problems, "panel_classes"):
+        return LEDGER_FAILED_EXIT
+    if args.round > last_round(ledger) + 1:
+        raise SystemExit(f"panel_classes mark: round {args.round} would skip round "
+                         f"{last_round(ledger) + 1} — the ledger's rounds are numbered "
+                         "without gaps")
+    mark_round(ledger, args.round)
+    if save_ledger(args.ledger, ledger):
+        return LEDGER_FAILED_EXIT
+    print(json.dumps({"round": args.round}) if args.json else
+          f"class ledger: round {args.round} recorded as run")
+    return 0
+
+
+def from_payload(args) -> None:
+    """Fill --round, --pr and --ledger from a round's payload, refusing a flag that
+    disagrees with it: two numberings for one round is the drift #846 removes."""
+    try:
+        payload = json.loads(Path(args.payload).read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"--payload {args.payload}: could not be read "
+                         f"({e.__class__.__name__})")
+    block = payload.get("class_ledger") if isinstance(payload, dict) else None
+    if not isinstance(block, dict) or _round(block.get("round")) is None:
+        raise SystemExit(f"--payload {args.payload} carries no ledger round — that "
+                         "round was run without --class-ledger, or by a panel older "
+                         "than #846")
+    for flag, mine, theirs in (("--round", args.round, block["round"]),
+                               ("--pr", args.pr, payload.get("pr"))):
+        if mine is not None and theirs is not None and mine != theirs:
+            raise SystemExit(f"{flag} {mine} disagrees with --payload, which says "
+                             f"{theirs} — pass one or the other")
+    if args.ledger and block.get("path") and \
+            Path(args.ledger).resolve() != Path(block["path"]).resolve():
+        raise SystemExit(f"--ledger {args.ledger} is not the ledger that round read "
+                         f"({block['path']})")
+    args.round = block["round"]
+    args.pr = args.pr if args.pr is not None else payload.get("pr")
+    args.ledger = args.ledger or block.get("path") or ""
+
+
 def _cmd_status(args, strikes_limit, rounds_limit, gh_repo) -> int:
     ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
     if refuse_unusable(problems, "panel_classes"):
@@ -856,15 +909,20 @@ def _parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p, rounds: bool = True):
-        p.add_argument("--ledger", required=True, metavar="PATH",
-                       help="the PR's ledger, beside its premise register")
+        p.add_argument("--ledger", default="", metavar="PATH",
+                       help="the PR's ledger, beside its premise register (default: "
+                            "the one --payload names)")
         p.add_argument("--repo", default=None, help="repo spec for the rules (default: "
                        "the cwd's repo)")
         p.add_argument("--pr", type=int, default=None)
         p.add_argument("--json", action="store_true")
         if rounds:
             p.add_argument("--round", type=int, default=None,
-                           help="the round whose findings this answers")
+                           help="the LEDGER round whose findings this answers")
+            p.add_argument("--payload", default="", metavar="ROUND.json",
+                           help="that round's panel payload: supplies --round, --pr "
+                                "and --ledger, so a panel round and a ledger round "
+                                "cannot be mismatched by hand")
 
     rec = sub.add_parser("record", help="record one sighting of a class")
     common(rec)
@@ -904,6 +962,9 @@ def _parser() -> argparse.ArgumentParser:
     status = sub.add_parser("status", help="convergence and budget after a round")
     common(status)
 
+    mk = sub.add_parser("mark", help="record that a round ran (after every round)")
+    common(mk)
+
     br = sub.add_parser("brief", help="print the reviewer brief for the next round")
     common(br, rounds=False)
     br.add_argument("--wave", action="append", default=[], metavar="PATH",
@@ -915,6 +976,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if getattr(args, "round", None) is not None and args.round < 1:
         raise SystemExit("--round: rounds are numbered from 1")
+    if getattr(args, "payload", ""):
+        from_payload(args)
+    if not args.ledger:
+        raise SystemExit(f"{args.cmd} needs --ledger, or --payload from a round that "
+                         "read one")
     if args.cmd == "brief":
         ledger, problems = load_ledger(args.ledger)
         if refuse_unusable(problems, "panel_classes"):
@@ -925,7 +991,7 @@ def main(argv: list[str] | None = None) -> int:
         print(ledger_brief(ledger, wave), end="")
         return 0
     strikes_limit, rounds_limit, gh_repo = _limits_for(args.repo)
-    if args.cmd in ("record", "structural", "dismiss", "file", "defer") \
+    if args.cmd in ("record", "structural", "dismiss", "file", "defer", "mark") \
             and args.round is None:
         raise SystemExit(f"{args.cmd} needs --round — the round whose findings it answers")
     if args.cmd == "record":
@@ -936,6 +1002,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_dismiss(args, gh_repo)
     if args.cmd in ("file", "defer"):
         return _cmd_defer(args, gh_repo)
+    if args.cmd == "mark":
+        return _cmd_mark(args, gh_repo)
     return _cmd_status(args, strikes_limit, rounds_limit, gh_repo)
 
 

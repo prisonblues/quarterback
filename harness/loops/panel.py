@@ -95,6 +95,7 @@ away from writing the payload somewhere else, and world-readable meanwhile.)
 from __future__ import annotations
 
 from datetime import UTC
+from datetime import datetime as _datetime
 
 # The caps (#55) — the board's round ceiling and the spend ceiling, and what an
 # unverifiable ceiling means. Deliberately NOT star-imported, for `panel_timing`'s
@@ -300,6 +301,11 @@ def board_escalations(gh_repo: str, pr_number: int) -> tuple[list[str], str]:
 #: direction (the round runs, as it always did) and it is reported rather than
 #: assumed away.
 TERMINAL_VERDICT_RUNS = 50
+
+
+def _now_iso() -> str:
+    """Now, UTC, to the second — when an owner's answer was recorded (#846)."""
+    return _datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _ago(seconds: float) -> str:
@@ -1722,6 +1728,8 @@ def _payload_defaults() -> dict:
         # #836's class-ledger block. None: no ledger was passed, or the run never
         # reached the point where the ledger is read.
         "class_ledger": None,
+        # #846's owner answer to a stop. None unless --continue-cycle ran a round.
+        "stop_answered": None,
         "changed_lines": 0,
         # The PR's file list, not this round's. Under #41 a later round reviews
         # only the increment, so the round's files narrow while the PR's
@@ -2429,7 +2437,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # #836's class ledger, last and named at the call site for the reason above.
         class_ledger: str = "",
         class_wave: list[str] | None = None,
-        class_rounds: int | None = None) -> int:
+        class_rounds: int | None = None,
+        # #846's owner override, named at the call site for the reason above.
+        continue_cycle: bool = False,
+        answered_by: str = "",
+        answered_why: str = "") -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -2640,13 +2652,20 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     class_strikes, class_budget = panel_classes.ledger_limits(panel, notes)
     if class_rounds is not None:
         class_budget = class_rounds
+    # ONE ROUND NUMBERING (#846). The ledger numbers its own rounds and never restarts:
+    # `--new-cycle` puts the panel back at round 1 while the ledger is at round 3, and
+    # reading the budget off the panel's round would check the wrong round. So this
+    # round is the ledger's NEXT one, whatever the panel calls it, and the payload
+    # carries that number for `panel_classes.py --payload` to record against.
+    ledger_round = panel_classes.last_round(classes) + 1
     if class_ledger:
-        class_refusal = panel_classes.budget_refusal(classes, round_no, class_strikes,
+        class_refusal = panel_classes.budget_refusal(classes, ledger_round, class_strikes,
                                                      class_budget)
         if class_refusal:
-            print(f"[{repo_name}#{pr_number}] round {round_no} refused — no panel ran.\n"
+            print(f"[{repo_name}#{pr_number}] round {round_no} (ledger round "
+                  f"{ledger_round}) refused — no panel ran.\n"
                   f"{class_refusal}", file=sys.stderr)
-            owed = panel_classes.round_state(classes, round_no - 1, class_strikes,
+            owed = panel_classes.round_state(classes, ledger_round - 1, class_strikes,
                                              class_budget)
             return (panel_classes.BUDGET_EXIT if owed["over"]
                     else panel_classes.STRUCTURAL_OWED_EXIT)
@@ -3422,6 +3441,19 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `terminal` for that reason.
     prior_said = ""
     ended = bool(prior_cycle and prior_cycle.get("terminal"))
+    stop_answered = None
+    if continue_cycle and not ended:
+        if not prior_cycle_why:
+            raise SystemExit(
+                f"--continue-cycle answers a stop, and the board records none ending "
+                f"PR #{pr_number}'s cycle as it stands. Continue the cycle with "
+                "--round and --baseline alone")
+        # The board could not be asked. Best-effort, as every board read here is:
+        # the round runs, and says it could not confirm what it was answering.
+        stop_answered = {"by": answered_by, "why": answered_why,
+                         "at": _now_iso(),
+                         "verdict": None, "round": None, "cycle": None,
+                         "unverified": prior_cycle_why}
     if prior_cycle:
         # Whether the branch has moved since that verdict. It does not soften the
         # refusal — a fix pass after a stop is the shape #617 measured, not an
@@ -3434,7 +3466,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # round continuing a live cycle on a PR that stopped months ago was not
         # refused, and a notice telling its operator to answer a stop they already
         # answered is a remedy list with nothing actionable in it.
-        prior_cycle["refused"] = ended and not new_cycle
+        prior_cycle["refused"] = ended and not new_cycle and not continue_cycle
         if ended:
             prior_said = (
                 f"round {prior_cycle['round'] or '?'} of cycle "
@@ -3467,6 +3499,22 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "host's judgement about what its own seats can read; the ceiling "
                 "is a number a person set on the board for the fleet, and a local "
                 "flag that switched it off would make it advice again")
+    elif ended and continue_cycle:
+        # #846: the OWNER answered the stop and said go on. This is the same cycle's
+        # next round — the caller passes its `--round` and `--baseline`, so the
+        # baseline, provenance and every guard measured from them carry on, which is
+        # what `--new-cycle` throws away. The answer is recorded with who gave it,
+        # when and why, because "the tool chose to run" and "a person overrode the
+        # tool" must never look alike. It moves THIS gate only: the spend ceiling
+        # above and the round cap in `round_stop` are other controls.
+        stop_answered = {
+            "by": answered_by, "why": answered_why,
+            "at": _now_iso(),
+            "verdict": prior_cycle.get("reason"), "round": prior_cycle.get("round"),
+            "cycle": prior_cycle.get("cycle")}
+        notes.append(f"--continue-cycle: {prior_said}. {answered_by} answered it "
+                     f"({answered_why}), so this round CONTINUES that cycle with its "
+                     "baseline and guards")
     elif ended and not new_cycle:
         # #617's refusal, and it is BELOW the spend ceiling for the reason the
         # ceiling is above mergeability: naming two preconditions in one refusal
@@ -7621,6 +7669,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # read straight back out of it by the NEXT round's `load_baseline` as the
         # left-hand end of that round's fix phase.
         "timing": timing,
+        # #846: the owner's answer to the stop this round continued past — who,
+        # when, why, and the verdict it answered. Null on every other round.
+        "stop_answered": stop_answered,
         # #836's ledger as this round found it: where the PREVIOUS round left the
         # cycle (converged, owed, over budget) and whether the seats were briefed
         # from it. Null for a cycle that passes no ledger. `--json` only, like
@@ -7628,9 +7679,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         "class_ledger": ({
             "path": class_ledger, "briefed": bool(class_brief),
             "classes": len(classes["classes"]),
+            # The LEDGER's round for this run, which is what every sighting from it
+            # is recorded against (`panel_classes.py --payload` reads it), beside
+            # the panel's own cycle and round so a reader can line the two up.
+            "round": ledger_round, "cycle": cycle, "panel_round": round_no,
             "previous_round": (panel_classes.round_state(
-                classes, round_no - 1, class_strikes, class_budget)
-                if round_no > 1 else None),
+                classes, ledger_round - 1, class_strikes, class_budget)
+                if ledger_round > 1 else None),
         } if class_ledger else None),
         # The commit reviewed: the NEXT round anchors its increment on it, and
         # provenance measures its fix range to it. One key, because two would be
@@ -8374,11 +8429,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             + (" The branch has moved since." if prior_cycle.get("head_moved")
                else " The branch has not moved since."),
             ">",
-            "> This run was started with `--new-cycle`, so it is a NEW cycle rather "
-            "than a continuation: it is round 1, it carries no baseline — the flag "
-            "REFUSES `--round` and `--baseline`, which is what makes that true "
-            "rather than merely stated — and every convergence guard starts from "
-            "scratch. Nothing below is measured against that earlier cycle.",
+            (f"> **The owner answered that stop and said go on.** "
+             f"{stop_answered['by']}, {stop_answered['at']}: "
+             f"\"{stop_answered['why']}\". This run was started with "
+             "`--continue-cycle`, so it CONTINUES that cycle: same baseline, same "
+             "provenance, same guards, and the same round cap."
+             if stop_answered else
+             "> This run was started with `--new-cycle`, so it is a NEW cycle rather "
+             "than a continuation: it is round 1, it carries no baseline — the flag "
+             "REFUSES `--round` and `--baseline`, which is what makes that true "
+             "rather than merely stated — and every convergence guard starts from "
+             "scratch. Nothing below is measured against that earlier cycle."),
             "",
         ]
     if in_rounds:
@@ -9706,6 +9767,21 @@ def main() -> int:
                          "and baseline would be a continuation wearing the banner of "
                          "a fresh cycle. --max-rounds is fine, and the rounds after "
                          "this one continue the new cycle without the flag")
+    ap.add_argument("--continue-cycle", action="store_true", dest="continue_cycle",
+                    help="#846: the OWNER's answer to a stop. When the board says the "
+                         "last round ENDED this cycle (a fix_injection stop, say), run "
+                         "the NEXT round of the same cycle instead of refusing — pass "
+                         "its --round and --baseline as usual, so the baseline, "
+                         "provenance and guards carry on. Needs --answered-by and "
+                         "--why, recorded in the payload (`stop_answered`) and the "
+                         "posted summary. It does not raise the round cap "
+                         "(--max-rounds) or the spend ceiling: those are other "
+                         "controls. Refused with --new-cycle, and when there is no "
+                         "stop to answer")
+    ap.add_argument("--answered-by", default="", dest="answered_by", metavar="NAME",
+                    help="with --continue-cycle: who answered the stop")
+    ap.add_argument("--why", default="", dest="answered_why", metavar="TEXT",
+                    help="with --continue-cycle: the owner's reason, in their words")
     ap.add_argument("--escalated-from-board", action="store_true",
                     dest="escalated_from_board",
                     help="take the escalation list from the board instead of naming "
@@ -10018,6 +10094,19 @@ def main() -> int:
             "and baseline is a CONTINUATION whatever the report's banner says. Pass "
             "--new-cycle on its own (with --max-rounds if the new cycle needs a cap) "
             "and let the rounds after it continue that cycle without it")
+    if args.continue_cycle:
+        if args.new_cycle:
+            raise SystemExit("--continue-cycle continues the stopped cycle and "
+                             "--new-cycle starts another — pass one")
+        if not (args.answered_by.strip() and args.answered_why.strip()):
+            raise SystemExit("--continue-cycle records who answered the stop and why: "
+                             "pass --answered-by NAME and --why TEXT")
+        if not args.baseline:
+            raise SystemExit("--continue-cycle continues a cycle, which is carried by "
+                             "its --baseline (the stopped round's payload) — pass it, "
+                             "with --round")
+    elif args.answered_by or args.answered_why:
+        raise SystemExit("--answered-by and --why go with --continue-cycle")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
                args.json_file, args.record, round_no, args.baseline,
                args.max_rounds, args.scope, args.since, args.force,
@@ -10027,7 +10116,8 @@ def main() -> int:
                retract=args.retract, assessed=args.assessed,
                assessed_by=args.assessed_by, no_history=args.no_history,
                class_ledger=args.class_ledger, class_wave=args.class_wave,
-               class_rounds=args.class_rounds)
+               class_rounds=args.class_rounds, continue_cycle=args.continue_cycle,
+               answered_by=args.answered_by, answered_why=args.answered_why)
 
 
 if __name__ == "__main__":
