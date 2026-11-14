@@ -29,6 +29,7 @@ def test_a_post_that_awaits_a_reply_names_the_watcher_and_its_own_id(posted, kin
     got = srv.board_post(None, summary="which way?", type=kind)
     assert got["id"] == 42
     assert "qb-watch-board --re 42" in got["next"]
+    assert "SendMessage" in got["next"]
 
 
 @pytest.mark.parametrize("kind", ["status", "done", "ack"])

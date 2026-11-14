@@ -5407,3 +5407,36 @@ def test_the_env_override_is_what_lets_a_checkout_live_elsewhere(monkeypatch, tm
     answer = qd.edge_runbook()
     expanded = answer.replace("~", str(Path.home()), 1) if answer.startswith("~") else answer
     assert str(tmp_path) in expanded, answer
+
+
+# --- messaging: a held cross-session message is reported as sent and never read ---
+
+
+@pytest.fixture
+def claude_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    return tmp_path / "settings.json"
+
+
+def test_messaging_is_ok_when_inbound_is_accepted(claude_settings):
+    claude_settings.write_text('{"crossSessionInbound": "accept"}')
+    assert qd.check_messaging(None).verdict == "ok"
+
+
+def test_messaging_warns_when_inbound_is_unset_because_peers_get_held(claude_settings):
+    claude_settings.write_text('{"permissions": {}}')
+    got = qd.check_messaging(None)
+    assert got.verdict == "warn"
+    assert "held for approval" in got.detail
+    assert "crossSessionInbound" in got.manual
+
+
+def test_messaging_warns_when_inbound_refuses_peers(claude_settings):
+    claude_settings.write_text('{"crossSessionInbound": "refuse"}')
+    assert qd.check_messaging(None).verdict == "warn"
+
+
+def test_messaging_is_unknown_when_settings_cannot_be_read(claude_settings):
+    assert qd.check_messaging(None).verdict == "unknown"
+    claude_settings.write_text("[1, 2]")
+    assert qd.check_messaging(None).verdict == "unknown"
