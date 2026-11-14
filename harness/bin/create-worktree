@@ -21,6 +21,10 @@ WORKTREE_SCRIPT_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pw
 #   --choose             Interactive branch picker
 #   --dry-run            Show plan without executing
 #   --frontend-only      Skip worker container, use shared queue
+#   --with-worker        Start the worker container too. By default it is written
+#                        into docker-compose.yml but not started (#853)
+#   --no-worker          Leave the worker stopped even if .worktree.json sets
+#                        worker.autostart
 #   --shared-db          Use main database (no copy)
 #   --docker             Force Docker on (override auto-detection)
 #   --no-nginx           Skip nginx configuration
@@ -735,6 +739,7 @@ BASE_BRANCH=""
 CHOOSE_BASE=false
 DRY_RUN=false
 FRONTEND_ONLY=false
+WORKER_START_FLAG=""      # on (--with-worker) | off (--no-worker) | "" = config
 SHARED_DB=false
 SKIP_NGINX=false
 SKIP_DOCKER=false
@@ -766,6 +771,10 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true; shift ;;
         --frontend-only)
             FRONTEND_ONLY=true; SHARED_DB=true; shift ;;
+        --with-worker)
+            WORKER_START_FLAG="on"; shift ;;
+        --no-worker)
+            WORKER_START_FLAG="off"; shift ;;
         --shared-db)
             SHARED_DB=true; shift ;;
         --no-nginx)
@@ -895,6 +904,34 @@ if [[ -z "$WORKER_COMMAND" ]]; then
         huey) WORKER_COMMAND="python huey_startup.py" ;;
         rq) WORKER_COMMAND="uv run rq worker" ;;
         celery) WORKER_COMMAND="celery -A tasks worker --loglevel=info" ;;
+    esac
+fi
+
+# Whether the worker starts with the app (#853). The worker is always written into
+# docker-compose.yml when there is one, under a `worker` compose profile, so no
+# bare `docker compose up -d` starts it — create-worktree's or anyone's later.
+# Starting it is opt-in because most worktrees are code-and-test only, and a
+# worker left running its periodic jobs burned ~4 cores on zeus for a worktree
+# that never asked for it (lexray#4458). --with-worker / --no-worker beat the
+# config.
+HAS_WORKER=false
+[[ "$FRONTEND_ONLY" = false && "$WORKER_TYPE" != "none" ]] && HAS_WORKER=true
+# The JSON type, not `cfg`'s text: `cfg` renders the string "true" exactly as it
+# renders the boolean, and a string must be refused rather than obeyed.
+WORKER_AUTOSTART=false
+if [[ -n "$CONFIG_JSON" ]]; then
+    WORKER_AUTOSTART=$(jq -r '.worker.autostart
+        | if . == null then false elif type == "boolean" then . else "bad" end' \
+        <<<"$CONFIG_JSON") || die "could not read .worker.autostart from the config"
+fi
+[[ "$WORKER_AUTOSTART" = true || "$WORKER_AUTOSTART" = false ]] \
+    || die ".worker.autostart must be true or false (a JSON boolean), not $(jq -c '.worker.autostart' <<<"$CONFIG_JSON")"
+START_WORKER=false
+if [[ "$HAS_WORKER" = true ]]; then
+    case "$WORKER_START_FLAG" in
+        on)  START_WORKER=true ;;
+        off) START_WORKER=false ;;
+        *)   START_WORKER="$WORKER_AUTOSTART" ;;
     esac
 fi
 
@@ -1107,9 +1144,18 @@ fi
 if [[ "$FRONTEND_ONLY" = true ]]; then
     echo -e "  Mode:      ${YELLOW}Frontend-only${NC}"
 elif [[ "$WORKER_TYPE" != "none" ]]; then
-    echo -e "  Mode:      ${GREEN}Full stack${NC} ($WORKER_TYPE worker)"
+    if [[ "$START_WORKER" = true ]]; then
+        echo -e "  Mode:      ${GREEN}Full stack${NC} ($WORKER_TYPE worker)"
+    else
+        echo -e "  Mode:      ${GREEN}Full stack${NC} ($WORKER_TYPE worker, not started)"
+    fi
 else
     echo -e "  Mode:      ${GREEN}Web only${NC} (no task queue)"
+fi
+if [[ "$WORKER_START_FLAG" = on && "$FRONTEND_ONLY" = true ]]; then
+    echo -e "  ${YELLOW}--with-worker ignored: --frontend-only gives this worktree no worker${NC}"
+elif [[ "$WORKER_START_FLAG" = on && "$HAS_WORKER" = false ]]; then
+    echo -e "  ${YELLOW}--with-worker: this worktree has no worker to start${NC}"
 fi
 if [[ -n "$DB_ENGINE" ]]; then
     if [[ "$SHARED_DB" = true ]]; then
@@ -1197,7 +1243,11 @@ if [[ "$DRY_RUN" = true ]]; then
         local_step=$((local_step + 1))
         echo -e "  $local_step. Generate docker-compose.yml"
         local_step=$((local_step + 1))
-        echo -e "  $local_step. Start Docker containers"
+        if [[ "$HAS_WORKER" = true && "$START_WORKER" = false ]]; then
+            echo -e "  $local_step. Start Docker containers (app only; the worker is not started)"
+        else
+            echo -e "  $local_step. Start Docker containers"
+        fi
     fi
 
     if [[ "$SKIP_NGINX" = false && -n "$NGINX_CONFIG" ]]; then
@@ -2058,8 +2108,9 @@ if [[ "$SKIP_DOCKER" = false ]]; then
             echo "$ENV_BLOCK"
         fi
 
-        # Worker container (if not frontend-only and worker type exists)
-        if [[ "$FRONTEND_ONLY" = false && "$WORKER_TYPE" != "none" ]]; then
+        # Worker container (if not frontend-only and worker type exists). Written
+        # whether or not it is started, so starting it later is one command.
+        if [[ "$HAS_WORKER" = true ]]; then
             echo ""
             echo "  ${WORKER_PREFIX}-${SAFE_NAME}:"
             echo "    container_name: ${WORKER_PREFIX}-${SAFE_NAME}"
@@ -2067,6 +2118,8 @@ if [[ "$SKIP_DOCKER" = false ]]; then
             echo "    env_file: .env"
             echo "$IMAGE_LINE"
             echo "    command: ${WORKER_COMMAND}"
+            # Out of every bare `up`; `--profile worker` or naming it starts it.
+            echo "    profiles: [\"worker\"]"
             echo "    networks:"
             echo "      ${NETWORK_NAME}:"
             echo "        aliases: []"
@@ -2094,9 +2147,14 @@ if [[ "$SKIP_DOCKER" = false ]]; then
     # failure that isn't about port binding.
     step "Starting Docker containers..."
     cd "$WORKTREE_DIR"
+    # The worker's profile keeps it out of a bare `up`; asking for the profile
+    # brings it in. Spelled as a string, not an array: an empty array under
+    # `set -u` is an unbound-variable error before bash 4.4.
+    UP_CMD="docker compose up -d"
+    [[ "$START_WORKER" = true ]] && UP_CMD="docker compose --profile worker up -d"
     START_OK=false
     for _attempt in 1 2 3 4 5; do
-        if UP_LOG=$(docker compose up -d 2>&1); then
+        if UP_LOG=$($UP_CMD 2>&1); then
             echo "$UP_LOG"
             START_OK=true
             break
@@ -2155,7 +2213,7 @@ sys.exit(0)
     else
         echo -e "${RED}Failed to start containers after retries${NC}"
         echo -e "${YELLOW}The worktree exists but its containers are not running.${NC}"
-        echo -e "${YELLOW}  Retry:  cd $WORKTREE_DIR && docker compose up -d${NC}"
+        echo -e "${YELLOW}  Retry:  cd $(sh_quote "$WORKTREE_DIR") && $UP_CMD${NC}"
         echo -e "${YELLOW}  Remove: remove-worktree $(sh_quote "$BRANCH_NAME")${NC}"
         exit 1
     fi
@@ -2427,8 +2485,11 @@ if [[ "$SKIP_DOCKER" = false ]]; then
     echo ""
     echo -e "  ${GREEN}Containers:${NC}"
     echo -e "    - ${PROJECT}-${SAFE_NAME}"
-    if [[ "$FRONTEND_ONLY" = false && "$WORKER_TYPE" != "none" ]]; then
+    if [[ "$HAS_WORKER" = true && "$START_WORKER" = true ]]; then
         echo -e "    - ${WORKER_PREFIX}-${SAFE_NAME}"
+    elif [[ "$HAS_WORKER" = true ]]; then
+        echo -e "    - ${WORKER_PREFIX}-${SAFE_NAME} ${YELLOW}(not started)${NC}"
+        echo -e "      Start it: cd $(sh_quote "$WORKTREE_DIR") && docker compose up -d ${WORKER_PREFIX}-${SAFE_NAME}"
     fi
 fi
 
