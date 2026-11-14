@@ -83,6 +83,13 @@ step() {
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# The worker rule is shared with remove-worktree and prune-worktrees (#854), so
+# the three cannot name a repo's worker container differently.
+WORKTREE_WORKER="$WORKTREE_SCRIPT_DIR/worktree-worker"
+[[ -r "$WORKTREE_WORKER" ]] || die "worktree-worker is not beside this script ($WORKTREE_WORKER) — the harness install is incomplete"
+# shellcheck source=worktree-worker
+. "$WORKTREE_WORKER"
+
 # A branch name as it can safely be PASTED into a shell.
 #
 # Every hint this script prints is a command line meant to be copied, and git's
@@ -336,23 +343,6 @@ detect_framework() {
         fi
     fi
     echo "unknown"
-}
-
-detect_worker_type() {
-    local root="$1"
-    for file in "$root/pyproject.toml" "$root/requirements.txt"; do
-        [[ -f "$file" ]] || continue
-        if grep -qi 'huey' "$file" 2>/dev/null; then echo "huey"; return; fi
-        if grep -qi '\brq\b' "$file" 2>/dev/null; then echo "rq"; return; fi
-        if grep -qi 'celery' "$file" 2>/dev/null; then echo "celery"; return; fi
-    done
-    # Check docker-compose for worker services
-    if [[ -f "$root/docker-compose.yml" ]]; then
-        if grep -qi 'huey' "$root/docker-compose.yml" 2>/dev/null; then echo "huey"; return; fi
-        if grep -qi '\brq\b' "$root/docker-compose.yml" 2>/dev/null; then echo "rq"; return; fi
-        if grep -qi 'celery' "$root/docker-compose.yml" 2>/dev/null; then echo "celery"; return; fi
-    fi
-    echo "none"
 }
 
 detect_docker_network() {
@@ -879,20 +869,12 @@ if [[ -z "$DB_ENGINE" ]]; then
 fi
 
 # Worker
-WORKER_TYPE=$(cfg '.worker.type' "$(detect_worker_type "$MAIN_REPO")")
-WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
+resolve_worker "$MAIN_REPO" "$PROJECT"
 WORKER_QUEUE_ENV=$(cfg '.worker.queue_env' "")
 WORKER_QUEUE_DEFAULT=$(cfg '.worker.queue_default' "$PROJECT")
 WORKER_COMMAND=$(cfg '.worker.command' "")
 
 # Set worker defaults based on type
-if [[ -z "$WORKER_PREFIX" ]]; then
-    case "$WORKER_TYPE" in
-        huey) WORKER_PREFIX="huey-consumer" ;;
-        rq) WORKER_PREFIX="${PROJECT}-rq-worker" ;;
-        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
-    esac
-fi
 if [[ -z "$WORKER_QUEUE_ENV" ]]; then
     case "$WORKER_TYPE" in
         huey) WORKER_QUEUE_ENV="HUEY_QUEUE_NAME" ;;
