@@ -12,7 +12,8 @@ wired in:
   path the reviewer can find (not just the first);
 * **later rounds** are handed the ledger and are closed-ended: verify each recorded
   invariant holds everywhere, report violations and genuinely new classes only;
-* **two strikes**: a class seen on a second path is owed a structural fix, and the next
+* **two strikes**: a class seen in a later round on a path its first round did not
+  list is owed a structural fix (paths found together in one round are one strike), and the next
   round will not start until `panel_classes.py structural` records one;
 * **the budget**: a round with no new class has converged. After
   `review_panel.class_ledger.rounds` (3) rounds without that, the next is refused and

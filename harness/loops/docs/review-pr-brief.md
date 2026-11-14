@@ -824,8 +824,8 @@ if the script isn't there.
 defect (the same missing argument, the same unguarded read), the fix is the one that
 makes the defect impossible by construction: a required argument, one gate plus a
 static guard, a type, a constraint. Patching each path is not that fix. When the
-orchestrator keeps a class ledger (`/panel-review-pr`, `codex_round.py`), a class seen on
-its second path is **owed** a structural fix: `panel_classes.py record` exits 5, and
+orchestrator keeps a class ledger (`/panel-review-pr`, `codex_round.py`), a class found
+in a later round on a path its first round did not list is **owed** a structural fix: `panel_classes.py record` exits 5, and
 "fix this path too" is refused. Make the class impossible, then record how with
 `panel_classes.py structural` (#836). If that is a redesign, it is step 3a's
 escalation, not your call.

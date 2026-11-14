@@ -32,6 +32,14 @@ def ledger_with(*paths, round_no=1, name=RESOLVER, limit=2):
     return ledger
 
 
+def owed_ledger():
+    """A class owed a structural fix: found on one path in round 1, then on a path
+    round 1 did not list in round 2 — the per-path fix did not cover it (#840)."""
+    ledger = ledger_with("a.py:10")
+    pc.record(ledger, RESOLVER, 2, "b.py:20", limit=2)
+    return ledger
+
+
 # ----------------------------------------------------------------------- identity
 
 def test_a_class_key_is_its_own_namespace_not_a_premises():
@@ -82,20 +90,48 @@ def test_the_second_distinct_path_makes_a_structural_fix_owed():
     assert verdict == {**verdict, "strikes": 2, "owed": True, "structural": False}
 
 
+def test_paths_found_together_in_one_round_are_one_strike():
+    """#840: the brief asks for EVERY instance of a class in one reply, so a class
+    with several instances on first sight is a class, not a per-path fix that
+    failed. Counting them made 14 of 15 classes owed on the first real run."""
+    ledger = ledger_with("a.py:10", "b.py:20", "c.py:30")
+    entry = ledger["classes"][0]
+    assert pc.strikes(entry) == 1 and not pc.is_owed(entry, 2)
+    assert pc.budget_refusal(ledger, 2, 2, 3) == ""
+
+
+def test_a_first_round_path_seen_again_later_is_not_a_new_strike():
+    ledger = ledger_with("a.py:10", "b.py:20")
+    verdict = pc.record(ledger, RESOLVER, 2, "b.py:20")
+    assert verdict["strikes"] == 1 and not verdict["owed"]
+
+
+def test_each_later_round_path_is_its_own_strike():
+    ledger = owed_ledger()
+    pc.record(ledger, RESOLVER, 3, "c.py:30")
+    assert pc.strikes(ledger["classes"][0]) == 3
+
+
+def test_the_cli_takes_a_whole_first_round_without_a_strike(cli):
+    for path in ("a.py:1", "b.py:2", "c.py:3"):
+        assert cli("record", "--round", "1", "--class", RESOLVER, "--path", path,
+                   "--invariant", INVARIANT) == 0
+
+
 def test_a_strike_limit_switched_off_owes_nothing():
     ledger = ledger_with("a.py:10", "b.py:20", "c.py:30", limit=None)
     assert not pc.is_owed(ledger["classes"][0], None)
 
 
 def test_a_structural_fix_must_name_its_enforcement_and_guard_test():
-    ledger = ledger_with("a.py:10", "b.py:20")
+    ledger = owed_ledger()
     with pytest.raises(ValueError, match="enforcement and its guard_test"):
         pc.record_structural(ledger, RESOLVER, 1, "viewer is required")
 
 
 def test_a_recorded_structural_fix_clears_the_debt():
-    ledger = ledger_with("a.py:10", "b.py:20")
-    pc.record_structural(ledger, RESOLVER, 1, "viewer is a required kwarg",
+    ledger = owed_ledger()
+    pc.record_structural(ledger, RESOLVER, 2, "viewer is a required kwarg",
                          enforcement="keyword-only viewer=",
                          guard_test="AST walk: no resolve() without viewer")
     assert not pc.is_owed(ledger["classes"][0], 2)
@@ -105,10 +141,10 @@ def test_any_sighting_after_the_structural_fix_reopens_the_debt():
     """"Impossible by construction" that then turns up again was not — on a new path
     or on one the fix was meant to have closed."""
     for path in ("mcp/read.py:7", "a.py:10"):
-        ledger = ledger_with("a.py:10", "b.py:20")
-        pc.record_structural(ledger, RESOLVER, 1, "required kwarg",
+        ledger = owed_ledger()
+        pc.record_structural(ledger, RESOLVER, 2, "required kwarg",
                              enforcement="kw-only viewer", guard_test="AST walk")
-        assert pc.record(ledger, RESOLVER, 2, path)["owed"]
+        assert pc.record(ledger, RESOLVER, 3, path)["owed"]
 
 
 # ------------------------------------------------------------- convergence + budget
@@ -142,15 +178,15 @@ def test_a_converged_round_at_the_budget_is_not_refused():
 
 
 def test_a_round_does_not_start_while_a_structural_fix_is_owed():
-    ledger = ledger_with("a.py:10", "b.py:20")
-    assert "structural fix is owed" in pc.budget_refusal(ledger, 2, 2, 3)
+    ledger = owed_ledger()
+    assert "structural fix is owed" in pc.budget_refusal(ledger, 3, 2, 3)
     assert pc.budget_refusal(pc.new_ledger(), 2, 2, 3) == ""
     assert pc.budget_refusal(ledger, 1, 2, 3) == ""
 
 
 def test_the_report_offers_structural_options_for_an_open_class():
-    ledger = ledger_with("a.py:10", "b.py:20")
-    text = pc.report(ledger, pc.round_state(ledger, 1, 2, 3))
+    ledger = owed_ledger()
+    text = pc.report(ledger, pc.round_state(ledger, 2, 2, 3))
     assert "STRUCTURAL FIX OWED" in text and "a required argument" in text
 
 
@@ -249,13 +285,13 @@ def cli(monkeypatch, tmp_path):
 def test_the_cli_refuses_a_per_path_patch_on_the_second_strike(cli, capsys):
     assert cli("record", "--round", "1", "--class", RESOLVER, "--path", "a.py:1",
                "--invariant", INVARIANT) == 0
-    assert cli("record", "--round", "1", "--class", RESOLVER, "--path",
+    assert cli("record", "--round", "2", "--class", RESOLVER, "--path",
                "b.py:2") == pc.STRUCTURAL_OWED_EXIT
     assert "Do NOT patch this path too" in capsys.readouterr().err
-    assert cli("status", "--round", "1") == pc.STRUCTURAL_OWED_EXIT
-    assert cli("structural", "--round", "1", "--class", RESOLVER, "--how", "required",
+    assert cli("status", "--round", "2") == pc.STRUCTURAL_OWED_EXIT
+    assert cli("structural", "--round", "2", "--class", RESOLVER, "--how", "required",
                "--enforcement", "kw-only", "--guard-test", "AST walk") == 0
-    assert cli("status", "--round", "2") == 0
+    assert cli("status", "--round", "3") == 0
 
 
 def test_the_cli_status_says_a_round_that_found_a_new_class_has_not_converged(cli):
@@ -318,7 +354,7 @@ def test_the_owner_can_raise_the_budget_for_one_run(monkeypatch, tmp_path):
 
 def test_a_round_with_a_structural_fix_owed_is_refused(monkeypatch, tmp_path):
     code, prompts, _ = _panel_run(monkeypatch, tmp_path,
-                                  ledger_with("a.py:10", "b.py:20"))
+                                  owed_ledger())
     assert code == pc.STRUCTURAL_OWED_EXIT and prompts == []
 
 
@@ -353,7 +389,7 @@ def test_a_later_sighting_cannot_rewrite_the_invariant():
 
 
 def test_a_structural_fix_for_a_round_that_has_not_run_is_refused():
-    ledger = ledger_with("a.py:10", "b.py:20")
+    ledger = owed_ledger()
     with pytest.raises(ValueError, match="has not run"):
         pc.record_structural(ledger, RESOLVER, 999, "required", enforcement="kw-only",
                              guard_test="AST walk")
@@ -361,7 +397,7 @@ def test_a_structural_fix_for_a_round_that_has_not_run_is_refused():
 
 
 def test_a_structural_fix_read_back_without_its_guard_test_is_not_one(tmp_path):
-    ledger = ledger_with("a.py:10", "b.py:20")
+    ledger = owed_ledger()
     ledger["classes"][0]["structural"] = {"how": "required", "round": 1}
     path = tmp_path / "classes.json"
     pc.save_ledger(str(path), ledger)
@@ -435,7 +471,7 @@ def test_a_clean_round_between_two_does_not_spend_the_budget():
 
 
 def test_a_dismissed_class_owes_nothing_and_is_briefed_as_ruled_out():
-    ledger = ledger_with("a.py:10", "b.py:20")
+    ledger = owed_ledger()
     pc.record_dismissal(ledger, RESOLVER, 1, "the viewer is implied by the session")
     assert not pc.is_owed(ledger["classes"][0], 2)
     assert pc.budget_refusal(ledger, 2, 2, 3) == ""
@@ -455,7 +491,7 @@ def test_a_dismissal_needs_a_reason_and_a_round_that_ran():
 def test_the_cli_dismisses_a_class_and_it_survives_the_file(cli):
     cli("record", "--round", "1", "--class", RESOLVER, "--path", "a.py:1",
         "--invariant", INVARIANT)
-    cli("record", "--round", "1", "--class", RESOLVER, "--path", "b.py:2")
+    cli("record", "--round", "2", "--class", RESOLVER, "--path", "b.py:2")
     assert cli("status", "--round", "1") == pc.STRUCTURAL_OWED_EXIT
     assert cli("dismiss", "--round", "1", "--class", RESOLVER, "--why", "not real") == 0
     assert cli("status", "--round", "1") == 1
@@ -471,7 +507,7 @@ def test_the_cli_dismisses_a_class_and_it_survives_the_file(cli):
      "has not run"),
 ])
 def test_a_ledger_that_lost_part_of_itself_is_a_problem(tmp_path, mutate, says):
-    raw = ledger_with("a.py:10", "b.py:20")
+    raw = owed_ledger()
     mutate(raw)
     path = tmp_path / "classes.json"
     path.write_text(json.dumps(raw))

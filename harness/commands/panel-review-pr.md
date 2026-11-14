@@ -976,10 +976,13 @@ python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes
     [--enforcement "<how it is made impossible>"] [--guard-test "<what keeps it so>"]
 ```
 
-- **Exit 5 is the two-strike rule.** The class is now seen on a second path, so
-  the fix pass must make it impossible by construction (a required argument, one
+- **Exit 5 is the two-strike rule.** The class has turned up, in a later round, on
+  a path its first round did not list: the per-path fix did not cover it, so the
+  fix pass must make it impossible by construction (a required argument, one
   gate plus a static guard, a type, a constraint), and "fix this path too" is
-  refused. Tell the fixer that in §4's brief, for that class, and once the fix
+  refused. Every path recorded in a class's FIRST round together is one strike
+  (#840): the brief asks for every instance at once, so a class found with three
+  instances is a class, not three failed fixes. Tell the fixer that in §4's brief, for that class, and once the fix
   exists record it with
   `panel_classes.py structural --class <key> --how … --enforcement … --guard-test …`.
   A structural fix that is really a redesign is step 3a's escalation.
