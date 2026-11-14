@@ -80,6 +80,8 @@ CLEANUP_WARNINGS=()
 warn_cleanup() { CLEANUP_WARNINGS+=("$1"); echo "WARNED: $1"; }
 REMOVED=()
 removed() { REMOVED+=("$1"); echo "REMOVED: $1"; }
+UNKNOWN_OUTCOMES=()
+could_not_tell() { UNKNOWN_OUTCOMES+=("$1"); echo "UNKNOWN: $1"; }
 """
 
 
@@ -116,7 +118,10 @@ def run_stanza(branch="feat/issue-337", *, keep="false", stub: str | None = None
                       + f'KEEP_CLAIM={keep}\nMAIN_REPO={tmp_path}\n'
                       + release_block()
                       + f'\nrelease_the_claim {branch!r} {left!r}\n'
-                      + 'echo "WARNINGS=${#CLEANUP_WARNINGS[@]}"\n')
+                      # Both lists: a could-not-tell outcome is said out loud and
+                      # recorded too, and that is what these tests pin (#843).
+                      + 'echo "WARNINGS=$(( ${#CLEANUP_WARNINGS[@]}'
+                      + ' + ${#UNKNOWN_OUTCOMES[@]} ))"\n')
     return subprocess.run(
         [BASH, str(script)], capture_output=True, text=True,
         env={"PATH": _path_sandbox.sandbox_path(tmp_path, bindir),

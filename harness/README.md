@@ -657,8 +657,13 @@ complete" (#808). It decides from the steps, not from a list checked beforehand,
 deleted by hand still has its leftovers cleaned, including a claim `qb-reconcile` sends you here
 to hand back. A directory the delete could not remove, a registration prune could not clear, a
 branch it could not delete, an nginx block not removed or not reloaded, a port file not
-rewritten and a claim answer it could not read are each recorded as warnings, so the summary
-reads "finished WITH WARNINGS".
+rewritten, a container that `docker rm -f` did not remove and a compose stack `down` left running
+are each recorded as warnings, so the summary reads "finished WITH WARNINGS". Container removal is
+read from what was listed before and after, never from an exit code. A step that could not TELL
+(no board, an unreadable claim answer, no DB user, no Postgres answering) is kept apart from one
+that left something behind: it is printed with every summary, but it does not keep a run that
+removed nothing out of exit 2 (#843). Port rows match exactly first; the flattened name is used
+only when it picks out one row, and an ambiguous file is a warning with nothing dropped.
 
 The commands are thin, guarded drivers over these. The scripts hold the deterministic
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model

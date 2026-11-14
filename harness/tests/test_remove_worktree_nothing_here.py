@@ -181,14 +181,69 @@ def test_a_claim_that_was_not_held_is_not_something_removed(repo, tmp_path,
     assert proc.returncode == 2
 
 
-def test_only_containers_left_are_removed(repo, tmp_path):
-    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": '''
+def fake_docker(tmp_path, running: list[str], stuck: tuple[str, ...] = ()) -> str:
+    """A `docker` whose `ps -a` lists `running` until `rm -f` takes one away — except
+    the `stuck` ones, whose removal fails. State lives in a file, because a fake
+    that lists the same names whatever happened cannot tell removal from failure."""
+    state = tmp_path / "docker-state"
+    state.write_text("".join(f"{n}\n" for n in running))
+    stuck_list = " ".join(stuck)
+    return f'''
+state={state}
 case "$1" in
-  ps) echo "proj-fix-issue-43" ;;
-  rm) exit 0 ;;
-esac'''})
+  ps) cat "$state" ;;
+  rm) shift; [[ "$1" == -f ]] && shift
+      for s in {stuck_list}; do [[ "$1" == "$s" ]] && exit 1; done
+      grep -vx -- "$1" "$state" > "$state.new"; mv "$state.new" "$state" ;;
+esac'''
+
+
+def test_only_containers_left_are_removed(repo, tmp_path):
+    docker = fake_docker(tmp_path, ["proj-fix-issue-43"])
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
 
     assert complete(proc)
+    assert (tmp_path / "docker-state").read_text() == ""
+
+
+def test_a_container_docker_rm_could_not_remove_is_a_warning(repo, tmp_path):
+    docker = fake_docker(tmp_path, ["proj-fix-issue-43"], stuck=("proj-fix-issue-43",))
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
+
+    assert "WITH WARNINGS" in proc.stdout and "is still there" in proc.stdout
+    assert "No containers found" not in proc.stdout
+
+
+def test_a_partial_container_removal_warns_for_the_one_left(repo, tmp_path):
+    (repo / ".worktree.json").write_text(json.dumps({"worker": {"type": "huey"}}))
+    docker = fake_docker(tmp_path, ["proj-fix-issue-43", "huey-consumer-fix-issue-43"],
+                         stuck=("huey-consumer-fix-issue-43",))
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
+
+    assert "Removed container proj-fix-issue-43" in proc.stdout
+    assert "huey-consumer-fix-issue-43 is still there" in proc.stdout
+    assert "WITH WARNINGS" in proc.stdout
+
+
+def test_compose_down_with_nothing_running_is_not_a_removal(repo, tmp_path):
+    """`docker compose down` exits 0 with nothing up. That is not a removal, so the
+    one artefact left (a branch kept by --keep-branch) still ends in exit 2."""
+    wt = add_worktree(repo, "fix-issue-43", "fix/issue-43")
+    (wt / "docker-compose.yml").write_text("services: {}\n")
+    docker = 'case "$1 $2" in "compose ps") exit 0 ;; "compose down") exit 0 ;; esac'
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
+
+    assert "Containers stopped via docker compose down" not in proc.stdout
+    assert "compose stack" not in proc.stdout
+
+
+def test_a_compose_down_that_leaves_containers_up_is_a_warning(repo, tmp_path):
+    wt = add_worktree(repo, "fix-issue-43", "fix/issue-43")
+    (wt / "docker-compose.yml").write_text("services: {}\n")
+    docker = 'case "$1 $2" in "compose ps") echo abc123 ;; "compose down") exit 1 ;; esac'
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
+
+    assert "left 1 of 1 container(s) running" in proc.stdout and "WITH WARNINGS" in proc.stdout
 
 
 def test_the_real_qb_release_saying_nothing_is_held_still_ends_in_exit_2(tmp_path,
@@ -204,13 +259,74 @@ def test_the_real_qb_release_saying_nothing_is_held_still_ends_in_exit_2(tmp_pat
 
 
 @pytest.mark.parametrize("answer", ["not json", '{"released": "x"}', '{"other": []}'])
-def test_a_claim_answer_that_cannot_be_read_is_a_warning(repo, tmp_path, other_repo,
-                                                         answer):
+def test_a_claim_answer_that_cannot_be_read_is_could_not_tell(repo, tmp_path, other_repo,
+                                                              answer):
     """Exit 0 from qb-release with output that is not a `released` array says nothing
-    about whether a claim went, so it is neither "removed" nor nothing."""
+    about whether a claim went. With nothing else removed, that is still exit 2 —
+    and the refusal names what could not be told."""
     proc = run_with(other_repo, ["fix-issue-43"], tmp_path,
                     {"qb-release": f"echo '{answer}'"})
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "could not read qb-release's answer" in proc.stderr
+
+
+def test_a_claim_answer_that_cannot_be_read_still_warns_after_a_removal(repo, tmp_path):
+    git(repo, "branch", "fix/issue-43")
+    proc = run_with(repo, ["fix/issue-43"], tmp_path, {"qb-release": "echo 'not json'"})
     assert proc.returncode == 0 and "WITH WARNINGS" in proc.stdout
+    assert "could not read qb-release's answer" in proc.stdout
+
+
+def test_a_board_that_did_not_answer_from_the_wrong_repo_is_still_exit_2(tmp_path,
+                                                                         other_repo):
+    """#843: qb-release exit 2 (no board, no origin) is could-not-tell. From the
+    wrong checkout it used to give WITH WARNINGS and exit 0, and no word that the
+    worktree was never in this repo."""
+    proc = run_with(other_repo, ["fix-issue-43"], tmp_path,
+                    {"qb-release": "echo 'unknown: board down' >&2; exit 2"})
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "Nothing removed" in proc.stderr and "NOT handed back" in proc.stderr
+
+
+def test_a_db_user_that_cannot_be_found_is_could_not_tell(tmp_path, other_repo):
+    (other_repo / ".env").write_text("DATABASE_URL=postgresql://nobody\n")
+    proc = run_with(other_repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "could not determine DB user" in proc.stderr
+
+
+# ------------------------------------------------------- the port file's rows
+
+def test_an_exact_port_row_is_dropped_and_its_flattened_twin_kept(repo, tmp_path):
+    """`fix/issue-43` and `fix-issue-43` are two worktrees once flattened. Tearing
+    down one drops its own row and leaves the other's port reserved."""
+    (repo / ".worktree-ports").write_text("5698:fix/issue-43\n5699:fix-issue-43\n")
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
+
+    assert complete(proc)
+    assert (repo / ".worktree-ports").read_text() == "5698:fix/issue-43\n"
+
+
+def test_two_flattened_port_rows_and_no_exact_one_drop_none(repo, tmp_path):
+    rows = "5698:fix/issue-43\n5699:fix-issue/43\n"
+    (repo / ".worktree-ports").write_text(rows)
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
+
+    assert (repo / ".worktree-ports").read_text() == rows
+    assert "WITH WARNINGS" in proc.stdout and "none is exact" in proc.stdout
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="permission bits do not stop root")
+def test_a_port_file_that_cannot_be_read_is_a_warning(repo, tmp_path):
+    ports = repo / ".worktree-ports"
+    ports.write_text("5698:fix/issue-43\n")
+    ports.chmod(0o000)
+    try:
+        proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
+    finally:
+        ports.chmod(0o644)
+
+    assert "could not read" in proc.stdout and "No port entry found" not in proc.stdout
 
 
 def test_a_kept_branch_is_not_something_removed(repo, tmp_path):
