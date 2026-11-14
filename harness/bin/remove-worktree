@@ -29,8 +29,8 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        when that is what it is looking at. Look with
 #                        `fuser -v <the lockfile it names>` first (#743)
 #
-# Exit 2: every step ran, none of them removed anything, and none of them warned
-# (#808). Usually the shell is in a different checkout from the worktree's.
+# Exit 2: no step that ran removed anything, and none of them warned (#808).
+# Usually the shell is in a different checkout from the worktree's.
 # Decided from what the steps did (REMOVED below), not from a probe.
 
 # ============================================
@@ -316,8 +316,8 @@ release_the_claim() {
     # **The tree is still there, so the checkout the claim belongs to is still
     # there.** The recursive delete in STEP 4 is `2>/dev/null` and fails against
     # root-owned files a container wrote (STEP 4 warns about that itself, and
-    # `prune-worktrees --remove-dirs` carries the sudo hint). Handing the claim back over a directory
-    # somebody can still `cd` into reports a slot free that is occupied — the
+    # `prune-worktrees --remove-dirs` carries the sudo hint). Handing the claim
+    # back over a directory somebody can still `cd` into reports a slot free that is occupied — the
     # exact wrong answer for a window that counts claims. So it stays held, is
     # said out loud, and is recorded: the TTL is under it, and
     # `prune-worktrees --prune` sweeps it once the tree really is gone.
@@ -330,27 +330,31 @@ release_the_claim() {
     # `${0%/*}` leaves $0 untouched and would build a nonsense path.
     if [[ -z "$qr" && "$0" == */* ]]; then qr="${0%/*}/qb-release"; fi
     if [[ -z "$qr" || ! -x "$qr" ]]; then
+        # A note, not a warning: no board tooling is a fact about this HOST, and a
+        # warning here would put "WITH WARNINGS" on every teardown it runs.
         echo -e "${YELLOW}qb-release not found — claim (if any) left held${NC}"
         return 0
     fi
     # --json, because exit 0 means both "released" and "nothing was held", and
     # only the first is something this teardown removed. Its "nothing" paths (no
     # live claim, a branch naming no issue) print no JSON at all, so empty output
-    # is a count of zero; only output that is there and unreadable is unknown.
+    # is a count of zero. Output that is there but is not a `released` array, or
+# that jq cannot read (jq absent included), is unknown.
     local out n
     out=$("$qr" --branch "$branch" --repo-path "$MAIN_REPO" --json)
     rc=$?
     if [[ -z "${out//[[:space:]]/}" ]]; then
         n=0
     else
-        n=$(jq -r '.released | length' <<<"$out" 2>/dev/null || true)
+        n=$(jq -r 'if (.released | type) == "array" then .released | length else "?" end' \
+                <<<"$out" 2>/dev/null || true)
     fi
     case "$rc" in
         0) if [[ "$n" =~ ^[0-9]+$ ]]; then
                [[ "$n" -gt 0 ]] && removed "claim"
                echo -e "${GREEN}Done${NC}"
            else
-               warn_cleanup "qb-release answered, but not in a form this could read — whether a claim was handed back is unknown"
+               warn_cleanup "could not read qb-release's answer — whether a claim was handed back is unknown"
            fi ;;
         1) echo -e "${YELLOW}Not ours to hand back (see above) — left alone${NC}" ;;
         *) warn_cleanup "the claim on '$branch' was NOT handed back (see above) and stays held until it lapses" ;;
@@ -688,7 +692,9 @@ if [[ ! -d "$WORKTREE_DIR" ]]; then
         # Prefer the original (possibly slash-bearing) create-name from the port
         # file, so port/nginx keys still match.
         if [[ -f "$MAIN_REPO/.worktree-ports" ]]; then
-            pf=$(awk -F: -v d="$CREATE_NAME" "$CREATE_NAME_AWK"'same_create_name($2, d) {print $2; exit}' "$MAIN_REPO/.worktree-ports")
+            pf=$(awk -F: -v d="$CREATE_NAME" \
+                     "$CREATE_NAME_AWK"'same_create_name($2, d) {print $2; exit}' \
+                     "$MAIN_REPO/.worktree-ports")
             [[ -n "$pf" ]] && CREATE_NAME="$pf"
         fi
         BRANCH_NAME="$CREATE_NAME"
@@ -1130,11 +1136,12 @@ fi
 if [[ -d "$WORKTREE_DIR" ]]; then
     rm -rf "$WORKTREE_DIR" 2>/dev/null
 fi
-# Only for a registration this teardown came for, once its directory is gone: a
-# tree deleted by hand leaves the registration behind and `git worktree remove`
-# may not clear it. Not on every run — prune is repo-wide, and another worktree
-# whose directory is briefly missing (an unmounted volume) would lose its own.
-if [[ "$HAD_REGISTRATION" = true && ! -d "$WORKTREE_DIR" ]]; then
+# Only when this teardown's own registration survived the removes above, which
+# is the hand-deleted case: its directory was already gone, so `git worktree
+# remove` had nothing to act on. Prune is still repo-wide when it runs, so it is
+# kept to that case; another worktree whose directory is briefly missing (an
+# unmounted volume) loses its registration only if it is pruned in the same call.
+if [[ "$HAD_REGISTRATION" = true && ! -d "$WORKTREE_DIR" ]] && is_registered; then
     git -C "$MAIN_REPO" worktree prune 2>/dev/null || true
 fi
 
@@ -1292,6 +1299,7 @@ if [[ -f "$PORT_FILE" ]]; then
             removed "port entry"
             echo -e "${GREEN}Done${NC}"
         else
+            rm -f "$PORT_FILE.tmp"
             warn_cleanup "could not rewrite $PORT_FILE — the port entry is still there"
         fi
     else
@@ -1314,14 +1322,14 @@ release_the_claim "$BRANCH_NAME" "$WORKTREE_DIR"
 # SUMMARY
 # ============================================
 echo ""
-# Every step ran, none removed anything and none warned — the one outcome that is
+# No step that ran removed anything and none warned — the one outcome that is
 # neither a clean teardown nor a partial one (#808). It says only that: a step
 # skipped by a --keep flag also removes nothing, so this cannot claim absence.
 if [[ ${#REMOVED[@]} -eq 0 && ${#CLEANUP_WARNINGS[@]} -eq 0 ]]; then
     echo -e "${RED}========================================${NC}" >&2
     echo -e "${RED}Nothing removed for '$BRANCH_NAME' in $MAIN_REPO${NC}" >&2
     echo -e "${RED}========================================${NC}" >&2
-    echo "  Every step ran and none of them removed anything (see above). If the" >&2
+    echo "  No step that ran removed anything (see above). If the" >&2
     echo "  worktree belongs to another repository, run this from inside that one." >&2
     exit 2
 fi

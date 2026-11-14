@@ -651,13 +651,14 @@ allocates a port. `remove-worktree` reverses it. `prune-worktrees` is the orphan
 it is the only one that is dry-run by default.
 
 `remove-worktree` resolves the repo from the shell's checkout, and the branch name is its only
-argument. Each step records what it actually removed. When every step ran, none removed
-anything and none warned, it exits 2 and names the repo it searched, rather than ending on "Cleanup complete"
-(#808). It decides from the steps, not from a list checked beforehand, so a tree deleted by hand
-still has its leftovers cleaned, including a claim `qb-reconcile` sends you here to hand back.
-A directory the delete could not remove, a registration prune could not clear, a branch it could
-not delete, and an nginx block removed but not reloaded are each recorded as warnings, so the
-summary reads "finished WITH WARNINGS".
+argument. Each step records what it actually removed. When no step that ran removed anything
+and none warned, it exits 2 and names the repo it searched, rather than ending on "Cleanup
+complete" (#808). It decides from the steps, not from a list checked beforehand, so a tree
+deleted by hand still has its leftovers cleaned, including a claim `qb-reconcile` sends you here
+to hand back. A directory the delete could not remove, a registration prune could not clear, a
+branch it could not delete, an nginx block not removed or not reloaded, a port file not
+rewritten and a claim answer it could not read are each recorded as warnings, so the summary
+reads "finished WITH WARNINGS".
 
 The commands are thin, guarded drivers over these. The scripts hold the deterministic
 logic on purpose: a model deciding *which* worktree to destroy is fine, a model

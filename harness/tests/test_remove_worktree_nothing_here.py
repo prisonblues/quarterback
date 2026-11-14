@@ -146,11 +146,12 @@ def test_a_teardown_does_not_prune_another_worktrees_registration(repo, tmp_path
     """Prune is repo-wide. Another tree whose directory is briefly missing (an
     unmounted volume) keeps its registration through an unrelated teardown."""
     other = add_worktree(repo, "feat-elsewhere", "feat/elsewhere")
+    target = add_worktree(repo, "fix-issue-43", "fix/issue-43")
     parked = other.with_name(other.name + ".unmounted")
     other.rename(parked)
-    git(repo, "branch", "fix/issue-43")
     try:
-        run_with(repo, ["fix/issue-43"], tmp_path, NOTHING_HELD)
+        proc = run_with(repo, ["fix-issue-43"], tmp_path, NOTHING_HELD)
+        assert complete(proc) and not target.exists()
         assert registered(repo, other)
     finally:
         parked.rename(other)
@@ -171,8 +172,7 @@ def test_only_a_claim_left_is_handed_back(repo, tmp_path):
     proc = run_with(repo, ["fix-issue-43"], tmp_path, {
         "qb-release": "echo '" + json.dumps({"released": [{"kind": "issue"}]}) + "'"})
 
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "Nothing removed" not in proc.stderr
+    assert complete(proc)
 
 
 def test_a_claim_that_was_not_held_is_not_something_removed(repo, tmp_path,
@@ -203,11 +203,13 @@ def test_the_real_qb_release_saying_nothing_is_held_still_ends_in_exit_2(tmp_pat
     assert proc.returncode == 2, proc.stdout + proc.stderr
 
 
-def test_a_claim_answer_that_cannot_be_read_is_a_warning(repo, tmp_path, other_repo):
-    """Exit 0 from qb-release with output this cannot parse says nothing about
-    whether a claim went, so it is neither "removed" nor nothing."""
+@pytest.mark.parametrize("answer", ["not json", '{"released": "x"}', '{"other": []}'])
+def test_a_claim_answer_that_cannot_be_read_is_a_warning(repo, tmp_path, other_repo,
+                                                         answer):
+    """Exit 0 from qb-release with output that is not a `released` array says nothing
+    about whether a claim went, so it is neither "removed" nor nothing."""
     proc = run_with(other_repo, ["fix-issue-43"], tmp_path,
-                    {"qb-release": "echo 'not json'"})
+                    {"qb-release": f"echo '{answer}'"})
     assert proc.returncode == 0 and "WITH WARNINGS" in proc.stdout
 
 
