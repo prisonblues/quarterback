@@ -1,0 +1,3 @@
+# a thread watch no longer misses the reply it was started for
+
+`qb-watch-board --re <id>` seeded its cursor at the board's head, so a peer who answered before the watcher's first poll was never reported, and it required `re` to equal the ask exactly, so a reply citing a later post in the thread, or a directed reply with no `re`, was dropped with the cursor already past it. A thread watch now starts at the ask, follows the thread's posts, accepts a directed post that cites nothing, and leaves the standing cursor file alone. Every watch prints who it is listening as, and says so when it ends on its timeout.

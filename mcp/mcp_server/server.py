@@ -44,9 +44,10 @@ _CALLER_DEPTH = 25
 
 AWAITS_REPLY = ("ask", "stuck")
 WATCH_HINT = (
-    "Do not end your turn waiting on this. Start `qb-watch-board --re {id}` under "
-    "the Monitor tool so the reply wakes you, and carry on with whatever does not "
-    "depend on the answer."
+    "Do not end your turn waiting on this. If the peer is on this machine, a direct "
+    "SendMessage (see ListAgents) wakes it, and notify_when_idle tells you when it "
+    "has finished. Otherwise start `qb-watch-board --re {id}` under the Monitor tool "
+    "so the reply wakes you. Carry on with whatever does not depend on the answer."
 )
 POST_TYPES = [
     "note",
@@ -219,7 +220,10 @@ mcp = FastMCP(
         "tool: it prints one line when a reply lands and is silent otherwise, so you "
         "wake on it. Do the part of the work that does not depend on the answer "
         "meanwhile. Without a watcher nothing wakes an idle agent, and the reply "
-        "waits for a human to type.\n"
+        "waits for a human to type. For a peer on the SAME machine, Claude Code's own "
+        "SendMessage wakes an idle session directly (find it with ListAgents; pass "
+        "notify_when_idle to hear when it finishes); the board post stays the durable "
+        "record, and the watcher is for peers on another machine.\n"
         "**Pointed at a post? Act on it, do not just ack.** When you are given a post "
         "number, `board_get` it, read the detail, and do what it asks or implies — "
         "investigate, fix, answer — then reply with the result. An `ack` that only "

@@ -28,6 +28,9 @@ Three rules are built on it:
    on a path the structural fix did not close re-opens the debt — the "impossible"
    claim was false. A class the builder finds is not a defect is recorded with
    ``dismiss`` and a reason: it owes nothing, and later rounds are told it is ruled out.
+   A real class that is not this change's to fix is DEFERRED to an issue (``file``
+   files it, ``defer`` records one filed by hand): it owes nothing either, and later
+   rounds are told it is tracked elsewhere (#844).
 3. **A budget measured in convergence.** A round converges when it records no new
    class. After ``class_ledger.rounds`` rounds without that (a clean round in between
    spends nothing), the next round is refused
@@ -44,8 +47,18 @@ Usage:
     panel_classes.py structural --ledger L --round N --class NAME|KEY --how ..
         [--enforcement ..] [--guard-test ..]
     panel_classes.py dismiss --ledger L --round N --class NAME|KEY --why ..
+    panel_classes.py file --ledger L --round N --class NAME|KEY --rule RULE
+        [--github OWNER/NAME]
+    panel_classes.py defer --ledger L --round N --class NAME|KEY --rule RULE --issue N
     panel_classes.py status --ledger L --round N
+    panel_classes.py mark --payload ROUND.json
     panel_classes.py brief --ledger L [--wave OTHER ...]
+
+Every command that takes --round also takes --payload, the round's own `--json-file`
+payload: its `class_ledger` block names the ledger round, the PR and the ledger path,
+so the orchestrator never maps a panel round to a ledger round by hand (#846). The
+two numberings differ on purpose — `--new-cycle` restarts the panel at round 1 and
+the ledger never restarts — and `--payload` is what keeps them from drifting.
 """
 from __future__ import annotations
 
@@ -53,6 +66,7 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -88,6 +102,17 @@ STRUCTURAL_SHAPES = ("a required argument the path cannot be called without",
                      "a database constraint")
 
 LEDGER_HEADING = "RECORDED DEFECT CLASSES — this round is a check against this list"
+
+#: Why a real class is left for later rather than fixed in this loop (#844). Every
+#: deferral names one, because "left for later" is a judgement the owner reads.
+#: pre-existing   — the change neither caused it nor made it worse
+#: outside-change — a seat's "outside the change:" note, outside the changed behaviour
+#: budget         — fixing it would grow the change past `low_severity_fix_lines`
+#: owner          — the owner said so
+DEFER_RULES = ("pre-existing", "outside-change", "budget", "owner")
+
+#: The label a filed class carries — used only when the repo already has it.
+FOUND_LABEL = "found-in-review"
 
 
 def class_key(name: str) -> str:
@@ -159,11 +184,17 @@ def _clean_entry(entry: object) -> dict | None:
     if not (isinstance(dismissed, dict) and str(dismissed.get("why") or "").strip()
             and _round(dismissed.get("round")) is not None):
         dismissed = None
+    deferred = entry.get("deferred")
+    if not (isinstance(deferred, dict) and deferred.get("rule") in DEFER_RULES
+            and _round(deferred.get("issue")) is not None
+            and _round(deferred.get("round")) is not None):
+        deferred = None
     name = " ".join(str(entry["name"]).split())
     return {"key": class_key(name), "name": name,
             "invariant": str(entry.get("invariant") or ""),
             "enforcement": enforcement, "guard_test": guard_test,
-            "sightings": sightings, "structural": structural, "dismissed": dismissed}
+            "sightings": sightings, "structural": structural, "dismissed": dismissed,
+            "deferred": deferred}
 
 
 def load_ledger(path: str, repo: str = "", pr: int | None = None
@@ -219,7 +250,7 @@ def load_ledger(path: str, repo: str = "", pr: int | None = None
         problems.append(f"class ledger {path} carries a round record that is not a "
                         "round number — it was NOT counted")
     for e in ledger["classes"]:
-        for mark in ("structural", "dismissed"):
+        for mark in ("structural", "dismissed", "deferred"):
             if e[mark] and e[mark]["round"] > last_round(ledger):
                 problems.append(f"class ledger {path}: [{e['key']}]'s {mark} record "
                                 f"names round {e[mark]['round']}, which has not run — "
@@ -303,7 +334,8 @@ def is_owed(entry: dict, limit: int | None) -> bool:
     or a new one: a class that was "impossible by construction" and then turned up was
     not. (Before a structural fix, the same path seen again is a patch that did not
     hold, and is not a second strike.)"""
-    if entry.get("dismissed") or limit is None or strikes(entry) < limit:
+    if (entry.get("dismissed") or entry.get("deferred") or limit is None
+            or strikes(entry) < limit):
         return False
     fix = entry.get("structural")
     if not fix:
@@ -337,7 +369,7 @@ def record(ledger: dict, name: str, round_no: int, path: str, *,
                              f"held everywhere, rules out {name!r}")
         entry = {"key": class_key(name), "name": name, "invariant": "",
                  "enforcement": "", "guard_test": "", "sightings": [],
-                 "structural": None, "dismissed": None}
+                 "structural": None, "dismissed": None, "deferred": None}
         ledger.setdefault("classes", []).append(entry)
     # A later sighting FILLS a field nobody recorded; it never rewrites one. The
     # invariant is what every later round is checked against, so a restatement in a
@@ -406,6 +438,91 @@ def record_dismissal(ledger: dict, name: str, round_no: int, why: str) -> dict:
     return {"key": entry["key"], "name": entry["name"], "dismissed": True}
 
 
+def record_deferral(ledger: dict, name: str, round_no: int, rule: str,
+                    issue: int) -> dict:
+    """Record that a real class is left for later, filed as ``issue``.
+
+    It owes nothing in this cycle, and later rounds are briefed that it is tracked
+    elsewhere, so a seat does not report it again unless the change makes it worse —
+    the "outside the change" rule, made durable rather than resting on one reply."""
+    entry = find_class(ledger, name)
+    if entry is None:
+        raise ValueError(f"no class {name!r} in the ledger")
+    if rule not in DEFER_RULES:
+        raise ValueError(f"--rule {rule!r}: expected one of {', '.join(DEFER_RULES)}")
+    if _round(issue) is None:
+        raise ValueError("--issue: the issue number the class is filed as")
+    if _round(round_no) is None or round_no > last_round(ledger):
+        raise ValueError(f"round {round_no} has not run (the ledger's last is "
+                         f"{last_round(ledger)})")
+    entry["deferred"] = {"issue": issue, "rule": rule, "round": round_no}
+    return {"key": entry["key"], "name": entry["name"], "deferred": True,
+            "issue": issue}
+
+
+def gh(*args: str) -> str:
+    """`gh`'s stdout. The one door to GitHub here, so tests replace it."""
+    return subprocess.run(["gh", *args], capture_output=True, text=True,
+                          check=True).stdout
+
+
+def issue_body(entry: dict, pr: int | None, round_no: int, rule: str) -> str:
+    """What a filed class says: the contract, every place it was seen, and where."""
+    where = f"#{pr}" if pr else "a review cycle"
+    lines = [f"Found reviewing {where} (round {round_no}) and left for later: "
+             f"**{rule}**.", "", f"**Invariant:** {entry['invariant'] or '(none recorded)'}"]
+    if entry.get("enforcement"):
+        lines.append(f"**Enforcement that would make it impossible:** {entry['enforcement']}")
+    if entry.get("guard_test"):
+        lines.append(f"**Guard test:** {entry['guard_test']}")
+    lines += ["", "**Seen at:**"]
+    lines += [f"- `{s['path']}` (round {s['round']})" for s in entry["sightings"]]
+    lines += ["", f"class-key: {entry['key']}"]
+    return "\n".join(lines)
+
+
+def file_class(ledger: dict, name: str, round_no: int, rule: str, github: str,
+               pr: int | None = None) -> dict:
+    """File a class as an issue — or comment on the open one that already carries its
+    key — and record the deferral with that number.
+
+    One issue per CLASS, deduplicated on the class key in its body, so a class that
+    recurs across rounds or PRs lands on one ticket rather than a pile of them. The
+    label is used only if the repo has it: creating labels is not a review's call."""
+    entry = find_class(ledger, name)
+    if entry is None:
+        raise ValueError(f"no class {name!r} in the ledger")
+    if rule not in DEFER_RULES:
+        raise ValueError(f"--rule {rule!r}: expected one of {', '.join(DEFER_RULES)}")
+    if _round(round_no) is None or round_no > last_round(ledger):
+        raise ValueError(f"round {round_no} has not run (the ledger's last is "
+                         f"{last_round(ledger)})")
+    if not github:
+        raise ValueError("--github: no owner/name to file in, and the repo config "
+                         "names none")
+    body = issue_body(entry, pr, round_no, rule)
+    found = gh("issue", "list", "--repo", github, "--state", "open", "--search",
+               f'"class-key: {entry["key"]}" in:body', "--json", "number",
+               "-q", ".[0].number").strip()
+    labelled = False
+    if found:
+        number = int(found)
+        gh("issue", "comment", str(number), "--repo", github, "--body",
+           f"Seen again — {body}")
+        how = "commented"
+    else:
+        labels = gh("label", "list", "--repo", github, "--search", FOUND_LABEL,
+                    "--json", "name", "-q", ".[].name").split()
+        labelled = FOUND_LABEL in labels
+        url = gh("issue", "create", "--repo", github, "--title", entry["name"],
+                 "--body", body, *(["--label", FOUND_LABEL] if labelled else []))
+        number = int(url.strip().rstrip("/").rsplit("/", 1)[1])
+        how = "created"
+    record_deferral(ledger, entry["key"], round_no, rule, number)
+    return {"key": entry["key"], "name": entry["name"], "issue": number,
+            "filed": how, "labelled": labelled}
+
+
 def first_round(entry: dict) -> int:
     return min(s["round"] for s in entry["sightings"])
 
@@ -455,7 +572,8 @@ def options(entry: dict) -> str:
 
 
 def _open_classes(ledger: dict, strikes_limit: int | None) -> list[dict]:
-    return [e for e in ledger.get("classes") or [] if not e.get("dismissed")
+    return [e for e in ledger.get("classes") or []
+            if not e.get("dismissed") and not e.get("deferred")
             and (not e.get("structural") or is_owed(e, strikes_limit))]
 
 
@@ -511,8 +629,9 @@ def ledger_brief(ledger: dict, wave: list[dict] | None = None) -> str:
     """The reviewer's closed list, or "" when there is nothing recorded — so a cycle
     with no ledger sends a prompt byte-identical to the one it always sent."""
     every = ledger.get("classes") or []
-    own = [e for e in every if not e.get("dismissed")]
+    own = [e for e in every if not e.get("dismissed") and not e.get("deferred")]
     ruled_out = [e for e in every if e.get("dismissed")]
+    tracked = [e for e in every if e.get("deferred") and not e.get("dismissed")]
     keys = {e["key"] for e in every}
     others = [e for e in wave or [] if e["key"] not in keys]
     if not every and not others:
@@ -542,6 +661,12 @@ def ledger_brief(ledger: dict, wave: list[dict] | None = None) -> str:
         for e in ruled_out[:BRIEF_CLASSES_MAX]:
             lines.append(f"- [class {e['key']}] {_quoted(e['name'])}: "
                          f"{_quoted(e['dismissed']['why'])}")
+    if tracked:
+        lines += ["", "TRACKED ELSEWHERE — real, and filed for later. Do not report one "
+                  "again unless this change makes it worse:"]
+        for e in tracked[:BRIEF_CLASSES_MAX]:
+            lines.append(f"- [class {e['key']}] {_quoted(e['name'])}: filed as "
+                         f"#{e['deferred']['issue']} ({e['deferred']['rule']})")
     if others:
         lines += ["", "Recorded on OTHER pull requests of the same wave — the same "
                   "invariants apply here:"]
@@ -684,6 +809,83 @@ def _cmd_dismiss(args, gh_repo) -> int:
     return 0
 
 
+def _cmd_defer(args, gh_repo) -> int:
+    ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
+    if refuse_unusable(problems, "panel_classes"):
+        return LEDGER_FAILED_EXIT
+    try:
+        if args.cmd == "file":
+            verdict = file_class(ledger, args.cls, args.round, args.rule,
+                                 args.github or gh_repo, args.pr)
+        else:
+            verdict = record_deferral(ledger, args.cls, args.round, args.rule,
+                                      args.issue)
+    except ValueError as e:
+        raise SystemExit(f"panel_classes {args.cmd}: {e}")
+    except (OSError, subprocess.CalledProcessError) as e:
+        detail = getattr(e, "stderr", "") or e
+        raise SystemExit(f"panel_classes file: gh failed, nothing recorded — {detail}")
+    if save_ledger(args.ledger, ledger):
+        return LEDGER_FAILED_EXIT
+    if args.json:
+        print(json.dumps(verdict))
+    elif args.cmd == "file":
+        print(f"{verdict['filed']} #{verdict['issue']} for [{verdict['key']}] "
+              f"{verdict['name']}")
+        if verdict["filed"] == "created" and not verdict["labelled"]:
+            print(f"  (filed without the `{FOUND_LABEL}` label: the repo does not "
+                  "have it)")
+    else:
+        print(f"deferred [{verdict['key']}] {verdict['name']} to #{verdict['issue']}")
+    return 0
+
+
+def _cmd_mark(args, gh_repo) -> int:
+    """Record that a round ran. Run after EVERY round, clean ones included: a clean
+    round records no sighting, so without this the next round would reuse its
+    number. Idempotent."""
+    ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
+    if refuse_unusable(problems, "panel_classes"):
+        return LEDGER_FAILED_EXIT
+    if args.round > last_round(ledger) + 1:
+        raise SystemExit(f"panel_classes mark: round {args.round} would skip round "
+                         f"{last_round(ledger) + 1} — the ledger's rounds are numbered "
+                         "without gaps")
+    mark_round(ledger, args.round)
+    if save_ledger(args.ledger, ledger):
+        return LEDGER_FAILED_EXIT
+    print(json.dumps({"round": args.round}) if args.json else
+          f"class ledger: round {args.round} recorded as run")
+    return 0
+
+
+def from_payload(args) -> None:
+    """Fill --round, --pr and --ledger from a round's payload, refusing a flag that
+    disagrees with it: two numberings for one round is the drift #846 removes."""
+    try:
+        payload = json.loads(Path(args.payload).read_text())
+    except (OSError, ValueError) as e:
+        raise SystemExit(f"--payload {args.payload}: could not be read "
+                         f"({e.__class__.__name__})")
+    block = payload.get("class_ledger") if isinstance(payload, dict) else None
+    if not isinstance(block, dict) or _round(block.get("round")) is None:
+        raise SystemExit(f"--payload {args.payload} carries no ledger round — that "
+                         "round was run without --class-ledger, or by a panel older "
+                         "than #846")
+    for flag, mine, theirs in (("--round", args.round, block["round"]),
+                               ("--pr", args.pr, payload.get("pr"))):
+        if mine is not None and theirs is not None and mine != theirs:
+            raise SystemExit(f"{flag} {mine} disagrees with --payload, which says "
+                             f"{theirs} — pass one or the other")
+    if args.ledger and block.get("path") and \
+            Path(args.ledger).resolve() != Path(block["path"]).resolve():
+        raise SystemExit(f"--ledger {args.ledger} is not the ledger that round read "
+                         f"({block['path']})")
+    args.round = block["round"]
+    args.pr = args.pr if args.pr is not None else payload.get("pr")
+    args.ledger = args.ledger or block.get("path") or ""
+
+
 def _cmd_status(args, strikes_limit, rounds_limit, gh_repo) -> int:
     ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
     if refuse_unusable(problems, "panel_classes"):
@@ -707,15 +909,20 @@ def _parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p, rounds: bool = True):
-        p.add_argument("--ledger", required=True, metavar="PATH",
-                       help="the PR's ledger, beside its premise register")
+        p.add_argument("--ledger", default="", metavar="PATH",
+                       help="the PR's ledger, beside its premise register (default: "
+                            "the one --payload names)")
         p.add_argument("--repo", default=None, help="repo spec for the rules (default: "
                        "the cwd's repo)")
         p.add_argument("--pr", type=int, default=None)
         p.add_argument("--json", action="store_true")
         if rounds:
             p.add_argument("--round", type=int, default=None,
-                           help="the round whose findings this answers")
+                           help="the LEDGER round whose findings this answers")
+            p.add_argument("--payload", default="", metavar="ROUND.json",
+                           help="that round's panel payload: supplies --round, --pr "
+                                "and --ledger, so a panel round and a ledger round "
+                                "cannot be mismatched by hand")
 
     rec = sub.add_parser("record", help="record one sighting of a class")
     common(rec)
@@ -739,8 +946,24 @@ def _parser() -> argparse.ArgumentParser:
     dis.add_argument("--class", dest="cls", required=True, metavar="NAME|KEY")
     dis.add_argument("--why", required=True)
 
+    for cmd, help_ in (("file", "file a class as an issue (or comment on its open one) "
+                        "and record the deferral"),
+                       ("defer", "record that a class is filed for later as an issue")):
+        d = sub.add_parser(cmd, help=help_)
+        common(d)
+        d.add_argument("--class", dest="cls", required=True, metavar="NAME|KEY")
+        d.add_argument("--rule", required=True, choices=DEFER_RULES)
+        if cmd == "file":
+            d.add_argument("--github", default="", metavar="OWNER/NAME",
+                           help="where to file (default: the repo config's `github`)")
+        else:
+            d.add_argument("--issue", type=int, required=True)
+
     status = sub.add_parser("status", help="convergence and budget after a round")
     common(status)
+
+    mk = sub.add_parser("mark", help="record that a round ran (after every round)")
+    common(mk)
 
     br = sub.add_parser("brief", help="print the reviewer brief for the next round")
     common(br, rounds=False)
@@ -753,6 +976,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if getattr(args, "round", None) is not None and args.round < 1:
         raise SystemExit("--round: rounds are numbered from 1")
+    if getattr(args, "payload", ""):
+        from_payload(args)
+    if not args.ledger:
+        raise SystemExit(f"{args.cmd} needs --ledger, or --payload from a round that "
+                         "read one")
     if args.cmd == "brief":
         ledger, problems = load_ledger(args.ledger)
         if refuse_unusable(problems, "panel_classes"):
@@ -763,7 +991,8 @@ def main(argv: list[str] | None = None) -> int:
         print(ledger_brief(ledger, wave), end="")
         return 0
     strikes_limit, rounds_limit, gh_repo = _limits_for(args.repo)
-    if args.cmd in ("record", "structural", "dismiss") and args.round is None:
+    if args.cmd in ("record", "structural", "dismiss", "file", "defer", "mark") \
+            and args.round is None:
         raise SystemExit(f"{args.cmd} needs --round — the round whose findings it answers")
     if args.cmd == "record":
         return _cmd_record(args, strikes_limit, gh_repo)
@@ -771,6 +1000,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_structural(args, gh_repo)
     if args.cmd == "dismiss":
         return _cmd_dismiss(args, gh_repo)
+    if args.cmd in ("file", "defer"):
+        return _cmd_defer(args, gh_repo)
+    if args.cmd == "mark":
+        return _cmd_mark(args, gh_repo)
     return _cmd_status(args, strikes_limit, rounds_limit, gh_repo)
 
 

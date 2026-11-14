@@ -1567,6 +1567,39 @@ def _edge_human_writes(host: Host) -> Check:
     return Check("edge", host.human_url, "human writes accepted", "ok")
 
 
+def claude_settings_path() -> Path:
+    home = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return Path(home) / "settings.json"
+
+
+def check_messaging(host: Host) -> Check:
+    """Will a message from another Claude session on this machine reach this one?
+
+    Claude Code holds a cross-session message behind an approval dialog when the
+    sender's permission mode class differs from the receiver's. Fleet seats run in
+    bypass mode, so a `claude -p` worker or a seat started without the flag sends a
+    message that is reported as sent and then sits unread until a person approves it
+    or it expires. `crossSessionInbound: "accept"` delivers it.
+    """
+    path = claude_settings_path()
+    try:
+        value = json.loads(path.read_text()).get("crossSessionInbound")
+    except OSError as exc:
+        return Check("messaging", str(path), f"could not read settings ({exc.strerror})",
+                     "unknown")
+    except (ValueError, AttributeError):
+        return Check("messaging", str(path), "settings.json is not a JSON object", "unknown")
+    if value == "accept":
+        return Check("messaging", str(path), 'crossSessionInbound is "accept"', "ok")
+    if value == "refuse":
+        return Check("messaging", str(path), 'crossSessionInbound is "refuse": peers cannot '
+                     "reach this session", "warn", manual='remove "refuse" if peers should '
+                     "be able to wake this session")
+    return Check("messaging", str(path), "crossSessionInbound is unset: a message from a "
+                 "session in a different permission mode is held for approval",
+                 "warn", manual='add "crossSessionInbound": "accept" to ' + str(path))
+
+
 def check_tools(host: Host) -> Check:
     """What this host carries that the harness shells out to — and `gh`'s auth.
 
@@ -4599,6 +4632,18 @@ CHECKS = (
                     "would do it inside somebody's production deploy.",
                 )),
         }),
+    CheckSpec(
+        "messaging", "host", check_messaging, scope="host",
+        needs_human="decision",
+        explanation=(
+            "Claude Code holds a message from a session in a different permission mode "
+            "behind an approval dialog in the receiver's terminal, and tells only the "
+            "sender. The send reports success, the receiver's Claude never sees it, and "
+            "the dialog expires after five minutes. Seats run in bypass mode, so any "
+            "sender that is not (a `claude -p` worker, a panel loop) is held. Accepting "
+            "is a decision because it lets every session under this user message this "
+            "one without an approval step."),
+        briefs={}),
     CheckSpec(
         "tools", "host", check_tools, scope="host",
         needs_human="environment",

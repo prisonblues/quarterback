@@ -474,3 +474,85 @@ def test_the_banner_says_what_makes_the_reset_true_rather_than_asserting_it(
                                      new_cycle=True)
     assert "it is round 1, it carries no baseline" in report
     assert "REFUSES `--round` and `--baseline`" in report
+
+
+# ------------------------------------------- the owner continues the cycle (#846)
+
+def _continue(monkeypatch, capsys, tmp_path, *, runs=STOPPED, err="", **kw):
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda name: CFG)
+    monkeypatch.setattr(panel_core, "sh", gh_stub(
+        meta={"title": "fix: a real bug", "additions": 3, "deletions": 1,
+              "headRefName": "feat/x", "headRefOid": HEAD},
+        diff="diff --git a/a.py b/a.py\n+x\n",
+        compare='{"status": "ahead", "files": [{"filename": "a.py", "patch": "@@"}]}'))
+    monkeypatch.setattr(panel, "review_llm",
+                        lambda *a, **k: panel.ReviewerRun([], None, 10, []))
+    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
+    monkeypatch.setattr(panel, "adjudicate",
+                        lambda *a, **k: ([], None, panel.CoverageRuling()))
+    monkeypatch.setattr(panel, "board_get",
+                        _board({"runs": list(runs)} if not err else None, err))
+    out = tmp_path / "r.json"
+    code = panel.run("board", 34, post=False, json_file=str(out), record=False,
+                     continue_cycle=True, answered_by="rich",
+                     answered_why="run round 3", **kw)
+    return code, capsys.readouterr().out, json.loads(out.read_text())
+
+
+def test_the_owners_go_on_continues_the_stopped_cycle(monkeypatch, capsys, tmp_path):
+    """On #841 the owner said "run round 3" after a fix_injection stop, and the only
+    way through was `--new-cycle`, which threw away the baseline the stop was
+    measured from. `--continue-cycle` runs the round and records the answer."""
+    code, report, payload = _continue(monkeypatch, capsys, tmp_path)
+    assert code == 0 and payload["reviewed"] is True
+    answered = payload["stop_answered"]
+    assert answered["by"] == "rich" and answered["why"] == "run round 3"
+    assert answered["round"] == 2 and "introduced by the fix pass" in answered["verdict"]
+    assert answered["at"]
+    assert payload["preflight"]["prior_cycle"]["refused"] is False
+    assert "**The owner answered that stop and said go on.**" in report
+    assert "`--continue-cycle`, so it CONTINUES that cycle" in report
+    assert any(n.startswith("--continue-cycle:") for n in payload["config_notes"])
+
+
+def test_there_is_nothing_to_continue_past_when_nothing_stopped(monkeypatch, capsys,
+                                                                tmp_path):
+    with pytest.raises(SystemExit, match="records none ending"):
+        _continue(monkeypatch, capsys, tmp_path,
+                  runs=(_run_row(2, stopped=False),))
+
+
+def test_a_board_that_could_not_be_asked_runs_and_says_it_could_not_check(
+        monkeypatch, capsys, tmp_path):
+    code, _report, payload = _continue(monkeypatch, capsys, tmp_path, runs=(),
+                                       err="HTTP 503")
+    assert code == 0 and payload["stop_answered"]["unverified"]
+
+
+def test_continuing_does_not_lift_the_round_cap(monkeypatch, capsys, tmp_path):
+    """The cap is a different control from the stop the owner answered."""
+    _code, _report, payload = _continue(monkeypatch, capsys, tmp_path,
+                                        round_no=3, max_rounds=3)
+    assert payload["round_stop"]["stop"] is True
+
+
+def _continue_cli(monkeypatch, *argv):
+    monkeypatch.setattr(sys, "argv", ["panel.py", "--repo", "board", "--pr", "34",
+                                      *argv])
+    with pytest.raises(SystemExit) as refused:
+        panel.main()
+    return str(refused.value)
+
+
+@pytest.mark.parametrize("argv, says", [
+    (("--continue-cycle", "--new-cycle", "--answered-by", "r", "--why", "w"),
+     "pass one"),
+    (("--continue-cycle", "--round", "3", "--baseline", "/tmp/r2.json"),
+     "pass --answered-by NAME and --why TEXT"),
+    (("--continue-cycle", "--answered-by", "r", "--why", "w"),
+     "pass it, with --round"),
+    (("--answered-by", "r", "--round", "2", "--baseline", "/tmp/r1.json"),
+     "go with --continue-cycle"),
+])
+def test_the_override_is_refused_where_it_means_nothing(monkeypatch, argv, says):
+    assert says in _continue_cli(monkeypatch, *argv)
