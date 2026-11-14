@@ -333,7 +333,13 @@ DEFAULTS: dict = {
         # model slug too — gemini-3.7-flash-high/-medium/-low are three separate
         # models. Pin it in the slug OR in `effort`, not both; two ways to say
         # the same thing is how they come to disagree.
-        "antigravity": {"enabled": False, "model": "", "effort": ""},
+        # `tools`: ON — the seat reviews from a throwaway copy of the PR's tree and
+        # may run commands there (`--dangerously-skip-permissions`; see
+        # SEAT_RUNS_CODE). The owner's call, 2026-11-14, after a model that probed
+        # `echo` in the no-tools mode ended its own session and cost a round the
+        # seat. `false` restores the diff-only seat. Policy, so it is set in
+        # `.harness-rules.sample`, never in a per-box overlay.
+        "antigravity": {"enabled": False, "model": "", "effort": "", "tools": True},
         # Off by default for the same reason as antigravity — `pi` is a workstation
         # package, not on every box. It is the widest-reach member when enabled:
         # it fronts many providers, so its `model` is a full provider/id pattern
@@ -534,7 +540,10 @@ DEFAULTS: dict = {
         # ON does not mean every seat gets it. Only a CLI that can express "read
         # but do not execute" is given the tree — see SEAT_READS_CODE, which
         # records per vendor why. #92 answered "may reviewers execute?" with no,
-        # and that is unchanged: this is reading. Which seats actually got it is
+        # and for those seats that is unchanged: this is reading. The exception is
+        # a SEAT_RUNS_CODE seat whose `reviewers.<seat>.tools` is on (antigravity,
+        # by the owner's call): it gets the same stripped copy WITH a shell, and
+        # turning this setting off takes the tree from it too. Which seats actually got it is
         # recorded per seat in the payload (`reviewers.<name>.code_blind`), because
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.
@@ -3644,6 +3653,11 @@ def _check_seat_shape(rules: dict, provenance: str) -> None:
                              f"object, not {type(entry).__name__} — "
                              f'e.g. {{"{seat}": {{"enabled": true}}}}. `{_LOCAL_BLOCK}` '
                              f"is an object of objects")
+        # `tools` grants a shell, so a value that only LOOKS like a boolean must not
+        # be read either way: refused, not guessed. `"false"` is truthy.
+        if "tools" in entry and not isinstance(entry["tools"], bool):
+            raise SystemExit(f"{provenance}: `{_LOCAL_BLOCK}.{seat}.tools` must be true "
+                             f"or false, not {entry['tools']!r}")
 
 
 def _report(where: str, problems: list[str], repo: str = "") -> None:

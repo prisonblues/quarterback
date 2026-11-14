@@ -4604,10 +4604,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "class(es) on this PR) and asked to verify its invariants rather "
                      "than hunt (#836)")
 
-    def prompt_for(budget: int | None, reads_code: bool = False) -> str:
+    def prompt_for(budget: int | None, reads_code: bool = False,
+                   runs: bool = False) -> str:
         # `reads_code` defaults False so the one-argument callers keep working —
-        # `fit_argv_budget` takes this as a single-arg render, and antigravity is
-        # never a code-reading seat, so that path is unaffected by construction.
+        # `fit_argv_budget` takes this as a single-arg render. Since antigravity can
+        # be a tool-running seat (SEAT_RUNS_CODE), its clamp renders both briefs and
+        # keeps the longer; see the clamp below. `runs` picks CODE_EXEC_BRIEF over
+        # CODE_ACCESS_BRIEF for a seat that was given a shell with the tree.
         # The slot is EITHER brief, never empty: a seat that gets the tree is told
         # to use it, and a seat that does not is told there is nothing to look at
         # and what to do instead (#458). Empty was the hole — it left the seats
@@ -4651,7 +4654,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text,
                             diff=history + claim + review.material(budget)[0],
-                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
+                            code=(CODE_EXEC_BRIEF if reads_code and runs
+                                  else CODE_ACCESS_BRIEF if reads_code
+                                  else NO_TOOLS_BRIEF)
                         ).replace(NEXT_DOOR_SLOT, next_door, 1
                         # #773's block, swapped after the render and bounded to one
                         # occurrence on exactly the argument above: it is built from
@@ -4692,7 +4697,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if "antigravity" in budgets:
         asked = budgets["antigravity"]
         want = sendable if asked is None else asked
-        fitted, cut_by_kernel = argv_clamp(prompt_for, sendable, asked)
+        # Whether this seat gets the tree is not known until the fetch below, so
+        # the clamp is measured against the LONGER of the two prompts it could be
+        # sent: the budget has to fit whichever one it turns out to be.
+        def agy_render(budget: int | None) -> str:
+            blind_text = prompt_for(budget)
+            if "antigravity" not in tool_seats(rev):
+                return blind_text
+            return max(blind_text, prompt_for(budget, True, True),
+                       key=lambda t: len(t.encode()))
+        fitted, cut_by_kernel = argv_clamp(agy_render, sendable, asked)
         if fitted < want:
             notes.append(
                 f"antigravity gets {fitted:,} of {sendable:,} diff chars — its prompt "
@@ -4817,7 +4831,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # first, precisely so that a round cannot route away the only eyes that could open
     # a file. Where it does empty, the seat was selected and not installed, and the
     # `elif` below already says so.
-    code_seats = sorted(n for n in routing.dispatched if n in SEAT_READS_CODE)
+    #: `tool_seats` rather than SEAT_READS_CODE: a SEAT_RUNS_CODE seat with `tools`
+    #: on wants the tree too, and a round whose only such seat is antigravity must
+    #: still fetch it.
+    can_use_tree = tool_seats(rev)
+    code_seats = sorted(n for n in routing.dispatched if n in can_use_tree)
     code_tree: Path | None = None
     stripped: list[str] = []
     #: Where the round's single copy of the tree lives, or None when nothing needed
@@ -4851,7 +4869,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     elif want_code and not code_seats:
         notes.append("`reviewer_code_access` is on, but no seat on this panel can use "
                      "it — see SEAT_READS_CODE; only claude can be given read tools "
-                     "without also being given a shell")
+                     "without also being given a shell, and a SEAT_RUNS_CODE seat "
+                     "takes the tree only with `tools` on")
+    executing = [n for n in code_seats if n in SEAT_RUNS_CODE] if code_tree else []
+    if executing:
+        notes.append(f"{', '.join(executing)} reviewed with a shell in a throwaway copy of "
+                     "the PR's tree (`reviewers.<seat>.tools`): it may have run commands")
     if stripped:
         # Said out loud, per round. A silent strip makes a PR that shipped an
         # `AGENTS.md` indistinguishable from one that did not, on the single axis
@@ -5031,7 +5054,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # because the default frame is "here is a diff" and a reviewer
                 # following it faithfully declares gaps it could have opened a file
                 # to close. See CODE_ACCESS_BRIEF.
-                reads = code_tree is not None and name in SEAT_READS_CODE
+                reads = code_tree is not None and name in can_use_tree
+                runs = reads and name in SEAT_RUNS_CODE
                 # A seat this box cannot run gets NO prompt (#222). Every SELECTED
                 # seat is still dispatched, because `run_seat` is the single
                 # authority on absence and is not only a PATH check — it answers a
@@ -5040,12 +5064,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # `prompt_for(None, …)` means "uncapped", so rendering one would
                 # compose the entire diff — per absent seat, per round — for
                 # `run_seat` to discard a moment later.
-                prompt = (prompt_for(budgets[name], reads) if name in budgets
+                prompt = (prompt_for(budgets[name], reads, runs) if name in budgets
                           else "")
                 tasks[name] = ex.submit(review_llm, name, models[name], prompt,
                                         efforts.get(name, ""),
                                         code_tree=code_tree,
-                                        budget_usd=budget_usd if reads else None)
+                                        budget_usd=budget_usd if reads else None,
+                                        # Only when set, so the review_llm doubles
+                                        # that name their keywords keep working.
+                                        **({"runs_code": True} if runs else {}))
         sonar_future = None
         sonar_filed = False
         if "sonarqube" in selected:

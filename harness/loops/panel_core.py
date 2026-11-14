@@ -1412,6 +1412,41 @@ coverage gap and none is a finding — they are how this checkout is built:
 `could_not_assess` means what you could not resolve with the code in front of you.
 """
 
+#: What a seat that was handed the PR's tree WITH a shell is told — the
+#: `SEAT_RUNS_CODE` seats whose `tools` setting is on. Same checkout as
+#: CODE_ACCESS_BRIEF and the same three facts about it, but the first limit is
+#: inverted: this seat may run things, so it is told what running is FOR (settling a
+#: claim the diff cannot) and what it must not do. The "must not" list is not the
+#: guard — the copy has no remote, `RUNS_CODE_ENV` points the database variables and
+#: `gh` at nothing, and the tree is deleted when the seat ends — it is what keeps a
+#: cooperative reviewer from spending the round on a full suite.
+CODE_EXEC_BRIEF = """YOU HAVE THE CODE, AND A SHELL. Your working directory is a throwaway copy of
+this PR at its head commit — the same code the diff below was taken from. Use it.
+Read the callers, the siblings, the tests, the config, the migration the diff refers
+to but does not contain. You may also RUN things to settle a claim: a targeted test,
+a script with an edge-case input, a grep across the tree. A question you can answer
+by opening a file or running one command is not a coverage gap: check before you
+declare, and before you raise a conditional finding, try it.
+
+What this copy is, so you do not spend the round discovering it. None of these is a
+coverage gap and none is a finding:
+- It is a copy that is deleted when you finish. Edits you make are thrown away and
+  are not a fix; report findings, do not repair them.
+- There is NO git history and NO remote. Do not commit, push, or open PRs, and do not
+  conclude from the missing history that the diff was reverted.
+- There is no database and no installed virtualenv. A test that needs either will
+  fail for that reason alone; that failure is not a finding about the PR.
+- Vendor instruction files (CLAUDE.md, AGENTS.md, .claude/ and the like) have been
+  REMOVED on purpose, so that a PR cannot instruct its own reviewer.
+
+Keep commands short and targeted: never the whole test suite, nothing that installs
+packages or reaches the network, nothing outside this directory. You have a time
+limit, and a review that runs out of it returns nothing.
+
+`could_not_assess` means what you could not resolve with the code and the commands
+in front of you.
+"""
+
 #: The other half of the same slot, and the reason it is prose. Every seat wants to go
 #: looking for the code — `codex_args` measured it at five runs in seven — and the answer
 #: has been a flag per vendor: `--no-tools` for pi, two `-c` overrides for codex. There is
@@ -3501,6 +3536,7 @@ __all__ = [
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
+    "CODE_EXEC_BRIEF",
     "NO_TOOLS_BRIEF",
     "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "JUDGE_SCHEMA", "JUDGE_NO_CODE_BRIEF", "ASK_PROMPT", "Finding", "ReviewerRun",

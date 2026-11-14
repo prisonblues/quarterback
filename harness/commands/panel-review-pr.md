@@ -295,6 +295,14 @@ even where the rules disable it. Fewer reviewers means thinner coverage feeding
 the fixer — surface that in §6 rather than letting a one-vendor review read
 like a full panel.
 
+**antigravity runs commands by default.** With `reviewers.antigravity.tools` on (the
+default) it reviews from a throwaway copy of the PR's tree with a shell
+(`agy --dangerously-skip-permissions`), may run targeted tests or scripts there, and
+the round's config notes say so. The copy has no remote, and the database variables and
+`gh` point at nothing. Set `"tools": false` in `.harness-rules.sample` for the
+diff-only seat, which is what a repo taking untrusted contributions wants alongside
+`reviewer_code_access: false`.
+
 From its output collect:
 - **Panel dials** — the line the report prints under that name, naming `review_panel`.
   It says which severity floor the fixer is being briefed to, what buys another round,
