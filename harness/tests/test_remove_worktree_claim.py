@@ -119,13 +119,33 @@ def run_stanza(branch="feat/issue-337", *, keep="false", stub: str | None = None
                       + release_block()
                       + f'\nrelease_the_claim {branch!r} {left!r}\n'
                       # Both lists: a could-not-tell outcome is said out loud and
-                      # recorded too, and that is what these tests pin (#843).
+                      # recorded too (#843). WARNINGS is the sum the older tests
+                      # pin; LEFT and UNKNOWN say which list it went to.
                       + 'echo "WARNINGS=$(( ${#CLEANUP_WARNINGS[@]}'
-                      + ' + ${#UNKNOWN_OUTCOMES[@]} ))"\n')
+                      + ' + ${#UNKNOWN_OUTCOMES[@]} ))"\n'
+                      + 'echo "LEFT=${#CLEANUP_WARNINGS[@]}"\n'
+                      + 'echo "UNKNOWN=${#UNKNOWN_OUTCOMES[@]}"\n')
     return subprocess.run(
         [BASH, str(script)], capture_output=True, text=True,
         env={"PATH": _path_sandbox.sandbox_path(tmp_path, bindir),
              "HOME": str(tmp_path)})
+
+
+def count(got, name: str) -> int:
+    line = next(ln for ln in got.stdout.splitlines() if ln.startswith(f"{name}="))
+    return int(line.split("=", 1)[1])
+
+
+def test_a_board_that_did_not_answer_is_could_not_tell_not_left_behind(tmp_path):
+    """#843: which list an outcome goes to is the substance — only one of them keeps
+    a run that removed nothing out of exit 2."""
+    got = run_stanza(tmp_path=tmp_path, stub='echo "unknown: board down" >&2; exit 2')
+    assert (count(got, "LEFT"), count(got, "UNKNOWN")) == (0, 1)
+
+
+def test_a_tree_still_on_disk_is_left_behind_not_could_not_tell(tmp_path):
+    got = run_stanza(tmp_path=tmp_path, stub="exit 0", dir_left=True)
+    assert (count(got, "LEFT"), count(got, "UNKNOWN")) == (1, 0)
 
 
 def warnings(got) -> int:

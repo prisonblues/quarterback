@@ -371,7 +371,7 @@ release_the_claim() {
                could_not_tell "could not read qb-release's answer — whether a claim was handed back is unknown"
            fi ;;
         1) echo -e "${YELLOW}Not ours to hand back (see above) — left alone${NC}" ;;
-        *) could_not_tell "the claim on '$branch' was NOT handed back (see above) and stays held until it lapses" ;;
+        *) could_not_tell "could not hand back the claim on '$branch' (qb-release exit $rc, see above) — if one is held, it stays held until it lapses" ;;
     esac
     return 0
 }
@@ -559,27 +559,45 @@ CREATE_NAME_AWK='function same_create_name(name, flat) { gsub("/", "-", name); r
 # Which `.worktree-ports` rows are this worktree's (#843). Flattening is
 # many-to-one — `fix/issue-43` and `fix-issue-43` are two worktrees once their
 # names lose the slash — so it cannot be the identity on its own: an EXACT row
-# (the name as typed, or the worktree's real branch) wins, the flattened match is
-# used only when it picks out exactly one row, and more than one is ambiguous and
-# picks none. `mode=key` prints the chosen key, `mode=drop` prints every other
+# (the name as typed) wins, the flattened match is used only when it picks out
+# exactly one row, and more than one is ambiguous and picks none. A row for the
+# worktree's real branch is taken as well, but does not stand in for an exact
+# row of the typed name, so it cannot suppress the flattened fallback. `mode=key` prints the chosen key, `mode=drop` prints every other
 # line. Exit 0 picked, 1 no row is this worktree's, 3 ambiguous; awk's own
 # failure (an unreadable file) is anything else.
 PORT_PICK_AWK=$CREATE_NAME_AWK'
 {
     line[NR] = $0; key[NR] = $2
-    if ($2 == exact || (rb != "" && $2 == rb)) { ex[NR] = 1; nex++ }
+    if ($2 == exact) { ex[NR] = 1; nex++ }
     else if (same_create_name($2, flat)) { fl[NR] = 1; nfl++ }
+    if (rb != "" && $2 == rb) { br[NR] = 1; nbr++ }
 }
 END {
-    if (nex) { for (i = 1; i <= NR; i++) pick[i] = ex[i] }
-    else if (nfl == 1) { for (i = 1; i <= NR; i++) pick[i] = fl[i] }
-    else exit (nfl > 1 ? 3 : 1)
+    if (!nex && nfl > 1) exit 3
+    for (i = 1; i <= NR; i++) pick[i] = ex[i] || br[i] || (!nex && nfl == 1 && fl[i])
+    for (i = 1; i <= NR; i++) any = any || pick[i]
+    if (!any) exit 1
     for (i = 1; i <= NR; i++) {
         if (mode == "key" && pick[i]) { print key[i]; exit 0 }
         if (mode == "drop" && !pick[i]) print line[i]
     }
     exit 0
 }'
+
+# Docker listings for STEP 1. Each prints the names (or ids) it found and returns
+# non-zero when docker itself did not answer, so a daemon that is down or a
+# permission denied reads as "could not tell", never as "nothing there" (#849).
+# `-a` throughout: a stopped container is still a container to remove.
+docker_names() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null
+}
+compose_ids() {
+    (cd "$WORKTREE_DIR" && docker compose ps -aq 2>/dev/null)
+}
+# Fixed-string, whole-line: a dot in a branch name is a dot, not any character.
+listed() {
+    grep -Fqx -- "$2" <<<"$1"
+}
 
 detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
@@ -734,7 +752,7 @@ if [[ ! -d "$WORKTREE_DIR" ]]; then
             # PORT_PICK_AWK's rule: an ambiguous file (two rows that flatten to
             # this name, neither exact) leaves the dir-derived name as it is.
             pf=$(awk -F: -v mode=key -v exact="$CREATE_NAME" -v flat="$CREATE_NAME" \
-                     -v rb="" "$PORT_PICK_AWK" "$MAIN_REPO/.worktree-ports")
+                     -v rb="" "$PORT_PICK_AWK" "$MAIN_REPO/.worktree-ports" 2>/dev/null)
             [[ -n "$pf" ]] && CREATE_NAME="$pf"
         fi
         BRANCH_NAME="$CREATE_NAME"
@@ -915,42 +933,56 @@ step "Stopping Docker containers..."
 # that was still up.
 CONTAINERS_BEFORE=0
 
-if [[ -d "$WORKTREE_DIR" && -f "$WORKTREE_DIR/docker-compose.yml" ]]; then
-    compose_up() {
-        (cd "$WORKTREE_DIR" && docker compose ps -q 2>/dev/null) | grep -c . || true
-    }
-    UP_BEFORE=$(compose_up)
-    if [[ "$UP_BEFORE" -gt 0 ]]; then
+DOCKER_ANSWERED=true
+
+# No docker on this host is a fact about the HOST, like no qb-release: there are
+# no containers to look for, and saying "could not tell" would mark every run.
+if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${YELLOW}docker not installed — no containers to check${NC}"
+elif [[ -d "$WORKTREE_DIR" && -f "$WORKTREE_DIR/docker-compose.yml" ]]; then
+    if ! ids=$(compose_ids); then
+        DOCKER_ANSWERED=false
+    elif UP_BEFORE=$(grep -c . <<<"$ids"); [[ "$UP_BEFORE" -gt 0 ]]; then
         CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + UP_BEFORE))
         (cd "$WORKTREE_DIR" && docker compose down >/dev/null 2>&1)
-        UP_AFTER=$(compose_up)
-        if [[ "$UP_AFTER" -eq 0 ]]; then
+        if ! ids=$(compose_ids); then
+            could_not_tell "docker compose did not answer after \`down\` — whether $UP_BEFORE container(s) went is unknown"
+        elif UP_AFTER=$(grep -c . <<<"$ids"); [[ "$UP_AFTER" -eq 0 ]]; then
             removed "compose stack ($UP_BEFORE container(s))"
             echo -e "${GREEN}Containers stopped via docker compose down${NC}"
         else
-            warn_cleanup "docker compose down left $UP_AFTER of $UP_BEFORE container(s) running in $WORKTREE_DIR"
+            warn_cleanup "docker compose down left $UP_AFTER of $UP_BEFORE container(s) in $WORKTREE_DIR"
         fi
     fi
 fi
 
-# Force-remove if still running
-listed() {
-    docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx -- "$1"
-}
-for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
-    [[ -z "$container" || "$container" = "-${SAFE_NAME}" ]] && continue
-    listed "$container" || continue
-    CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + 1))
-    docker rm -f "$container" >/dev/null 2>&1
-    if listed "$container"; then
-        warn_cleanup "container $container is still there — \`docker rm -f\` did not remove it"
-    else
-        removed "container $container"
-        echo -e "${GREEN}Removed container $container${NC}"
-    fi
-done
+# Force-remove if still there
+if ! command -v docker >/dev/null 2>&1; then
+    :
+elif NAMES=$(docker_names); then
+    for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
+        [[ -z "$container" || "$container" = "-${SAFE_NAME}" ]] && continue
+        listed "$NAMES" "$container" || continue
+        CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + 1))
+        docker rm -f "$container" >/dev/null 2>&1
+        if ! after=$(docker_names); then
+            could_not_tell "docker did not answer after removing $container — whether it went is unknown"
+        elif listed "$after" "$container"; then
+            warn_cleanup "container $container is still there — \`docker rm -f\` did not remove it"
+        else
+            removed "container $container"
+            echo -e "${GREEN}Removed container $container${NC}"
+        fi
+    done
+else
+    DOCKER_ANSWERED=false
+fi
 
-[[ "$CONTAINERS_BEFORE" -eq 0 ]] && echo -e "${YELLOW}No containers found${NC}"
+if [[ "$DOCKER_ANSWERED" != true ]]; then
+    could_not_tell "docker did not answer — whether this worktree has containers is unknown"
+elif [[ "$CONTAINERS_BEFORE" -eq 0 ]] && command -v docker >/dev/null 2>&1; then
+    echo -e "${YELLOW}No containers found${NC}"
+fi
 
 # ============================================
 # STEP 2: Remove nginx configuration
@@ -1344,7 +1376,9 @@ PORT_FILE="$MAIN_REPO/.worktree-ports"
 # Match the normalised key too, so either spelling is found, and the worktree's
 # real branch for entries written under a different create-name — by
 # PORT_PICK_AWK's rule, so a flattened match never takes another worktree's row.
-if [[ -f "$PORT_FILE" ]]; then
+if [[ -f "$PORT_FILE" ]] && ! : > "$PORT_FILE.tmp" 2>/dev/null; then
+    warn_cleanup "could not write beside $PORT_FILE — its port entry, if any, is still there"
+elif [[ -f "$PORT_FILE" ]]; then
     awk -F: -v mode=drop -v exact="$BRANCH_NAME" -v flat="$SAFE_NAME" \
         -v rb="$RESOLVED_BRANCH" "$PORT_PICK_AWK" "$PORT_FILE" > "$PORT_FILE.tmp"
     PORT_RC=$?
@@ -1361,7 +1395,7 @@ if [[ -f "$PORT_FILE" ]]; then
         echo -e "${YELLOW}No port entry found${NC}"
     elif [[ $PORT_RC -eq 3 ]]; then
         rm -f "$PORT_FILE.tmp"
-        warn_cleanup "more than one $PORT_FILE row flattens to '$SAFE_NAME' and none is exact — dropped none; remove this worktree's by hand"
+        warn_cleanup "more than one $PORT_FILE row flattens to '$SAFE_NAME' and none is exact — dropped none: $(awk -F: -v flat="$SAFE_NAME" "$CREATE_NAME_AWK"'same_create_name($2, flat)' "$PORT_FILE" | paste -sd, -); remove this worktree's row by hand"
     else
         rm -f "$PORT_FILE.tmp"
         warn_cleanup "could not read $PORT_FILE (awk exit $PORT_RC) — its port entry, if any, is still there"
