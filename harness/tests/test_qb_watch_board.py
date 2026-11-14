@@ -48,8 +48,8 @@ def test_my_own_posts_never_wake_me():
 
 
 def test_a_thread_watch_ignores_replies_to_other_posts():
-    assert w.wanted(post(5, re=7), ME, 7)
-    assert not w.wanted(post(6, re=8), ME, 7)
+    assert w.wanted(post(5, re=7), ME, {7})
+    assert not w.wanted(post(6, re=8), ME, {7})
 
 
 def test_the_line_names_the_sender_and_how_to_reply():
@@ -104,7 +104,7 @@ def run(monkeypatch, tmp_path):
 
 def test_first_pass_starts_at_now_and_reports_nothing_older(run, capsys):
     assert run([[post(40)], []]) == 0
-    assert capsys.readouterr().out == ""
+    assert "📨" not in capsys.readouterr().out
 
 
 def test_a_new_reply_is_printed_once_and_the_cursor_moves_past_it(run, capsys, tmp_path):
@@ -114,7 +114,7 @@ def test_a_new_reply_is_printed_once_and_the_cursor_moves_past_it(run, capsys, t
 
 
 def test_a_thread_watch_ends_at_the_first_reply(run, capsys):
-    pages = [[post(40)], [], [post(41, re=7)]]
+    pages = [[], [post(41, re=7)]]
     assert run(pages, re=7, once=False) == 0
     assert "#41" in capsys.readouterr().out
 
@@ -128,3 +128,59 @@ def test_eight_failed_reads_in_a_row_end_the_watch(run, capsys):
 def test_one_failed_read_is_a_wait_not_an_end(run):
     boom = urllib.error.URLError("down")
     assert run([[post(1)], boom, [post(2, re=7)]], re=7, once=False) == 0
+
+
+# --- a thread watch must not lose the reply it was started for ---
+
+
+class LiveBoard:
+    """A board that honours `since`, so a cursor seeded too high loses posts."""
+
+    instance = "t"
+
+    def __init__(self, posts):
+        self.posts = posts
+
+    def read(self, params):
+        head = max(p["id"] for p in self.posts)
+        since = params.get("since", 0)
+        page = [p for p in self.posts if p["id"] > since]
+        return (page[: params["limit"]] if "limit" in params else page), head
+
+
+def test_a_reply_posted_before_the_watch_started_is_still_reported(run, capsys):
+    board = LiveBoard([post(41, re=7)])
+    assert w.watch(board, args(re=7, once=False, timeout=-1)) == 0
+    assert "#41" in capsys.readouterr().out
+
+
+def test_a_thread_watch_leaves_the_standing_cursor_alone(run, tmp_path):
+    (tmp_path / "qb-board-watch-t").write_text("30")
+    run([[post(41, re=7)]], re=7, once=False)
+    assert (tmp_path / "qb-board-watch-t").read_text() == "30"
+
+
+def test_a_reply_that_cites_a_later_post_in_the_thread_counts():
+    seen = {7, 12}
+    assert w.wanted(post(15, re=12), ME, seen)
+
+
+def test_a_directed_reply_with_no_re_still_wakes_a_thread_watch():
+    assert w.wanted(post(15, "ack", re=None), ME, {7})
+
+
+def test_a_reply_to_an_unrelated_post_does_not_wake_a_thread_watch():
+    assert not w.wanted(post(15, re=99), ME, {7})
+
+
+# --- a watch that ends says so ---
+
+
+def test_a_timeout_says_the_watch_has_ended(run, capsys):
+    assert run([[post(1)], []], once=False, timeout=-1) == 0
+    assert "watch ended" in capsys.readouterr().out
+
+
+def test_the_watch_names_who_it_is_listening_as(run, capsys):
+    run([[post(1)], []])
+    assert "zeus/amber-otter" in capsys.readouterr().out
