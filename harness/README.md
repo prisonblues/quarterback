@@ -5141,11 +5141,24 @@ quarterback's own suite and pinned byte-identical to the copy you are given.
 Keys the script reads: `project`, `framework`, `base_port`, `app_port`,
 `docker.{enabled,network_pattern,network_default,image_pattern}`,
 `database.{engine,container,url_env,user_env,password_env,name_env}`,
-`worker.{type,command,container_prefix,queue_env,queue_default}`,
+`worker.{type,command,container_prefix,queue_env,queue_default,autostart}`,
 `nginx.{config,container,main_port,resolver,extra_proxy_headers}`,
 `server.{workers_env,workers_default}`, `env.copy_from`, `workspace.{enabled,editor_cli}`,
 and the arrays `symlinks`, `copies`, `setup`, `seed`, `reserved_names`, `gitignore_additions`,
 `backup_ignore`.
+
+**The worker is provisioned but not started unless something asks for it (#853).** When the
+repo has a worker (`worker.type`, or one detected from its dependencies), `create-worktree`
+writes the worker service into the worktree's `docker-compose.yml` under a `worker` compose
+profile, so no bare `docker compose up -d` starts it: neither the script's own, nor a later
+restart by hand. The summary lists the worker as `(not started)` with the exact command that
+starts it: `cd <worktree> && docker compose up -d <worker-container>` (naming a profiled service
+starts it). `--with-worker`, or `worker.autostart: true` (a JSON boolean; the string `"true"` is
+refused) in `.worktree.json`, runs `docker compose --profile worker up -d` instead; `--no-worker`
+keeps it stopped whatever the config says. Most worktrees are code-and-test only, and a worker
+left running its periodic jobs took ~4 cores on zeus away from a promotion gate and the CI
+runners (lexray#4458). A bare `docker compose down` leaves a profiled service running, so
+`remove-worktree` downs the stack with `COMPOSE_PROFILES='*'`.
 
 **`copies` and `gitignore_additions` also tell `remove-worktree` what NOT to back up.**
 The teardown tarball is for what somebody would otherwise lose, and neither of these is

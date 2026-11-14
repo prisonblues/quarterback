@@ -225,14 +225,19 @@ def test_a_partial_container_removal_warns_for_the_one_left(repo, tmp_path):
     assert "WITH WARNINGS" in proc.stdout
 
 
-def fake_compose(tmp_path, ids: list[str], down_works: bool = True) -> str:
+def fake_compose(tmp_path, ids: list[str], down_works: bool = True,
+                 profiled: bool = False) -> str:
     """A `docker` whose `compose ps -aq` lists `ids` until `compose down` clears them.
     Stateful, because a fake that answers the same before and after cannot tell a
     removal from a no-op. It answers ONLY `-aq`: `compose ps` without `-a` lists
-    running containers alone, and a stopped stack must still be taken down."""
+    running containers alone, and a stopped stack must still be taken down.
+    `profiled`: the stack has a service under a compose profile, which a `down`
+    leaves running unless every profile is enabled (measured on compose 5.1)."""
     state = tmp_path / "compose-state"
     state.write_text("".join(f"{i}\n" for i in ids))
     down = f': > "{state}"' if down_works else "exit 1"
+    if profiled:
+        down = f'[[ "${{COMPOSE_PROFILES:-}}" == "*" ]] && {down}'
     return f'''
 case "$1 $2" in
   "compose ps") [[ "$3" == -aq ]] && cat "{state}" ;;
@@ -253,6 +258,18 @@ def test_a_compose_stack_that_went_is_a_removal(repo, tmp_path):
     compose_worktree(repo)
     proc = run_with(repo, ["fix-issue-43"], tmp_path,
                     {**NOTHING_HELD, "docker": fake_compose(tmp_path, ["abc", "def"])})
+
+    assert complete(proc) and "Containers stopped via docker compose down" in proc.stdout
+    assert (tmp_path / "compose-state").read_text() == ""
+
+
+def test_compose_down_takes_a_profiled_worker_down_too(repo, tmp_path):
+    """create-worktree puts the worker under a `worker` compose profile (#853), and a
+    bare `docker compose down` leaves a profiled service running. The teardown
+    enables every profile, so a worker started later goes with the stack."""
+    compose_worktree(repo)
+    docker = fake_compose(tmp_path, ["app", "worker"], profiled=True)
+    proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
 
     assert complete(proc) and "Containers stopped via docker compose down" in proc.stdout
     assert (tmp_path / "compose-state").read_text() == ""

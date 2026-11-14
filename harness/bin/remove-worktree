@@ -946,7 +946,9 @@ elif [[ -d "$WORKTREE_DIR" && -f "$WORKTREE_DIR/docker-compose.yml" ]]; then
         DOCKER_ANSWERED=false
     elif UP_BEFORE=$(grep -c . <<<"$ids"); [[ "$UP_BEFORE" -gt 0 ]]; then
         CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + UP_BEFORE))
-        (cd "$WORKTREE_DIR" && docker compose down >/dev/null 2>&1)
+        # Every profile: a bare `down` leaves a profiled service running, and
+        # create-worktree puts the worker under one (#853).
+        (cd "$WORKTREE_DIR" && COMPOSE_PROFILES='*' docker compose down >/dev/null 2>&1)
         if ! ids=$(compose_ids); then
             could_not_tell "docker compose did not answer after \`down\` — whether $UP_BEFORE container(s) went is unknown"
         elif UP_AFTER=$(grep -c . <<<"$ids"); [[ "$UP_AFTER" -eq 0 ]]; then
