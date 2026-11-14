@@ -155,6 +155,51 @@ def test_the_pane_carries_the_current_conversation_to_the_other_half(hook):
     assert marker.read_text() == "sid-new"
 
 
+def test_a_seat_pane_gets_a_durable_claude_restore_record(hook):
+    """A Daedalus stop takes the tmux server and its pane options with it. The
+    hook therefore has to copy the pane's session identity to the file qb-seats
+    recorded on the pane, where the next morning's rebuilt screen can read it."""
+    state = hook.root / "state" / "seat-1.env"
+    (hook.stub / "tmux").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = show-options ] && [ "${6:-}" = @qb_seat_state_file ]; then\n'
+        f'  printf "%s\\n" {str(state)!r}\n'
+        "fi\n"
+        "exit 0\n")
+    (hook.stub / "tmux").chmod(0o755)
+
+    started(hook, "sid-claude", TMUX="/tmp/sock,1,0", TMUX_PANE="%7")
+    assert state.read_text().splitlines()[:2] == [
+        "agent=claude",
+        "session=sid-claude",
+    ]
+
+
+def test_a_codex_hook_writes_a_codex_restore_record(hook):
+    """The Codex adapter leaves CODEX_THREAD_ID in the environment while mapping
+    it onto the session field qb-hook already understands, so the durable record
+    can preserve the runtime as well as the id."""
+    state = hook.root / "state" / "seat-1.env"
+    (hook.stub / "tmux").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = show-options ] && [ "${6:-}" = @qb_seat_state_file ]; then\n'
+        f'  printf "%s\\n" {str(state)!r}\n'
+        "fi\n"
+        "exit 0\n")
+    (hook.stub / "tmux").chmod(0o755)
+
+    hook.fire("SessionStart",
+              env=hook.env(TMUX="/tmp/sock,1,0", TMUX_PANE="%7",
+                           CODEX_THREAD_ID="sid-codex",
+                           CLAUDE_CODE_ENTRYPOINT="",
+                           CLAUDE_CODE_SESSION_ID="sid-codex"),
+              session_id="sid-codex")
+    assert state.read_text().splitlines()[:2] == [
+        "agent=codex",
+        "session=sid-codex",
+    ]
+
+
 def test_a_fork_is_not_a_reset_but_is_still_a_supersession(hook):
     """A fork carries memory forward, so it is not a context reset — and it does
     mint a new conversation, so a different one IS in this pane, which is what
