@@ -8,6 +8,11 @@ from __future__ import annotations
 import argparse
 import importlib.machinery
 import importlib.util
+import io
+import json
+import os
+import shutil
+import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -71,6 +76,50 @@ def test_instance_key_follows_the_label_then_the_session(monkeypatch):
     assert w.instance_key() == "seat-3"
     monkeypatch.setenv("QUARTERBACK_INSTANCE", " ")
     assert w.instance_key() == "f5ca7491"
+
+
+QB_HOOK = Path(__file__).resolve().parents[1] / "bin" / "qb-hook"
+BASH = shutil.which("bash") or "/bin/bash"
+
+
+@pytest.mark.parametrize("label", ["seat-1", "seat 3", "..x", "aé-b", "a" * 60, "~~"])
+def test_instance_slug_is_qb_hooks_rule(label):
+    """qb-hook's `tr` replaces every non-ASCII BYTE, so "é" is two dashes there. A
+    per-character slug made one, and named a different agent from the hooks (#857)."""
+    rule = next(ln for ln in QB_HOOK.read_text().splitlines() if ln.startswith("_key_slug()"))
+    got = subprocess.run([BASH, "-c", f'{rule}\n_key_slug "$1"', "_", label],
+                         capture_output=True, text=True, check=True,
+                         env={**os.environ, "LC_ALL": "C.UTF-8"})
+    assert w.key_slug(label) == got.stdout.rstrip("\n")
+
+
+class _Resp(io.BytesIO):
+    headers = {"X-Board-Head": "7"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_every_board_request_carries_qbdatas_tls_context(monkeypatch):
+    """A bare urlopen fails every HTTPS read on an interpreter with no CA bundle of
+    its own, and the watch then reports an unreadable board that is up (#857)."""
+    sentinel = object()
+    seen = []
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen.append(context)
+        return _Resp(json.dumps({"agent": "zeus/a"} if req.full_url.endswith("/whoami")
+                                else []).encode())
+
+    monkeypatch.setattr(w, "_ssl_context", lambda: sentinel, raising=False)
+    monkeypatch.setattr(w.urllib.request, "urlopen", fake_urlopen)
+    board = w.Board("https://qb.example", "tok", "t")
+    board.read({})
+    w.identities(board)
+    assert seen == [sentinel, sentinel]
 
 
 class FakeBoard:
@@ -184,3 +233,26 @@ def test_a_timeout_says_the_watch_has_ended(run, capsys):
 def test_the_watch_names_who_it_is_listening_as(run, capsys):
     run([[post(1)], []])
     assert "zeus/amber-otter" in capsys.readouterr().out
+
+
+def test_no_board_client_in_harness_bin_opens_a_url_without_the_tls_context():
+    """The class, not the one instance: qb-watch-board was the bin/ client that
+    skipped it. Each `urlopen(` call must name `context=` before it closes."""
+    bin_dir = SCRIPT.parent
+    bare = []
+    for path in sorted(p for p in bin_dir.iterdir() if p.is_file()):
+        text = path.read_text(errors="replace")
+        if not text.startswith("#!") and path.suffix != ".py":
+            continue
+        for at in range(len(text)):
+            if not text.startswith("urlopen(", at):
+                continue
+            depth, end = 0, at + len("urlopen")
+            while end < len(text):
+                depth += {"(": 1, ")": -1}.get(text[end], 0)
+                end += 1
+                if depth == 0:
+                    break
+            if "context=" not in text[at:end]:
+                bare.append(f"{path.name}:{text.count(chr(10), 0, at) + 1}")
+    assert not bare, f"urlopen without context=: {bare}"

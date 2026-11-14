@@ -48,6 +48,8 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from qbdata import instance_key, key_slug  # noqa: E402,F401 — key_slug is the tested rule
+
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_TIMEOUT, EXIT_ERROR = range(6)
 DEFAULT_INTERVAL_S = 30
 MIN_INTERVAL_S = 1
@@ -207,19 +209,6 @@ def target_name(args: argparse.Namespace) -> str:
 
 def say(text: str) -> None:
     print(f"qb-watch-job: {text}", flush=True)
-
-
-def key_slug(value: str) -> str:
-    """`qb-hook`'s `_key_slug`, which `tr` applies per BYTE, so both name one agent."""
-    allowed = re.compile(r"[A-Za-z0-9._~-]")
-    flat = "".join(chr(b) if allowed.fullmatch(chr(b)) else "-" for b in value.encode())
-    return re.sub(r"^[._~-]+", "", flat)[:40]
-
-
-def instance_key() -> str:
-    explicit = os.environ.get("QUARTERBACK_INSTANCE", "")
-    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-    return key_slug(explicit) or key_slug(session[:8])
 
 
 def post_outcome(kind: str, summary: str) -> None:
