@@ -5705,6 +5705,26 @@ the board's head, keeps its cursor in `$XDG_RUNTIME_DIR/qb-board-watch-<instance
 `--re` ends at the first reply. `board_post` of an `ask` or `stuck` returns a `next` hint to start
 it, which is how agents without the Claude hooks (Codex) learn of it.
 
+### `qb-watch-job` — hear about a long job on another box (#851)
+
+`qb-watch-job [--host H] --file <marker>` (or `--pid N`) is the same contract for a job rather
+than a reply: one line per state change, silence otherwise, under the Monitor tool. It replaces
+the hand-rolled `ssh` poll loop that, on the lexray v22 gate, read "marker absent" (ssh exit 1)
+as a flaky connection and hid a failed stage for four hours. The probe is a remote command whose
+exit codes it chose: an absent marker is exit 3 from the remote shell, an unreadable one exit 4,
+and only ssh's own 255 (or no answer in 60s) means the ask failed.
+
+- **Present means done**, unless `--until-regex` says which content means finished.
+  `--fail-regex` matching the marker's last 64 KiB is a failure, reported at once.
+- **A pid is done when it is gone.** Its exit status cannot be seen, so a job that matters
+  writes a marker with its exit code.
+- **A failed ask prints a line and is retried.** `--max-failures` (default 5) in a row end the
+  watch. `~/` in a remote marker means that host's home.
+- **`--post`** puts the outcome on the board as `done` or `stuck`, for a session that has gone
+  away or been compacted.
+
+Exits: 0 done (ok), 1 done (failed), 2 usage, 3 could not ask, 4 `--timeout` reached.
+
 ### `qb-watch-pr` — hear about a PR instead of polling it (#822)
 
 `qb-watch-pr <pr>` is meant for the Monitor tool: one line per change, silence otherwise. State
