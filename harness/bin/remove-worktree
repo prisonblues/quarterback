@@ -28,6 +28,10 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        for a lock a dead process left behind — the refusal says
 #                        when that is what it is looking at. Look with
 #                        `fuser -v <the lockfile it names>` first (#743)
+#
+# Exit 2: no step that ran removed anything, and none of them warned (#808).
+# Usually the shell is in a different checkout from the worktree's.
+# Decided from what the steps did (REMOVED below), not from a probe.
 
 # ============================================
 # COLORS & HELPERS
@@ -47,6 +51,17 @@ CLEANUP_WARNINGS=()
 warn_cleanup() {
     CLEANUP_WARNINGS+=("$1")
     echo -e "${YELLOW}$1${NC}"
+}
+
+# What the steps actually removed, one entry per artefact. The run's outcome is
+# read from this at the end rather than from a probe made before the steps
+# (#808): a probe is a second list of what a worktree consists of, and it drifted
+# from the steps within one review round (a different spelling of the branch, a
+# branch the step then keeps, a claim and containers it never looked at). The
+# steps are the only list, so each records here as it acts.
+REMOVED=()
+removed() {
+    REMOVED+=("$1")
 }
 
 env_val() {
@@ -299,11 +314,10 @@ release_the_claim() {
         return 0
     fi
     # **The tree is still there, so the checkout the claim belongs to is still
-    # there.** STEP 4 prints "Done" whether or not the directory actually went:
-    # the recursive delete is `2>/dev/null` and fails silently against root-owned
-    # files a container wrote, which is the case `prune-worktrees --remove-dirs`
-    # carries its own sudo hint for. Handing the claim back over a directory
-    # somebody can still `cd` into reports a slot free that is occupied — the
+    # there.** The recursive delete in STEP 4 is `2>/dev/null` and fails against
+    # root-owned files a container wrote (STEP 4 warns about that itself, and
+    # `prune-worktrees --remove-dirs` carries the sudo hint). Handing the claim
+    # back over a directory somebody can still `cd` into reports a slot free that is occupied — the
     # exact wrong answer for a window that counts claims. So it stays held, is
     # said out loud, and is recorded: the TTL is under it, and
     # `prune-worktrees --prune` sweeps it once the tree really is gone.
@@ -316,13 +330,32 @@ release_the_claim() {
     # `${0%/*}` leaves $0 untouched and would build a nonsense path.
     if [[ -z "$qr" && "$0" == */* ]]; then qr="${0%/*}/qb-release"; fi
     if [[ -z "$qr" || ! -x "$qr" ]]; then
+        # A note, not a warning: no board tooling is a fact about this HOST, and a
+        # warning here would put "WITH WARNINGS" on every teardown it runs.
         echo -e "${YELLOW}qb-release not found — claim (if any) left held${NC}"
         return 0
     fi
-    "$qr" --branch "$branch" --repo-path "$MAIN_REPO"
+    # --json, because exit 0 means both "released" and "nothing was held", and
+    # only the first is something this teardown removed. Its "nothing" paths (no
+    # live claim, a branch naming no issue) print no JSON at all, so empty output
+    # is a count of zero. Output that is there but is not a `released` array, or
+# that jq cannot read (jq absent included), is unknown.
+    local out n
+    out=$("$qr" --branch "$branch" --repo-path "$MAIN_REPO" --json)
     rc=$?
+    if [[ -z "${out//[[:space:]]/}" ]]; then
+        n=0
+    else
+        n=$(jq -r 'if (.released | type) == "array" then .released | length else "?" end' \
+                <<<"$out" 2>/dev/null || true)
+    fi
     case "$rc" in
-        0) echo -e "${GREEN}Done${NC}" ;;
+        0) if [[ "$n" =~ ^[0-9]+$ ]]; then
+               [[ "$n" -gt 0 ]] && removed "claim"
+               echo -e "${GREEN}Done${NC}"
+           else
+               warn_cleanup "could not read qb-release's answer — whether a claim was handed back is unknown"
+           fi ;;
         1) echo -e "${YELLOW}Not ours to hand back (see above) — left alone${NC}" ;;
         *) warn_cleanup "the claim on '$branch' was NOT handed back (see above) and stays held until it lapses" ;;
     esac
@@ -503,6 +536,12 @@ collect_dirty_files() {
     done
 }
 
+# The one rule for matching a `.worktree-ports` key: create-worktree writes the
+# branch AS TYPED ("5698:fix/issue-1503") while the create-name is flattened
+# ("fix-issue-1503"), so a key matches when its flattened form does. Prepended to
+# both awk programs that read the file, so the two cannot disagree.
+CREATE_NAME_AWK='function same_create_name(name, flat) { gsub("/", "-", name); return name == flat }'
+
 detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
@@ -653,7 +692,9 @@ if [[ ! -d "$WORKTREE_DIR" ]]; then
         # Prefer the original (possibly slash-bearing) create-name from the port
         # file, so port/nginx keys still match.
         if [[ -f "$MAIN_REPO/.worktree-ports" ]]; then
-            pf=$(awk -F: -v d="$CREATE_NAME" '{n=$2; gsub("/","-",n); if (n==d) {print $2; exit}}' "$MAIN_REPO/.worktree-ports")
+            pf=$(awk -F: -v d="$CREATE_NAME" \
+                     "$CREATE_NAME_AWK"'same_create_name($2, d) {print $2; exit}' \
+                     "$MAIN_REPO/.worktree-ports")
             [[ -n "$pf" ]] && CREATE_NAME="$pf"
         fi
         BRANCH_NAME="$CREATE_NAME"
@@ -848,6 +889,7 @@ for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
 done
 
 if [[ "$CLEANED" = true ]]; then
+    removed "containers"
     echo -e "${GREEN}Done${NC}"
 else
     echo -e "${YELLOW}No containers found${NC}"
@@ -857,6 +899,7 @@ fi
 # STEP 2: Remove nginx configuration
 # ============================================
 step "Removing nginx configuration..."
+NGINX_BLOCK_REMOVED=false
 if [[ -n "$NGINX_CONFIG" ]]; then
     NGINX_CONF_PATH="$MAIN_REPO/$NGINX_CONFIG"
     # SAFE_NAME, not BRANCH_NAME: create-worktree keys the markers (and the
@@ -883,7 +926,14 @@ if [[ -n "$NGINX_CONFIG" ]]; then
         awk 'NF {blank=0; print} !NF {blank++; if (blank <= 2) print}' \
             "$NGINX_CONF_PATH" > "$NGINX_CONF_PATH.tmp" && mv "$NGINX_CONF_PATH.tmp" "$NGINX_CONF_PATH"
 
-        echo -e "${GREEN}Removed nginx block${NC}"
+        # Read back rather than trusted: either rewrite can fail and leave the block.
+        if nginx_block_present "$NGINX_CONF_PATH" "$SAFE_NAME"; then
+            warn_cleanup "could not remove the nginx block for $SAFE_NAME from $NGINX_CONF_PATH"
+        else
+            NGINX_BLOCK_REMOVED=true
+            removed "nginx block"
+            echo -e "${GREEN}Removed nginx block${NC}"
+        fi
     else
         echo -e "${YELLOW}No nginx block found${NC}"
     fi
@@ -899,15 +949,21 @@ if [[ -z "$NGINX_CONFIG" ]]; then
     # No nginx config for this repo — we didn't touch nginx, so don't restart
     # an unrelated project's nginx container.
     echo -e "${YELLOW}No nginx config — skipping restart${NC}"
+elif [[ "$NGINX_BLOCK_REMOVED" != true ]]; then
+    # Nothing changed in the config, so a restart would change nothing either —
+    # and a failed one would warn about a block that was never there.
+    echo -e "${YELLOW}No block removed — skipping restart${NC}"
 else
     if [[ "$NGINX_CONTAINER" = "auto" ]]; then
         NGINX_CONTAINER=$(detect_nginx_container)
     fi
     if [[ -n "$NGINX_CONTAINER" ]]; then
-        docker restart "$NGINX_CONTAINER" 2>/dev/null && echo -e "${GREEN}Done${NC}" \
-            || echo -e "${YELLOW}Could not restart nginx${NC}"
+        # A warning, not a note: the block is gone from the file but the running
+        # nginx still serves it until it restarts.
+        docker restart "$NGINX_CONTAINER" >/dev/null 2>&1 && echo -e "${GREEN}Done${NC}" \
+            || warn_cleanup "could not restart nginx ($NGINX_CONTAINER) — it still serves the removed block"
     else
-        echo -e "${YELLOW}Nginx container not found${NC}"
+        warn_cleanup "removed the nginx block but found no nginx container to restart — a running nginx still serves it"
     fi
 fi
 
@@ -915,6 +971,14 @@ fi
 # STEP 4: Backup and remove worktree directory
 # ============================================
 step "Handling worktree directory..."
+# Exact path, one line per worktree: a substring grep would answer "proj-feat-a"
+# with "proj-feat-abc".
+is_registered() {
+    git -C "$MAIN_REPO" worktree list --porcelain 2>/dev/null \
+        | grep -qxF "worktree $WORKTREE_DIR"
+}
+HAD_DIR=false; [[ -d "$WORKTREE_DIR" ]] && HAD_DIR=true
+HAD_REGISTRATION=false; is_registered && HAD_REGISTRATION=true
 if [[ -d "$WORKTREE_DIR" ]]; then
     cd "$WORKTREE_DIR" 2>/dev/null || true
 
@@ -1062,7 +1126,7 @@ fi
 # Remove git worktree. A worktree with a copied apps/models (hundreds of MB of
 # spaCy models) can take longer than a couple of seconds to delete, so allow a
 # generous timeout — too short a limit leaves a half-removed directory behind.
-if git worktree list 2>/dev/null | grep -q "$WORKTREE_DIR"; then
+if [[ "$HAD_REGISTRATION" = true ]]; then
     timeout 60 git worktree remove "$WORKTREE_DIR" 2>/dev/null \
         || timeout 60 git worktree remove --force "$WORKTREE_DIR" 2>/dev/null \
         || true
@@ -1071,10 +1135,32 @@ fi
 # Force-remove directory if still there
 if [[ -d "$WORKTREE_DIR" ]]; then
     rm -rf "$WORKTREE_DIR" 2>/dev/null
-    git worktree prune 2>/dev/null || true
+fi
+# Only when this teardown's own registration survived the removes above, which
+# is the hand-deleted case: its directory was already gone, so `git worktree
+# remove` had nothing to act on. Prune is still repo-wide when it runs, so it is
+# kept to that case; another worktree whose directory is briefly missing (an
+# unmounted volume) loses its registration only if it is pruned in the same call.
+if [[ "$HAD_REGISTRATION" = true && ! -d "$WORKTREE_DIR" ]] && is_registered; then
+    git -C "$MAIN_REPO" worktree prune 2>/dev/null || true
 fi
 
-echo -e "${GREEN}Done${NC}"
+# Checked, not assumed: the delete above is silent, and it fails against files
+# a container wrote as root. "Done" over a directory that is still there is
+# #808's defect in this step's own words.
+if [[ -d "$WORKTREE_DIR" ]]; then
+    warn_cleanup "worktree directory $WORKTREE_DIR is still there (files it could not delete — root-owned, from a container? \`prune-worktrees --remove-dirs\` carries the sudo hint)"
+elif is_registered; then
+    warn_cleanup "worktree $WORKTREE_DIR is still registered (\`git worktree prune\` did not clear it)"
+elif [[ "$HAD_DIR" = true ]]; then
+    removed "worktree directory"
+    echo -e "${GREEN}Done${NC}"
+elif [[ "$HAD_REGISTRATION" = true ]]; then
+    removed "worktree registration"
+    echo -e "${GREEN}Done${NC}"
+else
+    echo -e "${YELLOW}No worktree directory or registration${NC}"
+fi
 
 # ============================================
 # STEP 5: Drop database
@@ -1112,6 +1198,7 @@ elif [[ "$DB_ENGINE" = "postgresql" ]]; then
             "SELECT 1 FROM pg_database WHERE datname='$WORKTREE_DB'" 2>/dev/null || true)
         if [[ "$DB_EXISTS" = "1" ]]; then
             if drop_db_forcefully "$DB_CONTAINER" "$PG_USER" "$WORKTREE_DB"; then
+                removed "database $WORKTREE_DB"
                 echo -e "${GREEN}Dropped database: $WORKTREE_DB${NC}"
             else
                 warn_cleanup "could not drop database $WORKTREE_DB (still present)"
@@ -1177,9 +1264,10 @@ elif [[ "$DEL_BRANCH" = "$DEFAULT_BRANCH" || "$DEL_BRANCH" = "main" || "$DEL_BRA
 elif git worktree list 2>/dev/null | grep -qF "[$DEL_BRANCH]"; then
     echo -e "${YELLOW}Branch still used by another worktree, skipping: $DEL_BRANCH${NC}"
 elif git branch -d "$DEL_BRANCH" 2>/dev/null || git branch -D "$DEL_BRANCH" 2>/dev/null; then
+    removed "branch $DEL_BRANCH"
     echo -e "${GREEN}Branch deleted: $DEL_BRANCH${NC}"
 else
-    echo -e "${YELLOW}Could not delete branch: $DEL_BRANCH${NC}"
+    warn_cleanup "could not delete branch: $DEL_BRANCH"
 fi
 
 # ============================================
@@ -1199,19 +1287,21 @@ PORT_FILE="$MAIN_REPO/.worktree-ports"
 # Match on the normalised key instead, so either spelling is found, and also on
 # the worktree's real branch for entries written under a different create-name.
 if [[ -f "$PORT_FILE" ]]; then
-    awk -F: -v flat="$SAFE_NAME" -v rb="$RESOLVED_BRANCH" '
+    awk -F: -v flat="$SAFE_NAME" -v rb="$RESOLVED_BRANCH" "$CREATE_NAME_AWK"'
         {
-            key = $2
-            norm = key
-            gsub("/", "-", norm)
-            if (norm == flat || (rb != "" && key == rb)) { dropped++; next }
+            if (same_create_name($2, flat) || (rb != "" && $2 == rb)) { dropped++; next }
             print
         }
         END { exit (dropped ? 0 : 1) }
     ' "$PORT_FILE" > "$PORT_FILE.tmp"
     if [[ $? -eq 0 ]]; then
-        mv "$PORT_FILE.tmp" "$PORT_FILE"
-        echo -e "${GREEN}Done${NC}"
+        if mv "$PORT_FILE.tmp" "$PORT_FILE"; then
+            removed "port entry"
+            echo -e "${GREEN}Done${NC}"
+        else
+            rm -f "$PORT_FILE.tmp"
+            warn_cleanup "could not rewrite $PORT_FILE — the port entry is still there"
+        fi
     else
         rm -f "$PORT_FILE.tmp"
         echo -e "${YELLOW}No port entry found${NC}"
@@ -1232,6 +1322,17 @@ release_the_claim "$BRANCH_NAME" "$WORKTREE_DIR"
 # SUMMARY
 # ============================================
 echo ""
+# No step that ran removed anything and none warned — the one outcome that is
+# neither a clean teardown nor a partial one (#808). It says only that: a step
+# skipped by a --keep flag also removes nothing, so this cannot claim absence.
+if [[ ${#REMOVED[@]} -eq 0 && ${#CLEANUP_WARNINGS[@]} -eq 0 ]]; then
+    echo -e "${RED}========================================${NC}" >&2
+    echo -e "${RED}Nothing removed for '$BRANCH_NAME' in $MAIN_REPO${NC}" >&2
+    echo -e "${RED}========================================${NC}" >&2
+    echo "  No step that ran removed anything (see above). If the" >&2
+    echo "  worktree belongs to another repository, run this from inside that one." >&2
+    exit 2
+fi
 echo -e "${GREEN}========================================${NC}"
 if [[ ${#CLEANUP_WARNINGS[@]} -eq 0 ]]; then
     echo -e "${GREEN}Cleanup complete: $BRANCH_NAME${NC}"
