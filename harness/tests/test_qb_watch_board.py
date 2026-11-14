@@ -6,13 +6,11 @@ Run: pytest harness/tests/test_qb_watch_board.py
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.machinery
 import importlib.util
 import io
 import json
-import os
-import shutil
-import subprocess
 import sys
 import urllib.error
 from pathlib import Path
@@ -78,21 +76,6 @@ def test_instance_key_follows_the_label_then_the_session(monkeypatch):
     assert w.instance_key() == "f5ca7491"
 
 
-QB_HOOK = Path(__file__).resolve().parents[1] / "bin" / "qb-hook"
-BASH = shutil.which("bash") or "/bin/bash"
-
-
-@pytest.mark.parametrize("label", ["seat-1", "seat 3", "..x", "aé-b", "a" * 60, "~~"])
-def test_instance_slug_is_qb_hooks_rule(label):
-    """qb-hook's `tr` replaces every non-ASCII BYTE, so "é" is two dashes there. A
-    per-character slug made one, and named a different agent from the hooks (#857)."""
-    rule = next(ln for ln in QB_HOOK.read_text().splitlines() if ln.startswith("_key_slug()"))
-    got = subprocess.run([BASH, "-c", f'{rule}\n_key_slug "$1"', "_", label],
-                         capture_output=True, text=True, check=True,
-                         env={**os.environ, "LC_ALL": "C.UTF-8"})
-    assert w.key_slug(label) == got.stdout.rstrip("\n")
-
-
 class _Resp(io.BytesIO):
     headers = {"X-Board-Head": "7"}
 
@@ -105,21 +88,28 @@ class _Resp(io.BytesIO):
 
 def test_every_board_request_carries_qbdatas_tls_context(monkeypatch):
     """A bare urlopen fails every HTTPS read on an interpreter with no CA bundle of
-    its own, and the watch then reports an unreadable board that is up (#857)."""
+    its own, and the watch then reports an unreadable board that is up (#857). The
+    watcher's `_ssl_context` must BE qbdata's, not merely exist: patched without
+    `raising`, a missing import would be papered over by the patch itself."""
+    import qbdata
+
+    assert w._ssl_context is qbdata._ssl_context
     sentinel = object()
-    seen = []
+    built, seen = [], []
+    monkeypatch.setattr(w, "_ssl_context", lambda: built.append(1) or sentinel)
 
     def fake_urlopen(req, timeout=None, context=None):
         seen.append(context)
         return _Resp(json.dumps({"agent": "zeus/a"} if req.full_url.endswith("/whoami")
                                 else []).encode())
 
-    monkeypatch.setattr(w, "_ssl_context", lambda: sentinel, raising=False)
     monkeypatch.setattr(w.urllib.request, "urlopen", fake_urlopen)
     board = w.Board("https://qb.example", "tok", "t")
     board.read({})
+    board.read({})
     w.identities(board)
-    assert seen == [sentinel, sentinel]
+    assert seen == [sentinel] * 3
+    assert len(built) == 1, "the context is built once per watch, not once per poll"
 
 
 class FakeBoard:
@@ -235,24 +225,30 @@ def test_the_watch_names_who_it_is_listening_as(run, capsys):
     assert "zeus/amber-otter" in capsys.readouterr().out
 
 
+def _python_sources() -> list[Path]:
+    def first_line(p: Path) -> str:
+        return p.read_text(errors="replace").split("\n", 1)[0]
+
+    found = sorted(p for p in SCRIPT.parent.iterdir() if p.is_file() and (
+        p.suffix == ".py" or (first_line(p).startswith("#!") and "python" in first_line(p))))
+    assert found, "no python sources in harness/bin: this guard is asserting nothing"
+    return found
+
+
 def test_no_board_client_in_harness_bin_opens_a_url_without_the_tls_context():
     """The class, not the one instance: qb-watch-board was the bin/ client that
-    skipped it. Each `urlopen(` call must name `context=` before it closes."""
-    bin_dir = SCRIPT.parent
+    skipped it. Parsed, not grepped, so a comment cannot trip it and `context=None`
+    (the default that fails) cannot satisfy it."""
     bare = []
-    for path in sorted(p for p in bin_dir.iterdir() if p.is_file()):
-        text = path.read_text(errors="replace")
-        if not text.startswith("#!") and path.suffix != ".py":
-            continue
-        for at in range(len(text)):
-            if not text.startswith("urlopen(", at):
+    for path in _python_sources():
+        for node in ast.walk(ast.parse(path.read_text(), str(path))):
+            if not isinstance(node, ast.Call):
                 continue
-            depth, end = 0, at + len("urlopen")
-            while end < len(text):
-                depth += {"(": 1, ")": -1}.get(text[end], 0)
-                end += 1
-                if depth == 0:
-                    break
-            if "context=" not in text[at:end]:
-                bare.append(f"{path.name}:{text.count(chr(10), 0, at) + 1}")
-    assert not bare, f"urlopen without context=: {bare}"
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name != "urlopen":
+                continue
+            ctx = next((k.value for k in node.keywords if k.arg == "context"), None)
+            if ctx is None or (isinstance(ctx, ast.Constant) and ctx.value is None):
+                bare.append(f"{path.name}:{node.lineno}")
+    assert not bare, f"urlopen without a TLS context: {bare}"

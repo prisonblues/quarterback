@@ -14,6 +14,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -2672,3 +2674,43 @@ def test_the_config_lands_somewhere_that_gets_collected(monkeypatch):
     assert qd.gh_dash_config_path("pr-x-1") == "/run/user/999/qb-dash/pr-x-1.yml"
     monkeypatch.delenv("XDG_RUNTIME_DIR")
     assert qd.gh_dash_config_path("pr-x-1").endswith("/qb-dash/pr-x-1.yml")
+
+
+# ------------------------------------------------- the instance key is qb-hook's (#857)
+#
+# Every board client that sends `X-Agent-Instance` takes it from qbdata, so the one
+# parity test lives here, against qb-hook's own lines rather than a copy of them.
+
+QB_HOOK = BIN / "qb-hook"
+
+
+def _hook_instance_lines() -> str:
+    """qb-hook's `_key_slug` and the two lines that derive INSTANCE from it."""
+    src = QB_HOOK.read_text()
+    fn = re.search(r"^_key_slug\(\) \{.*?\}\s*$", src, re.M | re.S)
+    first = re.search(r"^INSTANCE=\$\(_key_slug .*$", src, re.M)
+    fallback = re.search(r'^\[ -n "\$INSTANCE" \] \|\| INSTANCE=.*$', src, re.M)
+    assert fn and first and fallback, "qb-hook no longer derives INSTANCE as this test reads it"
+    return "\n".join(m.group(0) for m in (fn, first, fallback))
+
+
+#: A byte that is not UTF-8, as os.environ hands it to Python: a lone surrogate.
+NOT_UTF8 = b"ab\xffc".decode("utf-8", "surrogateescape")
+
+
+@pytest.mark.parametrize("locale", ["C", "C.UTF-8"])
+@pytest.mark.parametrize("label", ["", "seat-1", "seat 3", "..x", "aé-b", "a" * 60, "~~", " ",
+                                   NOT_UTF8])
+def test_instance_key_is_what_qb_hook_sends(monkeypatch, tmp_path, locale, label):
+    """The whole name, not only the slug: the label, the fallback to the session's
+    first 8, and a label that slugs to nothing. Under both a byte locale and a UTF-8
+    one, because the hooks run under whatever locale their process was given."""
+    sid = "f5ca7491-aaaa-bbbb"
+    env = _path_sandbox.sandbox_env(tmp_path, tools=("bash", "tr", "sed", "cut"),
+                                    LC_ALL=locale, QUARTERBACK_INSTANCE=label)
+    got = subprocess.run(
+        [shutil.which("bash") or "/bin/bash", "-c", f'sid={sid}\n{_hook_instance_lines()}\nprintf "%s" "$INSTANCE"'],
+        capture_output=True, check=True, env=env)
+    monkeypatch.setenv("QUARTERBACK_INSTANCE", label)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+    assert qd.instance_key() == got.stdout.decode("utf-8", "surrogateescape")

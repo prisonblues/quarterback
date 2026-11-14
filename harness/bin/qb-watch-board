@@ -40,10 +40,10 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # One rule for the instance label and one TLS context, shared with every board
-# client here (#857): a per-character slug named a different agent from qb-hook's
-# per-byte one for any non-ASCII label, and a bare urlopen fails every HTTPS read
-# on an interpreter with no CA bundle of its own.
-from qbdata import _ssl_context, instance_key, key_slug  # noqa: E402,F401
+# client here (#857): a per-character slug could name a different agent from
+# qb-hook's per-byte one (`aé-b` was `a--b` here and `a---b` there), and a bare
+# urlopen fails every HTTPS read on an interpreter with no CA bundle of its own.
+from qbdata import _ssl_context, instance_key, resolve_config  # noqa: E402
 
 DEFAULT_INTERVAL_S = 20
 MIN_INTERVAL_S = 10
@@ -98,6 +98,8 @@ def write_cursor(path: Path, value: int) -> None:
 class Board:
     def __init__(self, base_url: str, token: str, instance: str) -> None:
         self.base_url, self.token, self.instance = base_url.rstrip("/"), token, instance
+        # Once per watch, not once per poll: it reads and parses the CA bundle.
+        self.context = _ssl_context()
 
     def read(self, params: dict) -> tuple[list[dict], int]:
         """A page of the inbox and the board's head, from one request."""
@@ -106,7 +108,7 @@ class Board:
         if self.instance:
             req.add_header("X-Agent-Instance", self.instance)
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S,
-                                    context=_ssl_context()) as resp:
+                                    context=self.context) as resp:
             head = int(resp.headers.get("X-Board-Head") or 0)
             return json.loads(resp.read().decode()), head
 
@@ -119,7 +121,7 @@ def identities(board: Board) -> set[str]:
     if board.instance:
         req.add_header("X-Agent-Instance", board.instance)
     with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S,
-                                context=_ssl_context()) as resp:
+                                context=board.context) as resp:
         who = json.loads(resp.read().decode())
     return {v for v in (who.get("agent"), who.get("alias")) if v}
 
@@ -189,8 +191,6 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--once", action="store_true", help="one pass, then exit")
     args = ap.parse_args(argv)
     args.interval = max(args.interval, MIN_INTERVAL_S)
-
-    from qbdata import resolve_config
 
     cfg = resolve_config()
     return watch(Board(cfg.base_url, cfg.token, instance_key()), args)

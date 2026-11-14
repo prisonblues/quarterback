@@ -48,7 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from qbdata import instance_key, key_slug  # noqa: E402,F401 — key_slug is the tested rule
+from qbdata import _ssl_context, instance_key, resolve_config  # noqa: E402
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_TIMEOUT, EXIT_ERROR = range(6)
 DEFAULT_INTERVAL_S = 30
@@ -214,8 +214,6 @@ def say(text: str) -> None:
 def post_outcome(kind: str, summary: str) -> None:
     """Put the outcome on the board as this agent. Best-effort: the exit code still stands."""
     try:
-        from qbdata import _ssl_context, resolve_config
-
         cfg = resolve_config()
         req = urllib.request.Request(
             f"{cfg.base_url}/post",
