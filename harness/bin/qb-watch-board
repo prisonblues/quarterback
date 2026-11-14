@@ -12,9 +12,11 @@ silent otherwise, so each line it prints is a reason to wake up.
 * **Broadcast to the machine: `ask` only.** A `finding` sent to a whole box must not wake
   every agent on it.
 * **Starts at now.** The first pass reads the board's head from `X-Board-Head` and reports
-  nothing older. The cursor lives in a file per session, so a restart does not announce
+  nothing older. A `--re` watch starts at the ask instead, so a fast reply is not missed.
+  The cursor lives in a file per session, so a restart does not announce
   everything again.
-* **`--re <id>` narrows the watch to replies in one thread.** The watch then ends on the
+* **`--re <id>` narrows the watch to one thread**: replies to the ask or to any post already in
+  the thread, plus directed posts that cite nothing. The watch then ends on the
   first reply, because that is what the agent was waiting for.
 * **A failed read is "wait".** Eight in a row end the watch, exit 1.
 
@@ -57,13 +59,20 @@ def instance_key() -> str:
     return key_slug(explicit or session[:8]) or key_slug(session[:8])
 
 
-def wanted(post: dict, me: set[str], thread: int | None) -> bool:
-    """Is this post worth waking for? Directed: any type. Broadcast: only an ask."""
+def wanted(post: dict, me: set[str], thread: set[int] | None) -> bool:
+    """Is this post worth waking for? Directed: any type. Broadcast: only an ask.
+
+    A thread watch also takes a reply that cites any post already in the thread, and a
+    directed post that cites nothing, since peers do not always set `re` to the original ask.
+    """
     if post.get("from") in me:
         return False
-    if thread is not None and post.get("re") != thread:
-        return False
     to = post.get("to") or ""
+    if thread is not None:
+        cited = post.get("re")
+        if cited is None:
+            return "/" in to
+        return cited in thread
     if "/" in to:
         return True
     return post.get("type") == "ask"
@@ -119,26 +128,41 @@ def identities(board: Board) -> set[str]:
     return {v for v in (who.get("agent"), who.get("alias")) if v}
 
 
-def pass_once(board: Board, cursor: int, me: set[str], thread: int | None) -> tuple[list[str], int]:
+def pass_once(
+    board: Board, cursor: int, me: set[str], thread: set[int] | None
+) -> tuple[list[str], int]:
     """One poll: the lines to print and the new cursor."""
     posts, _ = board.read({"to": "@me", "since": cursor})
-    lines = [line(p) for p in posts if wanted(p, me, thread)]
+    lines = []
+    for p in posts:
+        if wanted(p, me, thread):
+            lines.append(line(p))
+            if thread is not None:
+                thread.add(p["id"])
     newest = max([cursor, *(p["id"] for p in posts)])
     return lines, newest
 
 
 def watch(board: Board, args: argparse.Namespace) -> int:
-    state = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"qb-board-watch-{board.instance}"
     me = identities(board)
-    cursor = read_cursor(state)
-    if cursor is None:
-        _, cursor = board.read({"to": "@me", "limit": 1})
-        write_cursor(state, cursor)
+    thread = {args.re} if args.re is not None else None
+    state = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / f"qb-board-watch-{board.instance}"
+    if thread is not None:
+        # a thread watch starts at the ask, not at now: the reply may already be on the board,
+        # and it must not move the standing cursor
+        cursor, state = args.re, None
+    else:
+        cursor = read_cursor(state)
+        if cursor is None:
+            _, cursor = board.read({"to": "@me", "limit": 1})
+            write_cursor(state, cursor)
+    print(f"qb-watch-board: listening as {', '.join(sorted(me))} (instance {board.instance})",
+          flush=True)
     deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
     failures = 0
     while True:
         try:
-            lines, cursor = pass_once(board, cursor, me, args.re)
+            lines, cursor = pass_once(board, cursor, me, thread)
             failures = 0
         except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
             failures += 1
@@ -147,12 +171,15 @@ def watch(board: Board, args: argparse.Namespace) -> int:
                 return 1
             lines = []
         else:
-            write_cursor(state, cursor)
+            if state is not None:
+                write_cursor(state, cursor)
         for text in lines:
             print(text, flush=True)
         if args.once or (lines and args.re is not None):
             return 0
         if deadline is not None and time.monotonic() >= deadline:
+            print(f"qb-watch-board: watch ended after {args.timeout} min, restart it to keep "
+                  "listening", flush=True)
             return 0
         time.sleep(args.interval)
 

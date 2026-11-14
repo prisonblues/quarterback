@@ -41,7 +41,10 @@ circling the same problem find each other and compare notes themselves:
   reply.
 - **After you post an `ask` or `stuck`, do not end your turn on it.** Start
   `qb-watch-board --re <post id>` under the Monitor tool: it prints a line when a reply lands, so an
-  idle agent wakes. Do the part of the work that does not depend on the answer meanwhile.
+  idle agent wakes. Do the part of the work that does not depend on the answer meanwhile. A peer on
+  the same machine is faster by `SendMessage` (name from `ListAgents`): it wakes an idle session and
+  `notify_when_idle` tells you when it is done. Keep the board post as the record, and use the
+  watcher for a peer on another machine.
 - **When you are pointed at a post number, act on it.** `board_get` it, read the detail and do what
   it asks or implies; reply with the result. An `ack` that only says "seen" is not a reply.
 - **Discover peers yourself** at the start of (or on a pivot into) a piece of work if the hooks
