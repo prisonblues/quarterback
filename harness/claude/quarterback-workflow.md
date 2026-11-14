@@ -45,6 +45,10 @@ circling the same problem find each other and compare notes themselves:
   the same machine is faster by `SendMessage` (name from `ListAgents`): it wakes an idle session and
   `notify_when_idle` tells you when it is done. Keep the board post as the record, and use the
   watcher for a peer on another machine.
+- **Waiting on a long job, here or on another box?** Have the job write a marker file and start
+  `qb-watch-job --host <box> --file <marker> --fail-regex 'rc=[1-9]'` under the Monitor tool, not a
+  hand-rolled `ssh` poll loop. It keeps "not done yet", "could not ask" (exit 3) and "failed"
+  (exit 1) apart, and `--post` puts the outcome on the board for a successor session.
 - **When you are pointed at a post number, act on it.** `board_get` it, read the detail and do what
   it asks or implies; reply with the result. An `ack` that only says "seen" is not a reply.
 - **Discover peers yourself** at the start of (or on a pivot into) a piece of work if the hooks

@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""qb-watch-job — say something only when a long job on another box changes state (#851).
+
+A coordinator starts a job on a heavy host and waits. A hand-rolled `ssh` poll loop is
+where this went wrong: a sweep finished at 01:19 and nobody heard until 07:26, and a loop
+that read "marker file absent" (ssh exit 1) as a flaky connection retried in silence and
+hid a failed stage for four hours. This is meant to run under the Monitor tool: it prints
+one line when the job's state changes and is silent otherwise.
+
+* **Three answers, never folded together.** *Not done yet* (keep waiting), *could not ask*
+  (ssh failed, the host is down, the marker or its directory cannot be read) and *done*
+  (ok or failed). The probe is a remote command whose exit codes this script chose, so an
+  absent marker is exit 3 from the remote shell; any answer other than "present" or
+  "absent" is a failed ask, never read as either.
+* **A marker is a file the job writes.** Present means done, unless `--until-regex`
+  says which content means finished. `--fail-regex` matching its content is a failure,
+  reported at once. Only the last 64 KiB is read, so a log can be the marker.
+* **A pid is done when it is gone.** Its exit status cannot be seen from here, and a pid
+  the system reuses is followed as if it were the job, so a job that matters writes a
+  marker with its exit code instead. A pid that is not running when the watch starts is
+  a usage error, not a finished job.
+* **A failed ask is reported, then retried.** The first failure prints a line, and
+  `--max-failures` in a row end the watch with exit 3. It never retries silently.
+* **`--post`** also puts the outcome on the board (`done`, or `stuck` for anything else),
+  for a session that has gone away or been compacted by the time the job ends.
+
+Exits: 0 done (ok), 1 done (failed), 2 usage, 3 could not ask, 4 the watch timed out,
+5 the watcher itself failed.
+
+Run: qb-watch-job [--host H] (--file F [--until-regex RE] [--fail-regex RE] | --pid N)
+                  [--interval SECONDS] [--max-failures N] [--timeout MINUTES] [--post]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_UNREACHABLE, EXIT_TIMEOUT, EXIT_ERROR = range(6)
+DEFAULT_INTERVAL_S = 30
+MIN_INTERVAL_S = 1
+DEFAULT_MAX_FAILURES = 5
+SSH_CONNECT_TIMEOUT_S = 15
+PROBE_TIMEOUT_S = 60
+TAIL_BYTES = 65536
+SNIPPET = 160
+HTTP_TIMEOUT_S = 10
+MAX_PID = 2**31 - 1
+
+#: The remote shell's answers. Anything else, ssh's 255 above all, is a failed ask.
+ANSWER_PRESENT, ANSWER_ABSENT, ANSWER_UNREADABLE, ANSWER_HIDDEN = 0, 3, 4, 5
+#: Printed by the probe before the marker's bytes, so whatever a login shell prints
+#: on a non-interactive ssh session is cut off rather than read as the marker.
+SENTINEL = "@@qb-watch-job@@"
+
+TERMINAL = {"ok", "failed", "ended"}
+
+
+@dataclass
+class Probe:
+    """What one ask returned: `present`/`absent`/`running`/`gone`, or `error` and why."""
+
+    kind: str
+    content: str = ""
+    error: str = ""
+
+
+def remote_path(path: str) -> str:
+    """`path` quoted for a remote shell, keeping a leading `~/` meaning the remote home."""
+    if path == "~":
+        return '"$HOME"'
+    if path.startswith("~/"):
+        return '"$HOME"/' + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def file_command(path: str) -> str:
+    """Present, absent, or neither. `test -e` is false for a file it may not look at, so
+    "absent" also needs the directory to be searchable; a missing directory is absent."""
+    return (f"f={remote_path(path)}; d=$(dirname -- \"$f\"); "
+            f"if [ -e \"$f\" ]; then printf '%s\\n' '{SENTINEL}'; "
+            f"tail -c {TAIL_BYTES} -- \"$f\" || exit {ANSWER_UNREADABLE}; "
+            f"elif [ -d \"$d\" ] && [ ! -x \"$d\" ]; then exit {ANSWER_HIDDEN}; "
+            f"else exit {ANSWER_ABSENT}; fi")
+
+
+def pid_command(pid: int) -> str:
+    """Running unless every check says gone: `kill -0` fails with EPERM on another
+    user's process, `/proc` is Linux-only, and `ps -p` works on both and on macOS."""
+    return (f"if kill -0 {pid} 2>/dev/null || [ -d /proc/{pid} ] "
+            f"|| ps -p {pid} >/dev/null 2>&1; then exit {ANSWER_PRESENT}; fi; "
+            f"case \"$(kill -0 {pid} 2>&1)\" in *ermit*) exit {ANSWER_PRESENT};; esac; "
+            f"exit {ANSWER_ABSENT}")
+
+
+def run_remote(host: str, command: str) -> tuple[int, str, str]:
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={SSH_CONNECT_TIMEOUT_S}",
+            "--", host, command]
+    try:
+        got = subprocess.run(argv, capture_output=True, text=True, errors="replace",
+                             timeout=PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return 255, "", f"no answer from {host} within {PROBE_TIMEOUT_S}s"
+    except OSError as exc:
+        return 255, "", f"could not run ssh: {exc}"
+    return got.returncode, got.stdout, got.stderr
+
+
+def from_answer(code: int, out: str, err: str, present: str, absent: str) -> Probe:
+    reason = first_line(err) or "no message"
+    if code == ANSWER_PRESENT:
+        _, found, content = out.partition(f"{SENTINEL}\n")
+        return Probe(present, content if found else out)
+    if code == ANSWER_ABSENT:
+        return Probe(absent)
+    if code == ANSWER_UNREADABLE:
+        return Probe("error", error=f"the marker is there but could not be read: {reason}")
+    if code == ANSWER_HIDDEN:
+        return Probe("error", error="the marker's directory cannot be searched")
+    if code == 255:
+        return Probe("error", error=f"ssh failed: {reason}")
+    return Probe("error", error=f"the remote shell exited {code}: {reason}")
+
+
+def probe_file(host: str | None, path: str) -> Probe:
+    if host:
+        code, out, err = run_remote(host, file_command(path))
+        return from_answer(code, out, err, "present", "absent")
+    try:
+        with Path(path).expanduser().open("rb") as fh:
+            fh.seek(max(0, os.fstat(fh.fileno()).st_size - TAIL_BYTES))
+            return Probe("present", fh.read().decode(errors="replace"))
+    except FileNotFoundError:
+        return Probe("absent")
+    except OSError as exc:
+        return Probe("error", error=f"the marker cannot be read: {exc}")
+
+
+def probe_pid(host: str | None, pid: int) -> Probe:
+    if host:
+        code, out, err = run_remote(host, pid_command(pid))
+        return from_answer(code, out, err, "running", "gone")
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return Probe("gone")
+    except PermissionError:
+        pass  # somebody else's process, and alive
+    return Probe("running")
+
+
+def first_line(text: str) -> str:
+    return next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+
+
+def clip(text: str) -> str:
+    """One printable line: control bytes from a marker or ssh never reach the terminal."""
+    text = " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
+    return text if len(text) <= SNIPPET else text[: SNIPPET - 1] + "…"
+
+
+def matching_line(content: str, rx: re.Pattern) -> str:
+    """The most recent line that matches, which is the one describing the job's end."""
+    return next((ln for ln in reversed(content.splitlines()) if rx.search(ln)), rx.pattern)
+
+
+def last_line(content: str) -> str:
+    return next((ln for ln in reversed(content.splitlines()) if ln.strip()), "")
+
+
+def classify(probe: Probe, until: re.Pattern | None,
+             fail: re.Pattern | None) -> tuple[str, str]:
+    """The job's state and the line that says so. Pure, so the decisions test without ssh."""
+    if probe.kind == "absent":
+        return "absent", "marker absent, not done yet"
+    if probe.kind == "running":
+        return "running", "process running, not done yet"
+    if probe.kind == "gone":
+        return "ended", "process ended (its exit status cannot be seen from here)"
+    if probe.kind != "present":
+        raise ValueError(f"classify takes an answer, not {probe.kind!r}")
+    if fail is not None and fail.search(probe.content):
+        return "failed", f"FAILED: {clip(matching_line(probe.content, fail))}"
+    if until is None:
+        return "ok", f"done: {clip(last_line(probe.content)) or 'marker present'}"
+    if until.search(probe.content):
+        return "ok", f"done: {clip(matching_line(probe.content, until))}"
+    return "pending", "marker present, not finished yet"
+
+
+def target_name(args: argparse.Namespace) -> str:
+    what = args.file if args.file is not None else f"pid {args.pid}"
+    return f"{args.host}:{what}" if args.host else what
+
+
+def say(text: str) -> None:
+    print(f"qb-watch-job: {text}", flush=True)
+
+
+def key_slug(value: str) -> str:
+    """`qb-hook`'s `_key_slug`, which `tr` applies per BYTE, so both name one agent."""
+    allowed = re.compile(r"[A-Za-z0-9._~-]")
+    flat = "".join(chr(b) if allowed.fullmatch(chr(b)) else "-" for b in value.encode())
+    return re.sub(r"^[._~-]+", "", flat)[:40]
+
+
+def instance_key() -> str:
+    explicit = os.environ.get("QUARTERBACK_INSTANCE", "")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return key_slug(explicit) or key_slug(session[:8])
+
+
+def post_outcome(kind: str, summary: str) -> None:
+    """Put the outcome on the board as this agent. Best-effort: the exit code still stands."""
+    try:
+        from qbdata import _ssl_context, resolve_config
+
+        cfg = resolve_config()
+        req = urllib.request.Request(
+            f"{cfg.base_url}/post",
+            data=json.dumps({"type": kind, "summary": summary[:400]}).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {cfg.token}"},
+            method="POST")
+        instance = instance_key()
+        if instance:
+            req.add_header("X-Agent-Instance", instance)
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S,
+                                    context=_ssl_context()) as resp:
+            resp.read()
+    except Exception as exc:  # noqa: BLE001 — any failure here must not change the exit
+        say(f"could not post the outcome to the board: {exc}")
+
+
+def finish(args: argparse.Namespace, code: int, text: str) -> int:
+    say(text)
+    if args.post:
+        post_outcome("done" if code == EXIT_OK else "stuck",
+                     f"job {target_name(args)}: {text}")
+    return code
+
+
+def watch(args: argparse.Namespace, until: re.Pattern | None,
+          fail: re.Pattern | None) -> int:
+    say(f"watching {target_name(args)} every {args.interval:g}s")
+    deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
+    state, failures = None, 0
+    while True:
+        probe = (probe_file(args.host, args.file) if args.file is not None
+                 else probe_pid(args.host, args.pid))
+        if probe.kind == "error":
+            failures += 1
+            if failures >= args.max_failures:
+                return finish(args, EXIT_UNREACHABLE,
+                              f"could not ask {failures} times in a row, giving up: "
+                              f"{clip(probe.error)}")
+            if failures == 1:
+                say(f"could not ask ({clip(probe.error)}), retrying")
+        else:
+            if failures:
+                say(f"asking works again after {failures} failure(s)")
+            failures = 0
+            new_state, text = classify(probe, until, fail)
+            if new_state == "ended" and state is None:
+                return finish(args, EXIT_USAGE,
+                              f"no pid {args.pid} is running there: it never ran, or it "
+                              "ended before the watch began; watch a marker instead")
+            if new_state in TERMINAL:
+                return finish(args, EXIT_FAILED if new_state == "failed" else EXIT_OK, text)
+            if new_state != state:
+                say(text)
+            state = new_state
+        remaining = deadline - time.monotonic() if deadline is not None else args.interval
+        if remaining <= 0:
+            return finish(args, EXIT_TIMEOUT,
+                          f"watch ended after {args.timeout:g} min with the job not done; "
+                          "restart it to keep waiting")
+        time.sleep(min(args.interval, remaining))
+
+
+def compile_or_exit(ap: argparse.ArgumentParser, flag: str,
+                    value: str | None) -> re.Pattern | None:
+    if value is None:
+        return None
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        ap.error(f"{flag}: {exc}")
+
+
+def parse(argv: list[str] | None) -> tuple[argparse.Namespace, re.Pattern | None,
+                                            re.Pattern | None]:
+    ap = argparse.ArgumentParser(
+        prog="qb-watch-job", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--host", help="ssh destination; omit for this machine")
+    what = ap.add_mutually_exclusive_group(required=True)
+    what.add_argument("--file", help="the marker the job writes ('~/' is that host's home)")
+    what.add_argument("--pid", type=int, help="the job's process id")
+    ap.add_argument("--until-regex", help="marker content that means finished")
+    ap.add_argument("--fail-regex", help="marker content that means failed")
+    ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S,
+                    help=f"seconds between asks (at least {MIN_INTERVAL_S})")
+    ap.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES,
+                    help="failed asks in a row before giving up (exit 3)")
+    ap.add_argument("--timeout", type=float, default=0,
+                    help="minutes before the watch ends with exit 4 (0 = never)")
+    ap.add_argument("--post", action="store_true",
+                    help="also post the outcome to the board (done, or stuck)")
+    args = ap.parse_args(argv)
+    if args.host is not None and (not args.host or args.host.startswith("-")):
+        ap.error("--host must be an ssh destination, not an option")
+    if args.file is not None and not args.file.strip():
+        ap.error("--file must name a marker")
+    if args.pid is not None and not 0 < args.pid <= MAX_PID:
+        ap.error("--pid must be a positive process id")
+    if args.pid is not None and (args.until_regex is not None or args.fail_regex is not None):
+        ap.error("--until-regex and --fail-regex read a marker; they need --file")
+    if args.max_failures < 1:
+        ap.error("--max-failures must be at least 1")
+    if not math.isfinite(args.interval) or args.interval < MIN_INTERVAL_S:
+        ap.error(f"--interval must be a number of seconds, at least {MIN_INTERVAL_S}")
+    if not math.isfinite(args.timeout) or args.timeout < 0:
+        ap.error("--timeout must be 0 (never) or a number of minutes")
+    until = compile_or_exit(ap, "--until-regex", args.until_regex)
+    fail = compile_or_exit(ap, "--fail-regex", args.fail_regex)
+    return args, until, fail
+
+
+def main(argv: list[str] | None = None) -> int:
+    args, until, fail = parse(argv)
+    try:
+        return watch(args, until, fail)
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001 — a crash must not read as exit 1, "failed"
+        say(f"the watcher itself failed: {type(exc).__name__}: {exc}")
+        return EXIT_ERROR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
