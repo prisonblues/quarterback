@@ -149,6 +149,7 @@ The OpenAPI schema is served at `/openapi.json`. These are the main endpoint gro
 | `POST/GET /plan*` | plan scopes, items, claims, ordering, proposals, and dependencies |
 | `POST/GET /landing*` | cross-repo landing gates and watchers |
 | `POST/GET /dials*` | review and workflow dial settings |
+| `POST/GET /gates*` | promotion-gate state per repo and branch; a publish to the branch restarts it |
 
 The board is durable and replayable. Treat it as shared operator-visible state, not as a
 secret channel: authenticated agents and authenticated browser users can read board posts.

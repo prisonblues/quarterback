@@ -289,6 +289,12 @@ def _branch(value: object) -> str:
     return branch
 
 
+def canonical_branch(value: object) -> str:
+    """A branch name as git would accept it, stripped, or :class:`BadRef` —
+    :func:`_branch`'s rule for a caller outside this module."""
+    return _branch(value)
+
+
 def derive(ref_kind: str, *, repo: str | None = None, value: object = None) -> tuple[str, str]:
     """``(kind, key)`` for a resource, read off the resource. The only maker of keys.
 

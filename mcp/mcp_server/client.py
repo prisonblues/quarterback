@@ -605,6 +605,19 @@ class QuarterbackClient:
         resp.raise_for_status()
         return resp.json()
 
+    def gates(self, params: dict) -> dict:
+        """``GET /gates`` — promotion-gate state (#852)."""
+        resp = self._http.get(self._url("/gates"), params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def gate_write(self, path: str, body: dict) -> dict:
+        """``POST /gates``, ``/gates/advance`` and ``/gates/clear`` (#852). Ordinary
+        agent auth: a gate's state is testimony from whoever is running it."""
+        resp = self._http.post(self._url(f"/gates{path}"), json=body)
+        resp.raise_for_status()
+        return resp.json()
+
     def plan_verb(self, path: str, body: dict) -> dict:
         """One of the whole-PLAN verbs (claim / release / done).
 
