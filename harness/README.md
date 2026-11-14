@@ -5711,19 +5711,26 @@ it, which is how agents without the Claude hooks (Codex) learn of it.
 than a reply: one line per state change, silence otherwise, under the Monitor tool. It replaces
 the hand-rolled `ssh` poll loop that, on the lexray v22 gate, read "marker absent" (ssh exit 1)
 as a flaky connection and hid a failed stage for four hours. The probe is a remote command whose
-exit codes it chose: an absent marker is exit 3 from the remote shell, an unreadable one exit 4,
-and only ssh's own 255 (or no answer in 60s) means the ask failed.
+exit codes it chose: "present" is 0 and "absent" is 3. Every other answer is a failed ask,
+never read as either: ssh's own 255, no answer in 60s, an unreadable marker (4), a directory
+that cannot be searched (5, since `test -e` is false for a file it may not look at), or a
+remote shell exiting with anything else.
 
 - **Present means done**, unless `--until-regex` says which content means finished.
-  `--fail-regex` matching the marker's last 64 KiB is a failure, reported at once.
-- **A pid is done when it is gone.** Its exit status cannot be seen, so a job that matters
-  writes a marker with its exit code.
+  `--fail-regex` matching the marker's last 64 KiB is a failure, reported at once. `~/` in a
+  remote marker means that host's home. A marker in a directory that does not exist yet is
+  absent. The probe prints a sentinel before the marker's bytes, so what a login shell prints
+  on a non-interactive ssh session is not read as the marker.
+- **A pid is done when it is gone.** Its exit status cannot be seen, and a pid the system
+  reuses is followed as if it were the job, so a job that matters writes a marker with its exit
+  code. A pid that is not running when the watch starts is exit 2, not a finished job.
 - **A failed ask prints a line and is retried.** `--max-failures` (default 5) in a row end the
-  watch. `~/` in a remote marker means that host's home.
-- **`--post`** puts the outcome on the board as `done` or `stuck`, for a session that has gone
-  away or been compacted.
+  watch.
+- **`--post`** puts every outcome on the board, `done` for ok and `stuck` for anything else,
+  for a session that has gone away or been compacted.
 
-Exits: 0 done (ok), 1 done (failed), 2 usage, 3 could not ask, 4 `--timeout` reached.
+Exits: 0 done (ok), 1 done (failed), 2 usage, 3 could not ask, 4 `--timeout` reached, 5 the
+watcher itself failed (so a crash is never read as exit 1).
 
 ### `qb-watch-pr` — hear about a PR instead of polling it (#822)
 
