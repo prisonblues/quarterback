@@ -55,8 +55,9 @@
   "worker": {
     "type": "none",
     "_autostart": [
-      "Whether create-worktree STARTS the worker. It is written into docker-compose.yml",
-      "either way, and the summary prints the one command that starts it later.",
+      "Whether create-worktree STARTS the worker (a JSON boolean). It is written into",
+      "docker-compose.yml either way, under a 'worker' compose profile so no bare",
+      "`docker compose up -d` starts it; the summary prints the command that does.",
       "Default false: most worktrees are code-and-test only (#853). Per run,",
       "--with-worker and --no-worker beat this."
     ],
