@@ -60,6 +60,13 @@ NC='\033[0m'
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# The worker rule is shared with create-worktree and remove-worktree (#854), so
+# the three cannot name a repo's worker container differently.
+WORKTREE_WORKER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worktree-worker"
+[[ -r "$WORKTREE_WORKER" ]] || die "worktree-worker is not beside this script ($WORKTREE_WORKER) — the harness install is incomplete"
+# shellcheck source=worktree-worker
+. "$WORKTREE_WORKER"
+
 env_val() {
     local var="$1" file="$2"
     [[ -f "$file" ]] || return 0
@@ -210,17 +217,9 @@ DB_CONTAINER=$(cfg '.database.container' "auto")
 DB_USER_ENV=$(cfg '.database.user_env' "POSTGRES_USER")
 DB_URL_ENV=$(cfg '.database.url_env' "")
 
-# Worker container prefix + nginx config, mirroring create-worktree/remove-worktree
-# so we can recognise per-worktree containers and nginx blocks.
-WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
-WORKER_TYPE=$(cfg '.worker.type' "")
-if [[ -z "$WORKER_PREFIX" ]]; then
-    case "$WORKER_TYPE" in
-        huey)   WORKER_PREFIX="huey-consumer" ;;
-        rq)     WORKER_PREFIX="${PROJECT}-rq-worker" ;;
-        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
-    esac
-fi
+# Worker container prefix (worktree-worker's rule) + nginx config, so we can
+# recognise per-worktree containers and nginx blocks.
+resolve_worker "$MAIN_REPO" "$PROJECT"
 NGINX_CONFIG=$(cfg '.nginx.config' "")
 NGINX_CONTAINER=$(cfg '.nginx.container' "auto")
 

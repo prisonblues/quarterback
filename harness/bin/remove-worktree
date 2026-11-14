@@ -44,6 +44,18 @@ NC='\033[0m'
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# The worker rule is shared with create-worktree and prune-worktrees (#854), so
+# the three cannot name a repo's worker container differently. Missing, the
+# teardown still runs — a partial install must still tear down, as with
+# worktree-lock — and says what it could not name (see resolve_worker below).
+WORKTREE_WORKER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worktree-worker"
+if [[ -r "$WORKTREE_WORKER" ]]; then
+    # shellcheck source=worktree-worker
+    . "$WORKTREE_WORKER"
+else
+    WORKTREE_WORKER_MISSING=true
+fi
+
 # Steps that fail non-fatally record here instead of printing a yellow note and
 # being forgotten. The old behaviour ended every run with an unconditional
 # "Cleanup complete", so a database that was never dropped looked like a clean
@@ -709,15 +721,12 @@ DB_CONTAINER=$(cfg '.database.container' "auto")
 DB_USER_ENV=$(cfg '.database.user_env' "POSTGRES_USER")
 DB_NAME_ENV=$(cfg '.database.name_env' "POSTGRES_DB")
 DB_URL_ENV=$(cfg '.database.url_env' "")
-WORKER_TYPE=$(cfg '.worker.type' "none")
-WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
-
-if [[ -z "$WORKER_PREFIX" ]]; then
-    case "$WORKER_TYPE" in
-        huey) WORKER_PREFIX="huey-consumer" ;;
-        rq) WORKER_PREFIX="${PROJECT}-rq-worker" ;;
-        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
-    esac
+if [[ "${WORKTREE_WORKER_MISSING:-}" = true ]]; then
+    WORKER_TYPE=$(cfg '.worker.type' "none")
+    WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
+    warn_cleanup "worktree-worker is not beside this script ($WORKTREE_WORKER) — a worker container is found only through docker compose, not by name"
+else
+    resolve_worker "$MAIN_REPO" "$PROJECT"
 fi
 
 # If no DB engine in config, check .env

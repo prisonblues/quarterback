@@ -1,0 +1,56 @@
+# shellcheck shell=bash
+# worktree-worker — the ONE rule for a repo's background worker, SOURCED by
+# create-worktree, remove-worktree and prune-worktrees. Not executable.
+#
+# NO `set` AT THE TOP LEVEL, for worktree-lock's reason: `remove-worktree` runs
+# `set +e` on purpose and `prune-worktrees` runs `set -u`, and a library must not
+# impose either on the other.
+#
+# WHY IT IS A LIBRARY (#854). create-worktree resolved the worker type as
+# `.worker.type`, falling back to what the repo's dependencies say, while the two
+# teardown scripts fell back to "none" and "". So a repo whose huey/rq/celery
+# worker was only DETECTED got a worker container from create-worktree that
+# neither teardown could name: remove-worktree's name-based pass skipped it once
+# the worktree directory was gone, and prune-worktrees could not pair an orphan
+# worker with its worktree. Three readers of one fact cannot be allowed three
+# answers, so the fact lives here and each of them sources it.
+#
+# Callers define `cfg KEY DEFAULT` (each already has one) before calling
+# `resolve_worker`, which sets WORKER_TYPE and WORKER_PREFIX.
+
+# What the repo's dependencies say its worker is: huey, rq, celery or none.
+detect_worker_type() {
+    local root="$1" file
+    for file in "$root/pyproject.toml" "$root/requirements.txt"; do
+        [[ -f "$file" ]] || continue
+        if grep -qi 'huey' "$file" 2>/dev/null; then echo "huey"; return; fi
+        if grep -qi '\brq\b' "$file" 2>/dev/null; then echo "rq"; return; fi
+        if grep -qi 'celery' "$file" 2>/dev/null; then echo "celery"; return; fi
+    done
+    # Check docker-compose for worker services
+    if [[ -f "$root/docker-compose.yml" ]]; then
+        if grep -qi 'huey' "$root/docker-compose.yml" 2>/dev/null; then echo "huey"; return; fi
+        if grep -qi '\brq\b' "$root/docker-compose.yml" 2>/dev/null; then echo "rq"; return; fi
+        if grep -qi 'celery' "$root/docker-compose.yml" 2>/dev/null; then echo "celery"; return; fi
+    fi
+    echo "none"
+}
+
+# The container-name prefix a worker of TYPE gets in PROJECT; empty for none.
+default_worker_prefix() {
+    case "$1" in
+        huey)   echo "huey-consumer" ;;
+        rq)     echo "$2-rq-worker" ;;
+        celery) echo "$2-celery-worker" ;;
+    esac
+}
+
+# resolve_worker MAIN_REPO PROJECT — sets WORKER_TYPE and WORKER_PREFIX the way
+# create-worktree names the container: config first, then the repo itself.
+resolve_worker() {
+    WORKER_TYPE=$(cfg '.worker.type' "$(detect_worker_type "$1")")
+    WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
+    if [[ -z "$WORKER_PREFIX" ]]; then
+        WORKER_PREFIX=$(default_worker_prefix "$WORKER_TYPE" "$2")
+    fi
+}

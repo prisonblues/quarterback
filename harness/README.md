@@ -5160,6 +5160,16 @@ left running its periodic jobs took ~4 cores on zeus away from a promotion gate 
 runners (lexray#4458). A bare `docker compose down` leaves a profiled service running, so
 `remove-worktree` downs the stack with `COMPOSE_PROFILES='*'`.
 
+**One rule names the worker, in `bin/worktree-worker` (#854).** `create-worktree`,
+`remove-worktree` and `prune-worktrees` all source it, so all three resolve the worker type
+the same way: `worker.type` if the config sets it, otherwise what the repo's dependencies say
+(huey, rq, celery). They used to disagree: the two teardowns fell back to "none", so a worker
+that was only *detected* got a container neither could name. `remove-worktree` missed it once
+the worktree directory was gone, and `prune-worktrees` could not pair it with a dead worktree.
+The library sits beside the scripts like `worktree-lock`. Without it, `create-worktree` and
+`prune-worktrees` refuse to run, and `remove-worktree` still tears down but warns that it could
+find a worker container only through `docker compose`.
+
 **`copies` and `gitignore_additions` also tell `remove-worktree` what NOT to back up.**
 The teardown tarball is for what somebody would otherwise lose, and neither of these is
 that: a `copies` path is a byte-copy of the main checkout, and a `gitignore_additions`
