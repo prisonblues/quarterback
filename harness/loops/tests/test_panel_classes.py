@@ -529,3 +529,133 @@ def test_the_brief_drops_control_bytes_and_bounds_the_class_count():
     brief = pc.ledger_brief(ledger)
     assert "\x00" not in brief and "\x1b" not in brief
     assert f"(+{61 - pc.BRIEF_CLASSES_MAX} more" in brief
+
+
+# ------------------------------------------------- deferring and filing (#844)
+
+def test_a_deferral_round_trips_and_owes_nothing(tmp_path):
+    ledger = owed_ledger()
+    assert pc.is_owed(ledger["classes"][0], 2)
+    pc.record_deferral(ledger, RESOLVER, 2, "pre-existing", 901)
+    assert not pc.is_owed(ledger["classes"][0], 2)
+    assert pc.budget_refusal(ledger, 3, 2, 3) == ""
+    path = tmp_path / "classes.json"
+    pc.save_ledger(str(path), ledger)
+    loaded, problems = pc.load_ledger(str(path))
+    assert problems == [] and loaded["classes"][0]["deferred"] == {
+        "issue": 901, "rule": "pre-existing", "round": 2}
+
+
+@pytest.mark.parametrize("deferred, says", [
+    ({"issue": 901, "rule": "pre-existing", "round": 99}, "has not run"),
+    ({"issue": 901, "rule": "because", "round": 1}, None),
+    ({"issue": 0, "rule": "budget", "round": 1}, None),
+])
+def test_a_deferral_read_back_is_validated(tmp_path, deferred, says):
+    raw = ledger_with("a.py:10")
+    raw["classes"][0]["deferred"] = deferred
+    path = tmp_path / "classes.json"
+    path.write_text(json.dumps(raw))
+    loaded, problems = pc.load_ledger(str(path))
+    assert loaded["classes"][0]["deferred"] is None
+    if says:
+        assert any(says in p for p in problems)
+
+
+def test_a_deferred_class_is_briefed_as_tracked_elsewhere():
+    ledger = ledger_with("a.py:10")
+    pc.record_deferral(ledger, RESOLVER, 1, "outside-change", 901)
+    brief = pc.ledger_brief(ledger)
+    assert "TRACKED ELSEWHERE" in brief and "#901 (outside-change)" in brief
+    assert f"  invariant: {INVARIANT}" not in brief
+
+
+@pytest.mark.parametrize("call", [
+    lambda led: pc.record_deferral(led, RESOLVER, 1, "because", 901),
+    lambda led: pc.record_deferral(led, RESOLVER, 5, "budget", 901),
+    lambda led: pc.record_deferral(led, RESOLVER, 1, "budget", 0),
+])
+def test_a_deferral_needs_a_known_rule_a_round_that_ran_and_an_issue(call):
+    with pytest.raises(ValueError):
+        call(ledger_with("a.py:10"))
+
+
+@pytest.fixture
+def fake_gh(monkeypatch):
+    """Every gh call recorded; answers scripted per subcommand."""
+    calls: list[tuple] = []
+    answers = {"issue list": "", "label list": "", "issue create":
+               "https://github.com/acme/board/issues/902\n", "issue comment": ""}
+
+    def gh(*args):
+        calls.append(args)
+        return answers[" ".join(args[:2])]
+    monkeypatch.setattr(pc, "gh", gh)
+    return calls, answers
+
+
+def test_file_creates_an_issue_carrying_the_class_key(fake_gh):
+    calls, _ = fake_gh
+    ledger = ledger_with("a.py:10")
+    verdict = pc.file_class(ledger, RESOLVER, 1, "pre-existing", "acme/board", 34)
+    create = next(c for c in calls if c[:2] == ("issue", "create"))
+    body = create[create.index("--body") + 1]
+    key = ledger["classes"][0]["key"]
+    assert f"class-key: {key}" in body and "a.py:10" in body and "#34" in body
+    assert "--label" not in create and verdict["labelled"] is False
+    assert verdict["issue"] == 902 and verdict["filed"] == "created"
+    assert ledger["classes"][0]["deferred"]["issue"] == 902
+
+
+def test_file_uses_the_label_only_when_the_repo_has_it(fake_gh):
+    calls, answers = fake_gh
+    answers["label list"] = "found-in-review\n"
+    pc.file_class(ledger_with("a.py:10"), RESOLVER, 1, "budget", "acme/board")
+    create = next(c for c in calls if c[:2] == ("issue", "create"))
+    assert create[create.index("--label") + 1] == "found-in-review"
+
+
+def test_file_comments_on_the_open_issue_for_the_same_class(fake_gh):
+    calls, answers = fake_gh
+    answers["issue list"] = "777\n"
+    ledger = ledger_with("a.py:10")
+    verdict = pc.file_class(ledger, RESOLVER, 1, "pre-existing", "acme/board")
+    assert verdict == {**verdict, "issue": 777, "filed": "commented"}
+    assert not any(c[:2] == ("issue", "create") for c in calls)
+    assert ledger["classes"][0]["deferred"]["issue"] == 777
+
+
+def test_file_refuses_before_touching_github(fake_gh):
+    calls, _ = fake_gh
+    with pytest.raises(ValueError, match="--rule"):
+        pc.file_class(ledger_with("a.py:10"), RESOLVER, 1, "because", "acme/board")
+    with pytest.raises(ValueError, match="--github"):
+        pc.file_class(ledger_with("a.py:10"), RESOLVER, 1, "budget", "")
+    assert calls == []
+
+
+def test_the_cli_files_and_records_and_a_gh_failure_records_nothing(cli, fake_gh,
+                                                                    monkeypatch,
+                                                                    tmp_path):
+    cli("record", "--round", "1", "--class", RESOLVER, "--path", "a.py:1",
+        "--invariant", INVARIANT)
+    assert cli("file", "--round", "1", "--class", RESOLVER, "--rule", "budget") == 0
+    ledger, _ = pc.load_ledger(str(tmp_path / "classes.json"))
+    assert ledger["classes"][0]["deferred"]["issue"] == 902
+
+    def broken(*args):
+        raise pc.subprocess.CalledProcessError(1, "gh", stderr="no auth")
+    monkeypatch.setattr(pc, "gh", broken)
+    cli("record", "--round", "2", "--class", "token read apart from its value",
+        "--path", "b.py:2", "--invariant", "read together")
+    with pytest.raises(SystemExit, match="nothing recorded"):
+        cli("file", "--round", "2", "--class", "token read apart from its value",
+            "--rule", "budget")
+    ledger, _ = pc.load_ledger(str(tmp_path / "classes.json"))
+    assert ledger["classes"][1]["deferred"] is None
+
+
+def test_the_cli_refuses_an_unknown_rule(cli):
+    with pytest.raises(SystemExit):
+        cli("defer", "--round", "1", "--class", RESOLVER, "--rule", "because",
+            "--issue", "5")

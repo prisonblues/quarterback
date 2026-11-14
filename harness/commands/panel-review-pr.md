@@ -536,7 +536,8 @@ tells the sub-agent to Read that file first and follow it:
   panel missed and the fixer walks straight into is still a P1, and leaving it because
   no reviewer happened to name it is the worst outcome on offer. Below the floor, or
   outside the change under review, it is **reported in the summary and not fixed**,
-  exactly like a below-floor panel finding.
+  exactly like a below-floor panel finding — and the orchestrator files it (the
+  class ledger's fix-or-defer rule, #844), so "reported" never means "lost".
 - **Paste the 💸 marks with the findings that carry them, and the budget with the
   list.** The marks are how the fixer tells a budgeted finding from an unconditional
   one, and a **To fix** list pasted without them briefs the pre-#297 behaviour: every
@@ -606,6 +607,10 @@ board as confirmed.
 
 If `qb record-outcome` fails, say in the relay which outcomes are unrecorded; do not drop
 them — an outcome nobody records is the gap this whole feature exists to close.
+
+A finding the fix pass left as pre-existing or out of scope is not finished by saying
+so here: it is filed, with `panel_classes.py file --rule pre-existing` (or
+`outside-change`, `budget`), under the class ledger's fix-or-defer rule (#844).
 
 **Map the fixer's finding IDs to keys first — this is a step, not an aside.** The
 fixer reports the ID it was given (`236-F01`, exactly as the report prints it in
@@ -996,6 +1001,25 @@ python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes
   `panel_classes.py dismiss --ledger … --pr <pr> --round <r> --class <key> --why "…"`.
   It owes nothing after that, and later rounds are briefed that it was ruled out.
   Relay each dismissal in §6, because it is a judgement the owner should see.
+- **Fix it here, or file it for later — decided by rule, every round (#844).** Each
+  confirmed finding, and each `could_not_assess` phrase starting "outside the change:",
+  gets one of two dispositions before the fix pass:
+  - **fix** when this PR introduced it or it is in behaviour the PR changed, AND it is
+    P1/P2 (never budgeted) or fits `low_severity_fix_lines`. `provenance` already says
+    whether the PR introduced it.
+  - **defer** otherwise, naming the rule: `pre-existing` (the change neither caused
+    it nor made it worse), `outside-change` (a seat's "outside the change:" note),
+    `budget` (fixing it would grow the change past the budget), `owner` (the owner
+    said so).
+
+  Record a deferred finding against its class like any other (`record`), then file it:
+  `panel_classes.py file --ledger … --pr <pr> --round <r> --class <key> --rule <rule>`.
+  That files ONE issue per class, carrying `class-key: <key>` in its body, or comments
+  on the open issue already carrying that key, and records the deferral. A deferred
+  class owes nothing, and later rounds are briefed that it is tracked elsewhere, so a
+  seat does not report it again unless the change makes it worse. A class filed by
+  hand is recorded with `panel_classes.py defer … --issue <n>`. Overriding the rule
+  (a `fix` you defer, or the reverse) needs one line saying why, in §6.
 - **On 4, stop the cycle.** Relay the open classes and the structural options the
   report lists in §6, as a decision for the owner. There is no round 4 by default.
   The owner goes on with `--class-rounds N` on the next round, which is their
@@ -1560,6 +1584,11 @@ whether all checks passed, anything flagged
 hand-picked set rather than the repo's configured one, say which reviewers ran —
 the fixer's bar is only as good as the review that fed it. If the sub-agent
 stopped early, report exactly where and why.
+
+**List what was filed for later** (#844): each issue `panel_classes.py file` created or
+commented on this cycle, with its class and its rule. `panel_classes.py brief` shows
+them under TRACKED ELSEWHERE. A deferral the owner never hears about is the
+silent drop the rule exists to replace.
 
 **"The gate is clear" and "there was no gate" are different sentences and only one of
 them may be said.** With `sonarqube` not in `reviewers_ran`, the second is the true one, and reporting a clear gate off
