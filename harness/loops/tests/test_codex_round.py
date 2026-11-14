@@ -47,7 +47,9 @@ def test_a_new_class_records_every_instance_it_names():
            + [{"file": "b.py", "line": 3, "path": "MCP read"}]}
     lines = cr.apply_replies(ledger, [{"violations": [], "new_classes": [two]}], 1, 2)
     entry = ledger["classes"][0]
-    assert pc.strikes(entry) == 2 and entry["enforcement"] == "keyword-only viewer="
+    assert len(entry["sightings"]) == 2 and entry["enforcement"] == "keyword-only viewer="
+    # Two instances in one reply are one class with two instances (#840).
+    assert pc.strikes(entry) == 1 and not pc.is_owed(entry, 2)
     assert lines[0].startswith("  new class")
 
 

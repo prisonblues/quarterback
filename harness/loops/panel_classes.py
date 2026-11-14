@@ -20,10 +20,11 @@ Three rules are built on it:
    (:func:`ledger_brief`). A reviewer verifies each recorded invariant holds everywhere
    and may report only a violation of one or a genuinely NEW class — a new instance of a
    recorded class is a violation, not a new finding.
-2. **Two strikes.** The sighting of a class on its second distinct path means the next
-   fix must make the class impossible by construction (:func:`record` returns
-   ``owed``, and the CLI exits :data:`STRUCTURAL_OWED_EXIT`, 5). "Fix this path too" is
-   refused; the fix is accepted once it is recorded with ``--structural``. A sighting
+2. **Two strikes.** A class sighted in a later round on a path its first round did
+   not list means the per-path fix did not cover it, and the next fix must make the
+   class impossible by construction (:func:`record` returns
+   ``owed``, and the CLI exits :data:`STRUCTURAL_OWED_EXIT`, 5). Several paths found
+   together in one round are one strike (#840). "Fix this path too" is refused; the fix is accepted once it is recorded with ``--structural``. A sighting
    on a path the structural fix did not close re-opens the debt — the "impossible"
    claim was false. A class the builder finds is not a defect is recorded with
    ``dismiss`` and a reason: it owes nothing, and later rounds are told it is ruled out.
@@ -278,15 +279,26 @@ def find_class(ledger: dict, name: str) -> dict | None:
 
 
 def strikes(entry: dict) -> int:
-    """How many distinct PATHS this class has been seen on. The same path seen again
-    in a later round is a fix that did not hold, not a second strike."""
-    return len({_path_norm(s["path"]) for s in entry["sightings"]})
+    """How many times the per-path approach has failed this class, counting its
+    first sighting as the first strike (#840).
+
+    The first round's paths are all one strike, however many there are: the brief
+    asks a reviewer for EVERY instance of a class at once, so two paths in one reply
+    are one class with two instances, not a fix that failed. Each path first sighted
+    in a LATER round is another strike, because the fix for that round's list did not
+    cover it. The same path seen again later is a fix that did not hold, not a new
+    strike."""
+    first = first_round(entry)
+    early = {_path_norm(s["path"]) for s in entry["sightings"] if s["round"] == first}
+    late = {_path_norm(s["path"]) for s in entry["sightings"] if s["round"] > first}
+    return 1 + len(late - early)
 
 
 def is_owed(entry: dict, limit: int | None) -> bool:
     """Is the next fix for this class required to be structural?
 
-    Owed from the ``limit``-th distinct path until a structural fix is recorded, and
+    Owed from the ``limit``-th strike (:func:`strikes`: a new path in a round after
+    the class's first) until a structural fix is recorded, and
     owed AGAIN when any sighting is recorded in a round after that fix, on a known path
     or a new one: a class that was "impossible by construction" and then turned up was
     not. (Before a structural fix, the same path seen again is a patch that did not
@@ -465,7 +477,7 @@ def budget_refusal(ledger: dict, round_no: int, strikes_limit: int | None,
                  f"{prev} still recorded a new class. Stop: the owner decides. Open "
                  "classes and their structural options:"]
         for e in _open_classes(ledger, strikes_limit):
-            lines.append(f"  - [{e['key']}] {e['name']} ({strikes(e)} path(s)): "
+            lines.append(f"  - [{e['key']}] {e['name']} ({strikes(e)} strike(s)): "
                          f"{options(e)}")
         lines.append("To go on anyway, raise `review_panel.class_ledger.rounds` (or pass"
                      " --class-rounds) — that is the owner's call, not the loop's.")
@@ -476,7 +488,7 @@ def budget_refusal(ledger: dict, round_no: int, strikes_limit: int | None,
                  "`panel_classes.py structural`:"]
         for key in state["owed"]:
             e = by_key[key]
-            lines.append(f"  - [{e['key']}] {e['name']} ({strikes(e)} paths): "
+            lines.append(f"  - [{e['key']}] {e['name']} ({strikes(e)} strikes): "
                          f"{options(e)}")
         return "\n".join(lines)
     return ""
@@ -573,8 +585,8 @@ def report(ledger: dict, state: dict) -> str:
         lines.append(f"  new: [{key}] {by_key[key]['name']}")
     for key in state["owed"]:
         e = by_key[key]
-        lines.append(f"  STRUCTURAL FIX OWED: [{key}] {e['name']} — seen on "
-                     f"{strikes(e)} paths; {options(e)}")
+        lines.append(f"  STRUCTURAL FIX OWED: [{key}] {e['name']} — "
+                     f"{strikes(e)} strikes; {options(e)}")
     if state["over"]:
         for e in _open_classes(ledger, state["strikes_limit"]):
             lines.append(f"  open: [{e['key']}] {e['name']}: {options(e)}")
@@ -628,10 +640,10 @@ def _cmd_record(args, strikes_limit, gh_repo) -> int:
         return LEDGER_FAILED_EXIT
     print(json.dumps(verdict) if args.json else
           f"{'new' if verdict['new'] else 'known'} class [{verdict['key']}] "
-          f"{verdict['name']} — {verdict['strikes']} path(s)")
+          f"{verdict['name']} — {verdict['strikes']} strike(s)")
     if verdict["owed"]:
-        print(f"TWO STRIKES: [{verdict['key']}] has now been seen on {verdict['strikes']}"
-              " paths. Do NOT patch this path too: the next fix must make the class "
+        print(f"TWO STRIKES: [{verdict['key']}] has turned up on a path an earlier round "
+              f"did not list ({verdict['strikes']} strikes). Do NOT patch this path too: the next fix must make the class "
               "impossible by construction (a required argument, one gate plus a guard, "
               "a type, a constraint). Record it with `panel_classes.py structural "
               f"--class {verdict['key']} --how ... --enforcement ... --guard-test ...`.",
