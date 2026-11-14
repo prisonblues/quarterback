@@ -77,7 +77,8 @@ stdenvNoCC.mkDerivation {
   # SOURCE, each finding it as a sibling of $0 too. Neither relationship survives
   # anywhere else — home-manager links each file in as its own flat store path,
   # so "beside the script" is the only one there is. Same rule keeps
-  # `worktree-holder` here.
+  # `worktree-holder` here, and `worktree-worker` — the worker rule the three
+  # worktree scripts source (#854), unwrapped for worktree-lock's reason below.
   installPhase = ''
     runHook preInstall
 
