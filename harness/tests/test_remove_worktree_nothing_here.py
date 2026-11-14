@@ -181,17 +181,24 @@ def test_a_claim_that_was_not_held_is_not_something_removed(repo, tmp_path,
     assert proc.returncode == 2
 
 
-def fake_docker(tmp_path, running: list[str], stuck: tuple[str, ...] = ()) -> str:
+def fake_docker(tmp_path, running: list[str], stuck: tuple[str, ...] = (),
+                owners: dict[str, str] | None = None) -> str:
     """A `docker` whose `ps -a` lists `running` until `rm -f` takes one away — except
     the `stuck` ones, whose removal fails. State lives in a file, because a fake
-    that lists the same names whatever happened cannot tell removal from failure."""
+    that lists the same names whatever happened cannot tell removal from failure.
+    `owners` maps a container to the compose working_dir `docker inspect` reports
+    for it, which is how a teardown checks a worker is this worktree's (#854)."""
     state = tmp_path / "docker-state"
     state.write_text("".join(f"{n}\n" for n in running))
     stuck_list = " ".join(stuck)
+    inspect = "".join(f'    "{n}") echo "{d}" ;;\n' for n, d in (owners or {}).items())
     return f'''
 state={state}
 case "$1" in
   ps) cat "$state" ;;
+  inspect) case "${{@: -1}}" in
+{inspect}    *) echo "<no value>" ;;
+    esac ;;
   rm) shift; [[ "$1" == -f ]] && shift
       for s in {stuck_list}; do [[ "$1" == "$s" ]] && exit 1; done
       grep -vx -- "$1" "$state" > "$state.new"; mv "$state.new" "$state" ;;
@@ -217,7 +224,8 @@ def test_a_container_docker_rm_could_not_remove_is_a_warning(repo, tmp_path):
 def test_a_partial_container_removal_warns_for_the_one_left(repo, tmp_path):
     (repo / ".worktree.json").write_text(json.dumps({"worker": {"type": "huey"}}))
     docker = fake_docker(tmp_path, ["proj-fix-issue-43", "huey-consumer-fix-issue-43"],
-                         stuck=("huey-consumer-fix-issue-43",))
+                         stuck=("huey-consumer-fix-issue-43",),
+                         owners={"huey-consumer-fix-issue-43": str(repo.parent / "proj-fix-issue-43")})
     proc = run_with(repo, ["fix-issue-43"], tmp_path, {**NOTHING_HELD, "docker": docker})
 
     assert "Removed container proj-fix-issue-43" in proc.stdout
