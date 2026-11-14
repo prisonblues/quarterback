@@ -29,9 +29,10 @@ set +e  # Don't exit on errors — try all cleanup steps
 #                        when that is what it is looking at. Look with
 #                        `fuser -v <the lockfile it names>` first (#743)
 #
-# Exit 2: no step that ran removed anything, and none of them warned (#808).
-# Usually the shell is in a different checkout from the worktree's.
-# Decided from what the steps did (REMOVED below), not from a probe.
+# Exit 2: no step that ran removed anything and none left anything behind (#808)
+# — a step that could not tell (no board, no DB user) does not count against it,
+# and is printed with the refusal. Usually the shell is in a different checkout
+# from the worktree's. Decided from what the steps did (REMOVED below).
 
 # ============================================
 # COLORS & HELPERS
@@ -62,6 +63,19 @@ warn_cleanup() {
 REMOVED=()
 removed() {
     REMOVED+=("$1")
+}
+
+# A step that could not TELL — no board, no DB user, no Postgres answering, an
+# answer it could not read — is a different fact from one that left an artefact
+# behind, and #843 is what conflating them cost: run from the wrong checkout, a
+# board that did not answer turned "nothing of this worktree is here" into
+# "finished WITH WARNINGS", exit 0, with no word that the repo was the wrong one.
+# These are shown in every summary, but only CLEANUP_WARNINGS keeps a run out of
+# exit 2.
+UNKNOWN_OUTCOMES=()
+could_not_tell() {
+    UNKNOWN_OUTCOMES+=("$1")
+    echo -e "${YELLOW}$1${NC}"
 }
 
 env_val() {
@@ -354,10 +368,10 @@ release_the_claim() {
                [[ "$n" -gt 0 ]] && removed "claim"
                echo -e "${GREEN}Done${NC}"
            else
-               warn_cleanup "could not read qb-release's answer — whether a claim was handed back is unknown"
+               could_not_tell "could not read qb-release's answer — whether a claim was handed back is unknown"
            fi ;;
         1) echo -e "${YELLOW}Not ours to hand back (see above) — left alone${NC}" ;;
-        *) warn_cleanup "the claim on '$branch' was NOT handed back (see above) and stays held until it lapses" ;;
+        *) could_not_tell "could not hand back the claim on '$branch' (qb-release exit $rc, see above) — if one is held, it stays held until it lapses" ;;
     esac
     return 0
 }
@@ -542,6 +556,49 @@ collect_dirty_files() {
 # both awk programs that read the file, so the two cannot disagree.
 CREATE_NAME_AWK='function same_create_name(name, flat) { gsub("/", "-", name); return name == flat }'
 
+# Which `.worktree-ports` rows are this worktree's (#843). Flattening is
+# many-to-one — `fix/issue-43` and `fix-issue-43` are two worktrees once their
+# names lose the slash — so it cannot be the identity on its own: an EXACT row
+# (the name as typed) wins, the flattened match is used only when it picks out
+# exactly one row, and more than one is ambiguous and picks none. A row for the
+# worktree's real branch is taken as well, but does not stand in for an exact
+# row of the typed name, so it cannot suppress the flattened fallback. `mode=key` prints the chosen key, `mode=drop` prints every other
+# line. Exit 0 picked, 1 no row is this worktree's, 3 ambiguous; awk's own
+# failure (an unreadable file) is anything else.
+PORT_PICK_AWK=$CREATE_NAME_AWK'
+{
+    line[NR] = $0; key[NR] = $2
+    if ($2 == exact) { ex[NR] = 1; nex++ }
+    else if (same_create_name($2, flat)) { fl[NR] = 1; nfl++ }
+    if (rb != "" && $2 == rb) { br[NR] = 1; nbr++ }
+}
+END {
+    if (!nex && nfl > 1) exit 3
+    for (i = 1; i <= NR; i++) pick[i] = ex[i] || br[i] || (!nex && nfl == 1 && fl[i])
+    for (i = 1; i <= NR; i++) any = any || pick[i]
+    if (!any) exit 1
+    for (i = 1; i <= NR; i++) {
+        if (mode == "key" && pick[i]) { print key[i]; exit 0 }
+        if (mode == "drop" && !pick[i]) print line[i]
+    }
+    exit 0
+}'
+
+# Docker listings for STEP 1. Each prints the names (or ids) it found and returns
+# non-zero when docker itself did not answer, so a daemon that is down or a
+# permission denied reads as "could not tell", never as "nothing there" (#849).
+# `-a` throughout: a stopped container is still a container to remove.
+docker_names() {
+    docker ps -a --format '{{.Names}}' 2>/dev/null
+}
+compose_ids() {
+    (cd "$WORKTREE_DIR" && docker compose ps -aq 2>/dev/null)
+}
+# Fixed-string, whole-line: a dot in a branch name is a dot, not any character.
+listed() {
+    grep -Fqx -- "$2" <<<"$1"
+}
+
 detect_nginx_container() {
     docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'nginx' | head -1
 }
@@ -692,9 +749,10 @@ if [[ ! -d "$WORKTREE_DIR" ]]; then
         # Prefer the original (possibly slash-bearing) create-name from the port
         # file, so port/nginx keys still match.
         if [[ -f "$MAIN_REPO/.worktree-ports" ]]; then
-            pf=$(awk -F: -v d="$CREATE_NAME" \
-                     "$CREATE_NAME_AWK"'same_create_name($2, d) {print $2; exit}' \
-                     "$MAIN_REPO/.worktree-ports")
+            # PORT_PICK_AWK's rule: an ambiguous file (two rows that flatten to
+            # this name, neither exact) leaves the dir-derived name as it is.
+            pf=$(awk -F: -v mode=key -v exact="$CREATE_NAME" -v flat="$CREATE_NAME" \
+                     -v rb="" "$PORT_PICK_AWK" "$MAIN_REPO/.worktree-ports" 2>/dev/null)
             [[ -n "$pf" ]] && CREATE_NAME="$pf"
         fi
         BRANCH_NAME="$CREATE_NAME"
@@ -869,29 +927,60 @@ step() { CURRENT=$((CURRENT + 1)); echo -e "${YELLOW}[$CURRENT/$TOTAL_STEPS] $1$
 # STEP 1: Stop and remove Docker containers
 # ============================================
 step "Stopping Docker containers..."
-CLEANED=false
+# Removal is read from what was listed before and after, never from an exit code
+# (#843): `docker compose down` exits 0 with nothing running, and a failed
+# `docker rm -f` used to fall through to "No containers found" over a container
+# that was still up.
+CONTAINERS_BEFORE=0
 
-if [[ -d "$WORKTREE_DIR" && -f "$WORKTREE_DIR/docker-compose.yml" ]]; then
-    cd "$WORKTREE_DIR"
-    if docker compose down 2>/dev/null; then
-        echo -e "${GREEN}Containers stopped via docker compose down${NC}"
-        CLEANED=true
+DOCKER_ANSWERED=true
+
+# No docker on this host is a fact about the HOST, like no qb-release: there are
+# no containers to look for, and saying "could not tell" would mark every run.
+if ! command -v docker >/dev/null 2>&1; then
+    echo -e "${YELLOW}docker not installed — no containers to check${NC}"
+elif [[ -d "$WORKTREE_DIR" && -f "$WORKTREE_DIR/docker-compose.yml" ]]; then
+    if ! ids=$(compose_ids); then
+        DOCKER_ANSWERED=false
+    elif UP_BEFORE=$(grep -c . <<<"$ids"); [[ "$UP_BEFORE" -gt 0 ]]; then
+        CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + UP_BEFORE))
+        (cd "$WORKTREE_DIR" && docker compose down >/dev/null 2>&1)
+        if ! ids=$(compose_ids); then
+            could_not_tell "docker compose did not answer after \`down\` — whether $UP_BEFORE container(s) went is unknown"
+        elif UP_AFTER=$(grep -c . <<<"$ids"); [[ "$UP_AFTER" -eq 0 ]]; then
+            removed "compose stack ($UP_BEFORE container(s))"
+            echo -e "${GREEN}Containers stopped via docker compose down${NC}"
+        else
+            warn_cleanup "docker compose down left $UP_AFTER of $UP_BEFORE container(s) in $WORKTREE_DIR"
+        fi
     fi
-    cd "$MAIN_REPO"
 fi
 
-# Force-remove if still running
-for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
-    [[ -z "$container" || "$container" = "-${SAFE_NAME}" ]] && continue
-    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^${container}$"; then
-        docker rm -f "$container" 2>/dev/null && CLEANED=true
-    fi
-done
-
-if [[ "$CLEANED" = true ]]; then
-    removed "containers"
-    echo -e "${GREEN}Done${NC}"
+# Force-remove if still there
+if ! command -v docker >/dev/null 2>&1; then
+    :
+elif NAMES=$(docker_names); then
+    for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
+        [[ -z "$container" || "$container" = "-${SAFE_NAME}" ]] && continue
+        listed "$NAMES" "$container" || continue
+        CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + 1))
+        docker rm -f "$container" >/dev/null 2>&1
+        if ! after=$(docker_names); then
+            could_not_tell "docker did not answer after removing $container — whether it went is unknown"
+        elif listed "$after" "$container"; then
+            warn_cleanup "container $container is still there — \`docker rm -f\` did not remove it"
+        else
+            removed "container $container"
+            echo -e "${GREEN}Removed container $container${NC}"
+        fi
+    done
 else
+    DOCKER_ANSWERED=false
+fi
+
+if [[ "$DOCKER_ANSWERED" != true ]]; then
+    could_not_tell "docker did not answer — whether this worktree has containers is unknown"
+elif [[ "$CONTAINERS_BEFORE" -eq 0 ]] && command -v docker >/dev/null 2>&1; then
     echo -e "${YELLOW}No containers found${NC}"
 fi
 
@@ -1189,9 +1278,9 @@ elif [[ "$DB_ENGINE" = "postgresql" ]]; then
     fi
 
     if [[ -z "$PG_USER" ]]; then
-        warn_cleanup "could not determine DB user — database $WORKTREE_DB NOT dropped"
+        could_not_tell "could not determine DB user — database $WORKTREE_DB NOT dropped"
     elif [[ -z "$DB_CONTAINER" || "$DB_CONTAINER" = "auto" ]]; then
-        warn_cleanup "no Postgres container answered as '$PG_USER' — database $WORKTREE_DB NOT dropped"
+        could_not_tell "no Postgres container answered as '$PG_USER' — database $WORKTREE_DB NOT dropped"
         echo -e "${YELLOW}  Candidates tried: $(postgres_container_candidates | tr '\n' ' ')${NC}"
     else
         DB_EXISTS=$(docker exec "$DB_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
@@ -1284,17 +1373,16 @@ PORT_FILE="$MAIN_REPO/.worktree-ports"
 # name IS recovered from this file, but only on the branch of the code that runs
 # when the derived directory is missing — not the common path.)
 #
-# Match on the normalised key instead, so either spelling is found, and also on
-# the worktree's real branch for entries written under a different create-name.
-if [[ -f "$PORT_FILE" ]]; then
-    awk -F: -v flat="$SAFE_NAME" -v rb="$RESOLVED_BRANCH" "$CREATE_NAME_AWK"'
-        {
-            if (same_create_name($2, flat) || (rb != "" && $2 == rb)) { dropped++; next }
-            print
-        }
-        END { exit (dropped ? 0 : 1) }
-    ' "$PORT_FILE" > "$PORT_FILE.tmp"
-    if [[ $? -eq 0 ]]; then
+# Match the normalised key too, so either spelling is found, and the worktree's
+# real branch for entries written under a different create-name — by
+# PORT_PICK_AWK's rule, so a flattened match never takes another worktree's row.
+if [[ -f "$PORT_FILE" ]] && ! : > "$PORT_FILE.tmp" 2>/dev/null; then
+    warn_cleanup "could not write beside $PORT_FILE — its port entry, if any, is still there"
+elif [[ -f "$PORT_FILE" ]]; then
+    awk -F: -v mode=drop -v exact="$BRANCH_NAME" -v flat="$SAFE_NAME" \
+        -v rb="$RESOLVED_BRANCH" "$PORT_PICK_AWK" "$PORT_FILE" > "$PORT_FILE.tmp"
+    PORT_RC=$?
+    if [[ $PORT_RC -eq 0 ]]; then
         if mv "$PORT_FILE.tmp" "$PORT_FILE"; then
             removed "port entry"
             echo -e "${GREEN}Done${NC}"
@@ -1302,9 +1390,15 @@ if [[ -f "$PORT_FILE" ]]; then
             rm -f "$PORT_FILE.tmp"
             warn_cleanup "could not rewrite $PORT_FILE — the port entry is still there"
         fi
-    else
+    elif [[ $PORT_RC -eq 1 ]]; then
         rm -f "$PORT_FILE.tmp"
         echo -e "${YELLOW}No port entry found${NC}"
+    elif [[ $PORT_RC -eq 3 ]]; then
+        rm -f "$PORT_FILE.tmp"
+        warn_cleanup "more than one $PORT_FILE row flattens to '$SAFE_NAME' and none is exact — dropped none: $(awk -F: -v flat="$SAFE_NAME" "$CREATE_NAME_AWK"'same_create_name($2, flat)' "$PORT_FILE" | paste -sd, -); remove this worktree's row by hand"
+    else
+        rm -f "$PORT_FILE.tmp"
+        warn_cleanup "could not read $PORT_FILE (awk exit $PORT_RC) — its port entry, if any, is still there"
     fi
 else
     echo -e "${YELLOW}No port file${NC}"
@@ -1322,17 +1416,25 @@ release_the_claim "$BRANCH_NAME" "$WORKTREE_DIR"
 # SUMMARY
 # ============================================
 echo ""
-# No step that ran removed anything and none warned — the one outcome that is
-# neither a clean teardown nor a partial one (#808). It says only that: a step
-# skipped by a --keep flag also removes nothing, so this cannot claim absence.
+# No step that ran removed anything and none left anything behind — the one
+# outcome that is neither a clean teardown nor a partial one (#808). It says only
+# that: a step skipped by a --keep flag also removes nothing, so this cannot claim
+# absence. Could-not-tell outcomes are printed with it, not counted against it.
 if [[ ${#REMOVED[@]} -eq 0 && ${#CLEANUP_WARNINGS[@]} -eq 0 ]]; then
     echo -e "${RED}========================================${NC}" >&2
     echo -e "${RED}Nothing removed for '$BRANCH_NAME' in $MAIN_REPO${NC}" >&2
     echo -e "${RED}========================================${NC}" >&2
     echo "  No step that ran removed anything (see above). If the" >&2
     echo "  worktree belongs to another repository, run this from inside that one." >&2
+    if [[ ${#UNKNOWN_OUTCOMES[@]} -gt 0 ]]; then
+        echo "  Some steps could not tell whether there was anything to remove:" >&2
+        for w in "${UNKNOWN_OUTCOMES[@]}"; do echo "  - $w" >&2; done
+    fi
     exit 2
 fi
+# What could not be told is a warning to the reader once something was removed:
+# the teardown is partial in a way nobody can see.
+CLEANUP_WARNINGS+=("${UNKNOWN_OUTCOMES[@]}")
 echo -e "${GREEN}========================================${NC}"
 if [[ ${#CLEANUP_WARNINGS[@]} -eq 0 ]]; then
     echo -e "${GREEN}Cleanup complete: $BRANCH_NAME${NC}"
