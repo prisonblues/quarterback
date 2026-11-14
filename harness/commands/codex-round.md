@@ -46,6 +46,7 @@ before you commit.
 | 4 | **budget spent**: `review_panel.class_ledger.rounds` (3) rounds each found a new class | stop. Report the open classes and their structural options; the owner decides. `--class-rounds N` is their override, not yours |
 | 2 | codex absent or no usable reply | skip; it never blocks |
 | 5, for a class that is not a defect | the two-strike rule has nothing to fix | say why and record it: `python3 ~/.claude/loops/panel_classes.py dismiss --ledger <path> --round <n> --class <key> --why "…"`. It owes nothing after that, and later rounds are told it is ruled out. Put each dismissal in the PR body: it is a judgement the reviewer of the PR should see |
+| 1, 5 — a class that is real but not this change's | it is pre-existing, outside the changed behaviour, or over the fix budget | file it: `python3 ~/.claude/loops/panel_classes.py file --ledger <path> --round <n> --class <key> --rule pre-existing\|outside-change\|budget`. One issue per class (it comments on the open one if there is one), and later rounds are told it is tracked elsewhere. List what you filed in the PR body |
 | 3 | the ledger could not be read as it stands, or could not be written | nothing ran and the file was left as it was. Fix or move it; never delete it to get past this, which wipes the strike counts and the budget |
 
 A round where a shard gave no reply says `PARTIAL` and is never reported clean.
