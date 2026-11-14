@@ -659,3 +659,99 @@ def test_the_cli_refuses_an_unknown_rule(cli):
     with pytest.raises(SystemExit):
         cli("defer", "--round", "1", "--class", RESOLVER, "--rule", "because",
             "--issue", "5")
+
+
+# ------------------------------------------- one round numbering (#846)
+
+def _three_round_ledger():
+    """A ledger at round 3: a class in round 1, two clean rounds after it."""
+    ledger = ledger_with("a.py:10")
+    pc.mark_round(ledger, 2)
+    pc.mark_round(ledger, 3)
+    return ledger
+
+
+def test_a_new_cycles_round_1_is_the_ledgers_next_round(monkeypatch, tmp_path):
+    """`--new-cycle` restarts the panel at round 1; the ledger does not restart, so
+    this round is ledger round 4 and is measured against ledger round 3."""
+    code, _prompts, out = _panel_run(monkeypatch, tmp_path, _three_round_ledger(),
+                                     round_no=1)
+    block = json.loads(out.read_text())["class_ledger"]
+    assert code == 0
+    assert (block["previous_round"] or {}).get("round") == 3
+    assert block.get("round") == 4 and block.get("panel_round") == 1
+
+
+def test_the_budget_is_read_at_the_ledger_round_not_the_panel_round(monkeypatch,
+                                                                    tmp_path):
+    """Three rounds that each found a new class spend the budget, and a new panel
+    cycle's round 1 does not get it back."""
+    ledger = pc.new_ledger("acme/board", 34)
+    for r in (1, 2, 3):
+        pc.record(ledger, f"class number {r} of a kind", r, f"f{r}.py",
+                  invariant="holds")
+    code, prompts, _out = _panel_run(monkeypatch, tmp_path, ledger, round_no=1)
+    assert code == pc.BUDGET_EXIT and prompts == []
+
+
+@pytest.fixture
+def payload_cli(monkeypatch, tmp_path):
+    """The CLI given a round's payload instead of a round number."""
+    monkeypatch.setattr(pc, "load_repo_cfg", lambda name: {"github": "acme/board",
+                                                           "review_panel": {}})
+    ledger = tmp_path / "classes.json"
+    pc.save_ledger(str(ledger), pc.new_ledger("acme/board", 34))
+    payload = tmp_path / "r1.json"
+    payload.write_text(json.dumps({"pr": 34, "class_ledger": {
+        "path": str(ledger), "round": 1, "cycle": "c", "panel_round": 1}}))
+
+    def call(*argv):
+        return pc.main(list(argv))
+    return call, ledger, payload
+
+
+def test_payload_supplies_the_round_the_pr_and_the_ledger(payload_cli):
+    call, ledger, payload = payload_cli
+    assert call("record", "--payload", str(payload), "--class", RESOLVER,
+                "--path", "a.py:1", "--invariant", INVARIANT) == 0
+    saved, _ = pc.load_ledger(str(ledger))
+    assert saved["classes"][0]["sightings"][0]["round"] == 1
+
+
+@pytest.mark.parametrize("flag, value, says", [
+    ("--round", "2", "--round 2 disagrees"),
+    ("--pr", "35", "--pr 35 disagrees"),
+])
+def test_a_flag_that_disagrees_with_the_payload_is_refused(payload_cli, flag, value,
+                                                           says):
+    call, ledger, payload = payload_cli
+    with pytest.raises(SystemExit, match=says):
+        call("status", "--payload", str(payload), flag, value)
+
+
+def test_a_ledger_other_than_the_one_the_round_read_is_refused(payload_cli, tmp_path):
+    call, _ledger, payload = payload_cli
+    with pytest.raises(SystemExit, match="is not the ledger that round read"):
+        call("status", "--payload", str(payload), "--ledger", str(tmp_path / "x.json"))
+
+
+def test_a_payload_from_a_round_without_a_ledger_is_refused(payload_cli, tmp_path):
+    call, _ledger, _payload = payload_cli
+    bare = tmp_path / "bare.json"
+    bare.write_text(json.dumps({"pr": 34, "class_ledger": None}))
+    with pytest.raises(SystemExit, match="carries no ledger round"):
+        call("status", "--payload", str(bare))
+
+
+def test_mark_records_a_clean_round_once(payload_cli):
+    call, ledger, payload = payload_cli
+    assert call("mark", "--payload", str(payload)) == 0
+    assert call("mark", "--payload", str(payload)) == 0
+    saved, _ = pc.load_ledger(str(ledger))
+    assert saved["rounds"] == [1] and pc.last_round(saved) == 1
+
+
+def test_mark_will_not_skip_a_round(payload_cli):
+    call, ledger, _payload = payload_cli
+    with pytest.raises(SystemExit, match="would skip round 1"):
+        call("mark", "--ledger", str(ledger), "--round", "3")

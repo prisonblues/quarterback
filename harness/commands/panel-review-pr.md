@@ -240,10 +240,32 @@ measured against the cycle the banner had just said nothing was measured against
 one continue the new cycle with `--round`/`--baseline` and WITHOUT the flag**, because a
 live cycle's own rounds make the earlier stop non-terminal and the gate no longer fires.
 
-Three legitimate runs meet this refusal, and all three take `--new-cycle`:
+**When the OWNER answers the stop and says go on, that is `--continue-cycle`, not
+`--new-cycle` (#846).** The owner's "run round 3" after a `fix_injection` stop is an
+answer to the stop, and it wants the SAME cycle's next round: same baseline, same
+provenance, the same guards measured from them, which is everything `--new-cycle`
+throws away. Relay it in the owner's words:
 
-- **a genuinely new cycle** on a PR whose earlier cycle stopped — the intended case, and
-  the flag belongs there **once the thing that ended the last cycle has been answered**.
+```
+python3 ~/.claude/loops/panel.py --pr <pr> --post --round <r+1> --max-rounds <N> \
+    --baseline /tmp/tmp.AbC123/r<r>.json … \
+    --continue-cycle --answered-by <owner> --why "<what they said>"
+```
+
+The answer is recorded in the payload (`stop_answered`: who, when, why, and the verdict
+and round it answered) and at the top of the posted summary. It moves this gate only:
+it does not raise `--max-rounds` and it does not move the spend ceiling, which are
+other controls. It is refused with `--new-cycle`, without `--answered-by`/`--why`,
+without `--baseline`, and when the board records no stop to answer. Only the owner's
+words reach it: never pass it on your own judgement or a sub-agent's, for the reason
+`--new-cycle` is not a sub-agent's to decide.
+
+Three legitimate runs meet this refusal and take `--new-cycle` instead:
+
+- **a genuinely new cycle** on a PR whose earlier cycle stopped — the flag belongs
+  there **once the thing that ended the last cycle has been answered** and the owner
+  wants a fresh start rather than the same cycle continued. With a class ledger, a new
+  cycle needs no hand mapping: the ledger keeps counting where it was.
   A terminal verdict names something a fix pass cannot clear; passing the flag without
   answering it just buys the same stop again, more expensively;
 - **§5's verification pass on the final capped fix (#629)** — that pass follows a stop by
@@ -974,12 +996,23 @@ every round in front of you. Record each finding against its class, the same
 class for every finding that shares a cause:
 
 ```
-python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes.json \
-    --pr <pr> --round <r> --class "<what every instance has in common>" \
+python3 ~/.claude/loops/panel_classes.py record --payload /tmp/tmp.AbC123/r<r>.json \
+    --class "<what every instance has in common>" \
     --path "<file:line, or the route that reaches it>" --finding <key> \
     --invariant "<what, held everywhere, rules it out>" \
     [--enforcement "<how it is made impossible>"] [--guard-test "<what keeps it so>"]
 ```
+
+**`--payload`, not `--round` (#846).** The ledger numbers its own rounds and never
+restarts; the panel restarts at round 1 on `--new-cycle`. The round's payload carries
+the LEDGER's round (`class_ledger.round`, beside `cycle` and `panel_round`), the PR and
+the ledger path, so every `panel_classes.py` command takes `--payload <that round's
+--json-file>` and nothing maps one numbering onto the other by hand. A `--round`,
+`--pr` or `--ledger` passed alongside it must agree with it or the command refuses.
+
+**After EVERY round, clean ones included, run
+`panel_classes.py mark --payload /tmp/tmp.AbC123/r<r>.json`.** A clean round records no
+sighting, so without it the next round would reuse its number. It is idempotent.
 
 - **Exit 5 is the two-strike rule.** The class has turned up, in a later round, on
   a path its first round did not list: the per-path fix did not cover it, so the
@@ -991,14 +1024,14 @@ python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes
   exists record it with
   `panel_classes.py structural --class <key> --how … --enforcement … --guard-test …`.
   A structural fix that is really a redesign is step 3a's escalation.
-- **`panel_classes.py status --ledger … --round <r>`** gives the cycle's standing:
+- **`panel_classes.py status --payload …`** gives the cycle's standing:
   0 converged (this round recorded no new class), 1 not converged, 5 a structural
   fix owed, 4 **budget spent**. The budget is `review_panel.class_ledger.rounds`
   (3) rounds that each recorded a new class; a clean round in between spends
   nothing.
 - **A class that is not a defect is dismissed, not patched.** When re-examination
   shows a recorded class is a false positive, record why:
-  `panel_classes.py dismiss --ledger … --pr <pr> --round <r> --class <key> --why "…"`.
+  `panel_classes.py dismiss --payload … --class <key> --why "…"`.
   It owes nothing after that, and later rounds are briefed that it was ruled out.
   Relay each dismissal in §6, because it is a judgement the owner should see.
 - **Fix it here, or file it for later — decided by rule, every round (#844).** Each
@@ -1013,7 +1046,7 @@ python3 ~/.claude/loops/panel_classes.py record --ledger /tmp/tmp.AbC123/classes
     said so).
 
   Record a deferred finding against its class like any other (`record`), then file it:
-  `panel_classes.py file --ledger … --pr <pr> --round <r> --class <key> --rule <rule>`.
+  `panel_classes.py file --payload … --class <key> --rule <rule>`.
   That files ONE issue per class, carrying `class-key: <key>` in its body, or comments
   on the open issue already carrying that key, and records the deferral. A deferred
   class owes nothing, and later rounds are briefed that it is tracked elsewhere, so a
@@ -1109,7 +1142,9 @@ If `round_stop.stop_reason` names `fix_injection`, `round_stop.excision.count` i
 zero (or `excision.declined[]` is non-empty), or `config_notes` says the round `follows an
 integration`, read the matching section of `~/.claude/loops/docs/panel-round-stop.md`
 before acting. In short: `round_stop.revert` is a proposal for the user and never runs
-on its own; an `excision.excise[].command` is run as given, with its `answered` finding
+on its own; when the owner answers a `fix_injection` stop with "go on", the next round
+is `--continue-cycle` (§3, above the `--new-cycle` list); an `excision.excise[].command`
+is run as given, with its `answered` finding
 recorded `deferred` (§4b) and its `caused` findings handed to no fixer; an integration's
 DISTANT reading lets the earlier round stand, and its INVOLVED reading is reviewed.
 

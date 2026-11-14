@@ -2651,6 +2651,25 @@ step part of the loop:
   unless the change makes it worse. `defer --issue N` records a class filed by hand.
   `gh` is reached through one function (`panel_classes.gh`), and a failed call records
   nothing.
+- **One round numbering (#846).** The ledger numbers its own rounds and never
+  restarts, while `--new-cycle` puts the panel back at round 1. So `panel.py` takes
+  the round it checks and briefs from the LEDGER (`last_round + 1`), whatever the
+  panel calls the round, and writes it to the payload as `class_ledger.round`, beside
+  `cycle` and `panel_round`. Every `panel_classes.py` command takes `--payload <that
+  round's payload>` for its round, PR and ledger path, and refuses a `--round`,
+  `--pr` or `--ledger` that disagrees with it. `panel_classes.py mark --payload …`
+  records a round that ran; the orchestrator runs it after every round, because a
+  clean round records no sighting. `panel.py` itself still never writes the ledger.
+- **An owner's "go on" continues the stopped cycle (#846).** After a terminal stop
+  (`fix_injection`, say) the panel refuses the next round, and `--new-cycle` was the
+  only way through: it starts again and drops the baseline and provenance the stop was
+  measured from. `--continue-cycle --answered-by NAME --why TEXT` runs the same cycle's
+  next round (`--round`/`--baseline` as usual) and records `stop_answered` (who, when,
+  why, the verdict and round it answered) in the payload and at the top of the posted
+  summary. It does not lift `--max-rounds` or the spend ceiling. It is refused with
+  `--new-cycle`, without its two arguments or `--baseline`, and when the board records
+  no stop to answer; when the board cannot be asked, the round runs and
+  `stop_answered.unverified` says why.
 
 `panel-review-pr.md` §5 has the orchestrator's procedure: classify the To-fix list
 after each round, record before the fix pass, and stop on exit 4.
