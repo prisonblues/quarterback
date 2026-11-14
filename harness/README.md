@@ -5162,13 +5162,18 @@ runners (lexray#4458). A bare `docker compose down` leaves a profiled service ru
 
 **One rule names the worker, in `bin/worktree-worker` (#854).** `create-worktree`,
 `remove-worktree` and `prune-worktrees` all source it, so all three resolve the worker type
-the same way: `worker.type` if the config sets it, otherwise what the repo's dependencies say
-(huey, rq, celery). They used to disagree: the two teardowns fell back to "none", so a worker
-that was only *detected* got a container neither could name. `remove-worktree` missed it once
-the worktree directory was gone, and `prune-worktrees` could not pair it with a dead worktree.
-The library sits beside the scripts like `worktree-lock`. Without it, `create-worktree` and
-`prune-worktrees` refuse to run, and `remove-worktree` still tears down but warns that it could
-find a worker container only through `docker compose`.
+the same way: `worker.type` if the config sets it, otherwise what the repo's dependency files
+(`pyproject.toml`, `requirements.txt`) and then its `docker-compose.yml` mention (huey, rq,
+celery). They used to disagree: `remove-worktree` fell back to `"none"` and `prune-worktrees`
+to `""`, so a worker that was only *detected* got a container neither could name.
+`remove-worktree` missed it once the worktree directory was gone, and `prune-worktrees` could
+not pair it with a dead worktree. Before either removes or reports a worker container by name,
+it checks that `docker compose` made it in that worktree (its `working_dir` label), because
+huey's prefix `huey-consumer` does not encode the project, and another repo's branch of the same
+name has a worker of the same name. The library sits beside the scripts like `worktree-lock`.
+Without it, `create-worktree` refuses to run. The two teardowns degrade instead: they look for no
+worker container by name (`docker compose down` still takes one), and they say so, as a
+could-not-tell in `remove-worktree` and as NOT CHECKED in `prune-worktrees`.
 
 **`copies` and `gitignore_additions` also tell `remove-worktree` what NOT to back up.**
 The teardown tarball is for what somebody would otherwise lose, and neither of these is

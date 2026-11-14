@@ -85,7 +85,7 @@ die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
 # The worker rule is shared with remove-worktree and prune-worktrees (#854), so
 # the three cannot name a repo's worker container differently.
-WORKTREE_WORKER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worktree-worker"
+WORKTREE_WORKER="$WORKTREE_SCRIPT_DIR/worktree-worker"
 [[ -r "$WORKTREE_WORKER" ]] || die "worktree-worker is not beside this script ($WORKTREE_WORKER) — the harness install is incomplete"
 # shellcheck source=worktree-worker
 . "$WORKTREE_WORKER"
