@@ -8,9 +8,13 @@ gated branch moves the gate to that commit with nothing banked.
 
 from __future__ import annotations
 
-import pytest
-from sqlalchemy import delete, select
+import asyncio
+import logging
 
+import pytest
+from sqlalchemy import delete, select, text
+
+from app.api import gates as gates_api
 from app.db import async_session
 from app.models.gate import Gate
 from app.models.post import Post
@@ -23,11 +27,20 @@ HEAD = "a" * 40
 NEXT = "b" * 40
 
 
+#: Every branch a test here publishes on. Their posts are this file's alone.
+BRANCHES = (BRANCH, "integration/v23", "feat/x")
+
+
 @pytest.fixture(autouse=True)
 async def _no_gates(client):
-    """The schema is built once per session; every test starts with no gates."""
+    """The schema is built once per session, and a commit an earlier test
+    published counts as already published (`_published_before`), so every test
+    starts with no gates and none of this file's posts."""
     async with async_session() as s:
         await s.execute(delete(Gate))
+        for b in BRANCHES:
+            await s.execute(delete(Post).where(
+                Post.refs.contains([{"kind": "branch", "value": b}])))
         await s.commit()
 
 
@@ -142,10 +155,95 @@ async def test_a_run_finishing_after_a_publish_is_refused(client):
     assert r.json()["detail"]["restarted_from"] == HEAD
 
 
-async def test_a_landed_post_moves_the_gate_too(client):
+async def answers_to(pid: int) -> list[Post]:
+    async with async_session() as s:
+        return list((await s.execute(select(Post).where(Post.re == pid))).scalars())
+
+
+async def test_a_landed_post_does_not_move_the_gate(client):
+    """`landed` says a commit exists somewhere, not that the runners can fetch it."""
     await start(client)
-    await publish(client, NEXT, type_="landed")
+    pid = await publish(client, NEXT, type_="landed")
+    assert (await the_gate(client))["head"] == HEAD
+    assert await answers_to(pid) == []
+
+
+async def test_a_reannounced_older_commit_does_not_move_the_gate(client):
+    """A checkout behind its upstream, or CI re-announcing, publishes a commit the
+    branch was already published at. That is not the branch moving."""
+    await publish(client, HEAD)          # the branch was at HEAD…
+    await publish(client, NEXT)          # …then moved to NEXT
+    await start(client, head=NEXT)
+    await advance(client, "clean", head=NEXT)
+    pid = await publish(client, HEAD)    # a stale announcement of the old tip
+    g = await the_gate(client)
+    assert (g["head"], g["clean_runs"]) == (NEXT, 1)
+    assert await answers_to(pid) == []
+
+
+async def test_a_commit_published_on_another_branch_first_still_moves_the_gate(client):
+    """A fast-forward merge brings a feature branch's commit to the gated branch:
+    new HERE, whatever other branch it was published on."""
+    await publish(client, NEXT, branch="feat/x")
+    await start(client)
+    await publish(client, NEXT)
     assert (await the_gate(client))["head"] == NEXT
+
+
+async def test_an_abbreviated_publish_on_a_gated_branch_says_the_gate_did_not_move(client):
+    await start(client)
+    await advance(client, "clean")
+    pid = await publish(client, NEXT[:7])
+    g = await the_gate(client)
+    assert (g["head"], g["clean_runs"]) == (HEAD, 1)
+    said = await answers_to(pid)
+    assert len(said) == 1 and "NOT moved" in said[0].summary
+
+
+async def test_a_publish_naming_two_qualified_repos_moves_nothing(client):
+    """Which repo's branch moved cannot be told, so nothing moves."""
+    await start(client)
+    refs = [{"kind": "commit", "value": NEXT, "repo": REPO},
+            {"kind": "repo", "value": "prisonblues/quarterback"},
+            {"kind": "branch", "value": BRANCH}]
+    r = await client.post("/post", json={"type": "published", "summary": "x",
+                                         "refs": refs}, headers=SERVER)
+    assert r.status_code == 200
+    assert (await the_gate(client))["head"] == HEAD
+
+
+async def test_a_publish_with_no_refs_at_all_is_still_a_publish(client):
+    await start(client)
+    r = await client.post("/post", json={"type": "published", "summary": "x"},
+                          headers=SERVER)
+    assert r.status_code == 200
+    assert (await the_gate(client))["head"] == HEAD
+
+
+@pytest.mark.parametrize("boom", ["database", "python"])
+async def test_a_failing_reset_costs_the_publish_nothing(client, monkeypatch, caplog,
+                                                         boom):
+    """The hook's promise: the publish commits, the gate is untouched, and the
+    failure is logged. `database` raises a real Postgres error inside the savepoint
+    (division by zero), which is what proves the savepoint leaves the outer
+    transaction usable; `python` is any other defect in the hook."""
+    await start(client)
+    await advance(client, "clean")
+
+    async def broken(session, *args):
+        if boom == "database":
+            await session.execute(text("SELECT 1/0"))
+        raise RuntimeError("a defect in the hook")
+
+    monkeypatch.setattr(gates_api, "_published_before", broken)
+    with caplog.at_level(logging.ERROR, logger="app.api.gates"):
+        pid = await publish(client, NEXT)
+    async with async_session() as s:
+        assert await s.get(Post, pid) is not None
+    g = await the_gate(client)
+    assert (g["head"], g["clean_runs"]) == (HEAD, 1)
+    assert await answers_to(pid) == []
+    assert "the post stands" in caplog.text
 
 
 async def test_republishing_the_gate_s_own_head_changes_nothing(client):
@@ -179,6 +277,59 @@ async def test_a_publish_naming_no_qualified_repo_moves_nothing(client):
                                          "refs": refs}, headers=SERVER)
     assert r.status_code == 200
     assert (await the_gate(client))["head"] == HEAD
+
+
+async def test_setting_a_head_behind_the_branch_says_so(client):
+    """A gate set on a commit the branch has already been published past would
+    never be moved by a publish that came before it."""
+    await publish(client, NEXT)
+    r = await start(client, head=HEAD)
+    assert (r.json()["branch_published"], r.json()["behind"]) == (NEXT, True)
+    r = await start(client, head=NEXT)
+    assert r.json()["behind"] is False
+
+
+async def test_the_reset_rule_round_trips_and_omitting_it_keeps_it(client):
+    await start(client, reset_rule="a change to sim/ data")
+    r = await start(client, stage="db")
+    assert r.json()["gate"]["reset_rule"] == "a change to sim/ data"
+
+
+async def test_reading_with_no_filter_lists_every_repo_s_gates(client):
+    await start(client)
+    await client.post("/gates", json={"repo": "prisonblues/quarterback",
+                                      "branch": "main", "head": NEXT}, headers=LAPTOP)
+    r = await client.get("/gates", headers=SERVER)
+    assert [(g["repo"], g["branch"]) for g in r.json()["gates"]] == [
+        (REPO, BRANCH), ("prisonblues/quarterback", "main")]
+
+
+async def test_a_run_recorded_while_another_write_holds_the_gate_is_not_lost(client):
+    """`_locked`'s FOR UPDATE. A second writer holds the row and moves the count to
+    5; an advance arriving meanwhile must wait and read 5. Without the lock it
+    reads 0 before the other commits and writes 1 over the 5."""
+    await start(client, exit_bar=9)
+    async with async_session() as other:
+        g = await gates_api._locked(other, REPO, BRANCH)
+        pending = asyncio.ensure_future(advance(client, "clean"))
+        await asyncio.sleep(0.3)
+        g.clean_runs = 5
+        await other.commit()
+    r = await asyncio.wait_for(pending, 10)
+    assert r.status_code == 200, r.text
+    assert (await the_gate(client))["clean_runs"] == 6
+
+
+async def test_two_gates_started_at_once_give_the_loser_a_409(client, monkeypatch):
+    """The unique index is the backstop when both writers saw no row."""
+    await start(client)
+
+    async def nothing(*args):
+        return None
+
+    monkeypatch.setattr(gates_api, "_locked", nothing)
+    r = await start(client, head=NEXT)
+    assert r.status_code == 409
 
 
 async def test_an_abbreviated_head_is_refused(client):

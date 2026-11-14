@@ -42,12 +42,32 @@ def sent(monkeypatch):
     return rec
 
 
-def test_setting_a_gate_derives_the_repo_and_omits_unset_fields(sent):
-    """An omitted `exit_bar` must not go out as null: on an update the board
-    reads absent as "keep it", and null would not mean that."""
+def test_setting_a_gate_derives_the_repo_and_sends_only_what_was_given(sent):
+    """The body carries exactly the fields the caller named, so it says what the
+    caller meant to change and nothing more."""
     srv.gate_set(None, branch="integration/v22", head=HEAD, outputs="zeus:~/sim-runs")
     assert sent.calls == [("set", {"repo": "acme/here", "branch": "integration/v22",
                                    "head": HEAD, "outputs": "zeus:~/sim-runs"})]
+
+
+def test_every_gate_set_field_reaches_the_body(sent):
+    srv.gate_set(None, branch="b", head=HEAD, exit_bar=3, stage="db",
+                 outputs="zeus:~/o", reset_rule="a sim/ change")
+    assert sent.calls[0][1] == {"repo": "acme/here", "branch": "b", "head": HEAD,
+                                "exit_bar": 3, "stage": "db", "outputs": "zeus:~/o",
+                                "reset_rule": "a sim/ change"}
+
+
+def test_reading_one_branch_names_it(sent):
+    srv.gate(None, branch="integration/v22")
+    assert sent.calls == [("read", {"repo": "acme/here", "branch": "integration/v22"})]
+
+
+def test_the_advance_result_is_an_enum_in_the_tool_schema():
+    """The board takes only `clean` or `failed`; the schema says so, so a typo is
+    refused by the caller's harness rather than as a 422."""
+    tool, = (t for t in srv.mcp._tool_manager.list_tools() if t.name == "gate_advance")
+    assert tool.parameters["properties"]["result"]["enum"] == ["clean", "failed"]
 
 
 def test_advancing_sends_the_result_and_the_head_it_ran_on(sent):

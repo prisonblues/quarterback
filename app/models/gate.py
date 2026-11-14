@@ -25,6 +25,9 @@ MAX_STAGE = 200
 #: be. A pointer and a sentence, not a log.
 MAX_NOTE = 2000
 
+#: Consecutive clean runs that pass a gate whose owner named no bar: lexray's.
+DEFAULT_EXIT_BAR = 2
+
 
 class Gate(Base):
     """One promotion gate's state, per repository and branch — #852.
@@ -50,9 +53,11 @@ class Gate(Base):
 
     **The head is the whole mechanism.** A run counts only against the head it
     ran on (:func:`app.api.gates.advance_gate` refuses one that names another),
-    and a ``published`` post landing a different commit on this branch zeroes the
-    count and moves the head (:func:`app.api.gates.reset_on_publish`), so a clean
-    run on a superseded head can never be counted toward the current one.
+    and a ``published`` post putting a commit on this branch for the first time
+    zeroes the count and moves the head (:func:`app.api.gates.reset_on_publish`),
+    so a clean run on a superseded head can never be counted toward the current
+    one. ``landed`` does not move it: that type says a commit exists somewhere,
+    not that the branch's runners can fetch it.
     """
 
     __tablename__ = "gates"
@@ -74,7 +79,8 @@ class Gate(Base):
     stage: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
     clean_runs: Mapped[int] = mapped_column(Integer(), nullable=False, server_default="0")
-    exit_bar: Mapped[int] = mapped_column(Integer(), nullable=False, server_default="2")
+    exit_bar: Mapped[int] = mapped_column(Integer(), nullable=False,
+                                          server_default=str(DEFAULT_EXIT_BAR))
 
     #: ``clean`` or ``failed``, and when — the last run recorded on this head.
     last_result: Mapped[str | None] = mapped_column(Text(), nullable=True)
@@ -86,7 +92,9 @@ class Gate(Base):
     outputs: Mapped[str | None] = mapped_column(Text(), nullable=True)
     reset_rule: Mapped[str | None] = mapped_column(Text(), nullable=True)
 
-    #: The head a publish moved the gate off, and when. NULL until the first reset.
+    #: The head the gate was last moved off, and when: by a publish, or by a
+    #: ``POST /gates`` naming a new head. ``updated_by`` says which. NULL until the
+    #: first move.
     restarted_from: Mapped[str | None] = mapped_column(Text(), nullable=True)
     restarted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True)

@@ -177,9 +177,7 @@ async def create_post(
         refs=[r.model_dump(exclude_none=True) for r in body.refs] if body.refs else None,
     )
     session.add(post)
-    # Flushed first so the post has its id: a gate this publish moves (#852)
-    # answers it with a post of its own, in this same transaction.
-    await session.flush()
+    # A gate this publish moves (#852) answers it in this same transaction.
     await reset_on_publish(session, post)
     await session.commit()
     await session.refresh(post)

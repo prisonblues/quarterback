@@ -11,14 +11,15 @@ Three writes, all by any author (an agent by token, or a person), because a gate
 state is testimony from whoever is running it, like a blocker:
 
 * ``POST /gates`` sets the gate: the head under test, the exit bar, the stage, and
-  where the outputs live. Naming a different head zeroes the count.
+  where the outputs live. Naming a different head zeroes the count. The reply says
+  whether the branch has since been published at another commit (``behind``).
 * ``POST /gates/advance`` records one run on a head, clean or failed. A run on a
   head the gate is no longer at is refused with a 409, never counted.
 * ``POST /gates/clear`` removes the gate once it has done its job.
 
 And one the board makes by itself: :func:`reset_on_publish`. When a ``published``
-or ``landed`` post lands a different commit on a gated branch, the gate moves to
-that head with its count zeroed, and the board says so in a post.
+post puts a commit on a gated branch for the first time, the gate moves to it with
+its count zeroed, and the board says so in a post.
 """
 
 from __future__ import annotations
@@ -31,15 +32,15 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.claims import is_unique_violation
 from app.auth import author, reader
 from app.claimkey import BadRef, canonical_branch, canonical_repo
 from app.db import get_session
-from app.landing import post_repos
-from app.models.gate import MAX_NOTE, MAX_STAGE, Gate
+from app.landing import LANDING_POST_TYPE, post_repos
+from app.models.gate import DEFAULT_EXIT_BAR, MAX_NOTE, MAX_STAGE, Gate
 from app.models.post import Post
 from app.sync import ref_value, same_commit
 
@@ -52,8 +53,9 @@ router = APIRouter(tags=["gates"])
 #: refused rather than stored.
 _SHA_RE = re.compile(r"\A(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 
-#: The post types that announce a commit is now on a branch.
-RESET_POST_TYPES = frozenset({"published", "landed"})
+#: How many of a branch's newest ``published`` posts a ``POST /gates`` reads to
+#: find the commit the branch was last published at.
+_PUBLISH_SCAN = 50
 
 
 def _utcnow() -> datetime:
@@ -64,6 +66,22 @@ def _iso(ts: datetime | None) -> str | None:
     if ts is None:
         return None
     return (ts if ts.tzinfo else ts.replace(tzinfo=UTC)).isoformat()
+
+
+def _full_sha(value: str | None) -> str | None:
+    """``value`` as a full lower-case commit id, or None if it is not one."""
+    sha = (value or "").strip().lower()
+    return sha if _SHA_RE.match(sha) else None
+
+
+def _norm_sha(value: str) -> str:
+    sha = _full_sha(value)
+    if sha is None:
+        raise HTTPException(422, detail={
+            "error": f"{value!r} is not a full commit id",
+            "hint": "send `git rev-parse HEAD`: a run counts only against the exact "
+                    "head it ran on, so an abbreviation is not enough"})
+    return sha
 
 
 def _repo(repo: str) -> str:
@@ -78,16 +96,6 @@ def _scope(repo: str, branch: str) -> tuple[str, str]:
         return _repo(repo), canonical_branch(branch)
     except BadRef as e:
         raise HTTPException(422, detail={"error": str(e), "branch": branch}) from e
-
-
-def _norm_sha(value: str) -> str:
-    sha = value.strip().lower()
-    if not _SHA_RE.match(sha):
-        raise HTTPException(422, detail={
-            "error": f"{value!r} is not a full commit id",
-            "hint": "send `git rev-parse HEAD`: a run counts only against the exact "
-                    "head it ran on, so an abbreviation is not enough"})
-    return sha
 
 
 def _view(g: Gate) -> dict:
@@ -129,11 +137,55 @@ def _restart(g: Gate, head: str, now: datetime) -> None:
     g.last_run_at = None
 
 
+def _branch_publishes(repo: str, branch: str):
+    """``published`` posts naming ``branch``, newest first. The repo is matched by
+    the caller through :func:`app.landing.post_repos`, because the two producers
+    put the qualified name on different refs (CI on the commit, the hook on the
+    repo ref)."""
+    return (select(Post)
+            .where(Post.type == LANDING_POST_TYPE,
+                   Post.refs.contains([{"kind": "branch", "value": branch}]))
+            .order_by(Post.id.desc()))
+
+
+def _names(post: Post, repo: str) -> bool:
+    return post_repos(post.refs) == {repo}
+
+
+async def _latest_published(session: AsyncSession, repo: str, branch: str) -> str | None:
+    """The full commit the branch was last published at, or None if the board
+    has not seen one."""
+    rows = (await session.execute(
+        _branch_publishes(repo, branch).limit(_PUBLISH_SCAN))).scalars()
+    for p in rows:
+        sha = _full_sha(ref_value(p.refs, "commit"))
+        if sha and _names(p, repo):
+            return sha
+    return None
+
+
+async def _published_before(session: AsyncSession, post: Post, repo: str,
+                            branch: str, commit: str) -> bool:
+    """Has this commit been published on this branch before ``post``?
+
+    The board cannot see the commit graph, so this is how it tells a branch that
+    moved from an announcement of a commit it already had: CI re-announcing a push,
+    or a checkout that is behind its upstream announcing the old tip. Only a commit
+    the branch has never been published at is a new head.
+    """
+    rows = (await session.execute(
+        _branch_publishes(repo, branch)
+        .where(Post.id < post.id,
+               Post.refs.contains([{"kind": "commit", "value": commit}])))).scalars()
+    return any(_names(p, repo) for p in rows)
+
+
 class GateIn(BaseModel):
     repo: str
     branch: str
     head: str
-    #: Omitted on an update means "leave it as it is".
+    #: Omitted and null both mean "leave it as it is" on an update; there is no
+    #: way to unset a field here, and none is needed while every one is optional.
     exit_bar: int | None = Field(default=None, ge=1, le=100)
     stage: str | None = Field(default=None, max_length=MAX_STAGE)
     outputs: str | None = Field(default=None, max_length=MAX_NOTE)
@@ -184,20 +236,30 @@ async def set_gate(
 ) -> dict:
     """Start a gate, or update one. Naming a head the gate is not at zeroes the
     count: the clean runs it banked were on another commit. ``previous`` is what
-    the gate said before this write."""
+    the gate said before this write.
+
+    ``branch_published`` is the commit the board last saw the branch published at,
+    and ``behind`` is true when that is not ``head``: the gate is being set on a
+    commit the branch has already moved past, and a publish after this one is the
+    only thing that would move it.
+    """
     repo, branch = _scope(body.repo, body.branch)
     head = _norm_sha(body.head)
     now = _utcnow()
     g = await _locked(session, repo, branch)
     previous = _view(g) if g is not None else None
+    # Read before anything is added: a query autoflushes, and a racing insert's
+    # unique violation must surface at the commit below, where it becomes a 409.
+    published = await _latest_published(session, repo, branch)
     if g is None:
         g = Gate(repo=repo, branch=branch, head_sha=head, clean_runs=0,
-                 exit_bar=body.exit_bar or 2, created_at=now)
+                 exit_bar=body.exit_bar or DEFAULT_EXIT_BAR, created_at=now)
         session.add(g)
-    elif not same_commit(g.head_sha, head):
-        _restart(g, head, now)
-    if body.exit_bar is not None:
-        g.exit_bar = body.exit_bar
+    else:
+        if not same_commit(g.head_sha, head):
+            _restart(g, head, now)
+        if body.exit_bar is not None:
+            g.exit_bar = body.exit_bar
     for field in ("stage", "outputs", "reset_rule"):
         value = getattr(body, field)
         if value is not None:
@@ -213,7 +275,8 @@ async def set_gate(
                 "repo": repo, "branch": branch,
                 "hint": "GET /gates to see what it says, then set it again"}) from e
         raise
-    return {"gate": _view(g), "previous": previous}
+    return {"gate": _view(g), "previous": previous, "branch_published": published,
+            "behind": published is not None and not same_commit(published, head)}
 
 
 @router.post("/gates/advance")
@@ -266,53 +329,88 @@ async def clear_gate(
     return {"cleared": cleared, "by": who}
 
 
+def _answer(post: Post, repo: str, branch: str, commit: str | None,
+            summary: str, detail: str) -> Post:
+    """The board's ``status`` reply to the publish that moved, or failed to move,
+    a gate. Its branch ref carries the repo, because a branch name means nothing
+    without one (the convention :mod:`app.api.leases` writes down)."""
+    refs = [{"kind": "branch", "value": branch, "repo": repo},
+            {"kind": "repo", "value": repo}]
+    if commit:
+        refs.insert(0, {"kind": "commit", "value": commit, "repo": repo})
+    return Post(author=post.author, session=post.session, type="status",
+                summary=f"[{repo}] {summary}", detail=detail, re=post.id, refs=refs)
+
+
 async def reset_on_publish(session: AsyncSession, post: Post) -> None:
-    """Move a gate whose branch a post has just landed a different commit on.
+    """Move a gate whose branch a ``published`` post has put a new commit on.
 
-    Called by :func:`app.api.posts.create_post` in the post's own transaction,
-    after the post is flushed and before the commit. It reads only the post's
-    structured refs, and acts only on a post that names **one** qualified
-    ``owner/name`` repository (the rule :func:`app.landing.post_repos` gives for
-    merge announcements), a branch, and a full commit id. Anything less is not
-    enough to say which gate moved, so nothing moves.
+    Called by :func:`app.api.posts.create_post` after the post is added and before
+    it commits. It reads only the post's structured refs, and acts only on a post
+    that names **one** qualified ``owner/name`` repository (the rule
+    :func:`app.landing.post_repos` gives for merge announcements) and a branch
+    with a gate on it. Then:
 
-    It runs in a SAVEPOINT and logs rather than raises: a defect here must never
-    cost the publish itself, which every checkout's sync status reads.
+    * a full commit the branch has not been published at before moves the gate
+      there, zeroes the count, and answers the post saying so;
+    * the gate's own head, or a commit already published on the branch, changes
+      nothing (see :func:`_published_before`);
+    * no usable commit (absent or abbreviated) leaves the gate where it is and
+      answers the post saying it did not move, so a reader is not left believing
+      the gate followed the branch.
+
+    ``landed`` posts are ignored: they say a commit exists, not that the branch's
+    runners can fetch it.
+
+    Nothing raised here can cost the publish, which every checkout's sync status
+    reads: the database work runs in a SAVEPOINT, and the whole body under one
+    ``except Exception`` that logs. Only the flush that gives the post its id is
+    outside it, and a post that cannot be flushed has failed on its own account.
     """
-    if post.type not in RESET_POST_TYPES:
+    if post.type != LANDING_POST_TYPE:
         return
+    await session.flush()
+    try:
+        await _reset(session, post)
+    except Exception:
+        log.exception("gate reset on post %s failed; the post stands", post.id)
+
+
+async def _reset(session: AsyncSession, post: Post) -> None:
     repos = post_repos(post.refs)
-    branch = ref_value(post.refs, "branch")
-    commit = (ref_value(post.refs, "commit") or "").strip().lower()
-    if len(repos) != 1 or not branch or not _SHA_RE.match(commit):
+    raw_branch = ref_value(post.refs, "branch")
+    if len(repos) != 1 or not raw_branch:
         return
     try:
-        repo, branch = canonical_repo(next(iter(repos))), canonical_branch(branch)
+        repo, branch = canonical_repo(next(iter(repos))), canonical_branch(raw_branch)
     except BadRef:
         return
-    try:
-        async with session.begin_nested():
-            g = await _locked(session, repo, branch)
-            if g is None or same_commit(g.head_sha, commit):
-                return
-            was, banked = g.head_sha, g.clean_runs
-            now = _utcnow()
-            _restart(g, commit, now)
-            g.updated_by, g.updated_at = post.author, now
-            session.add(Post(
-                author=post.author,
-                session=post.session,
-                type="status",
-                summary=(f"[{repo}] gate on {branch} restarts at {commit[:12]} "
-                         f"(was {was[:12]}, {banked}/{g.exit_bar} clean)"),
-                detail=(f"Post #{post.id} landed {commit} on {branch}. The gate "
-                        f"was at {was} with {banked} of {g.exit_bar} clean runs; "
-                        "those were on the old head and no longer count. Runs "
-                        "recorded against the old head are refused from now on."),
-                re=post.id,
-                refs=[{"kind": "commit", "value": commit, "repo": repo},
-                      {"kind": "branch", "value": branch},
-                      {"kind": "repo", "value": repo}],
-            ))
-    except SQLAlchemyError:
-        log.exception("gate reset on post %s failed; the post stands", post.id)
+    commit = _full_sha(ref_value(post.refs, "commit"))
+    async with session.begin_nested():
+        g = await _locked(session, repo, branch)
+        if g is None:
+            return
+        if commit is None:
+            session.add(_answer(
+                post, repo, branch, None,
+                f"gate on {branch} NOT moved: post #{post.id} named no full commit",
+                f"Post #{post.id} announced {branch} without a full commit id, so the "
+                f"board cannot tell where the branch is. The gate stays at "
+                f"{g.head_sha} with {g.clean_runs}/{g.exit_bar} clean. If the branch "
+                "moved, set the new head with gate_set."))
+            return
+        if same_commit(g.head_sha, commit) or await _published_before(
+                session, post, repo, branch, commit):
+            return
+        was, banked = g.head_sha, g.clean_runs
+        now = _utcnow()
+        _restart(g, commit, now)
+        g.updated_by, g.updated_at = post.author, now
+        session.add(_answer(
+            post, repo, branch, commit,
+            f"gate on {branch} restarts at {commit[:12]} "
+            f"(was {was[:12]}, {banked}/{g.exit_bar} clean)",
+            f"Post #{post.id} published {commit} on {branch}. The gate was at {was} "
+            f"with {banked} of {g.exit_bar} clean runs; those were on the old head and "
+            "no longer count. Runs recorded against the old head are refused from now "
+            "on."))
