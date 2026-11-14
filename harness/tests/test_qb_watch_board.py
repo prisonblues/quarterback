@@ -91,9 +91,12 @@ def test_every_board_request_carries_qbdatas_tls_context(monkeypatch):
     its own, and the watch then reports an unreadable board that is up (#857). The
     watcher's `_ssl_context` must BE qbdata's, not merely exist: patched without
     `raising`, a missing import would be papered over by the patch itself."""
-    import qbdata
-
-    assert w._ssl_context is qbdata._ssl_context
+    # Where it was defined, not object identity: other suites reload qbdata in this
+    # same process, so the function the watcher imported need not be the one a
+    # fresh `import qbdata` returns.
+    code = w._ssl_context.__code__
+    assert (code.co_name, Path(code.co_filename).resolve()) == (
+        "_ssl_context", SCRIPT.parent.joinpath("qbdata.py").resolve())
     sentinel = object()
     built, seen = [], []
     monkeypatch.setattr(w, "_ssl_context", lambda: built.append(1) or sentinel)
