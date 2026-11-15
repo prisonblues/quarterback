@@ -437,6 +437,14 @@ class Canonical:
     #: severity and the synthesis, and dropping it here would mean parsing the
     #: judge's answer twice.
     premise_verdict: str = ""
+    #: What the judge said this finding IS (#623): one of
+    #: :data:`panel_core.FINDING_KINDS`, or ``""`` when it said nothing readable,
+    #: which is every unjudged finding. ``kind_said`` is the judge's own word, and
+    #: differs from ``kind`` only where a regression or claim_miss came without the
+    #: ``evidence`` that has to back it — see :func:`panel_core._finding_kind`.
+    kind: str = ""
+    kind_said: str = ""
+    evidence: str = ""
 
     @property
     def reviewers(self) -> list[str]:
@@ -525,6 +533,9 @@ class Canonical:
             "related": self.related,
             "rationale": self.rationale,
             "premise_verdict": self.premise_verdict,
+            "kind": self.kind,
+            "kind_said": self.kind_said,
+            "evidence": self.evidence,
         }
 
 
@@ -628,14 +639,13 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
         # parsing kept it, and the two must not disagree about what a verdict is.
         if not _is_answer(v, "verdicts"):
             continue
-        # dict.fromkeys: one verdict listing the same report twice must not
-        # credit its reviewer twice.
-        members = list(dict.fromkeys(
-            i for i in _member_ids(v.get("members"))
-            if 0 <= i < len(flat) and i not in claimed))
+        f = _verdict_fields(v)
+        # `f["members"]` is already deduplicated: one verdict listing the same
+        # report twice must not credit its reviewer twice.
+        members = [i for i in f["members"] if 0 <= i < len(flat) and i not in claimed]
         if not members:
-            if v.get("members"):
-                dropped.append(f"{v.get('id') or '?'}: members={v.get('members')!r}")
+            if f["members_raw"]:
+                dropped.append(f"{f['id'] or '?'}: members={f['members_raw']!r}")
             continue
         claimed.update(members)
         accounts = [flat[i] for i in members]
@@ -644,26 +654,24 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
         # worst report's own. Falling back to the whole joined account instead
         # would put a detail — up to RAW_DETAIL_CHARS of it — in the synthesis,
         # which the board stores as the title.
-        synthesis = str(v.get("synthesis") or v.get("title") or "").strip()
         c = Canonical(
             id=_finding_id(pr, len(out) + 1),
-            severity=_severity(v.get("severity"), rep.severity),
-            file=str(v.get("file") or rep.file),
-            line=v.get("line") if isinstance(v.get("line"), int) else rep.line,
-            synthesis=synthesis or rep.title,
-            verdict=_ruling(v.get("real")),
+            severity=f["severity"] or rep.severity,
+            file=f["file"] or rep.file,
+            line=f["line"] if f["line"] is not None else rep.line,
+            synthesis=f["synthesis"] or rep.title,
+            verdict=f["real"],
             detail=rep.detail,
             reported_by=accounts,
-            rationale=str(v.get("reason") or v.get("rationale") or "").strip(),
+            rationale=f["reason"],
             # #67, and only ever present when the recurrence brief was in the
             # prompt — a judge that was never asked cannot answer, and a stray key
             # on a round-1 reply normalises to "" like any other unreadable value.
-            premise_verdict=_premise_verdict(v.get("premise")) if asked else "",
+            premise_verdict=f["premise"] if asked else "",
+            kind=f["kind"], kind_said=f["kind_said"], evidence=f["evidence"],
         )
         out.append(c)
-        rel = v.get("related")
-        links.append((c, str(v["id"]) if v.get("id") is not None else None,
-                      rel if isinstance(rel, list) else []))
+        links.append((c, f["id"], f["related"]))
 
     if dropped:
         print(f"panel: judge verdict(s) named no valid report id and were dropped "
@@ -8057,9 +8065,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # severity alone would put the gate issues back under it silently, which is how
     # this came back the first time.
     exempt = frozenset(c.key for c in outstanding if c.verdict == "sonar")
+    # #623: what the judge typed decides what blocks. A demonstrated regression or
+    # claim_miss blocks at any severity; an observation never does. An untyped
+    # finding (old payload, judge that did not answer) keeps the severity floors.
+    # `- demonstrated` is load-bearing: two findings can share a key, and a key a
+    # regression carries must not be subtracted because an observation carries it.
+    demonstrated = frozenset(c.key for c in outstanding
+                             if c.kind in DEMONSTRATED_KINDS)
+    observed = frozenset(c.key for c in outstanding
+                         if c.kind == "observation") - exempt - demonstrated
 
     def above(key: str, floor: str) -> bool:
-        return (key in exempt
+        return (key in exempt or key in demonstrated
                 or severity_at_least(severity.get(key, SEVERITIES[0]), floor))
 
     held = frozenset(k for k in escalated if k)
@@ -8129,7 +8146,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # decline to generalise?"). Folding them into one name would make an escalation
     # and a narrowing indistinguishable in the payload; keeping two subtractions would
     # be two places for the filter to fall out of step.
-    cleared_out = held | answered
+    cleared_out = held | answered | observed
     clearable_new = [k for k in new_keys if k not in cleared_out]
     clearable = [c for c in outstanding if c.key not in cleared_out]
     #: New findings that buy a round, and the ones that were raised and do not.
@@ -8348,6 +8365,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
+        if observed:
+            reason += f" ({len(observed)} observation(s), none blocking)"
     # #84, and BEFORE the cap on purpose: both can be true of the same round, and
     # "the rounds stopped being about different things" is the more specific truth
     # than "the counter ran out". A cap reached is a cost bound; this is a futility
@@ -9099,6 +9118,9 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # owes are the caller's (`panel-review-pr.md`), and an issue is owed only where
         # the general form is itself a claim-miss.
         "narrowed": sorted(narrowed_cleared),
+        # #623: typed observations, subtracted with `held | answered` and listed
+        # so the round's finding count still reconciles.
+        "observed": sorted(observed),
         # "Nothing left to find" is a claim; "the counter hit zero" is not the
         # same claim, and the difference is exactly what a reader of a clean
         # verdict needs to see.
@@ -9434,6 +9456,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             # against this block would find them nowhere and read the gap as a
             # dropped finding rather than as a fixer's declared decision.
             "narrowed": sorted(narrowed_cleared),
+            "observed": sorted(observed),
             # #665. In this block for the reason `escalated` and `narrowed` are: it
             # is the whole answer to "who gets what is left", and a known-unfixed
             # defect is left to whoever lands the PR. It is not a fourth disposal —

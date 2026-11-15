@@ -25,10 +25,11 @@ RESOLVER = "resolver call without the viewer"
 INVARIANT = "every resolver call is handed the viewer"
 
 
-def ledger_with(*paths, round_no=1, name=RESOLVER, limit=2):
+def ledger_with(*paths, round_no=1, name=RESOLVER, limit=2, kind=""):
     ledger = pc.new_ledger("acme/board", 34)
     for path in paths:
-        pc.record(ledger, name, round_no, path, invariant=INVARIANT, limit=limit)
+        pc.record(ledger, name, round_no, path, invariant=INVARIANT, limit=limit,
+                  kind=kind)
     return ledger
 
 
@@ -596,7 +597,7 @@ def fake_gh(monkeypatch):
 
 def test_file_creates_an_issue_carrying_the_class_key(fake_gh):
     calls, _ = fake_gh
-    ledger = ledger_with("a.py:10")
+    ledger = ledger_with("a.py:10", kind="regression")
     verdict = pc.file_class(ledger, RESOLVER, 1, "pre-existing", "acme/board", 34)
     create = next(c for c in calls if c[:2] == ("issue", "create"))
     body = create[create.index("--body") + 1]
@@ -610,7 +611,8 @@ def test_file_creates_an_issue_carrying_the_class_key(fake_gh):
 def test_file_uses_the_label_only_when_the_repo_has_it(fake_gh):
     calls, answers = fake_gh
     answers["label list"] = "found-in-review\n"
-    pc.file_class(ledger_with("a.py:10"), RESOLVER, 1, "budget", "acme/board")
+    pc.file_class(ledger_with("a.py:10", kind="regression"), RESOLVER, 1, "budget",
+                  "acme/board")
     create = next(c for c in calls if c[:2] == ("issue", "create"))
     assert create[create.index("--label") + 1] == "found-in-review"
 
@@ -618,7 +620,7 @@ def test_file_uses_the_label_only_when_the_repo_has_it(fake_gh):
 def test_file_comments_on_the_open_issue_for_the_same_class(fake_gh):
     calls, answers = fake_gh
     answers["issue list"] = "777\n"
-    ledger = ledger_with("a.py:10")
+    ledger = ledger_with("a.py:10", kind="regression")
     verdict = pc.file_class(ledger, RESOLVER, 1, "pre-existing", "acme/board")
     assert verdict == {**verdict, "issue": 777, "filed": "commented"}
     assert not any(c[:2] == ("issue", "create") for c in calls)
@@ -638,7 +640,7 @@ def test_the_cli_files_and_records_and_a_gh_failure_records_nothing(cli, fake_gh
                                                                     monkeypatch,
                                                                     tmp_path):
     cli("record", "--round", "1", "--class", RESOLVER, "--path", "a.py:1",
-        "--invariant", INVARIANT)
+        "--invariant", INVARIANT, "--kind", "regression")
     assert cli("file", "--round", "1", "--class", RESOLVER, "--rule", "budget") == 0
     ledger, _ = pc.load_ledger(str(tmp_path / "classes.json"))
     assert ledger["classes"][0]["deferred"]["issue"] == 902
@@ -647,7 +649,7 @@ def test_the_cli_files_and_records_and_a_gh_failure_records_nothing(cli, fake_gh
         raise pc.subprocess.CalledProcessError(1, "gh", stderr="no auth")
     monkeypatch.setattr(pc, "gh", broken)
     cli("record", "--round", "2", "--class", "token read apart from its value",
-        "--path", "b.py:2", "--invariant", "read together")
+        "--path", "b.py:2", "--invariant", "read together", "--kind", "claim_miss")
     with pytest.raises(SystemExit, match="nothing recorded"):
         cli("file", "--round", "2", "--class", "token read apart from its value",
             "--rule", "budget")

@@ -1321,6 +1321,16 @@ JUDGE_RECURRENCE_SLOT = "<<<RECURRENCE_BRIEF>>>"
 #: the findings that most needed a shrug.
 PREMISE_VERDICTS = ("invalidates", "separate", "unclear")
 
+#: What a judge may say a finding IS (#623). The first two are what a change owes:
+#: it broke something that worked, or it does not do what it claims. The third is
+#: everything else, and is the default. ``""`` (unsaid or unreadable) is a fourth
+#: state and is kept apart from ``observation``, so an old payload or a judge that
+#: did not answer is never counted as having typed anything.
+FINDING_KINDS = ("regression", "claim_miss", "observation")
+
+#: The two kinds that need a demonstration before they are believed.
+DEMONSTRATED_KINDS = ("regression", "claim_miss")
+
 #: What a judge is told when there IS an earlier round, and what it is asked on
 #: top of its ordinary ruling.
 #:
@@ -1495,6 +1505,19 @@ flagged by only ONE reviewer MUST be marked real — never dismiss it because th
 Mark real=false ONLY when the issue is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
+KIND. Separately from real and severity, say what each issue IS, in `kind`:
+- "regression" — something that worked before this change no longer works, AND it is
+  DEMONSTRATED: a failing test or check, a command and its wrong output, or a concrete input whose
+  result this diff changes for the worse. Put that demonstration in `evidence`. "This could break
+  X" is not a regression until someone shows X breaking; until then it is an observation.
+- "claim_miss" — the change does not do what it says it is for. Quote the claim (from the author's
+  claim block or the PR title) in `evidence`, and say in `reason` how the diff fails it.
+- "observation" — everything else: generality, robustness the change never promised, test
+  style, naming, docs, simplification, and any defect that was just as true before this change.
+  THIS IS THE DEFAULT AND THE COMMON CASE. A real, well-argued issue is still usually this.
+Kind and severity are independent: a P2 can be an observation and a P4 can be a regression. A
+regression or claim_miss with no `evidence` is recorded as an observation.
+
 Return one `verdicts` entry per REAL-WORLD ISSUE, covering every report id, in this shape:
   {{"verdicts": [{{"id": "F01",
                   "members": [<the bracketed report NUMBERS merged into this issue, e.g. 0, 3>],
@@ -1503,6 +1526,8 @@ Return one `verdicts` entry per REAL-WORLD ISSUE, covering every report id, in t
                   "file": "path", "line": <int|null>,
                   "synthesis": "the merged statement of the issue",
                   "related": ["F03"],
+                  "kind": "regression|claim_miss|observation",
+                  "evidence": "the failing check, or the quoted claim",
                   "reason": "why real or a false positive"}}],
    "coverage_rulings": [{{"declarations": [<the bracketed declaration NUMBERS this claim merges, e.g. 0, 2>],
                   "claim": "what nobody settled, in one line",
@@ -1571,6 +1596,8 @@ JUDGE_SCHEMA = {
                 "line": {"type": ["integer", "null"]},
                 "synthesis": {"type": "string"},
                 "related": {"type": "array", "items": {"type": "string"}},
+                "kind": {"type": "string", "enum": list(FINDING_KINDS)},
+                "evidence": {"type": ["string", "null"]},
                 "reason": {"type": "string"},
             },
             "required": ["id", "members", "real", "severity", "synthesis", "reason"],
@@ -2673,27 +2700,41 @@ def _findings_of(reviewer: str, obj: dict, items: list) -> list[Finding]:
     return out
 
 
-def _verdict_reading(v: dict) -> tuple:
-    """One verdict as :func:`_parse_verdicts` will read it — every field it
-    consumes, normalised the way it normalises them, and nothing else.
+def _verdict_fields(v: dict) -> dict:
+    """Every field of one judge verdict, normalised. The ONLY reader of a verdict:
+    :func:`panel_rounds._parse_verdicts` builds its record from this and
+    :func:`_verdict_reading` compares candidates by it, so a field cannot be parsed
+    without also being compared (a guard test holds the parser to it).
 
-    The judge's counterpart to :func:`_findings_of`, and needed for the same
-    reason: two spellings of one ruling (`"severity": "p1"`, a `title` where a
-    `synthesis` was asked for, a repeated member id, an extra key nobody reads)
-    are one ruling, and the judge gets no retry when they are mistaken for
-    two."""
+    ``severity`` and ``file`` are ``""`` when the judge gave none; the parser
+    falls back to the worst report's. ``premise`` is read whether or not it was
+    asked; the parser drops it when it was not."""
     rel = v.get("related")
-    return (
-        str(v["id"]) if v.get("id") is not None else None,
-        tuple(dict.fromkeys(_member_ids(v.get("members")))),
-        _ruling(v.get("real")),
-        _severity(v.get("severity"), ""),
-        str(v.get("file") or "").strip(),
-        v.get("line") if isinstance(v.get("line"), int) else None,
-        str(v.get("synthesis") or v.get("title") or "").strip(),
-        tuple(str(r) for r in rel) if isinstance(rel, list) else (),
-        str(v.get("reason") or v.get("rationale") or "").strip(),
-    )
+    kind, kind_said, evidence = _finding_kind(v.get("kind"), v.get("evidence"))
+    return {
+        "id": str(v["id"]) if v.get("id") is not None else None,
+        "members": tuple(dict.fromkeys(_member_ids(v.get("members")))),
+        "members_raw": v.get("members"),
+        "real": _ruling(v.get("real")),
+        "severity": _severity(v.get("severity"), ""),
+        "file": str(v.get("file") or "").strip(),
+        "line": v.get("line") if isinstance(v.get("line"), int) else None,
+        "synthesis": str(v.get("synthesis") or v.get("title") or "").strip(),
+        "related": tuple(str(r) for r in rel) if isinstance(rel, list) else (),
+        "reason": str(v.get("reason") or v.get("rationale") or "").strip(),
+        "premise": _premise_verdict(v.get("premise")),
+        "kind": kind, "kind_said": kind_said, "evidence": evidence,
+    }
+
+
+def _verdict_reading(v: dict) -> tuple:
+    """One verdict as :func:`_parse_verdicts` will read it, for telling two judge
+    candidates apart: two spellings of one ruling (`"severity": "p1"`, a `title`
+    where a `synthesis` was asked for, a repeated member id, an extra key nobody
+    reads) are one ruling, and the judge gets no retry when they are mistaken for
+    two. ``members_raw`` is left out: it only words a diagnostic."""
+    f = _verdict_fields(v)
+    return tuple(val for k, val in f.items() if k != "members_raw")
 
 
 def _str_list(val) -> list[str]:
@@ -2918,6 +2959,23 @@ def _premise_verdict(raw) -> str:
     """
     said = raw.strip().lower() if isinstance(raw, str) else ""
     return said if said in PREMISE_VERDICTS else ""
+
+
+def _finding_kind(raw_kind, raw_evidence) -> tuple[str, str, str]:
+    """``(kind, kind_said, evidence)`` from one judge verdict (#623).
+
+    ``kind_said`` is the judge's word whenever it was one of :data:`FINDING_KINDS`;
+    ``kind`` is what is counted. They differ in exactly one case: a ``regression`` or
+    ``claim_miss`` with no evidence is counted as an ``observation``, because the
+    decided rule is that a finding is a regression only on a demonstrated failure,
+    and keeping the judge's word beside it shows how often that rule bit."""
+    said = raw_kind.strip().lower() if isinstance(raw_kind, str) else ""
+    if said not in FINDING_KINDS:
+        return "", "", ""
+    evidence = raw_evidence.strip() if isinstance(raw_evidence, str) else ""
+    if said in DEMONSTRATED_KINDS and not evidence:
+        return "observation", said, ""
+    return said, said, evidence
 
 
 def _ruling(raw) -> str:
@@ -3497,7 +3555,7 @@ __all__ = [
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
     "JUDGE_RECURRENCE_SLOT", "PREMISE_VERDICTS", "RECURRENCE_BRIEF",
-    "_premise_verdict",
+    "_premise_verdict", "FINDING_KINDS", "DEMONSTRATED_KINDS", "_finding_kind",
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
@@ -3518,7 +3576,7 @@ __all__ = [
     "CoverageRule", "_rulings",
     "_read", "_Ambiguous", "_AMBIGUOUS", "_agreed",
     "extract_json_value", "_severity", "_TRUTHY", "_flag",
-    "_to_findings", "_findings_of", "_verdict_reading", "_str_list",
+    "_to_findings", "_findings_of", "_verdict_fields", "_verdict_reading", "_str_list",
     "_declaration", "parse_reply", "_raw_finding", "_member_ids",
     "_ruling", "ASK_VERDICTS", "_ASK_ALIASES", "ASK_REASON_CHARS",
     "_REVIEW_SHAPED", "_cut", "_ask_reason", "Answer",
