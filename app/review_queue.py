@@ -509,6 +509,14 @@ def _norm_mergeable(value: str | None) -> str:
     return (value or "").strip().upper() or UNKNOWN
 
 
+def _accounted(run: LastRun) -> str:
+    """The parenthetical that says why ``outstanding`` is less than ``confirmed``,
+    naming only the parts that are non-zero."""
+    parts = [f"{n} {what}" for n, what in ((run.observed, "observation(s) not counted"),
+                                           (run.cleared, "cleared")) if n]
+    return f" ({run.confirmed} confirmed, {', '.join(parts)})" if parts else ""
+
+
 def _review_state(pr: PullRequest, run: LastRun | None) -> tuple[str, str, str]:
     """``(state, action, reason)`` from the review record alone.
 
@@ -548,9 +556,7 @@ def _review_state(pr: PullRequest, run: LastRun | None) -> tuple[str, str, str]:
             "unresolved",
             "fix",
             f"{run.outstanding} confirmed finding(s) outstanding at the current head"
-            + (f" ({run.confirmed} confirmed, {run.observed} observation(s) not "
-               f"counted, {run.cleared} cleared)"
-               if run.cleared or run.observed else ""),
+            + _accounted(run),
         )
     if run.stopped is True and run.stop_confident is not True:
         # `stop_confident` is the column that exists so a clean verdict can be
