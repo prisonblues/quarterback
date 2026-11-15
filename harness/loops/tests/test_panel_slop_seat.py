@@ -329,7 +329,7 @@ def test_the_seat_has_no_model_no_budget_and_no_truncation(monkeypatch, tmp_path
     row = r2["reviewers"]["slop"]
     assert row["model"] is None and row["effort"] is None
     assert row["max_diff_chars"] is None
-    assert row["truncated"] is False and row["argv_capped"] is False
+    assert row["truncated"] is False
     assert row["absent"] is False
 
 

@@ -98,9 +98,8 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #:   of an already-in-prompt diff over CLI_TIMEOUT and cost the panel the vendor.
 #: * **pi** — `--no-tools` is all-or-nothing, and what it would restore is
 #:   read/bash/edit/write. There is no read-only subset to ask for.
-#: * **antigravity** — its one per-run switch grants every tool, so it cannot be a
-#:   reader without being an executor; with `tools` on it is one, as
-#:   :data:`SEAT_RUNS_CODE` describes.
+#: * **antigravity** — its one per-run switch grants every tool, so it reads only
+#:   with a shell: see SEAT_RUNS_CODE.
 #: * **grok** — the only absence here that is not about the mechanism. `--tools`
 #:   names an exact read-only set (`read_file,grep,list_dir`) and `--sandbox
 #:   strict` bounds READS to the cwd under Landlock — verified on 1.0.3, a read
@@ -121,60 +120,34 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #: that mitigates it is a denylist.
 SEAT_READS_CODE = frozenset({"claude"})
 
-#: Seats that are given the PR's tree WITH a shell when their `tools` setting is on —
-#: the answer to #92 changed for this one by the owner's call (2026-11-14: "I don't
-#: mind letting the review agents run some tools and code"), not by a new flag.
-#:
-#: * **antigravity** — headless print mode auto-denies any tool it cannot prompt
-#:   for, and that denial ENDS the session with exit 0 and no output, so a model that
-#:   ignores NO_TOOLS_BRIEF and probes `echo …` costs the panel the whole seat (#853's
-#:   round 1). `--dangerously-skip-permissions` is the only per-run switch agy 1.1.24
-#:   has. The seat stands in :func:`seat_checkout`'s throwaway copy and is TOLD
-#:   that copy's absolute path (CODE_EXEC_BRIEF's SEAT_DIR_SLOT).
-#:
-#: **Nothing here is a bound, and that was measured, not assumed.** agy's command tool
-#: takes a cwd the MODEL chooses, defaulting to agy's own scratch directory rather
-#: than the process cwd. On PR #861's first live round, before the seat was told its
-#: path, it ran `find /home/rich -maxdepth 3`, found the PR's real worktree, and ran
-#: its `git diff`s and a pytest file there — all read-only, the worktree came out
-#: clean, and nothing stopped it from writing. Told the path, round 2's seat ran all
-#: 214 of its commands in the copy. :func:`runs_code_env` starts it with an allowlisted
-#: environment. Files under HOME, the filesystem and the network stay reachable: the
-#: trade the owner accepted. `"tools": false` restores the diff-only seat.
+#: Seats given the tree AND a shell when `reviewers.<seat>.tools` is true — the owner's
+#: call (2026-11-14) after a model that ignored NO_TOOLS_BRIEF had its tool call
+#: soft-denied and the denial ended its session, losing the seat for the round (#853).
+#: What this does and does not protect is stated once, in the loops README under
+#: "The one seat that is given a shell".
 SEAT_RUNS_CODE = frozenset({"antigravity"})
 
 
 def tool_seats(reviewers: dict) -> frozenset[str]:
-    """The seats this round would hand the tree: every :data:`SEAT_READS_CODE` seat,
-    plus each :data:`SEAT_RUNS_CODE` seat whose `reviewers.<seat>.tools` is exactly
-    True. Exactly: a rules file saying `"tools": "false"` must not grant a shell."""
+    """The seats that take the tree this round. `tools` must be exactly True: a
+    `"false"` string is truthy, and this grants a shell."""
     return SEAT_READS_CODE | frozenset(
         n for n in SEAT_RUNS_CODE if (reviewers.get(n) or {}).get("tools") is True)
 
 
-#: The ONLY inherited variables a tool-running seat starts with. An allowlist because
-#: a denylist of credential names was found short twice in one review (#861: AWS keys,
-#: kubeconfig, PGHOSTADDR, *_DATABASE_URI), and every miss is a credential handed to a
-#: shell. Measured 2026-11-15: agy 1.1.24 authenticates and runs commands with exactly
-#: this set — its auth is a file under HOME, not a variable.
+#: The only inherited variables a tool-running seat starts with. An allowlist because
+#: a denylist of credential names leaks whatever it did not think of.
 _SEAT_ENV_ALLOW = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TZ|TZDIR"
                              r"|TMPDIR|XDG_\w+|LOCALE_ARCHIVE|\w*_CERT_(FILE|DIR))$")
 
 
 def runs_code_env(home: Path, base: dict[str, str] | None = None) -> dict[str, str | None]:
-    """Environment overlay for a seat that may execute, on top of :func:`sandbox_env`.
-    A None value means "remove this variable" (see `run_cli`).
+    """`run_cli`'s `env_extra` for a tool-running seat; None removes a variable.
 
-    Every inherited variable outside :data:`_SEAT_ENV_ALLOW` is removed, so no
-    credential, database URL or agent socket in the panel's environment reaches the
-    seat. :data:`SANDBOX_ENV` survives because it is applied, not inherited. Three are
-    then SET, because a test suite falls back to defaults that are a live database on
-    this box and `gh` to the user's config: the database variables name a host that
-    cannot resolve, and `gh` gets an empty config dir. What this does not do is hide
-    the FILES under HOME — see :data:`SEAT_RUNS_CODE`.
-
-    `base` defaults to the live `os.environ`, a parameter only so a test can hand in
-    a known one."""
+    Removes every inherited variable outside :data:`_SEAT_ENV_ALLOW` (SANDBOX_ENV is
+    applied after inheritance, so it stays), then points the database variables at a
+    host that cannot resolve — the tree has no `.env`, and a test suite's defaults
+    here are a live database — and `gh` at an empty config."""
     gh = home / "gh-config"
     gh.mkdir(exist_ok=True)
     env = os.environ if base is None else base
@@ -1172,8 +1145,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     buy nothing and would trade a guard for it.
 
     `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
-    the only way to hand a reviewer a diff larger than the kernel's per-argument
-    limit (see ARGV_PROMPT_MAX_BYTES). It does NOT weaken the guard that stdin
+    the only way to hand a reviewer a diff larger than the kernel's 128 KiB
+    per-argument limit. It does NOT weaken the guard that stdin
     is otherwise DEVNULL: subprocess writes the string and closes the pipe, so a
     CLI that decides to prompt for more reads EOF instead of hanging the panel
     on an inherited terminal.
@@ -1236,7 +1209,6 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     # between attempts changes it, and building it three times would be three
     # copies of `os.environ` for one dict entry.
     env = sandbox_env() if cwd is not None else None
-    # `env_extra` overlays the seat env, and a None value removes the variable.
     for k, v in (env_extra or {}).items() if env is not None else ():
         if v is None:
             env.pop(k, None)
@@ -1817,12 +1789,7 @@ def diff_budget(block: dict, key: str, fallback: int | None,
     Only what cannot be a budget at all is refused: a non-number, or <= 0 (which
     would send an empty diff and produce a confident review of nothing). Those
     fall back and SAY so — silently honouring them reviews a fragment, silently
-    dropping them leaves you believing a budget you never got.
-
-    There is one ceiling this cannot see, and it belongs to the caller: `agy`'s
-    prompt travels in argv, so the kernel caps it however large a budget says
-    (see fit_argv_budget). That clamp is applied per reviewer, after this, and
-    reported the same way — as truncation with a reason, not as a refusal."""
+    dropping them leaves you believing a budget you never got."""
     raw = block.get(key)
     if raw is None or raw == "":
         return fallback
@@ -3607,97 +3574,6 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
     return dials
 
 
-def fit_argv_budget(render, budget: int) -> int:
-    """The largest diff budget <= `budget` whose rendered prompt still fits in one
-    argv element, for the seat whose prompt has nowhere else to go.
-
-    This is the same rule diff_budget follows and the reason it can now keep it:
-    a budget over the kernel's limit USED to be honoured right up to execve and
-    then kill the reviewer with an opaque error. Here it becomes ordinary
-    truncation with the consequence surfaced — the config still wins as far as
-    the machine allows, and the report says where the machine stopped it.
-
-    `render` renders the whole prompt from a budget, because the ceiling applies
-    to the prompt, not the diff: the template counts, and so does the difference
-    between characters and the bytes they encode to (this repo's own comments are
-    full of em dashes, each of which is three bytes and one char).
-
-    `budget` is counted in CHARACTERS and the ceiling in BYTES, deliberately and
-    safely: subtracting a byte overflow from a character budget over-shrinks (a
-    char is never fewer than one byte, so dropping N chars drops at least N
-    bytes), which converges in one pass and errs on the side of a prompt that
-    fits. The loop is kept for the pathological case where the template alone is
-    near the limit, and for a `render` whose length is not linear in its budget —
-    an ask's is not, since a budget below a section's length drops the sections
-    after it whole.
-
-    **The result is always between 0 and `budget`, and 0 does not mean "it
-    fits".** When the template and the premise are over the ceiling on their own
-    there is nothing left to take out, and this returns 0 having failed — so a
-    caller must measure the rendered prompt rather than trust the reduction.
-    `ask()` does exactly that, and skips the seat with the reason said."""
-    for _ in range(8):
-        over = len(render(budget).encode()) - ARGV_PROMPT_MAX_BYTES
-        if over <= 0:
-            return budget
-        budget = max(0, budget - over)
-    return budget
-
-
-def argv_clamp(render, sendable: int, asked: int | None) -> tuple[int, bool]:
-    """The budget the kernel will actually carry for the argv-bound seat, and
-    whether the KERNEL is what cut it.
-
-    Returns ``(fitted, kernel_cut)``. `fitted` is what to hand the seat.
-    `kernel_cut` is half of what :func:`coverage_veto` needs — this function can say
-    who did the cutting, and deliberately does not try to say whether the cut cost
-    the seat any of the review TARGET. See below.
-
-    Two conditions on `kernel_cut`, both load-bearing:
-
-    * ``fitted < want`` — the clamp actually cut what was asked for, so the kernel
-      is the binding constraint. A repo that pins antigravity a smaller
-      ``max_diff_chars`` than this box could carry is truncated by a number
-      somebody typed; that is fixable, so it is evidence about the round and still
-      vetoes. A dropped zero (60_000 -> 6_000) is the exact slip
-      :func:`diff_budget` declines to guard against, on the grounds that the
-      CONSEQUENCE gets surfaced instead — so the consequence has to keep arriving.
-    * ``0 < fitted`` — the seat was partly served rather than not served at all.
-      Not hypothetical: :func:`fit_argv_budget` subtracts a BYTE overflow from a
-      CHARACTER budget, over-shrinking on purpose to converge in one pass, and on
-      three-byte characters it over-shrinks to **zero** — a 200,000 em-dash diff
-      hands this seat an empty prompt. A seat given no diff has not "structurally
-      seen part of it"; it reviewed nothing, which is a stronger reason to withhold
-      confidence rather than a weaker one, so it falls through to the ordinary
-      truncation veto exactly as it did before this exemption existed.
-
-    **Whether the target was actually cut is the caller's half, and it must be
-    measured by COMPOSING the material rather than by comparing this budget against
-    the target's length.** They are different numbers under increment scope: the
-    budget also pays for the brief and the section headers, which are over a
-    kilobyte, so a budget a little OVER the target's size still cuts it. `run`
-    already computes that properly for every seat (`truncated_for`), and the
-    exemption is the intersection — a seat that is truncated by measurement AND was
-    cut by the kernel. Comparing against a raw `target_len` here instead classified
-    exactly that overhead case as a budget truncation, quietly keeping the standing
-    veto this change exists to remove on precisely the rounds that run scoped.
-
-    Note also what this does NOT do: compute a config-independent "ceiling" from
-    `sendable` and compare budgets against it. That reads better and is wrong,
-    because `fit_argv_budget` is not composable — its overshoot depends on the
-    budget it starts from, so ``min(asked, fit(sendable))`` is not ``fit(asked)``.
-    On multibyte material the ceiling collapses to 0 and every budget, however
-    small and deliverable, would be clamped to nothing.
-
-    Extracted from ``run`` so the rule has a name and a test. Inline it was
-    conditions buried in a thousand-line function, reachable only by standing up a
-    whole panel — which is how a classification that decides whether a round can
-    stop confidently ends up with no test at all."""
-    want = sendable if asked is None else asked
-    fitted = fit_argv_budget(render, want)
-    return fitted, 0 < fitted < want
-
-
 def reviewer_label(name: str, model: str, effort: str = "") -> str:
     """`codex (gpt-5.6-luna, high)` — the report says WHICH brain reviewed.
 
@@ -3815,7 +3691,7 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     Takes no prompt: `codex exec` with no positional argument reads its
     instructions from stdin, which is where the diff goes. The parameter is gone
     rather than ignored so the argv-limit bug cannot be reintroduced by passing
-    one (see ARGV_PROMPT_MAX_BYTES).
+    one.
 
     `reply_file` turns on the pair that gets usage out of this seat WITHOUT
     wrapping the findings: `--json` puts the event stream (which carries
@@ -3897,85 +3773,50 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     return args
 
 
-def antigravity_args(model: str, effort: str, prompt: str,
-                     timeout: int = CLI_TIMEOUT, tools: bool = False) -> list[str]:
-    """`agy` argv — Google's Antigravity CLI, which replaced gemini-cli in this
-    seat. `-p` is its non-interactive print mode.
+def antigravity_args(model: str, effort: str, timeout: int = CLI_TIMEOUT,
+                     tools: bool = False) -> list[str]:
+    """`agy` argv. The prompt goes on stdin as one stream-json message (see
+    :func:`antigravity_stdin`) and the reply comes back in the stream's final
+    `result` event (:func:`antigravity_reply`). Text-mode `-p` was the only other
+    way in, and it takes the prompt in argv, where the kernel caps one argument at
+    128 KiB; `-p -` is taken as the literal prompt "-".
 
-    This is the ONE seat whose prompt travels in argv: `agy` has no way to read
-    one from anywhere else — not stdin, not a `@file`, not a `--prompt-file`.
-    So it is also the one seat that can hit the kernel's per-argument limit, and
-    the caller clamps its diff to ARGV_PROMPT_MAX_BYTES before rendering.
-
-    **Two modes, chosen by `tools`** (the caller passes it only when the seat was
-    actually given :func:`seat_checkout`'s copy — see :data:`SEAT_RUNS_CODE`):
-
-    * `tools=True` adds `--dangerously-skip-permissions`, the one per-run switch
-      `agy` 1.1.24 has (`--settings` is in its changelog and not in the binary: it
-      exits 2). The cwd bounds NOTHING: agy's command tool runs where the model
-      says, by default in agy's own scratch directory, and on #861's first live
-      round the seat found and read the PR's real worktree (see
-      :data:`SEAT_RUNS_CODE`). An earlier measurement here, with the seat standing
-      in a real checkout, ran the test suite against the dev database;
-      :func:`runs_code_env` makes that unlikely, not impossible.
-    * `tools=False` is the old seat. `--mode plan` is NOT a sandbox, despite
-      reading like one: with permissions granted, plan mode writes files. What
-      keeps this reviewer off the tree is that headless print mode cannot prompt
-      for a tool permission, so any tool needing one is auto-denied. Plan mode is
-      kept in both modes for the narrower thing it does do (biasing it away from
-      proposing edits), not as the guarantee.
-
-    **THAT AUTO-DENIAL IS FATAL** in the no-tools mode, and used to be documented
-    here as benign, the reasoning being that the diff is in the prompt so the seat
-    needs no tool anyway. `agy` does not shrug and carry on reviewing. On 1.1.x it
-    exited 1 with `permission check failed for command "pwd && ls -la": user denied
-    permission` (#458); on 1.1.24 a soft-deny ends the session with exit 0 and an
-    empty stdout ("jetski: no output"), which the panel reports as a degraded seat
-    (#853). A settings-file `permissions.deny` rule is the one denial that does NOT
-    end the session, but it lives in the user's global agy settings and cannot be
-    set per run, which is why the fix for a reaching model is the tools mode rather
-    than a deny rule.
-
-    It reaches because every seat reaches — `codex_args` measured five runs in
-    seven — and this is the seat with no flag to stop it: pi has `--no-tools`,
-    codex has its two `-c` overrides, `agy --help` offers only
-    `--dangerously-skip-permissions`, pointing the other way. `--sandbox` does not
-    help either; it restricts what a tool may do, not whether asking is fatal.
-    `NO_TOOLS_BRIEF` in the prompt is this seat's `--no-tools`, and it is measured:
-    on the same failing prompt it is the difference between exit 1 and a findings
-    array that names the gap instead of hunting for it.
-
-    **In BOTH prompts that reach this function**, which is the correction #459 made
-    to this paragraph: it was written as a fact about the seat while only the review
-    path had been given the brief, so an `--ask` still reached `agy` with the older,
-    milder sentence — no tools, but not that reaching for one ends the session — and
-    could still lose the seat on every invocation. `ASK_PROMPT` carries
-    `NO_TOOLS_RULE` now, which is the half of the brief that is not about findings.
-
-    `--print-timeout` is passed because `agy` otherwise aborts itself at 5m0s
-    while run_cli is still patiently waiting out its own much longer bound — a
-    reviewer that reads as dead when it was only slow. It takes a Go duration,
-    hence the `s` suffix.
-
-    Left on the default `--output-format text` rather than `json`: the JSON mode
-    wraps the reply in {response, status, usage, ...}, which would hide the
-    findings array inside an escaped string where parse_reply's balanced-bracket
-    scan cannot see it. Text mode puts the array straight on stdout, which is what
-    every other seat here produces and what the parser is written against.
-
-    Unlike gemini-cli, `agy` fails loudly on an unknown model instead of silently
-    serving a different one, so a pinned slug that stops existing shows up as a
-    dead reviewer rather than a quietly wrong one. Its effort scale is only
-    low/medium/high (see EFFORTS) — narrower than codex's or pi's.
-    """
-    args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s", "-p", prompt]
+    `tools=True` adds `--dangerously-skip-permissions`, agy's only per-run permission
+    switch; the caller passes it only to a seat that was given its copy of the tree.
+    Without it, headless agy soft-denies any tool it cannot prompt for and the denial
+    ends the session with no reply, which NO_TOOLS_BRIEF exists to head off.
+    `--mode plan` biases it away from proposing edits; it is not a guard.
+    `--print-timeout` because agy otherwise aborts itself at 5m."""
+    args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s",
+            "--input-format", "stream-json", "--output-format", "stream-json"]
     if tools:
-        args.insert(1, "--dangerously-skip-permissions")
+        args.append("--dangerously-skip-permissions")
     if model:
         args += ["--model", model]
     if effort:
         args += ["--effort", effort]
     return args
+
+
+def antigravity_stdin(prompt: str) -> str:
+    """The one stream-json message that carries `prompt` to agy."""
+    return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
+
+def antigravity_reply(stdout: str | None) -> str:
+    """The reply text of a stream-json agy run: the final `result` event's
+    `response` when its status is SUCCESS, else "" (which the caller reads as no
+    reply). Lines that are not JSON are skipped, not fatal."""
+    reply = ""
+    for line in (stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(event, dict) and event.get("event") == "result":
+            result = event.get("result") or {}
+            reply = (result.get("response") or "") if result.get("status") == "SUCCESS" else ""
+    return reply
 
 
 def pi_args(model: str, effort: str, session_id: str, session_dir: Path) -> list[str]:
@@ -4016,12 +3857,8 @@ def grok_args(model: str, effort: str, prompt_file: Path) -> list[str]:
     """grok argv — xAI's CLI, the panel's fifth vendor.
 
     `--prompt-file` is its headless mode. grok's `-p/--single` wants the prompt as
-    a flag VALUE and reads nothing from stdin, so on the face of it this looked
-    like a second `antigravity` — the one member the kernel's argv limit binds. It
-    is not: `--prompt-file` takes a path, so the diff travels in a file and there
-    is no ceiling on it. That is why nothing in the argv-clamping path
-    (ARGV_PROMPT_MAX_BYTES, argv_clamp, the "truncated for antigravity" note) grew
-    a second member when this seat was added.
+    a flag VALUE and reads nothing from stdin; `--prompt-file` takes a path, so
+    the diff travels in a file and the kernel's argv limit does not bind it.
 
     The file lives in the member's private temp dir, NOT in the sandbox repo it is
     given as a cwd, and that is load-bearing rather than tidy — same rule as
@@ -4870,11 +4707,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: `SEAT_READS_CODE` records per vendor why four of the five cannot. A seat
         #: that cannot read gains nothing from standing in the tree and still pays
         #: the instruction-file channel for it, so it keeps the empty sandbox.
-        #: `runs_code` is the caller's word that this seat's `tools` setting is on
-        #: (see `tool_seats`); it only ever widens the set to a SEAT_RUNS_CODE seat,
-        #: never to one this module has not reasoned about.
-        reads_code = code_tree is not None and (
-            cmd_name in SEAT_READS_CODE or (runs_code and cmd_name in SEAT_RUNS_CODE))
+        executes = code_tree is not None and runs_code and cmd_name in SEAT_RUNS_CODE
+        reads_code = code_tree is not None and (cmd_name in SEAT_READS_CODE or executes)
         if reads_code:
             # Reassigned from what actually happened, never left as the intent: a
             # staging failure downgrades this seat to the empty sandbox, and every
@@ -4895,8 +4729,20 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # diff-only seats get. SWAPPED, not removed — since #458 the slot
                 # is never empty, and a seat downgraded here is precisely one that
                 # will otherwise go looking for a checkout it was promised.
-                prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF).replace(
-                    CODE_EXEC_BRIEF, NO_TOOLS_BRIEF)
+                prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF)
+            if executes and not reads_code:
+                # Not downgraded like a reader: its prompt promises a shell in a
+                # copy that does not exist, and no swap is exact once untrusted text
+                # is in the prompt. It sits the round out instead, which the round
+                # reports as a degraded seat.
+                return SeatTurn(skip=f"{label}: could not stage its copy of the PR "
+                                     "tree, so the tool-running seat did not run",
+                                duration_ms=elapsed(), code_blind=True)
+            if executes:
+                # Appended, never substituted: nothing in the prompt can collide
+                # with it. agy runs a command where the model says, by default in
+                # its own scratch dir, so the seat has to be told where its copy is.
+                prompt += f"\n\nYOUR COPY OF THE PR IS AT: {sandbox}\n"
         else:
             sandbox = member_sandbox(tmpdir / "seat")
         #: What that sandbox COSTS the seat, recorded at the line that causes it.
@@ -4913,16 +4759,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: could have read the answer and still could not give one is describing
         #: THIS round rather than the panel's design.
         blind = not reads_code
-        #: Followed DOWN with `reads_code`, like the brief: a seat whose copy failed to
-        #: stage is the old no-tools seat, flag and all, and gets no overlay.
-        executes = reads_code and runs_code and cmd_name in SEAT_RUNS_CODE
-        if executes:
-            # Its copy's path, unknown when the brief was composed. Replaced INSIDE the
-            # brief, so a model-authored block quoting the slot is left alone, and
-            # padded to SEAT_DIR_RESERVE so the prompt is the size the clamp measured.
-            prompt = prompt.replace(CODE_EXEC_BRIEF, exec_brief(sandbox), 1)
-        #: Passed only when there is something to pass, so `run_cli`'s many test
-        #: doubles that name its keywords need not learn this one.
+        #: Only when set, so `run_cli`'s test doubles that name their keywords keep
+        #: working.
         cli_env = {"env_extra": runs_code_env(tmpdir)} if executes else {}
         #: One reply path per codex ATTEMPT, in the order they were made; empty
         #: for every other seat. A single shared path let an attempt that wrote
@@ -4947,14 +4785,9 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             sessions.append(str(uuid.uuid4()))
             return sessions[-1]
 
-        # The prompt goes on stdin wherever the CLI will take it there — which is
-        # everywhere but `agy` and `grok`. That is not a style choice: a diff big
-        # enough to be worth a panel is big enough to exceed the kernel's
-        # per-argument limit, and in argv that failure lands at execve, before the
-        # reviewer exists, as an error with nothing in it. On stdin there is no such
-        # ceiling — and neither is there in a FILE, which is how `grok` takes one
-        # and why it is not a second seat the argv clamp has to know about. `agy`
-        # remains the only member with nowhere but argv to put it.
+        # The prompt goes on stdin everywhere but `grok`, which takes a file. Not a
+        # style choice: a diff worth a panel can exceed the kernel's per-argument
+        # limit, and in argv that fails at execve with nothing in the error.
         stdin_text: str | None = prompt
         #: What this seat actually asks for — the pins until a fallback lowers one.
         #: One-element lists because the argv thunk below closes over them and a
@@ -4977,12 +4810,10 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 return claude_args(model, new_session(), reads_code=reads_code,
                                    budget_usd=budget_usd, effort=asked_effort[0])
         elif cmd_name == "antigravity":
-            # Not instrumented: `agy` has no session-id to pin, and its usage
-            # lives only in the JSON mode this design declines. It reviews
-            # exactly as before and reports no tokens, which the board renders as
-            # "not recorded" rather than as zero.
-            args, stdin_text = antigravity_args(model, effort, prompt,
-                                                tools=executes), None
+            # Not instrumented: its usage arrives in the stream's `result` event,
+            # which nothing reads yet, so the board shows "not recorded".
+            args = antigravity_args(model, effort, tools=executes)
+            stdin_text = antigravity_stdin(prompt)
         elif cmd_name == "grok":
             # In the private temp dir and NOT in `sandbox`: a seat must not be
             # able to find its own prompt as a file in the tree it is reviewing.
@@ -5047,6 +4878,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             attempt's stdout. Reading a fixed path instead meant a failed final
             attempt inherited an earlier one's reply.
             """
+            if cmd_name == "antigravity":
+                return antigravity_reply(stdout)
             if not replies:
                 return stdout
             try:
@@ -5057,8 +4890,14 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         # `replied` only for the seat whose stdout is not its reply. For every
         # other seat `cli_outcome`'s stdout test is still exactly right, and
         # passing a predicate would be a second way to ask one question.
-        wrote_reply = (lambda: bool(replies) and replies[-1].exists()
-                       and replies[-1].read_text().strip()) if replies_used else None
+        if cmd_name == "antigravity":
+            # `outputs` already holds this attempt's stdout: run_cli hands it over
+            # before asking.
+            def wrote_reply():
+                return bool(outputs) and bool(antigravity_reply(outputs[-1]).strip())
+        else:
+            wrote_reply = (lambda: bool(replies) and replies[-1].exists()
+                           and replies[-1].read_text().strip()) if replies_used else None
         out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
                            replied=wrote_reply, cwd=sandbox, **cli_env)
         #: Which pins this host could not serve, once we have stopped trying them.
@@ -5139,8 +4978,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             out, err = run_cli(args, label, attempts=1, stdin_text=stdin_text,
                                timeout=max(FALLBACK_MIN_TIMEOUT_S,
                                            FALLBACK_MAX_ELAPSED_S - spent),
-                               on_output=collect, replied=wrote_reply, cwd=sandbox,
-                               **cli_env)
+                               on_output=collect, replied=wrote_reply, cwd=sandbox, **cli_env)
         if err:
             # `model` and not `asked[0]`: the hint explains the PIN, and after a
             # failed fallback the thing worth naming is still what was configured.
@@ -5162,8 +5000,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # turn, which `usage_of` already counts: it runs under its own fresh
             # session, and its stdout lands in `outputs` too.
             out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text,
-                                 on_output=collect, replied=wrote_reply, cwd=sandbox,
-                                 **cli_env)
+                                 on_output=collect, replied=wrote_reply, cwd=sandbox, **cli_env)
             retry_text = reply_of(out2) if not err2 else None
             if retry_text:
                 retried = parse(retry_text)
@@ -6045,7 +5882,7 @@ __all__ = [
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "SEAT_RUNS_CODE", "tool_seats", "runs_code_env",
-    "CONVENTION_FILES", "CONVENTION_DIRS",
+    "antigravity_stdin", "antigravity_reply", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "pr_claim_wanted", "history_wanted",
     "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
@@ -6067,7 +5904,7 @@ __all__ = [
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",
-    "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",
+    "reviewer_label", "fallback_label",
     "seat_label", "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args",
     "antigravity_args",

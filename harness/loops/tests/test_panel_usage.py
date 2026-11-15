@@ -412,17 +412,18 @@ def test_a_member_that_flaked_then_landed_is_charged_for_both(monkeypatch, tmp_p
     assert u["input_tokens"] == 300 and u["output_tokens"] == 30
 
 
-def test_antigravity_reviews_exactly_as_before_and_reports_no_tokens(monkeypatch):
-    """`agy` has no session id to pin and states usage only in the JSON mode this
-    design declines. It is left uninstrumented rather than half-converted, and a
-    null renders as "not recorded" rather than as a free reviewer."""
+def test_antigravity_reports_no_tokens(monkeypatch):
+    """agy's usage arrives in the stream's `result` event, which nothing reads yet:
+    a null renders as "not recorded" rather than as a free reviewer."""
     seen = {}
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
+    stream = json.dumps({"event": "result", "result": {"status": "SUCCESS",
+                                                       "response": FINDINGS}})
     monkeypatch.setattr(panel_seats, "run_cli",
-                        lambda args, *a, **k: (seen.update(args=args), (FINDINGS, None))[1])
+                        lambda args, *a, **k: (seen.update(args=args), (stream, None))[1])
     run = panel.review_llm("antigravity", "gemini-3-pro", "p")
     assert run.usage is None and len(run.findings) == 1
-    assert seen["args"] == panel.antigravity_args("gemini-3-pro", "", "p")
+    assert seen["args"] == panel.antigravity_args("gemini-3-pro", "")
 
 
 def test_a_real_timeout_still_hands_over_what_the_cli_printed():

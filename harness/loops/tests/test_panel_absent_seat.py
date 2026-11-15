@@ -67,13 +67,7 @@ import panel_rounds  # noqa: E402
 import panel_seats  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
-#: A diff big enough to be cut by a small budget AND by the kernel's argv ceiling.
-#:
-#: Sized deliberately past :data:`panel.ARGV_PROMPT_MAX_BYTES` rather than "big
-#: enough looking": the first version of this was ~14 KB, so the argv clamp never
-#: fired, and the test asserting the clamp STILL works for an installed
-#: `antigravity` passed vacuously — a fixture that would have reported the
-#: regression it exists to catch as a pass.
+#: A diff big enough to be cut by a small budget.
 BIG = "".join(
     f"diff --git a/f{i}.py b/f{i}.py\nindex 1..2 100644\n"
     f"--- a/f{i}.py\n+++ b/f{i}.py\n@@ -0,0 +1,100 @@\n"
@@ -84,12 +78,6 @@ BIG = "".join(
 CFG = {"github": "acme/board", "path": "/tmp/acme-board", "name": "board",
        "_rules_baseline": ".harness-rules.sample",
        "review_panel": {}}
-
-
-def test_the_fixture_really_is_over_the_kernels_argv_ceiling():
-    """Pinned, because the clamp test below is meaningless otherwise and passes
-    just as green when it is."""
-    assert len(BIG.encode()) > panel.ARGV_PROMPT_MAX_BYTES
 
 
 def _cfg(**seats):
@@ -268,10 +256,7 @@ def test_an_absent_seat_is_not_handed_the_diff_it_will_never_read(monkeypatch,
 
     What it is not handed is a prompt. No budget means `prompt_for(None)`, which
     means the WHOLE diff — rendered per absent seat, per round, for `run_seat` to
-    throw away. The empty string also bounds the blast radius if the round's PATH
-    read and `run_seat`'s ever disagree: a seat decided absent here can never carry
-    an uncapped prompt into `agy`'s argv, which is the E2BIG that
-    `ARGV_PROMPT_MAX_BYTES` exists to prevent."""
+    throw away."""
     got, seen = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
                        present={"claude"})
     assert seen["prompts"]["antigravity"] == ""
@@ -388,20 +373,6 @@ def test_no_config_note_claims_an_absent_seat_GETS_a_share_of_the_diff(monkeypat
     got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
                     present={"claude"})
     assert not any("antigravity" in n for n in got["config_notes"]), got["config_notes"]
-
-
-def test_the_argv_clamp_still_fires_when_the_seat_IS_installed(monkeypatch,
-                                                              tmp_path):
-    """The other direction, and the one that must not regress: where `agy` really
-    is on the box, its prompt really does travel in argv and the kernel really
-    does cap it. Filtering absent seats must not disarm the clamp for present
-    ones."""
-    got, _ = _round(monkeypatch, tmp_path, _cfg(claude=None, antigravity=None),
-                    present={"claude", "antigravity"})
-    assert got["diff_budgets"]["antigravity"] is not None
-    assert got["diff_budgets"]["antigravity"] <= panel.ARGV_PROMPT_MAX_BYTES
-    assert any("antigravity" in n and "argv" in n for n in got["config_notes"])
-    assert got["reviewers"]["antigravity"]["truncated"] is True
 
 
 def test_a_seat_that_RAN_and_was_cut_is_still_recorded_truncated(monkeypatch,

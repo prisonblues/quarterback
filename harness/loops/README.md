@@ -309,7 +309,7 @@ Detected from the checkout, **not settable** here: `path`, `github`, `default_br
 | `review_panel.judge_model` | Claude model for the master judge — `sonnet`, deliberately **not** `reviewers.claude.model`; see below. An explicit `""` is passed through as empty and lets the CLI pick, which is NOT the same as omitting the key (that gets the default). |
 | `review_panel.ask_quorum` / `ask_threshold` | `--ask`'s tally rules: how many seats must have **answered** for the vote to mean anything, and how many must have said the same thing for it to be that answer. Both **2** — one seat agreeing with the agent that wrote the premise is not a challenge. A rule above the number of seats on the ask is warned about: it can never be met. |
 | `review_panel.ask_max_context_chars` | Total `--context` material one ask may hand its seats, across every spec. **60,000** (~15k tokens). Over budget is clamped and SAID, per spec — an ask's whole claim is that it is the cheap check, and unbounded context is the #117 cost shape on the path advertised as costing a minute. |
-| `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (`claude`), plus antigravity when its `reviewers.antigravity.tools` is on, which gives it a shell in that copy too (see below), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
+| `review_panel.reviewer_code_access` | May a seat READ the code under review? **true**. `false` is the old posture — every seat in an empty repo, the diff its only evidence — and is what a repo taking UNTRUSTED contributions selects. On does not mean every seat gets it: only a CLI that can express "read but do not execute" is handed the tree (today just `claude`), and which seats did is recorded per seat. `--no-code-access` turns it off for one run. See below. |
 | `review_panel.pr_claim` | Are the seats shown what the PR CLAIMS to be for — its own title and body (#550)? **true**, which is what #631 shipped: the reviewer prompt used to carry five keys and none of them was the claim, so "this change asserts a measured result and ships nothing that produces it" was invisible to the panel by construction. The block is framed as the author's ASSERTION and names the diff as the evidence; it is charged against the tightest seat's diff budget (`PR_CLAIM_BUDGET_SHARE`) and dropped whole below `PR_CLAIM_MIN_CHARS` of the author's own words, because the claim yields to the diff and never the other way round. **`false` exists to be the control arm, not to review less carefully.** #550 shipped the mechanism with its own condition unmet: a body saying "this is safe because X" primes a reviewer to accept X, a primed seat reports FEWER findings, and fewer findings look like a clean PR — so whether the framing holds has to be measured by running the same PRs with and without the block and comparing counts, and without an off switch that control arm cannot be produced at all. `--no-pr-claim` turns it off for one run, and for this key the flag is the instrument rather than a convenience: this file lives in the repo under review, so flipping the dial to get the control arm would change the very diff whose findings are being counted. Which arm a round was in is recorded on `review_runs` (`pr_claim`, `pr_claim_sent`) rather than only in `config_notes`, because no aggregation can partition a population on prose. |
 | `review_panel.history_brief` | Are the seats shown the changed files' **git history** (#716)? **true**. A code-reading seat's checkout is materialised from GitHub's tarball endpoint, which carries no `.git`, and `READ_ONLY_TOOLS = ("Read", "Grep", "Glob")` gives it no shell to run `git log` with if one were there — so it has every file in the change and cannot tell when any of them landed. It declares a coverage gap instead, and each declared gap costs the round its confident stop. On the one instrumented cycle (lexray#1631, 2 rounds, 29 confirmed findings, 8 declared gaps) **three of the eight** were questions a single `git log` answers — when a constant landed relative to a migration, whether a file had ever held another entry, whether a frozen list matched a registry *as it stood on a date* — and **zero** were closable by executing the repo's suite, which is why #92 stays closed and this exists instead. `panel_scope.history_brief` computes the block once per round from the operator's own trusted clone (`cfg["path"]`), at the ref the PR NAMES (`base_sha`, else `origin/<base>`, else `<base>` — **never the checkout's HEAD**, which is on whatever branch it was last left on), and renders it into every seat's prompt and the judge's. Per file: how many non-merge commits it has ever had, when it was first added, and its five most recent commits with author dates to the minute in one timezone — the measured question was whether one commit landed "one day after" another and the true answer was 74 minutes, which a day-granularity block would have let a seat confirm wrongly. **Renames are followed** on every read, which is a correctness fix and not a nicety: `git log -- <path>` stops dead at the commit that renamed a file INTO that path, so a file born as `old.py` and renamed last week reads as "2 commits, first added <the rename>" — a confident wrong answer where the gap it replaced was an honest "I cannot tell". The total is therefore counted off a followed log rather than taken from `rev-list --count`, which has no `--follow`: one entry may not carry a followed date beside an unfollowed count. The block also says that a git date is set by the client and rewritten by a rebase, so a gap of minutes is strong evidence rather than proof. **Vendor-neutral, which is the part no widening of `reviewer_code_access` can do:** `SEAT_READS_CODE` is `{claude}`, and on the measured cycle codex was `code_blind` in both rounds and asked `grep`-shaped questions of an empty sandbox; a prompt block reaches it anyway. **It executes nothing from the PR** — it reads a local, trusted clone's history, the safe side of #75's boundary, strictly smaller than #113 which already shipped. **It fails closed and cheap:** no `cfg["path"]`, a PR this clone never fetched, a shallow clone (whose graft would be reported as the commit that added every file), or no `git` → no block, a `config_notes` line, and the round proceeds exactly as it does today. Same contract as `fetch_pr_tree` ("never raises") and `default_branch_rules` (`{}` on any failure). Budgeted like the claim block and on the same rule — **the block yields, the diff does not**: `HISTORY_CHARS` (**4,200**) or one part in `HISTORY_BUDGET_SHARE` (**8**) of the tightest seat's `max_diff_chars`, whichever is smaller, charged off `capped` as it stood *before* the claim's deduction so the two cannot compound; files richest-first by churn, five commits each, and the block SAYS how many files did not fit so a seat cannot read a budget decision as an absence of history. **What it does not do**, said in the block itself: it answers *when* a file changed and never what it CONTAINED then — the general form is a read-only `git show`, which is a bigger change than a brief. `false` is the pre-#716 posture and `--no-history-brief` turns it off for one run; that flag is #716's control arm, because the finding is n=1 on one history-heavy migration PR and the way that stops being n=1 is running the same PRs both ways and counting the declared gaps. Which arm a round was in is a `config_notes` line. |
 | `review_panel.require_mergeable` | Must the branch be able to MERGE before a round is worth running? **true**. GitHub reporting the branch `CONFLICTING` means the merged state the review is implicitly reasoning about does not exist, and the rebase that resolves it changes the diff every finding is about — so the round is refused before any seat is dispatched. It is nearly free: mergeability rides on the PR metadata the panel already fetches, and the same check used to run only at the merge gate (`preland.check_pr_state`), i.e. after a full multi-vendor round and a judge had been spent. `false` reviews conflicted branches and says so in `config_notes`; `--force` is the per-run override. GitHub computes mergeability lazily and answers `UNKNOWN` while it does, so the question is put a second time when the first answer is cold — measured here, three consecutive reads of an open PR gave `UNKNOWN`, `CONFLICTING`, `CONFLICTING`. An `UNKNOWN` that survives both reads is a note and never a refusal. |
@@ -619,10 +619,9 @@ at what budget, which is worth knowing when two reviewers disagree and only one
 of them saw the whole change. Only a value that cannot be a budget at all — not a
 number, or `<= 0` — falls back, with a ⚠️ config line in the report saying so.
 
-One seat is capped whatever you configure: `agy` takes its prompt in argv, so the
-kernel bounds it. The panel clamps that seat to what `execve` will carry and
-reports it as ordinary truncation rather than dying at exec — which is what it
-used to do, reporting "LLM reviewers ran: none" as a clean review.
+`agy` was the last seat to take its prompt in argv, where the kernel capped it at
+128 KiB; it now takes one stream-json message on stdin, so no seat is capped unless
+you configure it.
 
 `review_panel.refuse_over_cap_multiple` (default: **3**) — how many times over the
 **tightest seat ceiling** a diff may be before the round is *refused* instead of
@@ -871,28 +870,25 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     boundary of its own; codex's `-c` knobs only REMOVE tools and its single read path
     is the shell, so granting reads grants execution and re-opens the tool-hunt that
     once spent 99% of a run; pi's `--no-tools` is all-or-nothing over read/bash/edit/
-    write; antigravity's one per-run switch grants every tool, so it reads only with a
-    shell (next point). A seat that cannot read keeps its
-    empty sandbox — standing in a checkout it cannot open buys the instruction-file
-    channel for nothing.
-  - **The one seat that is given a shell: antigravity, with `tools` on** (the default
-    since 2026-11-14, by the owner's call; `SEAT_RUNS_CODE`). In the no-tools mode a
-    model that ignores the brief and probes `echo …` has the command auto-denied, and
-    that denial ends the `agy` session with exit 0 and no output — the seat is lost for
-    the round (#853). With `tools` on it runs `agy --dangerously-skip-permissions`,
-    standing in its own stripped copy of the PR's tree and told that copy's absolute
-    path by `CODE_EXEC_BRIEF`. **None of that is a boundary**: agy runs a command
-    where the model says, by default in its own scratch directory, and on #861's first
-    live round, before it was given the path, the seat ran `find /home/rich -maxdepth
-    3`, found the PR's real worktree and read and tested it there (read-only; the
-    worktree came out clean); told the path, round 2's seat ran all 214 commands in the
-    copy. `runs_code_env` starts it with an allowlisted environment (PATH, HOME,
-    locale, XDG and certificate variables, nothing else), plus database variables
-    naming an unresolvable host and an empty `gh` config. Files under HOME, the
-    filesystem and the network stay reachable, which is the trade the owner accepted.
-    `"reviewers": {"antigravity": {"tools": false}}` in
-    `.harness-rules.sample` restores the diff-only seat, and `reviewer_code_access:
-    false` or `--no-code-access` takes the tree (and so the shell) from it too.
+    write; antigravity's one per-run switch grants every tool, so it reads only with
+    a shell (next point). A seat that cannot read keeps its empty sandbox — standing in
+    a checkout it cannot open buys the instruction-file channel for nothing.
+  - <a id="the-one-seat-that-is-given-a-shell"></a>**The one seat that is given a
+    shell: antigravity, when `reviewers.antigravity.tools` is true** (the default;
+    `SEAT_RUNS_CODE`). Without it, headless `agy` soft-denies any tool call it cannot
+    prompt for, and the denial ends the session with no reply, so a model that ignores
+    the no-tools brief loses the seat for the round (#853). With it, `agy` runs with
+    `--dangerously-skip-permissions`, standing in its own stripped copy of the PR's
+    tree, and the prompt's last line gives that copy's path; a copy that fails to
+    stage sits the seat out. **This is accident prevention, not a sandbox.** `agy` runs
+    a command wherever the model chooses (by default in its own scratch directory), so
+    nothing confines it to the copy. The seat starts with only PATH, HOME, locale, XDG
+    and certificate variables, so no inherited credential, database URL or ssh agent
+    reaches it; the database variables name a host that cannot resolve and `gh` gets
+    an empty config. Files under HOME, the rest of the filesystem and the network stay
+    reachable. That is the trade the owner accepted; `"tools": false` in
+    `.harness-rules.sample` keeps the seat diff-only, and `reviewer_code_access: false`
+    takes the tree from it as from claude.
   - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,
     `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/` and the rest of
     `CONVENTION_FILES`/`CONVENTION_DIRS`, at every depth, because a nested one is
@@ -1055,9 +1051,9 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   `not veto`, leaving it in makes a confident stop unreachable rather than rare.
   The three are an absent CLI (above), a seat that **cannot read the code**
   (`ReviewerRun.code_blind` — see the coverage bullet below), and the **argv
-  ceiling** on antigravity: its prompt travels in argv, the kernel caps one element
-  at 120,000 bytes, and on a large diff it structurally cannot be handed all of it
-  (measured on PR #160: 116,771 of 175,547 chars, 66.5%). Each is exempted off
+  ceiling** antigravity had while its prompt travelled in argv. That one is now read
+  only off payloads recorded before agy moved to stdin, so an old baseline keeps its
+  meaning. Each is exempted off
   recorded state, never off the wording of a message; each is still reported; and
   each has a floor so that exempting seats one at a time cannot empty the veto list
   on a round where nothing was read whole. Truncation by a **budget** still vetoes —
@@ -1597,7 +1593,8 @@ ceiling behind the smaller integer, and at two bytes per character that seat's r
 decides. `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
 which of them `cap` and `over_cap` are in, so the multiple can be checked by hand rather than
 assumed — and every renderer of the verdict (the refusal notice, the manifest banner, the
-`--force` banner, each seat's skip reason) states the unit it measured in.
+`--force` banner, each seat's skip reason) states the unit it measured in. Since `agy` moved
+to stdin no seat declares the byte ceiling, so today every ceiling is in characters.
 
 **The judge's `judge_max_diff_chars` is deliberately not one of the ceilings.** This verdict
 decides whether to dispatch the *seats* and what to hand them; that key says what adjudication

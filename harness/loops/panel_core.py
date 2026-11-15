@@ -199,14 +199,6 @@ BUDGET_MARKER = "Exceeded USD budget"
 #: says so.
 BUDGET_EXHAUSTED = "spend cap reached mid-review"
 
-# Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
-# the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
-# CLI starts. Every reviewer whose prompt travels on stdin is free of this, and
-# that is all of them but one — `agy` has no stdin path (`-p ""` is "empty
-# prompt", `-p -` reviews the literal string "-"), so its prompt is clamped to
-# fit here and the truncation is reported like any other. The margin is for the
-# rest of the argv and the environment, which share the kernel's accounting.
-ARGV_PROMPT_MAX_BYTES = 120_000
 # The severities everything downstream counts in. A value outside this set is not
 # a stricter or a looser call, it is an unreadable one — it would reach the
 # board's leaderboard as a bucket nothing counts, and it sorts wherever its first
@@ -490,7 +482,7 @@ ROUNDS_HEADING = "**Rounds:**"
 # `selected`). This seat has none of those: it is `panel_slop.review_fix_pass`,
 # a pure function of the fix pass's diff and the rule files beside it, costing no
 # vendor call and no token. Putting it in LLM_REVIEWERS would hand it a diff
-# budget it cannot spend, an argv clamp it cannot hit and a `model` field naming a
+# budget it cannot spend and a `model` field naming a
 # brain that never ran — the contradictory pairing #222 exists to remove.
 #
 # ALL_REVIEWERS is what `select_reviewers` resolves against and what `--reviewers`
@@ -520,8 +512,8 @@ def seat_installed(name: str) -> bool:
 
     It lives HERE, beside :data:`CLI_BIN`, because that exemption was applied to
     the veto and to nothing else — and the seats' budgets were built from the
-    CONFIGURED set, so a seat this box cannot run still acquired a diff budget, an
-    argv clamp, a `config_notes` line about how much diff it "gets", and a
+    CONFIGURED set, so a seat this box cannot run still acquired a diff budget, a
+    `config_notes` line about how much diff it "gets", and a
     `truncated: True` record. On a repo enabling a workstation-only vendor that
     made `diff_truncated` true on rounds where nothing that ran was cut, and
     `load_baseline` then banked it as a coverage gap the next round inherited
@@ -1412,65 +1404,25 @@ coverage gap and none is a finding — they are how this checkout is built:
 `could_not_assess` means what you could not resolve with the code in front of you.
 """
 
-#: What a seat that was handed the PR's tree WITH a shell is told — the
-#: `SEAT_RUNS_CODE` seats whose `tools` setting is on. Same checkout as
-#: CODE_ACCESS_BRIEF and the same three facts about it, but the first limit is
-#: inverted: this seat may run things, so it is told what running is FOR (settling a
-#: claim the diff cannot) and what it must not do. Nothing enforces the "must not"
-#: list — `runs_code_env` only makes the accidents unlikely (see SEAT_RUNS_CODE) —
-#: so the brief is what keeps a cooperative reviewer in its copy and off the full
-#: suite. agy runs commands where the model says, and a model not told its path was
-#: measured going to find the real checkout instead (#861), so `run_seat` fills the
-#: path in through :func:`exec_brief`.
-SEAT_DIR_SLOT = "<<<SEAT_DIR>>>"
-#: Bytes reserved for that path: Linux's PATH_MAX, so no real path can overrun it. The
-#: argv clamp measures the brief at this size and :func:`exec_brief` never exceeds it,
-#: so the prompt agy is handed is never larger than the one the clamp cleared.
-SEAT_DIR_RESERVE = 4096
-CODE_EXEC_BRIEF = """YOU HAVE THE CODE, AND A SHELL. A throwaway copy of this PR at its head commit —
-the same code the diff below was taken from — is at:
+#: CODE_ACCESS_BRIEF's counterpart for a SEAT_RUNS_CODE seat with `tools` on. The
+#: path goes on the prompt's LAST line, appended by `run_seat` once the copy exists.
+CODE_EXEC_BRIEF = """YOU HAVE THE CODE, AND A SHELL. A throwaway copy of this PR at its
+head commit is on disk; its path is the last line of this prompt. Run every command
+in it, and use no other checkout of this repository, even one you know of.
 
-    <<<SEAT_DIR>>>
+Read the callers, the siblings, the tests, the config. Run a targeted test or a
+small script to settle a claim the diff cannot. A question one file or one command
+answers is not a coverage gap.
 
-Run every command there (`cd` to it first, or pass it as the cwd). It is the ONLY
-checkout of this repository you may use: do not search the filesystem for another
-one, and do not read or run anything in one you know of.
-
-Read the callers, the siblings, the tests, the config, the migration the diff refers
-to but does not contain. You may also RUN things to settle a claim: a targeted test,
-a script with an edge-case input, a grep across the tree. A question you can answer
-by opening a file or running one command is not a coverage gap: check before you
-declare, and before you raise a conditional finding, try it.
-
-What this copy is, so you do not spend the round discovering it. None of these is a
-coverage gap and none is a finding:
-- It is a copy that is deleted when you finish. Edits you make in it are thrown away
-  and are not a fix; report findings, do not repair them. Write nowhere else.
-- There is NO git history and NO remote. Do not commit, push, or open PRs, and do not
-  conclude from the missing history that the diff was reverted.
-- There is no database and no installed virtualenv. A test that needs either will
-  fail for that reason alone; that failure is not a finding about the PR.
-- Vendor instruction files (CLAUDE.md, AGENTS.md, .claude/ and the like) have been
-  REMOVED on purpose, so that a PR cannot instruct its own reviewer.
-
-Keep commands short and targeted: never the whole test suite, nothing that installs
-packages or reaches the network, nothing outside that directory. You have a time
-limit, and a review that runs out of it returns nothing.
+The copy has no git history, no remote, no database and no virtualenv, and vendor
+instruction files (CLAUDE.md, AGENTS.md, .claude/ and the like) were removed so a
+PR cannot instruct its reviewer. None of that is a finding. Edits you make are
+discarded: report, do not repair. Never run the whole test suite, install packages
+or use the network — a review that runs out of time returns nothing.
 
 `could_not_assess` means what you could not resolve with the code and the commands
 in front of you.
 """
-
-
-def exec_brief(seat_dir: str) -> str:
-    """CODE_EXEC_BRIEF with the seat's path in its slot, and as long as it would be
-    with a SEAT_DIR_RESERVE-byte path. A path longer than the reserve cannot exist on Linux; one that did would be
-    refused here rather than handed to an argv the clamp did not measure."""
-    pad = SEAT_DIR_RESERVE - len(seat_dir.encode())
-    if pad < 0:
-        raise ValueError(f"seat path is {-pad} bytes over SEAT_DIR_RESERVE")
-    # Padded at the END, where trailing blanks cost the model nothing to read.
-    return CODE_EXEC_BRIEF.replace(SEAT_DIR_SLOT, seat_dir, 1) + " " * pad
 
 #: The other half of the same slot, and the reason it is prose. Every seat wants to go
 #: looking for the code — `codex_args` measured it at five runs in seven — and the answer
@@ -3553,7 +3505,7 @@ __all__ = [
     "REFUTED_SLOT", "CLASSES_SLOT", "REFUTED_HEADING", "_REFUTED_BRIEF", "REFUTED_MAX",
     "REFUTED_TITLE_CHARS", "REFUTED_REASON_CHARS",
     "refuted_rows", "_refutation_line", "refuted_brief", "refuted_note",
-    "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
+    "CLI_ABSENT", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
     "JUDGE_RECURRENCE_SLOT", "PREMISE_VERDICTS", "RECURRENCE_BRIEF",
@@ -3562,9 +3514,6 @@ __all__ = [
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
     "CODE_EXEC_BRIEF",
-    "SEAT_DIR_SLOT",
-    "SEAT_DIR_RESERVE",
-    "exec_brief",
     "NO_TOOLS_BRIEF",
     "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "JUDGE_SCHEMA", "JUDGE_NO_CODE_BRIEF", "ASK_PROMPT", "Finding", "ReviewerRun",

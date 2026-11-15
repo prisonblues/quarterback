@@ -249,90 +249,21 @@ def test_no_configured_cap_means_there_is_nothing_to_refuse_against():
     assert pf.tightest_ceiling(UNCAPPED, pf.diff_shape(SPLIT), ALL_HERE) is None
 
 
-def test_antigravity_is_capped_by_the_kernel_whether_or_not_a_repo_says_so():
-    """That seat's prompt travels in argv, so `MAX_ARG_STRLEN` applies to it
-    without anybody configuring anything. It is the only cap PR #137's repo had,
-    and therefore the only reason the case is catchable at all."""
-    got = pf.tightest_ceiling({"claude": None, "antigravity": None},
-                              pf.diff_shape(SPLIT), ALL_HERE)
-    assert got == pf.Ceiling(panel_core.ARGV_PROMPT_MAX_BYTES, "bytes", "antigravity")
-
-
-def test_a_configured_antigravity_cap_does_not_HIDE_the_kernels():
-    """The mixed-unit collapse, and the reason this is two ceilings rather than a
-    `min()` of them.
-
-    `min(cap, ARGV_PROMPT_MAX_BYTES)` compared a CHARACTER budget against a BYTE
-    limit and kept whichever was the smaller integer, so a repo setting
-    `antigravity.max_diff_chars: 100_000` hid the 120,000-byte argv ceiling behind
-    the smaller number. On a diff averaging two bytes per character that seat's
-    real ceiling is ~60,000 characters — genuinely tighter than the one that won —
-    and the round was measured against the looser one and let through.
-    """
-    argv = panel_core.ARGV_PROMPT_MAX_BYTES
-    small = argv // 2
-    both = pf.seat_ceilings({"antigravity": small}, ALL_HERE)
-    assert both == (pf.Ceiling(small, "chars", "antigravity"),
-                    pf.Ceiling(argv, "bytes", "antigravity")), \
-        "both are declared, both are real"
-
-    # ASCII: the two readings of the size are the same number, so the smaller
-    # ceiling binds and it is the configured one — the old answer, still right.
-    ascii_shape = pf.diff_shape(FRESH * 40)
-    assert ascii_shape.chars == ascii_shape.nbytes, "fixture drifted: not ASCII"
-    assert pf.tightest_ceiling({"antigravity": small}, ascii_shape, ALL_HERE).unit \
-        == "chars"
-
-    # A diff the CHARACTER budget fits whole and the kernel's BYTE limit does not.
-    # Under `min()` the configured ceiling won on being the smaller integer, the
-    # round was measured in characters, `size <= cap` held and the verdict was
-    # `run` — handing `execve` a prompt it cannot carry.
-    text = _file("w.py", added=[f"    # 全角の行 {i} — 相当な長さの説明があります"
-                                for i in range(2600)])
-    wide = pf.diff_shape(text)
-    assert wide.nbytes > argv > wide.chars, f"fixture drifted: {wide}"
-    cap = wide.chars + 1
-    assert cap < argv, "the numeric min() would have chosen the configured cap"
-    assert pf.tightest_ceiling({"antigravity": cap}, wide, ALL_HERE) \
-        == pf.Ceiling(argv, "bytes", "antigravity")
-    # End to end, which is the half a unit test of the selection cannot show. Read
-    # in characters this diff FITS (`size <= cap`, so `run` with an empty reason and
-    # nothing said anywhere); read in the bytes the kernel actually counts it is
-    # half again over the argv ceiling. The threshold is written down rather than
-    # left at 3 because CJK is three bytes per character at most, so no fixture can
-    # be 3x over in bytes while still fitting a character ceiling.
-    assert wide.chars <= cap, "read in characters, this diff fitted"
-    got = _pre(text, {"antigravity": cap}, {"refuse_over_cap_multiple": 1}, [])
-    assert got.refused, got.reason
-    assert got.cap_unit == "bytes" and got.measured == wide.nbytes
-    assert got.over == pytest.approx(wide.nbytes / argv)
-    assert f"{argv:,}-byte ceiling" in got.reason
-
-
-def test_a_bigger_configured_budget_leaves_the_kernel_holding_the_floor():
-    """The other side of the pair above: a cap looser than the kernel's changes
-    nothing, because the kernel's applies to that seat regardless."""
-    big = panel_core.ARGV_PROMPT_MAX_BYTES * 4
-    got = pf.tightest_ceiling({"antigravity": big}, pf.diff_shape(SPLIT), ALL_HERE)
-    assert got.limit == panel_core.ARGV_PROMPT_MAX_BYTES and got.unit == "bytes"
-
-
 def test_a_seat_whose_CLI_is_ABSENT_declares_no_ceiling_here():
     """The headless-host regression, and the one this whole feature could most
     easily have caused. `budgets` holds every CONFIGURED seat, not every runnable
     one, and `agy` is a workstation package — this repo's own rules enable a seat
     that records "antigravity: CLI absent" and never runs on a headless box.
-    Counting its argv ceiling would refuse a round on behalf of a reviewer that was
+    Counting its ceiling would refuse a round on behalf of a reviewer that was
     never going to read anything, on exactly the unattended hosts where nobody is
-    watching to pass `--force`, while the seats that DID run read off stdin with no
-    cap at all."""
-    budgets = {"claude": None, "antigravity": None}
+    watching to pass `--force`."""
+    big = FRESH * 40
+    budgets = {"claude": None, "antigravity": len(big) // 10}
     no_agy = {"claude": True, "antigravity": False}.get
     assert pf.seat_ceilings(budgets, no_agy) == ()
     # The same round, on a box that HAS it: the ceiling is real and applies.
     assert pf.seat_ceilings(budgets, ALL_HERE)[0].seat == "antigravity"
     # End to end: the verdict follows.
-    big = FRESH * 40
     assert _pre(big, budgets, {}, [], installed=no_agy).verdict == "run"
     assert _pre(big, budgets, {}, [], installed=ALL_HERE).refused
 
@@ -624,37 +555,6 @@ def test_a_forced_refusal_does_not_still_advise_passing_force():
     assert "The refusal was overruled" in got.reason
 
 
-def test_the_argv_ceiling_is_measured_in_BYTES_not_characters():
-    """`ARGV_PROMPT_MAX_BYTES` is the kernel's `MAX_ARG_STRLEN`, in bytes;
-    `DiffShape.chars` is `len(diff)`, in characters. Compared against each other, a
-    diff full of em-dashes and arrows — which every diff in this repo is — is
-    understated by exactly its non-ASCII density, in the direction that lets an
-    over-cap round through."""
-    # Three bytes per character over most of the line, so the two readings differ by
-    # more than 2x — and a pure move, so the verdict has a reason to state the unit in.
-    wide = [f"    # 全角の行 {i} — 相当な長さの説明がここにあります" for i in range(900)]
-    diff = (_file("wide.py", removed=wide)
-            + _file("part_a.py", added=wide[:450])
-            + _file("part_b.py", added=wide[450:]))
-    shape = pf.diff_shape(diff)
-    assert shape.nbytes > shape.chars * 2, "fixture drifted: not enough non-ASCII"
-    # A diff whose CHARACTER count fits the kernel ceiling and whose BYTE count does
-    # not. Read in characters this round is not over the cap at all.
-    cap = panel_core.ARGV_PROMPT_MAX_BYTES
-    assert shape.chars < cap < shape.nbytes, f"fixture drifted: {shape}"
-    got = _pre(diff, {"antigravity": None}, {}, [])
-    assert got.over > 1, "the byte reading is what the argv ceiling is in"
-    assert got.over == pytest.approx(shape.nbytes / cap)
-    assert got.verdict == "manifest"
-    assert "bytes of diff" in got.reason
-    assert f"{cap:,}-byte ceiling" in got.reason
-    # And a CONFIGURED ceiling is still characters, on the same diff.
-    chars = _pre(diff, {"claude": shape.chars // 2}, {}, [])
-    assert chars.over == pytest.approx(shape.chars / (shape.chars // 2))
-    assert "chars of diff" in chars.reason
-    assert f"{shape.chars // 2:,}-char ceiling" in chars.reason
-
-
 def test_the_one_sided_file_LISTS_cannot_be_passed_positionally():
     """`nbytes` was inserted ahead of them, which changed what the sixth positional
     argument means without changing the arity: an existing
@@ -938,9 +838,9 @@ def test_a_measured_ratio_of_zero_is_not_serialised_as_NO_CEILING():
     load-bearing one level up, so reusing null inside it undercuts the same
     argument."""
     small = _file("x.py", added=["one line"])
-    got = _pre(small, {"antigravity": None}, {}, [])
+    got = _pre(small, {"codex": 120_000}, {}, [])
     assert got.verdict == "run"
-    assert got.cap == panel_core.ARGV_PROMPT_MAX_BYTES
+    assert got.cap == 120_000
     assert round(got.over, 2) == 0.0
     assert got.as_dict()["over_cap"] == 0.0, "measured, and small"
     # And no cap at all still serialises as null, which is the other statement.
@@ -983,44 +883,6 @@ def test_the_refusal_notice_names_the_measurement_and_the_remedies():
     assert "tightest seat ceiling" in text
     # Every remedy on one line each: the source wraps and the rendered text must
     # not, or a reader gets a run of spaces mid-sentence.
-    for line in text.splitlines():
-        assert "  " not in line.strip(), line
-
-
-def test_the_refusal_notice_ADDS_UP_when_the_verdict_was_measured_in_BYTES():
-    """The notice is the human-facing artefact: it goes on the PR, and a reader who
-    divides the two numbers it prints must get the multiple it prints.
-
-    It did not. `over` came from UTF-8 bytes whenever antigravity's argv ceiling
-    bound, and every line of the report said "chars" and quoted `shape.chars` — so a
-    100,000-character / 260,000-byte diff against a 120,000-BYTE ceiling posted
-    "100,000 chars … tightest seat ceiling: 120,000 chars, exceeded 2.2x". Divide
-    and you get 0.83x, and the only honest conclusion is that the tool is broken.
-    Nothing covered it: the byte work was pinned on `reason` alone.
-    """
-    argv = panel_core.ARGV_PROMPT_MAX_BYTES
-    wide = [f"    # 全角の行 {i} — 相当な長さの説明があります" for i in range(6000)]
-    diff = _file("w.py", added=wide)
-    s = pf.diff_shape(diff)
-    assert s.nbytes > argv * 3 and s.nbytes > s.chars * 2, f"fixture drifted: {s}"
-    got = _pre(diff, {"antigravity": None}, {}, [])
-    assert got.refused and got.cap_unit == "bytes"
-
-    text = pf.refusal_report("board", 137, "a title", "main", got)
-    # The ceiling, the size it was compared against and the multiple are all in the
-    # SAME unit, and the multiple is what dividing them gives.
-    assert f"{argv:,} bytes (antigravity)" in text
-    assert f"{s.nbytes:,} bytes" in text
-    assert f"exceeded {s.nbytes / argv:.1f}x" in text
-    assert "in BYTES rather than characters" in text
-    # Both readings of the diff, because the ratio was computed from one of them.
-    assert f"{s.chars:,} chars / {s.nbytes:,} bytes" in text
-    # And the remedy that cannot work is not offered: no setting raises the
-    # kernel's argv limit, so "raise `max_diff_chars`" would send an operator round
-    # the loop for the same refusal. That advice only reads as plausible while the
-    # notice is silent about which ceiling it means.
-    assert "Raise `review_panel.max_diff_chars`" not in text
-    assert "Drop the `antigravity` seat" in text
     for line in text.splitlines():
         assert "  " not in line.strip(), line
 
@@ -1174,15 +1036,10 @@ def test_the_manifest_ranks_ceilings_by_its_OWN_size_not_the_diffs(monkeypatch):
     diff need not bind for the manifest (217-R3-F01). The substitution therefore
     measures against every ceiling rather than the diff's winner alone.
 
-    **This is LATENT, not reachable from config today, and the test says so rather
-    than pretending otherwise.** For a byte ceiling to out-rank the char ones on the
-    diff, the char budgets have to exceed ~87,000 (`ARGV_PROMPT_MAX_BYTES` over this
-    repo's ~1.38 bytes/char) — and a manifest is ~2.3 KB, so it then fits them
-    trivially and the two rankings agree. `seat_ceilings` also gives a configured
-    `antigravity: N` a **chars** ceiling plus the kernel's bytes one, so the mixed
-    pair that flips has to be built by hand. What is pinned here is the ranking
-    property itself, which is what the code relies on and what a future ceiling unit
-    would break.
+    **This is LATENT, not reachable from config today.** No seat declares a byte
+    ceiling since agy moved to stdin, so the mixed pair is built by hand. What is
+    pinned here is the ranking property itself, which a future ceiling unit would
+    rely on.
     """
     shape = pf.diff_shape(DENSE_SPLIT)
     text = pf.move_manifest(DENSE_SPLIT, shape)
@@ -1677,51 +1534,6 @@ def _wide_move(lines):
     return (_file("big.py", removed=body)
             + _file("part_a.py", added=body[:lines // 2])
             + _file("part_b.py", added=body[lines // 2:]))
-
-
-def test_every_BANNER_on_a_byte_measured_round_names_the_unit(monkeypatch, tmp_path,
-                                                              capsys):
-    """The verdict knew, and none of its renderers did. `preflight` computed `over`
-    from UTF-8 bytes whenever antigravity's argv ceiling bound, while the manifest
-    banner, the `--force` banner and every per-seat skip reason printed
-    `shape.chars` beside the word "chars" — so the report stated a character count
-    against a byte ceiling and a multiple that matched neither."""
-    argv = panel_core.ARGV_PROMPT_MAX_BYTES
-    diff = _wide_move(1400)
-    s = pf.diff_shape(diff)
-    assert s.nbytes > argv > s.chars, f"fixture drifted: {s}"
-
-    # A manifest round: the banner above the findings.
-    _, got, _ = _run(monkeypatch, tmp_path, diff, _panel(), seats=("antigravity",))
-    assert got["preflight"]["verdict"] == "manifest"
-    assert got["preflight"]["cap_unit"] == "bytes"
-    printed = capsys.readouterr().out
-    assert f"diff is {s.nbytes:,} bytes against antigravity's {argv:,}" in printed
-
-    # The same round forced: the `--force` banner.
-    _, got, _ = _run(monkeypatch, tmp_path, diff, _panel(), seats=("antigravity",),
-                     force=True)
-    assert got["preflight"]["would_have"] == "manifest"
-    assert f"{s.nbytes:,}-byte diff against a {argv:,}-byte ceiling" \
-        in capsys.readouterr().out
-
-
-def test_a_byte_measured_REFUSAL_says_bytes_in_every_seats_skip_reason(monkeypatch,
-                                                                      tmp_path):
-    """`skipped` is parsed board-side and `reviewers[n]["skip"]` is the structured
-    twin, so a per-seat reason stating characters against a byte ceiling disagrees
-    with `skip_reason` in the same payload — and does it in the table that answers
-    which reviewer finds the real issues."""
-    argv = panel_core.ARGV_PROMPT_MAX_BYTES
-    diff = _wide_move(3000) + FRESH * 30      # over the multiple, not move-shaped
-    s = pf.diff_shape(diff)
-    assert not s.is_move() and s.nbytes > argv * 3, f"fixture drifted: {s}"
-    _, got, _ = _run(monkeypatch, tmp_path, diff, _panel(),
-                     seats=("antigravity", "claude"))
-    assert got["preflight"]["verdict"] == "refuse"
-    want = f"({s.nbytes:,} bytes against {argv:,})"
-    assert all(want in row for row in got["skipped"]), got["skipped"]
-    assert all(want in r["skip"] for r in got["reviewers"].values())
 
 
 def test_a_refused_SCOPED_round_records_what_it_was_going_to_review(monkeypatch,

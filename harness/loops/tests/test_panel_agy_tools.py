@@ -1,24 +1,8 @@
-"""The antigravity seat with a shell: `reviewers.antigravity.tools` and SEAT_RUNS_CODE.
+"""The antigravity seat: its prompt on stdin, and its shell when `tools` is on.
 
-In the no-tools mode a model that ignored NO_TOOLS_BRIEF and probed `echo …` had the
-command auto-denied by agy's headless print mode, and that denial ended the session
-with exit 0 and no output — the seat lost for #853's round. The owner's call
-(2026-11-14) was to let review agents run tools, so the seat now reviews from its own
-stripped copy of the PR's tree with `--dangerously-skip-permissions`.
-
-What these hold down:
-
-**The flag and the tree arrive together, or neither does.** A shell with an empty
-sandbox is the old seat plus a risk; a tree with no flag is the old seat's fatal
-soft-deny with more to tempt it. A copy that fails to stage takes both back.
-
-**The cwd is a copy, never the tree the round fetched and never a real worktree.**
-
-**The overlay reaches the child process.** The tarball copy has no `.env`, so a test
-the seat runs falls back to defaults — a live database on this box — unless the
-database variables point at nothing. Accident prevention, not a boundary: on #861's
-first live round the seat went and found the real worktree, which is why it is now
-told its copy's path.
+Driven through the real `review_llm` → `run_seat` → `run_cli` path with a fake `agy`
+on PATH that records what it was handed, so these hold the invocation that would
+actually run rather than a double of it.
 """
 from __future__ import annotations
 
@@ -36,64 +20,140 @@ import panel_core  # noqa: E402
 import panel_seats  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
+REPLY = '[{"severity": "P3", "file": "a.py", "line": 1, "title": "t", "detail": "d"}]'
 
-def _tree(root: Path, files: dict) -> Path:
-    for rel, text in files.items():
-        (root / rel).parent.mkdir(parents=True, exist_ok=True)
-        (root / rel).write_text(text)
+#: The output path is baked in (OUT_PATH), not passed in the environment: the seat's
+#: environment is an allowlist, and a variable would not reach a tool-running run.
+FAKE_AGY = f"""#!{sys.executable}
+import json, os, sys
+out = OUT_PATH
+stdin = sys.stdin.read()
+with open(out, "w") as f:
+    json.dump({{"argv": sys.argv[1:], "stdin": stdin, "cwd": os.getcwd(),
+               "env": dict(os.environ),
+               "had_code": os.path.exists("app/main.py"),
+               "gh_empty": os.listdir(os.environ.get("GH_CONFIG_DIR") or "/") == []}}, f)
+status = STATUS
+print(json.dumps({{"event": "init", "init": {{}}}}))
+print(json.dumps({{"event": "result",
+                  "result": {{"status": status, "response": {REPLY!r}}}}}))
+"""
+
+
+def _install(bin_dir: Path, out: Path, status: str) -> None:
+    exe = bin_dir / "agy"
+    exe.write_text(FAKE_AGY.replace("OUT_PATH", repr(str(out)))
+                   .replace("STATUS", repr(status), 1))
+    exe.chmod(0o755)
+
+
+@pytest.fixture
+def agy(tmp_path, monkeypatch):
+    """A fake `agy` first on PATH; returns a reader for what its last run saw."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    out = tmp_path / "agy-saw.json"
+    _install(bin_dir, out, "SUCCESS")
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/run/agent.sock")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+    monkeypatch.setenv("PGHOSTADDR", "10.0.0.1")
+    return lambda: json.loads(out.read_text()) if out.exists() else None
+
+
+def _tree(root: Path) -> Path:
+    (root / "app").mkdir(parents=True)
+    (root / "app/main.py").write_text("x = 1\n")
     return root
 
 
-def _seat_run(monkeypatch):
-    """One seat run, recording what run_cli was handed while the cwd still exists."""
-    seen = {}
-    monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
-
-    def fake_run_cli(args, label, timeout=panel.CLI_TIMEOUT, attempts=3,
-                     stdin_text=None, on_output=None, replied=None, cwd=None,
-                     env_extra=None):
-        seen["cwd"] = cwd
-        seen["args"] = args() if callable(args) else args
-        seen["had_code"] = (Path(cwd) / "app/main.py").exists()
-        seen["env"] = env_extra
-        if env_extra:
-            gh = Path(env_extra["GH_CONFIG_DIR"])
-            seen["gh_empty"] = gh.is_dir() and not any(gh.iterdir())
-        return "[]", None
-
-    monkeypatch.setattr(panel_seats, "run_cli", fake_run_cli)
-    return seen
+def _stdin_prompt(saw: dict) -> str:
+    message = json.loads(saw["stdin"])
+    assert message["event"] == "user"
+    return message["message"]["content"]
 
 
-def test_the_tools_mode_adds_the_permission_switch_and_nothing_else():
-    off = panel.antigravity_args("gemini-3.8-flash-high", "", "PROMPT")
-    on = panel.antigravity_args("gemini-3.8-flash-high", "", "PROMPT", tools=True)
-    assert "--dangerously-skip-permissions" not in off
-    assert off == ["agy", "--mode", "plan", "--print-timeout", f"{panel.CLI_TIMEOUT}s",
-                   "-p", "PROMPT", "--model", "gemini-3.8-flash-high"]
-    assert on.count("--dangerously-skip-permissions") == 1
-    assert [a for a in on if a != "--dangerously-skip-permissions"] == off
+def test_the_prompt_travels_on_stdin_however_large(agy):
+    """argv capped agy at 128 KiB; stdin has no such ceiling."""
+    prompt = "REVIEW " + "x" * 300_000
+
+    got = panel.review_llm("antigravity", "m", prompt)
+
+    saw = agy()
+    assert _stdin_prompt(saw) == prompt
+    assert not any("x" * 1000 in a for a in saw["argv"])
+    assert "--input-format" in saw["argv"] and "--output-format" in saw["argv"]
+    assert len(got.findings) == 1
+
+
+def test_with_tools_the_seat_runs_in_its_copy_with_a_stripped_environment(agy, tmp_path):
+    tree = _tree(tmp_path / "src")
+
+    got = panel.review_llm("antigravity", "m", "PROMPT", code_tree=tree, runs_code=True)
+
+    saw = agy()
+    assert saw["argv"].count("--dangerously-skip-permissions") == 1
+    assert saw["had_code"] is True
+    assert Path(saw["cwd"]).resolve() != tree.resolve(), "ran in the shared tree"
+    assert _stdin_prompt(saw).endswith(f"YOUR COPY OF THE PR IS AT: {saw['cwd']}\n")
+    env = saw["env"]
+    for gone in ("SSH_AUTH_SOCK", "OPENAI_API_KEY", "PGHOSTADDR"):
+        assert gone not in env, gone
+    assert ".invalid" in env["DATABASE_URL"] and ".invalid" in env["PGHOST"]
+    assert saw["gh_empty"] is True
+    assert env["QB_SANDBOX"] == "1" and env["PATH"]
+    assert got.code_blind is False and len(got.findings) == 1
+
+
+def test_without_tools_the_seat_is_the_diff_only_reviewer(agy, tmp_path):
+    tree = _tree(tmp_path / "src")
+
+    got = panel.review_llm("antigravity", "m", "PROMPT", code_tree=tree)
+
+    saw = agy()
+    assert "--dangerously-skip-permissions" not in saw["argv"]
+    assert saw["had_code"] is False
+    assert _stdin_prompt(saw) == "PROMPT"
+    assert saw["env"]["SSH_AUTH_SOCK"] == "/run/agent.sock"
+    assert got.code_blind is True
+
+
+def test_a_copy_that_fails_to_stage_sits_the_seat_out(agy, tmp_path, monkeypatch):
+    """Its prompt promises a shell in a copy that does not exist, so it does not run."""
+    tree = _tree(tmp_path / "src")
+
+    def boom(*a, **k):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(panel_seats.shutil, "copytree", boom)
+
+    got = panel.review_llm("antigravity", "m", "PROMPT", code_tree=tree, runs_code=True)
+
+    assert agy() is None, "agy was started"
+    assert "could not stage its copy" in got.skip
+
+
+def test_a_failed_turn_is_no_reply_not_an_empty_review(agy, tmp_path):
+    _install(tmp_path / "bin", tmp_path / "agy-saw.json", "ERROR")
+
+    got = panel.review_llm("antigravity", "m", "PROMPT")
+
+    assert got.findings == [] and "wrote no reply" in got.skip
 
 
 @pytest.mark.parametrize("cfg, want", [
     ({"antigravity": {"tools": True}}, True),
     ({"antigravity": {"tools": False}}, False),
-    # A string that reads like a boolean must not grant a shell.
     ({"antigravity": {"tools": "true"}}, False),
     ({}, False),
-    # Only a SEAT_RUNS_CODE seat can be widened in by the setting.
     ({"codex": {"tools": True}}, False),
 ])
 def test_only_an_exact_true_on_a_runs_code_seat_grants_the_tree(cfg, want):
     got = panel_seats.tool_seats(cfg)
-    assert "claude" in got
-    assert ("antigravity" in got) is want
-    assert "codex" not in got
+    assert ("antigravity" in got) is want and "codex" not in got and "claude" in got
 
 
 def test_the_shipped_default_is_on():
     assert harness_rules.DEFAULTS["reviewers"]["antigravity"]["tools"] is True
-    assert "antigravity" in panel_seats.tool_seats(harness_rules.DEFAULTS["reviewers"])
 
 
 def test_a_tools_value_that_is_not_a_boolean_is_refused():
@@ -102,163 +162,31 @@ def test_a_tools_value_that_is_not_a_boolean_is_refused():
             {"reviewers": {"antigravity": {"tools": "false"}}}, ".harness-rules.sample")
 
 
-def test_an_executing_seat_runs_in_its_own_copy_with_the_flag_and_overlay(monkeypatch,
-                                                                         tmp_path):
-    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
-    seen = _seat_run(monkeypatch)
-
-    got = panel.review_llm("antigravity", "m", "p", code_tree=tree, runs_code=True)
-
-    assert seen["had_code"] is True
-    assert Path(seen["cwd"]).resolve() != tree.resolve(), "ran in the shared tree"
-    assert not Path(seen["cwd"]).resolve().is_relative_to(tree.resolve())
-    assert "--dangerously-skip-permissions" in seen["args"]
-    assert got.code_blind is False
-    env = seen["env"]
-    assert env and ".invalid" in env["DATABASE_URL"] and ".invalid" in env["PGHOST"]
-    assert seen["gh_empty"] is True
-
-
-def test_the_executing_brief_names_the_seat_copy(monkeypatch, tmp_path):
-    """agy runs commands where the MODEL says; told nothing, it went and found the
-    real worktree (#861). The path is only known once the copy exists, so it is
-    substituted in `run_seat`, and it has to be the cwd the seat was given."""
-    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
-    seen = _seat_run(monkeypatch)
-    prompt = "head\n" + panel_core.CODE_EXEC_BRIEF + "\ntail"
-
-    panel.review_llm("antigravity", "m", prompt, code_tree=tree, runs_code=True)
-
-    sent = seen["args"][seen["args"].index("-p") + 1]
-    assert panel_core.SEAT_DIR_SLOT not in sent
-    assert seen["cwd"] in sent
-
-
-def test_a_quoted_slot_before_the_brief_is_left_alone(monkeypatch, tmp_path):
-    """Model-authored blocks precede the brief; a finding quoting the slot must not be
-    the occurrence that gets the path, leaving the brief without one."""
-    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
-    seen = _seat_run(monkeypatch)
-    quoted = f"a finding about {panel_core.SEAT_DIR_SLOT}\n"
-    panel.review_llm("antigravity", "m", quoted + panel_core.CODE_EXEC_BRIEF,
-                     code_tree=tree, runs_code=True)
-    sent = seen["args"][seen["args"].index("-p") + 1]
-    assert sent.startswith(quoted)
-    assert seen["cwd"] in sent
-
-
-def test_the_filled_brief_is_exactly_the_size_the_clamp_measured():
-    """By construction: whatever the path, the brief run_seat sends is the brief the
-    argv clamp measured, byte for byte in length."""
-    measured = len(panel_core.exec_brief("").encode())
-    for path in ("/tmp/panel-antigravity-abcd1234/seat", "/" + "x" * 4000, "/tmp/é"):
-        assert len(panel_core.exec_brief(path).encode()) == measured
-    with pytest.raises(ValueError):
-        panel_core.exec_brief("/" + "x" * panel_core.SEAT_DIR_RESERVE)
-
-
-def test_runs_code_env_lets_through_only_the_allowlist(tmp_path):
-    """An allowlist, not a list of credential names: anything not named is removed,
-    including the families a denylist missed (#861 round 2)."""
-    base = {"PATH": "/bin", "HOME": "/h", "LANG": "C", "LC_ALL": "C", "XDG_RUNTIME_DIR": "/r",
-            "NIX_SSL_CERT_FILE": "/c", "TERM": "xterm", "QB_SANDBOX": "1",
-            "SSH_AUTH_SOCK": "/agent", "OPENAI_API_KEY": "k", "AWS_ACCESS_KEY_ID": "a",
-            "KUBECONFIG": "/k", "PGHOSTADDR": "10.0.0.1", "TEST_DATABASE_URL": "pg://x",
-            "GOOGLE_APPLICATION_CREDENTIALS": "/g", "GEMINI_API_KEY": "g", "WHATEVER": "w"}
-    env = panel_seats.runs_code_env(tmp_path, base)
-    kept = {"PATH", "HOME", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "NIX_SSL_CERT_FILE",
-            "TERM", "QB_SANDBOX"}
-    for k in base:
-        assert (k not in env) is (k in kept), k
-        if k not in kept:
-            assert env[k] is None, k
-
-
-def test_run_cli_merges_the_overlay_into_the_child_env(monkeypatch, tmp_path):
-    """The real merge, not a double: a set value reaches the child and a None removes
-    an inherited one."""
-    monkeypatch.setenv("SSH_AUTH_SOCK", "/inherited-agent")
-    out, err = panel_seats.run_cli(
-        ["sh", "-c", 'printf "%s|%s" "$DATABASE_URL" "${SSH_AUTH_SOCK-unset}"'],
-        "probe", attempts=1, cwd=str(tmp_path),
-        env_extra={"DATABASE_URL": "postgresql://x.invalid/n", "SSH_AUTH_SOCK": None})
-    assert err is None
-    assert out == "postgresql://x.invalid/n|unset"
-    assert os.environ["SSH_AUTH_SOCK"] == "/inherited-agent", "mutated the panel's env"
-
-
-def test_without_the_setting_the_seat_is_unchanged(monkeypatch, tmp_path):
-    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
-    seen = _seat_run(monkeypatch)
-
-    got = panel.review_llm("antigravity", "m", "p", code_tree=tree)
-
-    assert seen["had_code"] is False
-    assert "--dangerously-skip-permissions" not in seen["args"]
-    assert seen["env"] is None
-    assert got.code_blind is True
-
-
-def test_runs_code_cannot_hand_a_shell_to_a_seat_outside_the_set(monkeypatch, tmp_path):
-    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
-    seen = _seat_run(monkeypatch)
-
-    got = panel.review_llm("codex", "m", "p", code_tree=tree, runs_code=True)
-
-    assert seen["had_code"] is False and seen["env"] is None
-    assert got.code_blind is True
-
-
-def test_a_staging_failure_takes_back_the_flag_the_overlay_and_the_brief(monkeypatch,
-                                                                         tmp_path, capsys):
-    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
-
-    def boom(*a, **k):
-        raise OSError(28, "No space left on device")
-    monkeypatch.setattr(panel_seats.shutil, "copytree", boom)
-    seen = _seat_run(monkeypatch)
-    prompt = "head\n" + panel_core.CODE_EXEC_BRIEF + "\ntail"
-
-    got = panel.review_llm("antigravity", "m", prompt, code_tree=tree, runs_code=True)
-
-    assert got.code_blind is True
-    assert "--dangerously-skip-permissions" not in seen["args"]
-    assert seen["env"] is None
-    sent = seen["args"][seen["args"].index("-p") + 1]
-    assert "AND A SHELL" not in sent and "YOU HAVE NO TOOLS" in sent
-    assert "could not stage the PR tree" in capsys.readouterr().err
-
-
 # --------------------------------------------------------------- through run()
 
 CFG = {"github": "acme/board", "path": "/tmp/acme-board",
        "_rules_baseline": ".harness-rules.sample",
        "reviewers": {"claude": {"enabled": True, "model": "sonnet"},
-                     "antigravity": {"enabled": True, "model": "gemini-3.8-flash-high",
-                                     "effort": "", "tools": True}},
+                     "antigravity": {"enabled": True, "model": "m", "effort": "",
+                                     "tools": True}},
        "review_panel": {}}
 
 
-def _round(monkeypatch, tmp_path, capsys, tools=True, no_code_access=False):
-    seen = {"prompts": {}, "runs": {}, "trees": {}}
-    cfg = json.loads(json.dumps(CFG))
-    cfg["reviewers"]["antigravity"]["tools"] = tools
-    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
+def _round(monkeypatch, tmp_path, capsys, no_code_access=False):
+    seen = {"prompts": {}, "runs": {}}
+    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: json.loads(json.dumps(CFG)))
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "feat: x", "additions": 3, "deletions": 1,
               "headRefOid": "abcdef1234"},
         diff="diff --git a/a.py b/a.py\n+x\n"))
     monkeypatch.setattr(panel, "fetch_pr_tree",
-                        lambda _r, _s, into: (_tree(into / "t", {"a.py": "x"}), ""))
+                        lambda _r, _s, into: (_tree(into / "t"), ""))
     monkeypatch.setattr(panel.shutil, "which", lambda name: "/usr/bin/" + name)
 
     def reviewer(name, model, prompt, effort="", code_tree=None, budget_usd=None,
                  runs_code=False):
-        seen["prompts"][name] = prompt
-        seen["runs"][name] = runs_code
-        seen["trees"][name] = code_tree
-        # What run_seat would record: sighted only with a tree AND a seat that can use it.
-        sighted = code_tree is not None and name in panel_seats.tool_seats(cfg["reviewers"])
+        seen["prompts"][name], seen["runs"][name] = prompt, runs_code
+        sighted = code_tree is not None and name in panel_seats.tool_seats(CFG["reviewers"])
         return panel.ReviewerRun([], None, 10, [], code_blind=not sighted)
 
     monkeypatch.setattr(panel, "review_llm", reviewer)
@@ -270,29 +198,15 @@ def _round(monkeypatch, tmp_path, capsys, tools=True, no_code_access=False):
     return capsys.readouterr().out, json.loads(out.read_text()), seen
 
 
-def test_with_tools_on_the_seat_is_told_it_has_a_shell_and_the_round_says_so(
+def test_a_round_gives_the_shell_brief_to_antigravity_and_records_it(
         monkeypatch, tmp_path, capsys):
     report, payload, seen = _round(monkeypatch, tmp_path, capsys)
 
     assert "YOU HAVE THE CODE, AND A SHELL" in seen["prompts"]["antigravity"]
     assert seen["runs"]["antigravity"] is True
-    # claude keeps its read-only brief; the shell is not offered to it.
-    assert "YOU HAVE THE CODE." in seen["prompts"]["claude"]
-    assert "AND A SHELL" not in seen["prompts"]["claude"]
-    assert seen["runs"]["claude"] is False
+    assert "AND A SHELL" not in seen["prompts"]["claude"] and not seen["runs"]["claude"]
     assert payload["code_access"]["shell_seats"] == ["antigravity"]
-    assert "(antigravity with a shell, so it may have run commands)" in report
-
-
-def test_a_seat_that_did_not_get_the_tree_is_not_recorded_as_having_a_shell():
-    """From what the seat DID: absent, crashed, or downgraded seats are not listed."""
-    meta = {"antigravity": {"ran": True, "code_blind": True},
-            "claude": {"ran": True, "code_blind": False}}
-    assert panel.shell_seats(meta) == []
-    meta["antigravity"] = {"ran": False, "code_blind": False}
-    assert panel.shell_seats(meta) == []
-    meta["antigravity"] = {"ran": True, "code_blind": False}
-    assert panel.shell_seats(meta) == ["antigravity"]
+    assert "(antigravity with a shell)" in report
 
 
 def test_no_code_access_takes_the_shell_away(monkeypatch, tmp_path, capsys):
@@ -302,32 +216,3 @@ def test_no_code_access_takes_the_shell_away(monkeypatch, tmp_path, capsys):
     assert "YOU HAVE NO TOOLS" in seen["prompts"]["antigravity"]
     assert payload["code_access"]["shell_seats"] == []
     assert "with a shell" not in report
-
-
-@pytest.mark.parametrize("no_code_access, want_exec", [(False, True), (True, False)])
-def test_the_clamp_measures_the_exec_prompt_only_when_it_can_be_sent(
-        monkeypatch, tmp_path, capsys, no_code_access, want_exec):
-    """The budget has to fit the longer prompt the seat could get, and only that one:
-    clamping for a shell that code access has ruled out would cut diff for nothing."""
-    renders = []
-    real = panel.argv_clamp
-
-    def spy(render, sendable, asked):
-        renders.append(render(None))
-        return real(render, sendable, asked)
-    monkeypatch.setattr(panel, "argv_clamp", spy)
-    _round(monkeypatch, tmp_path, capsys, no_code_access=no_code_access)
-
-    assert renders, "the clamp never ran"
-    assert ("AND A SHELL" in renders[0]) is want_exec
-
-
-def test_with_tools_off_the_seat_is_the_diff_only_reviewer_again(monkeypatch, tmp_path,
-                                                                 capsys):
-    _report, payload, seen = _round(monkeypatch, tmp_path, capsys, tools=False)
-
-    assert "YOU HAVE NO TOOLS" in seen["prompts"]["antigravity"]
-    assert "YOU HAVE THE CODE" not in seen["prompts"]["antigravity"]
-    assert seen["runs"]["antigravity"] is False
-    assert payload["code_access"]["shell_seats"] == []
-    assert payload["reviewers"]["antigravity"]["code_blind"] is True

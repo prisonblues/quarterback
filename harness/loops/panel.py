@@ -2377,16 +2377,6 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
                        duration_ms=elapsed())
 
 
-def shell_seats(reviewer_meta: dict) -> list[str]:
-    """The seats that reviewed with a shell this round, read off what they DID.
-
-    A SEAT_RUNS_CODE seat that ran with the tree is one `run_seat` launched with
-    `--dangerously-skip-permissions`; one that is absent, crashed, or whose copy failed
-    to stage records `ran` False or `code_blind` True and is not listed."""
-    return sorted(n for n, m in reviewer_meta.items()
-                  if n in SEAT_RUNS_CODE and m.get("ran") and m.get("code_blind") is False)
-
-
 def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
                ledger_round: int, new_cycle: bool) -> str:
     """Why this run cannot continue its PR's cycle, or "" when it can or need not.
@@ -2416,6 +2406,13 @@ def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
     return (f"round {round_no} cannot continue this PR's cycle: {why}, {then}. No "
             "earlier round's findings, provenance or fix_injection carry into it. To "
             "continue the cycle, pass every earlier round's payload with --baseline")
+
+
+def shell_seats(reviewer_meta: dict) -> list[str]:
+    """The seats that reviewed with a shell, read off what they did: a SEAT_RUNS_CODE
+    seat only sights the tree when `run_seat` launched it with one."""
+    return sorted(n for n, m in reviewer_meta.items()
+                  if n in SEAT_RUNS_CODE and m.get("ran") and m.get("code_blind") is False)
 
 
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
@@ -4054,9 +4051,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # labelled in the prompt, is reported in `config_notes`, and already vetoes a
     # confident stop through the `short_context` sentence below. Refusing a round
     # because the optional tiers behind its target are large would refuse the case
-    # scoping exists to make cheap. The one place the total genuinely binds — argv,
-    # which cannot carry an oversized prompt at all — is clamped separately against
-    # `sendable` a few dozen lines down, and says so per seat.
+    # scoping exists to make cheap.
     #
     # `notes` is passed so a junk threshold in `.harness-rules` is reported the way
     # every other bad config value is. The VERDICT itself is deliberately not a
@@ -4685,18 +4680,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
     def prompt_for(budget: int | None, reads_code: bool = False,
                    runs: bool = False) -> str:
-        # `reads_code` and `runs` default False so the one-argument callers keep
-        # working; `agy_render` below is the one that passes both.
         # The slot is EITHER brief, never empty: a seat that gets the tree is told
         # to use it, and a seat that does not is told there is nothing to look at
         # and what to do instead (#458). Empty was the hole — it left the seats
         # with no tool flag to work out their own situation, and the way they work
         # it out is by trying.
-        #
-        # Inside the render on purpose, so `fit_argv_budget` counts it: the ceiling
-        # applies to the PROMPT, and antigravity is both the seat this text is for
-        # and the one seat the kernel can veto. Adding it in `antigravity_args`
-        # would put ~1,100 bytes past the clamp that just measured the prompt.
         #
         # The claim rides in the `{diff}` slot rather than in a slot of its own, and
         # that is where it belongs rather than where it fits: the template's tail is
@@ -4730,9 +4718,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text,
                             diff=history + claim + review.material(budget)[0],
-                            code=(CODE_EXEC_BRIEF if reads_code and runs
-                                  else CODE_ACCESS_BRIEF if reads_code
-                                  else NO_TOOLS_BRIEF)
+                            code=(CODE_EXEC_BRIEF if runs else CODE_ACCESS_BRIEF
+                                  if reads_code else NO_TOOLS_BRIEF)
                         ).replace(NEXT_DOOR_SLOT, next_door, 1
                         # #773's block, swapped after the render and bounded to one
                         # occurrence on exactly the argument above: it is built from
@@ -4747,59 +4734,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                         # because a fixer typed it, and bounded to the first occurrence.
                         ).replace(CLASSES_SLOT, class_brief, 1)
 
-    # `agy` is the only reviewer whose prompt must travel in argv, so it is the
-    # only one the kernel can veto. Clamp it to what execve will carry and say
-    # so — the alternative, honouring the number and dying at exec, is how a
-    # panel came to report "LLM reviewers ran: none" as a clean review.
-    #
-    # It is also the only seat an UNCAPPED budget can still cut, which is why the
-    # clamp starts from the material's own length when there is no budget: "no
-    # cap" means "as much as this machine can hand over", and on this one seat
-    # that is a smaller number than on the others. The note says so in chars of
-    # the material rather than in config terms, since there is no config value to
-    # blame.
-    #
-    # `sendable` is that length — everything this round would hand a reviewer,
-    # target and context together, which under increment scope is not the PR's
-    # length. Starting from the PR's would tell antigravity it had been cut on a
-    # round whose material fits whole.
+    #: Everything this round would hand a reviewer, target and context together —
+    #: under increment scope, not the PR's length.
     sendable = len(review.target) + len(review.near) + len(review.far)
-    #: Seats whose budget the KERNEL cut, rather than a number somebody typed.
-    #: Half of the coverage exemption; the other half is whether the cut actually
-    #: cost the seat any of the target, which only `truncated_for` below can
-    #: measure — see `argv_clamp` for why a comparison against the target's length
-    #: is not the same question under increment scope.
-    kernel_cut: set[str] = set()
-    if "antigravity" in budgets:
-        asked = budgets["antigravity"]
-        want = sendable if asked is None else asked
-        # Whether this seat gets the tree is not known until the fetch below, so
-        # the clamp is measured against the LONGER of the two prompts it could be
-        # sent: the budget has to fit whichever one it turns out to be. Only when it
-        # COULD be sent the exec prompt — `tools` on and code access wanted — so a
-        # round with code access off is not clamped for a shell it cannot have. A
-        # throwaway notes list: the real call below reports the setting once.
-        agy_may_run = ("antigravity" in tool_seats(rev)
-                       and code_access_wanted(panel, no_code_access, []))
-        def agy_render(budget: int | None) -> str:
-            blind_text = prompt_for(budget)
-            if not agy_may_run:
-                return blind_text
-            # At the size run_seat will send: the slot filled to SEAT_DIR_RESERVE.
-            exec_text = prompt_for(budget, True, True).replace(
-                CODE_EXEC_BRIEF, exec_brief(""), 1)
-            return max(blind_text, exec_text, key=lambda t: len(t.encode()))
-        fitted, cut_by_kernel = argv_clamp(agy_render, sendable, asked)
-        if fitted < want:
-            notes.append(
-                f"antigravity gets {fitted:,} of {sendable:,} diff chars — its prompt "
-                f"travels in argv and the kernel caps one element at "
-                f"{ARGV_PROMPT_MAX_BYTES:,} bytes. It is the only reviewer with no way "
-                "to read a prompt off stdin.")
-            budgets["antigravity"] = fitted
-        if cut_by_kernel:
-            kernel_cut.add("antigravity")
-
     # Truncation is measured against the review TARGET, not against everything
     # sent. Under increment scope losing context is the design — that is what the
     # priority order in `ReviewScope.material` is for, and a reviewer short of
@@ -4819,12 +4756,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     truncated_for = {n: b for n, b in budgets.items()
                      if sent[n][0] < len(review.target)}
     truncated = bool(truncated_for)
-    # The coverage exemption, assembled from both halves: truncated by MEASUREMENT
-    # (composed above, so the brief and headers are accounted for) and cut by the
-    # kernel rather than by a config budget. A subset of `truncated_for` by
-    # construction, which is what keeps the report footnote and the veto agreeing
-    # about the same seats.
-    argv_capped = {n for n in truncated_for if n in kernel_cut}
     # A budget below the scoped frame's OWN size cannot be honoured. The brief and
     # the section headers are over a kilobyte and they are what makes the target
     # legible as the target; cutting them to fit would hand the reviewer an
@@ -4914,9 +4845,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # first, precisely so that a round cannot route away the only eyes that could open
     # a file. Where it does empty, the seat was selected and not installed, and the
     # `elif` below already says so.
-    #: `tool_seats` rather than SEAT_READS_CODE: a SEAT_RUNS_CODE seat with `tools`
-    #: on wants the tree too, and a round whose only such seat is antigravity must
-    #: still fetch it.
     can_use_tree = tool_seats(rev)
     code_seats = sorted(n for n in routing.dispatched if n in can_use_tree)
     code_tree: Path | None = None
@@ -4951,9 +4879,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 code_tree = None
     elif want_code and not code_seats:
         notes.append("`reviewer_code_access` is on, but no seat on this panel can use "
-                     "it — see SEAT_READS_CODE; only claude can be given read tools "
-                     "without also being given a shell, and a SEAT_RUNS_CODE seat "
-                     "takes the tree only with `tools` on")
+                     "it — see SEAT_READS_CODE and SEAT_RUNS_CODE")
     if stripped:
         # Said out loud, per round. A silent strip makes a PR that shipped an
         # `AGENTS.md` indistinguishable from one that did not, on the single axis
@@ -5149,8 +5075,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                                         efforts.get(name, ""),
                                         code_tree=code_tree,
                                         budget_usd=budget_usd if reads else None,
-                                        # Only when set, so the review_llm doubles
-                                        # that name their keywords keep working.
                                         **({"runs_code": True} if runs else {}))
         sonar_future = None
         sonar_filed = False
@@ -5255,10 +5179,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # checked against the budget rather than asked for, because the
                 # one thing a truncated reviewer cannot notice is the truncation.
                 "truncated": not got.absent and name in truncated_for,
-                # WHY it was truncated, where the answer is the kernel rather than
-                # a number in a config file. Same shape of fact as `absent` and
-                # treated the same way by coverage_veto.
-                "argv_capped": name in argv_capped,
                 "duration_ms": got.duration_ms,
                 "could_not_assess": got.could_not_assess,
                 "unstructured": got.unstructured,
@@ -5357,7 +5277,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "effort": None,
                 "max_diff_chars": None,
                 "truncated": False,
-                "argv_capped": False,
                 "unstructured": False,
                 "model_unavailable": None,
                 "effort_unsupported": None,
@@ -5430,7 +5349,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "effort": efforts.get(name) or None,
             "max_diff_chars": None,
             "truncated": False,
-            "argv_capped": False,
             "duration_ms": None,
             "could_not_assess": [],
             "unstructured": False,
@@ -8017,9 +7935,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "setting": want_code,
             "seats": sorted(n for n, m in reviewer_meta.items()
                             if m.get("ran") and m.get("code_blind") is False),
-            # The seats that had a SHELL in that tree, from what each seat did rather
-            # than what was planned: a SEAT_RUNS_CODE seat with the tree is one that
-            # ran with `--dangerously-skip-permissions` (see run_seat's `executes`).
             "shell_seats": shell_seats(reviewer_meta),
             # What the strip took out of the reviewers' checkout. `[]` is "the PR
             # carried none", which is a different fact from the null a round that
@@ -9106,9 +9021,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if read_code:
         lines.append(f"**Code access:** {', '.join(read_code)} read the PR's tree at "
                      f"{(meta.get('headRefOid') or '')[:8]}"
-                     + (f" ({', '.join(shells)} with a shell, so "
-                        f"{'it' if len(shells) == 1 else 'they'} may have run commands)"
-                        if shells else "")
+                     + (f" ({', '.join(shells)} with a shell)" if shells else "")
                      + (f"; {', '.join(diff_only)} reviewed the diff alone"
                         if diff_only else "")
                      + " — a seat's own `could_not_assess` counts against the round "
@@ -9133,13 +9046,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # Named per reviewer, since the budgets can now differ: "truncated" alone
         # would hide that one model saw the whole diff and another saw a third of
         # it, which is exactly what you need to know when they disagree.
-        # The kernel-capped seat is marked, because the footnote is now the only
-        # place its truncation appears at all: it no longer files a veto line, and
-        # a reader comparing "truncated for antigravity" against a confident stop
-        # needs to see, right there, that the cap was the machine's and not a
-        # budget somebody could raise.
-        cut = ", ".join(f"{n} ({b:,}{', argv ceiling' if n in argv_capped else ''})"
-                        for n, b in sorted(truncated_for.items()))
+        cut = ", ".join(f"{n} ({b:,})" for n, b in sorted(truncated_for.items()))
         # `target_scope`, not `review.scope`: a manifest round's material is a
         # whole-target "pr" composition of whatever the round targeted (#138).
         what = ("manifest" if pre.verdict == "manifest"
