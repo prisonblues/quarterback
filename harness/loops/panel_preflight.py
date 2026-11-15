@@ -60,8 +60,8 @@ diff at all, and no amount of parsing recovers it from `gh pr diff` alone.
 biases toward false positives — and that reasoning stands untouched here. A
 budget answers *what to send*; this answers *whether to start*, and only ever
 against a ceiling the repo already declared. On a repo that sets no
-`max_diff_chars` there is no cap, so nothing here
-ever fires and no number this file invented is ever applied to anyone's diff.
+`max_diff_chars` there is no cap, so nothing here ever fires and no number this
+file invented is ever applied to anyone's diff.
 
 **Nor is it a silent skip.** A panel that quietly declines is #62's disease in a
 new place — a merge gate trusting a proxy. So a refusal prints, carries

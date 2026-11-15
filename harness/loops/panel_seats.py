@@ -148,9 +148,8 @@ def runs_code_env(scratch: Path, base: dict[str, str] | None = None) -> dict[str
     """`run_cli`'s `env_extra` for a tool-running seat; None removes a variable.
 
     Removes every inherited variable outside :data:`_SEAT_ENV_ALLOW` (SANDBOX_ENV is
-    applied after inheritance, so it stays), then points the database variables at a
-    host that cannot resolve — the tree has no `.env`, and a test suite's defaults
-    here are a live database — and `gh` at an empty config."""
+    applied after inheritance, so it stays), points the database variables at a host
+    that cannot resolve, and gives `gh` an empty config."""
     gh = scratch / "gh-config"
     gh.mkdir(exist_ok=True)
     env = os.environ if base is None else base
@@ -3779,16 +3778,13 @@ def antigravity_args(model: str, effort: str, timeout: int = CLI_TIMEOUT,
                      tools: bool = False) -> list[str]:
     """`agy` argv. The prompt goes on stdin as one stream-json message (see
     :func:`antigravity_stdin`) and the reply comes back in the stream's final
-    `result` event (:func:`antigravity_reply`). Text-mode `-p` was the only other
-    way in, and it takes the prompt in argv, where the kernel caps one argument at
-    128 KiB; `-p -` is taken as the literal prompt "-".
+    `result` event (:func:`antigravity_reply`). Text-mode `-p` takes the prompt in
+    argv instead, which the kernel caps at 128 KiB.
 
-    `tools=True` adds `--dangerously-skip-permissions`, agy's only per-run permission
-    switch; the caller passes it only to a seat that was given its copy of the tree.
-    Without it, headless agy soft-denies any tool it cannot prompt for and the denial
-    ends the session with no reply, which NO_TOOLS_BRIEF exists to head off.
-    `--mode plan` biases it away from proposing edits; it is not a guard.
-    `--print-timeout` because agy otherwise aborts itself at 5m."""
+    `tools=True` adds `--dangerously-skip-permissions`; the caller passes it only to a
+    seat that was given its copy of the tree. Without it a tool call headless agy
+    cannot prompt for is denied, which can end the session with no reply (#853).
+    `--mode plan` is not a guard. `--print-timeout` because agy's own default is 5m."""
     args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s",
             "--input-format", "stream-json", "--output-format", "stream-json"]
     if tools:
@@ -3805,34 +3801,47 @@ def antigravity_stdin(prompt: str) -> str:
     return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
 
 
-def _antigravity_result(stdout: str | None) -> dict:
-    """The last well-formed `result` event's body, or {}. Anything malformed —
-    a line that is not JSON, a result that is not an object — counts as absent."""
-    found: dict = {}
+#: What `_antigravity_result` returns for a final result that is not an object, or
+#: for output that stops parsing after a result was seen.
+_MALFORMED = object()
+
+
+def _antigravity_result(stdout: str | None):
+    """The stream's LAST `result` event body — authoritative whatever it holds — or
+    None if there was none. A result that is not an object, or a line that is not
+    JSON after one, makes it :data:`_MALFORMED`: an earlier success does not stand
+    once the stream says something it cannot read."""
+    found = None
     for line in (stdout or "").splitlines():
         try:
             event = json.loads(line)
         except ValueError:
+            if found is not None and line.strip():
+                found = _MALFORMED
             continue
-        if (isinstance(event, dict) and event.get("event") == "result"
-                and isinstance(event.get("result"), dict)):
-            found = event["result"]
+        if isinstance(event, dict) and event.get("event") == "result":
+            body = event.get("result")
+            found = body if isinstance(body, dict) else _MALFORMED
     return found
 
 
 def antigravity_reply(stdout: str | None) -> str:
-    """The reply text of a stream-json agy run, or "" (no reply) unless the turn
-    ended in SUCCESS with a string response."""
+    """The reply text of a stream-json agy run, or "" (no reply) unless the final
+    result is SUCCESS with a string response."""
     result = _antigravity_result(stdout)
+    if not isinstance(result, dict) or result.get("status") != "SUCCESS":
+        return ""
     reply = result.get("response")
-    return reply if result.get("status") == "SUCCESS" and isinstance(reply, str) else ""
+    return reply if isinstance(reply, str) else ""
 
 
 def antigravity_error(stdout: str | None) -> str:
-    """Why a stream-json agy turn gave no reply, in agy's words, or ""."""
+    """Why a stream-json agy turn gave no reply, in agy's words where it gave any."""
     result = _antigravity_result(stdout)
-    if not result:
+    if result is None:
         return "no result event"
+    if result is _MALFORMED:
+        return "malformed final result"
     if result.get("status") == "SUCCESS":
         return "" if isinstance(result.get("response"), str) else "response is not text"
     why = result.get("error") or result.get("finished_reason") or ""
@@ -4760,9 +4769,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                                      "tree, so the tool-running seat did not run",
                                 duration_ms=elapsed(), code_blind=True)
             if executes:
-                # Appended, never substituted: nothing in the prompt can collide
-                # with it. agy runs a command where the model says, by default in
-                # its own scratch dir, so the seat has to be told where its copy is.
+                # Appended, never substituted, so nothing in the prompt can collide
+                # with it. agy's commands need not run in its cwd, so it is told.
                 prompt += f"\n\nYOUR COPY OF THE PR IS AT: {sandbox}\n"
         else:
             sandbox = member_sandbox(tmpdir / "seat")
@@ -5906,7 +5914,8 @@ __all__ = [
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "SEAT_RUNS_CODE", "tool_seats", "runs_code_env",
-    "antigravity_stdin", "antigravity_reply", "antigravity_error", "CONVENTION_FILES", "CONVENTION_DIRS",
+    "antigravity_stdin", "antigravity_reply", "antigravity_error",
+    "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "pr_claim_wanted", "history_wanted",
     "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",

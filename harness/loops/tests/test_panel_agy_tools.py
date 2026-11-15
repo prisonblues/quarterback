@@ -6,9 +6,11 @@ actually run rather than a double of it.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -169,6 +171,21 @@ def test_a_malformed_result_is_no_reply_not_a_crash(stdout):
     assert panel_seats.antigravity_error(stdout)
 
 
+_SUCCESS = json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": REPLY}})
+
+
+@pytest.mark.parametrize("tail, why", [
+    ('{"event": "result", "result": "not an object"}', "malformed final result"),
+    ("garbage after the result", "malformed final result"),
+    ('{"event": "result", "result": {"status": "ERROR", "error": "cut off"}}',
+     "status ERROR: cut off"),
+])
+def test_the_last_result_decides_even_after_an_earlier_success(tail, why):
+    stdout = f"{_SUCCESS}\n{tail}\n"
+    assert panel_seats.antigravity_reply(stdout) == ""
+    assert panel_seats.antigravity_error(stdout) == why
+
+
 def test_the_overlay_applies_even_without_a_cwd(monkeypatch):
     monkeypatch.setenv("SSH_AUTH_SOCK", "/inherited-agent")
     out, err = panel_seats.run_cli(
@@ -178,16 +195,43 @@ def test_the_overlay_applies_even_without_a_cwd(monkeypatch):
     assert os.environ["SSH_AUTH_SOCK"] == "/inherited-agent", "mutated the panel's env"
 
 
+def _argv_capped_owner(path: Path, lineno: int, tree: ast.AST) -> ast.FunctionDef | None:
+    owners = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+              and n.lineno <= lineno <= n.end_lineno]
+    return min(owners, key=lambda n: n.end_lineno - n.lineno) if owners else None
+
+
 def test_the_removed_argv_machinery_is_named_nowhere():
-    """agy's prompt left argv; nothing may still export, call or describe as current
-    what went with it. panel_rounds reads `argv_capped` off OLD payloads on purpose."""
+    """agy's prompt left argv. Nothing may still export, call, test or describe what
+    went with it — in code, tests or the prose docs. `argv_capped` is the one
+    exception, allowed exactly where it is read off OLD payloads: inside
+    `panel_rounds.load_baseline`, and in tests that feed `load_baseline` one."""
     loops = Path(__file__).resolve().parent.parent
     gone = ("ARGV_PROMPT_MAX_BYTES", "fit_argv_budget", "argv_clamp", "_context_chars",
             "kernel_cut")
-    for src in [*loops.glob("*.py"), loops / "README.md"]:
+    prose = [loops / "README.md", loops.parent / "commands" / "panel-review-pr.md"]
+    code = [*loops.glob("*.py"), *(p for p in loops.glob("tests/*.py")
+                                   if p.name != Path(__file__).name)]
+    for src in [*code, *prose]:
         text = src.read_text()
         for name in gone:
             assert not re.search(rf"\b{name}\b", text), f"{src.name} still names {name}"
+    for src in code:
+        text = src.read_text()
+        if "argv_capped" not in text:
+            continue
+        tree = ast.parse(text)
+        for lineno, line in enumerate(text.splitlines(), 1):
+            if "argv_capped" not in line:
+                continue
+            owner = _argv_capped_owner(src, lineno, tree)
+            body = ast.get_source_segment(text, owner) if owner else ""
+            in_reader = (src.name == "panel_rounds.py" and owner is not None
+                         and owner.name == "load_baseline")
+            feeds_reader = (src.parent.name == "tests"
+                            and ("load(" in body or "load_baseline(" in body))
+            allowed = in_reader or feeds_reader
+            assert allowed, f"{src.name}:{lineno} names argv_capped outside the old-payload read"
 
 
 @pytest.mark.parametrize("cfg, want", [
@@ -206,14 +250,25 @@ def test_the_shipped_default_is_on():
     assert harness_rules.DEFAULTS["reviewers"]["antigravity"]["tools"] is True
 
 
-def test_this_repos_rules_reach_dispatch_with_tools_on():
-    """Through the config loader, from a sample that never mentions `tools`."""
-    rules = panel.load_repo_cfg(str(Path(__file__).resolve().parents[3]))["reviewers"]
-    assert "tools" not in json.loads(
-        (Path(__file__).resolve().parents[3] / ".harness-rules.sample").read_text()
-    )["reviewers"]["antigravity"]
-    assert "antigravity" in panel_seats.tool_seats(rules)
+def test_a_repo_that_never_mentions_tools_reaches_dispatch_with_it_on(tmp_path, monkeypatch):
+    """Through the real resolver, from a throwaway repo whose sample enables the seat
+    without saying `tools` — not from whatever checkout the suite runs in."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".harness-rules.sample").write_text(
+        json.dumps({"reviewers": {"antigravity": {"enabled": True}}}))
+    for cmd in (["init", "-q", "-b", "main"],
+                ["remote", "add", "origin", "https://github.com/acme/board.git"],
+                ["add", "."],
+                ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rules"]):
+        subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True)
+    box = tmp_path / "box-rules.json"
+    box.write_text("{}")
+    monkeypatch.setenv("QUARTERBACK_HARNESS_RULES", str(box))
 
+    rules = harness_rules.resolve_repo(str(repo), from_default_branch=False)["reviewers"]
+
+    assert "antigravity" in panel_seats.tool_seats(rules)
 
 def test_a_tools_value_that_is_not_a_boolean_is_refused():
     with pytest.raises(SystemExit, match=r"antigravity\.tools` must be true or false"):

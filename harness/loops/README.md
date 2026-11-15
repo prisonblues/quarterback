@@ -875,15 +875,14 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     a checkout it cannot open buys the instruction-file channel for nothing.
   - <a id="the-one-seat-that-is-given-a-shell"></a>**The one seat that is given a
     shell: antigravity, when `reviewers.antigravity.tools` is true** (the default;
-    `SEAT_RUNS_CODE`). Without it, headless `agy` soft-denies any tool call it cannot
-    prompt for, and the denial ends the session with no reply, so a model that ignores
-    the no-tools brief loses the seat for the round (#853). With it, `agy` runs with
-    `--dangerously-skip-permissions`, standing in its own stripped copy of the PR's
-    tree, and the prompt's last line gives that copy's path; a copy that fails to
-    stage sits the seat out. **This is accident prevention, not a sandbox.** `agy` runs
-    a command wherever the model chooses (by default in its own scratch directory), so
-    nothing confines it to the copy. The seat starts with only PATH, HOME, locale, XDG
-    and certificate variables, so no inherited credential, database URL or ssh agent
+    `SEAT_RUNS_CODE`). Without it, a tool call headless `agy` cannot prompt for is
+    denied, which can end the session with no reply and lose the seat for the round
+    (#853). With it, `agy` runs with `--dangerously-skip-permissions` in its own
+    stripped copy of the PR's tree, and the prompt's last line gives that copy's path;
+    a copy that fails to stage sits the seat out. **This is accident prevention, not a
+    sandbox.** Nothing confines the seat's commands to the copy. It starts with only
+    PATH, HOME, locale, XDG base-directory and certificate variables, so no other
+    inherited variable — credentials, database URLs, the ssh agent, the session bus —
     reaches it; the database variables name a host that cannot resolve and `gh` gets
     an empty config. Files under HOME, the rest of the filesystem and the network stay
     reachable. That is the trade the owner accepted; `"tools": false` in
@@ -948,8 +947,9 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     run **after** `adjudicate`, or the judge gets a path to a deleted directory,
     degrades to an empty sandbox, and reviews blind with the setting still reading
     true — the silent failure that the degrade path's own correctness makes possible.
-  - **The board stores it, rather than dropping it at ingest.** `absent`,
-    `code_blind` and `argv_capped` per reviewer, plus `code_access` and
+  - **The board stores it, rather than dropping it at ingest.** `absent` and
+    `code_blind` per reviewer (and `argv_capped`, which the panel stopped sending
+    when agy moved to stdin), plus `code_access` and
     `convention_files_removed` per run (migration `0024`), read back out of
     `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
     silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
@@ -1031,7 +1031,8 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   does not begin raising `KeyError` on exactly the boxes this is for.
   `load_baseline` banks a round as truncated on `truncated and not argv_capped and
   not absent` — both exemptions, each keyed on its own recorded field — because
-  baselines written before either release still carry the old pairings. Its sibling
+  baselines written before either release still carry the old pairings. Only
+  payloads from before agy moved to stdin carry `argv_capped`. Its sibling
   `truncated_any`, which decides whether a round may **close** every earlier round's
   gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
   saw a prefix, so the round did not read its target whole and cannot be the one that
@@ -1045,27 +1046,18 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   `ran and truncated`: `ran` is false for *every* way of not running, so that would
   also drop the truncation of a seat that was installed, read a real prefix and then
   crashed — a genuine coverage gap, and the fail-open direction.
-- **A constant never vetoes, and three of them used to** (#113). The rule
-  generalises the absent-CLI exemption above: an observation that is true of every
-  round cannot tell a quiet round from a broken one, and because `confident` is
-  `not veto`, leaving it in makes a confident stop unreachable rather than rare.
-  The three are an absent CLI (above), a seat that **cannot read the code**
-  (`ReviewerRun.code_blind` — see the coverage bullet below), and the **argv
-  ceiling** antigravity had while its prompt travelled in argv. That one is now read
-  only off payloads recorded before agy moved to stdin, so an old baseline keeps its
-  meaning. Each is exempted off
-  recorded state, never off the wording of a message; each is still reported; and
-  each has a floor so that exempting seats one at a time cannot empty the veto list
-  on a round where nothing was read whole. Truncation by a **budget** still vetoes —
-  someone typed that number and can raise it, so it is a fact about the round.
-  The argv exemption is applied in **two** places, and the second is easy to miss: the
-  baseline loader carries an earlier round's truncation forward (increment scope never
-  returns to what round 1 was cut off from), and a kernel-capped seat was not going to
-  be closed by a later round either — so carrying it reintroduces the constant one
-  round later and leaves it standing for the rest of the cycle, with round 1's veto
-  list looking fixed. `/panel-review-pr` drives several rounds, so exempting only
-  `coverage_veto` would have undone the change exactly where it matters. A budget
-  truncation still carries: raise the number and the next round really does read it.
+- **A constant never vetoes** (#113). The rule generalises the absent-CLI exemption
+  above: an observation that is true of every round cannot tell a quiet round from a
+  broken one, and because `confident` is `not veto`, leaving it in makes a confident
+  stop unreachable rather than rare. The two are an absent CLI (above) and a seat
+  that **cannot read the code** (`ReviewerRun.code_blind` — see the coverage bullet
+  below). Each is exempted off recorded state, never off the wording of a message;
+  each is still reported; and each has a floor so that exempting seats one at a time
+  cannot empty the veto list on a round where nothing was read whole. Truncation by a
+  **budget** still vetoes — someone typed that number and can raise it, so it is a
+  fact about the round. A third constant, the argv ceiling antigravity had while its
+  prompt travelled in argv, went when agy moved to stdin; the baseline loader still
+  reads its flag off older payloads, as described above.
 - **No settled CI result is its own veto, and it is not the same as nothing read**
   (#546). Every bullet above asks whether a seat read the diff; a round can satisfy
   all of them and still have had no test run against the code. `ci_status` used to
@@ -1704,8 +1696,9 @@ evidence about the writer, not about the round.
 **This is not a diff budget, and that distinction is the whole design.** v2.16 refused a
 default budget on evidence — truncating when nothing forces it biases toward false
 positives — and that reasoning is untouched. A budget answers *what to send*; this answers
-*whether to start*, and only ever against a ceiling that already exists. **On a repo with
-`max_diff_chars` unset there is no ceiling, so none of this ever fires** and no number it invented reaches anyone's diff.
+*whether to start*, and only ever against a ceiling that already exists. **On a repo
+with `max_diff_chars` unset there is no ceiling, so none of this ever fires** and no
+number it invented reaches anyone's diff.
 
 **Nor is it a silent skip.** A panel that quietly declines is a merge gate trusting a proxy.
 A refusal:

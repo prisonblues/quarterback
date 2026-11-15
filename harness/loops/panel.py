@@ -4821,8 +4821,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
     # May the seats read the PR's code (#113)? A per-repo setting, ON by default,
     # and the seats that can actually use it are `tool_seats(rev)`: SEAT_READS_CODE,
-    # plus a SEAT_RUNS_CODE seat whose `tools` is on. `--no-code-access` turns it off for one run, the
-    # same shape as `--reviewers`: a switch this file honours over the config.
+    # plus a SEAT_RUNS_CODE seat whose `tools` is on. `--no-code-access` turns it
+    # off for one run, the same shape as `--reviewers`: a switch this file honours
+    # over the config.
     want_code = code_access_wanted(panel, no_code_access, notes)
     # Read even when code access is off, so a misconfigured value is reported on
     # the round that carries it rather than staying silent until someone turns

@@ -471,12 +471,12 @@ DEFAULTS: dict = {
         # These are NOT a diff budget and must not become one. v2.16/#49 refused a
         # default budget on evidence — truncating when nothing forces it biases
         # toward false positives — and that stands. A budget says what to SEND;
-        # these decide whether to START, and only ever against a ceiling that
-        # already exists: a seat's `max_diff_chars`. With it null there is no
-        # ceiling, so none of this fires and
-        # no number invented here reaches anyone's diff. That is why they are ON by
-        # default and still "the safe end of the switch": the default configuration
-        # behaves exactly as it did before them.
+        # these decide whether to START, and only against a configured
+        # `max_diff_chars` (the panel's or a seat's). With none set there is no
+        # ceiling, so none of this fires and no number invented here reaches
+        # anyone's diff. That is why they are ON by default and still "the safe end
+        # of the switch": the default configuration behaves exactly as it did
+        # before them.
         #
         # How many times over the tightest seat ceiling a diff may be before the
         # round is REFUSED rather than truncated. Over the ceiling is ordinary
