@@ -5760,6 +5760,19 @@ remote shell exiting with anything else.
 Exits: 0 done (ok), 1 done (failed), 2 usage, 3 could not ask, 4 `--timeout` reached, 5 the
 watcher itself failed (so a crash is never read as exit 1).
 
+### `heavy-slot` — one memory queue for the heavy jobs on a host (#874)
+
+On 2026-11-15 four lexray CI runs filled zeus's memory twice, and both times a panel round was
+killed before it produced anything; lexray's own queue counted runs, not memory. `heavy-slot`
+admits a job when its memory fits: live reservations plus the grant stay within the budget
+(MemTotal minus `reserve`, 12G by default, or a fixed `budget`), and below MemAvailable minus
+`min_free` (2G). A job asks for `--min`/`--max` in whole `--unit`s and gets as much as fits, or
+waits, first come first served. A reservation is an flock on a file in `/tmp/heavy-slot`, so
+the kernel ends it however its holder exits: `heavy-slot run -- CMD` execs CMD holding it
+(with `HEAVY_SLOT_GRANT_BYTES`/`HEAVY_SLOT_UNITS` set), and `heavy-slot hold` prints the grant
+as JSON and holds it until its stdin closes. Config is `KEY=VALUE` in `/etc/heavy-slot.conf`,
+then `~/.config/heavy-slot.conf`, then `HEAVY_SLOT_<KEY>`. Usage and exits: `heavy-slot --help`. The queue directory is trusted: only the host's own users (rich, `github-runner` and their agents) write it, so a malformed record is ignored and nothing more is defended against.
+
 ### `qb-watch-pr` — hear about a PR instead of polling it (#822)
 
 `qb-watch-pr <pr>` is meant for the Monitor tool: one line per change, silence otherwise. State
