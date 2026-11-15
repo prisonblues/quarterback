@@ -49,10 +49,13 @@ def fmt(n: int) -> str:
 
 
 def say(text: str) -> None:
-    """A message to stderr, which our caller may have closed: that costs the message only."""
+    """A message to stderr, which our caller may have closed: that costs the message only.
+    sys.stderr is None then, and print(file=None) would write to stdout, the grant channel."""
+    if sys.stderr is None:
+        return
     try:
         print(text, file=sys.stderr, flush=True)
-    except (OSError, AttributeError):  # AttributeError: sys.stderr is None
+    except OSError:
         pass
 
 

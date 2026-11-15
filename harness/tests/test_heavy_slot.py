@@ -252,8 +252,8 @@ def test_the_command_gets_the_signal_dispositions_a_plain_launch_would(box, igno
 
 
 def test_a_caller_that_closed_stderr_still_gets_its_place_and_its_grant(box):
-    """With fd 2 closed, the first file heavy-slot opens would be fd 2, and a message
-    written there would land in its own queue record and lose it its place."""
+    """With fd 2 closed, sys.stderr is None, and the "waiting" message must not go to
+    stdout, which is where the caller reads the grant."""
     env, _, tmp = box
     first, _ = hold(env, "--min", "10G")
     waiter = spawn(env, "hold", "--min", "4G", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
