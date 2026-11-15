@@ -8071,7 +8071,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     demonstrated = frozenset(c.key for c in outstanding
                              if c.kind in DEMONSTRATED_KINDS)
     observed = frozenset(c.key for c in outstanding
-                         if c.kind == "observation") - exempt - demonstrated
+                         if c.kind == "observation") - exempt
 
     def above(key: str, floor: str) -> bool:
         return (key in exempt or key in demonstrated
@@ -8363,6 +8363,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
+        if observed:
+            reason += f" ({len(observed)} observation(s), none blocking)"
     # #84, and BEFORE the cap on purpose: both can be true of the same round, and
     # "the rounds stopped being about different things" is the more specific truth
     # than "the counter ran out". A cap reached is a cost bound; this is a futility

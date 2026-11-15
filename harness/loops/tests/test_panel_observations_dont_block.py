@@ -70,7 +70,7 @@ def test_a_class_with_only_observations_is_refused_before_gh_is_called(monkeypat
         raise AssertionError("gh must not be called for an observation")
     monkeypatch.setattr(pc, "gh", gh)
     ledger, _ = _ledger("observation")
-    with pytest.raises(ValueError, match="observation"):
+    with pytest.raises(ValueError, match="not a demonstrated failure"):
         pc.file_class(ledger, "resolver drift", 1, "pre-existing", "acme/board", 34)
 
 
@@ -103,3 +103,24 @@ def test_an_observation_is_listed_apart_from_to_fix(monkeypatch, tmp_path, capsy
     assert "### To fix (1)" in report
     assert "### Observations, not blocking (1)" in report
     assert "could be general" in report.split("### Observations, not blocking")[1]
+
+
+def test_a_later_record_of_the_same_sighting_fills_its_kind():
+    """879-F11: the dedup kept the first record whole, so a sighting first recorded
+    untyped could never become fileable, which is the route `file`'s error names."""
+    ledger = pc.new_ledger("acme/board", 34)
+    pc.mark_round(ledger, 1)
+    pc.record(ledger, "resolver drift", 1, "a.py:1", invariant="one resolver")
+    pc.record(ledger, "resolver drift", 1, "a.py:1", kind="regression")
+    [sighting] = pc.find_class(ledger, "resolver drift")["sightings"]
+    assert sighting["kind"] == "regression"
+
+
+def test_a_p4_claim_miss_buys_a_round_too():
+    c = _finding("P4", "claim_miss")
+    assert _stop(c, trigger_floor="P2", cleared_floor="P2")["stop"] is False
+
+
+def test_a_dry_stop_says_how_many_observations_it_held():
+    d = panel.round_stop(1, 5, [], [_finding("P2", "observation")], [])
+    assert d["stop"] is True and "1 observation(s), none blocking" in d["reason"]

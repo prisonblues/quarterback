@@ -357,7 +357,9 @@ def record(ledger: dict, name: str, round_no: int, path: str, *,
     whether the fix about to be written for it may be a per-path patch.
 
     The sighting is recorded whether or not the class is owed a structural fix:
-    `declare_premise`'s rule, because the count is what the next decision reads."""
+    `declare_premise`'s rule, because the count is what the next decision reads.
+    ``kind`` is what the judge typed the finding as (#623); an observation is no
+    strike, and a kind that is not one of :data:`FINDING_KINDS` is refused."""
     name = " ".join(str(name).split())
     path = str(path).strip()
     if not name or not class_key(name):
@@ -368,6 +370,8 @@ def record(ledger: dict, name: str, round_no: int, path: str, *,
                          "reaches it, this instance was found on")
     if _round(round_no) is None:
         raise ValueError("rounds are numbered from 1")
+    if kind and kind not in FINDING_KINDS:
+        raise ValueError(f"--kind {kind!r}: expected one of {', '.join(FINDING_KINDS)}")
     entry = find_class(ledger, name)
     new = entry is None
     if new:
@@ -386,13 +390,15 @@ def record(ledger: dict, name: str, round_no: int, path: str, *,
                          ("guard_test", guard_test)):
         if value.strip() and not entry[field]:
             entry[field] = " ".join(value.split())
-    if kind and kind not in FINDING_KINDS:
-        raise ValueError(f"--kind {kind!r}: expected one of {', '.join(FINDING_KINDS)}")
-    sighting = {"round": round_no, "path": path, "finding": str(finding or ""),
-                "kind": kind}
-    if not any(s["round"] == round_no and _path_norm(s["path"]) == _path_norm(path)
-               for s in entry["sightings"]):
-        entry["sightings"].append(sighting)
+    same = [s for s in entry["sightings"]
+            if s["round"] == round_no and _path_norm(s["path"]) == _path_norm(path)]
+    if not same:
+        entry["sightings"].append({"round": round_no, "path": path,
+                                   "finding": str(finding or ""), "kind": kind})
+    elif kind and not same[0].get("kind"):
+        # A later record of the same sighting FILLS its kind, the rule the
+        # invariant follows above; it never rewrites one already recorded.
+        same[0]["kind"] = kind
     return {"key": entry["key"], "name": entry["name"], "new": new,
             "strikes": strikes(entry), "limit": limit,
             "owed": is_owed(entry, limit), "structural": bool(entry["structural"])}
@@ -514,9 +520,9 @@ def file_class(ledger: dict, name: str, round_no: int, rule: str, github: str,
     # sighting nobody typed, is listed on the PR instead.
     if not any(s.get("kind") in DEMONSTRATED_KINDS for s in entry["sightings"]):
         raise ValueError(f"[{entry['key']}] has no sighting typed regression or "
-                         "claim_miss, so it is an observation: list it on the PR, do "
-                         "not file it (record the sighting with --kind or --payload "
-                         "--finding if the judge did type it)")
+                         "claim_miss, so it is not a demonstrated failure: list it on "
+                         "the PR, do not file it (record the sighting with --kind, or "
+                         "--payload --finding, if the judge did type it)")
     body = issue_body(entry, pr, round_no, rule)
     found = gh("issue", "list", "--repo", github, "--state", "open", "--search",
                f'"class-key: {entry["key"]}" in:body', "--json", "number",

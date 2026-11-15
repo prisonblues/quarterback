@@ -1179,8 +1179,8 @@ the story that fix passes spend their lines on.
 `round_stop` applies this mechanically (#623): a judge-typed `observation` is
 subtracted before every rule and listed in `round_stop.observed` and under
 **Observations, not blocking**; a typed `regression` or `claim_miss` blocks at any
-severity; an untyped finding keeps the severity floors. Fix an observation only if it is
-trivial, and never file one.
+severity; an untyped finding keeps the severity floors. An observation is optional to
+fix, and is never filed.
 
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer
