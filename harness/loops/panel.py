@@ -117,6 +117,7 @@ import panel_propose  # noqa: F401
 import panel_rounds  # noqa: F401
 import panel_scope  # noqa: F401
 import panel_seats  # noqa: F401
+import panel_slot
 
 # #771's locality matcher, and the ONE import in this file that is allowed to
 # fail. Everything it is used for is a second opinion beside an answer this file
@@ -2552,6 +2553,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             round_no = round_inferred_from + 1
     else:
         prior = load_baseline(baseline or [], {**identity, "round": round_no})
+    # #874: wait for memory first, before the board, the dials or the PR are read, so a
+    # long wait cannot leave the round on stale state. Held until the process exits.
+    memory_note = panel_slot.reserve(pr_number)
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
     # Every config diagnostic this run will report. Initialised HERE, not beside the
@@ -2564,7 +2568,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # a floor without a pull request. First, before the dial resolution below it,
     # because it is about where the dials came FROM and reads oddly after a
     # complaint about one of their values.
-    notes: list[str] = board_dial_notes(cfg)
+    notes: list[str] = board_dial_notes(cfg) + ([memory_note] if memory_note else [])
     if round_inferred_from is not None:
         notes.append(f"--round not given: this is round {round_no}, the round after "
                      f"--baseline's round {round_inferred_from}")
