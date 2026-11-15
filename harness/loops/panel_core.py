@@ -2700,28 +2700,41 @@ def _findings_of(reviewer: str, obj: dict, items: list) -> list[Finding]:
     return out
 
 
-def _verdict_reading(v: dict) -> tuple:
-    """One verdict as :func:`_parse_verdicts` will read it — every field it
-    consumes, normalised the way it normalises them, and nothing else.
+def _verdict_fields(v: dict) -> dict:
+    """Every field of one judge verdict, normalised. The ONLY reader of a verdict:
+    :func:`panel_rounds._parse_verdicts` builds its record from this and
+    :func:`_verdict_reading` compares candidates by it, so a field cannot be parsed
+    without also being compared (a guard test holds the parser to it).
 
-    The judge's counterpart to :func:`_findings_of`, and needed for the same
-    reason: two spellings of one ruling (`"severity": "p1"`, a `title` where a
-    `synthesis` was asked for, a repeated member id, an extra key nobody reads)
-    are one ruling, and the judge gets no retry when they are mistaken for
-    two."""
+    ``severity`` and ``file`` are ``""`` when the judge gave none; the parser
+    falls back to the worst report's. ``premise`` is read whether or not it was
+    asked; the parser drops it when it was not."""
     rel = v.get("related")
-    return (
-        str(v["id"]) if v.get("id") is not None else None,
-        tuple(dict.fromkeys(_member_ids(v.get("members")))),
-        _ruling(v.get("real")),
-        _severity(v.get("severity"), ""),
-        str(v.get("file") or "").strip(),
-        v.get("line") if isinstance(v.get("line"), int) else None,
-        str(v.get("synthesis") or v.get("title") or "").strip(),
-        tuple(str(r) for r in rel) if isinstance(rel, list) else (),
-        str(v.get("reason") or v.get("rationale") or "").strip(),
-        _finding_kind(v.get("kind"), v.get("evidence")),
-    )
+    kind, kind_said, evidence = _finding_kind(v.get("kind"), v.get("evidence"))
+    return {
+        "id": str(v["id"]) if v.get("id") is not None else None,
+        "members": tuple(dict.fromkeys(_member_ids(v.get("members")))),
+        "members_raw": v.get("members"),
+        "real": _ruling(v.get("real")),
+        "severity": _severity(v.get("severity"), ""),
+        "file": str(v.get("file") or "").strip(),
+        "line": v.get("line") if isinstance(v.get("line"), int) else None,
+        "synthesis": str(v.get("synthesis") or v.get("title") or "").strip(),
+        "related": tuple(str(r) for r in rel) if isinstance(rel, list) else (),
+        "reason": str(v.get("reason") or v.get("rationale") or "").strip(),
+        "premise": _premise_verdict(v.get("premise")),
+        "kind": kind, "kind_said": kind_said, "evidence": evidence,
+    }
+
+
+def _verdict_reading(v: dict) -> tuple:
+    """One verdict as :func:`_parse_verdicts` will read it, for telling two judge
+    candidates apart: two spellings of one ruling (`"severity": "p1"`, a `title`
+    where a `synthesis` was asked for, a repeated member id, an extra key nobody
+    reads) are one ruling, and the judge gets no retry when they are mistaken for
+    two. ``members_raw`` is left out: it only words a diagnostic."""
+    f = _verdict_fields(v)
+    return tuple(val for k, val in f.items() if k != "members_raw")
 
 
 def _str_list(val) -> list[str]:
@@ -3563,7 +3576,7 @@ __all__ = [
     "CoverageRule", "_rulings",
     "_read", "_Ambiguous", "_AMBIGUOUS", "_agreed",
     "extract_json_value", "_severity", "_TRUTHY", "_flag",
-    "_to_findings", "_findings_of", "_verdict_reading", "_str_list",
+    "_to_findings", "_findings_of", "_verdict_fields", "_verdict_reading", "_str_list",
     "_declaration", "parse_reply", "_raw_finding", "_member_ids",
     "_ruling", "ASK_VERDICTS", "_ASK_ALIASES", "ASK_REASON_CHARS",
     "_REVIEW_SHAPED", "_cut", "_ask_reason", "Answer",

@@ -2378,20 +2378,21 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
 
 
 def kind_line(findings: list[Canonical]) -> str:
-    """One summary line counting what the judge said the findings ARE (#623).
+    """The kinds the judge gave the listed findings (#623), as ``label N`` pairs.
 
-    Recorded and nothing more: no rule reads the kind yet. ``""`` when no finding
-    has a readable kind (the judge gave none, or gave a word outside
-    :data:`FINDING_KINDS`), so such a round reads as it always did."""
+    A fixed table rather than a sentence, so there is no wording to drift from
+    the counts. ``downgraded`` counts the findings the judge called a regression
+    or claim_miss without evidence. ``""`` when nothing listed has a kind."""
     tally = Counter(c.kind or "untyped" for c in findings)
     if len(findings) == tally["untyped"]:
         return ""
-    parts = [f"{tally[k]} {k}" for k in (*FINDING_KINDS, "untyped") if tally[k]]
-    unbacked = sum(1 for c in findings if c.kind and c.kind_said != c.kind)
-    tail = (f"; {unbacked} said to be {' or '.join(DEMONSTRATED_KINDS)} without "
-            f"evidence, so counted as {'observations' if unbacked > 1 else 'an observation'}"
-            if unbacked else "")
-    return f"_Kinds: {', '.join(parts)}{tail}. Recorded only; nothing stops on it yet._"
+    tally["downgraded"] = sum(1 for c in findings if c.kind and c.kind_said != c.kind)
+    pairs = [f"{k} {tally[k]}" for k in KIND_LINE_LABELS if tally[k]]
+    return f"_Kinds: {' · '.join(pairs)} (recorded only)_"
+
+
+#: The labels :func:`kind_line` may print, in order.
+KIND_LINE_LABELS = (*FINDING_KINDS, "untyped", "downgraded")
 
 
 def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,

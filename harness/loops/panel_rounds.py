@@ -639,14 +639,13 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
         # parsing kept it, and the two must not disagree about what a verdict is.
         if not _is_answer(v, "verdicts"):
             continue
-        # dict.fromkeys: one verdict listing the same report twice must not
-        # credit its reviewer twice.
-        members = list(dict.fromkeys(
-            i for i in _member_ids(v.get("members"))
-            if 0 <= i < len(flat) and i not in claimed))
+        f = _verdict_fields(v)
+        # `f["members"]` is already deduplicated: one verdict listing the same
+        # report twice must not credit its reviewer twice.
+        members = [i for i in f["members"] if 0 <= i < len(flat) and i not in claimed]
         if not members:
-            if v.get("members"):
-                dropped.append(f"{v.get('id') or '?'}: members={v.get('members')!r}")
+            if f["members_raw"]:
+                dropped.append(f"{f['id'] or '?'}: members={f['members_raw']!r}")
             continue
         claimed.update(members)
         accounts = [flat[i] for i in members]
@@ -655,28 +654,24 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
         # worst report's own. Falling back to the whole joined account instead
         # would put a detail — up to RAW_DETAIL_CHARS of it — in the synthesis,
         # which the board stores as the title.
-        synthesis = str(v.get("synthesis") or v.get("title") or "").strip()
-        kind, kind_said, evidence = _finding_kind(v.get("kind"), v.get("evidence"))
         c = Canonical(
             id=_finding_id(pr, len(out) + 1),
-            severity=_severity(v.get("severity"), rep.severity),
-            file=str(v.get("file") or rep.file),
-            line=v.get("line") if isinstance(v.get("line"), int) else rep.line,
-            synthesis=synthesis or rep.title,
-            verdict=_ruling(v.get("real")),
+            severity=f["severity"] or rep.severity,
+            file=f["file"] or rep.file,
+            line=f["line"] if f["line"] is not None else rep.line,
+            synthesis=f["synthesis"] or rep.title,
+            verdict=f["real"],
             detail=rep.detail,
             reported_by=accounts,
-            rationale=str(v.get("reason") or v.get("rationale") or "").strip(),
+            rationale=f["reason"],
             # #67, and only ever present when the recurrence brief was in the
             # prompt — a judge that was never asked cannot answer, and a stray key
             # on a round-1 reply normalises to "" like any other unreadable value.
-            premise_verdict=_premise_verdict(v.get("premise")) if asked else "",
-            kind=kind, kind_said=kind_said, evidence=evidence,
+            premise_verdict=f["premise"] if asked else "",
+            kind=f["kind"], kind_said=f["kind_said"], evidence=f["evidence"],
         )
         out.append(c)
-        rel = v.get("related")
-        links.append((c, str(v["id"]) if v.get("id") is not None else None,
-                      rel if isinstance(rel, list) else []))
+        links.append((c, f["id"], f["related"]))
 
     if dropped:
         print(f"panel: judge verdict(s) named no valid report id and were dropped "
