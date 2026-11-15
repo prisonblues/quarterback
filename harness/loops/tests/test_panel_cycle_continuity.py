@@ -12,10 +12,13 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_classes  # noqa: E402
 import panel_core  # noqa: E402  — `sh`, the seam every stub here replaces
+import panel_rounds  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
 CFG = {"github": "acme/board", "path": "/nonexistent/acme-board",
@@ -27,7 +30,7 @@ HEAD = "abc1230000000000000000000000000000000000"
 NOT_EARLIER = "which is not earlier than this run's round"
 
 
-def _stub(monkeypatch):
+def _stub(monkeypatch, runs=()):
     monkeypatch.setattr(panel, "load_repo_cfg", lambda name: CFG)
     monkeypatch.setattr(panel_core, "sh", gh_stub(
         meta={"title": "fix: a real bug", "additions": 3, "deletions": 1,
@@ -39,12 +42,13 @@ def _stub(monkeypatch):
     monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
     monkeypatch.setattr(panel, "adjudicate",
                         lambda *a, **k: ([], None, panel.CoverageRuling()))
-    monkeypatch.setattr(panel, "board_get", lambda path, params: ({"runs": []}, ""))
+    monkeypatch.setattr(panel, "board_get",
+                        lambda path, params: ({"runs": list(runs)}, ""))
 
 
-def _cli(monkeypatch, capsys, out: Path, *extra):
+def _cli(monkeypatch, capsys, out: Path, *extra, runs=()):
     """The run as the nix-fleet agent made it: through `main()`, flags only."""
-    _stub(monkeypatch)
+    _stub(monkeypatch, runs)
     monkeypatch.setattr(sys, "argv", ["panel.py", "--repo", "board", "--pr", "34",
                                       "--no-record", "--json-file", str(out), *extra])
     code = panel.main()
@@ -89,7 +93,7 @@ def test_the_nix_fleet_sequence_continues_the_cycle_as_the_next_round(
     assert NOT_EARLIER not in _notes(r2)
     assert "--round not given: this is round 2, the round after --baseline's round 1" \
         in _notes(r2)
-    assert "cannot continue this PR's cycle" not in err + _notes(r2)
+    assert LOST not in err + _notes(r2)
 
 
 def test_the_round_follows_the_LATEST_baseline(monkeypatch, capsys, tmp_path):
@@ -111,6 +115,21 @@ def test_an_explicit_round_still_wins(monkeypatch, capsys, tmp_path):
 
 
 LOST = "cannot continue this PR's cycle"
+MINTED = object()
+
+
+def _assert_lost(err: str, r: dict, said: str, round_no: int, cycle) -> None:
+    """The ONE way a test here checks a lost-cycle warning (#866): the message once
+    on stderr and once in the notes, AND the round and cycle it describes, so a test
+    cannot pin the text of a warning about a state it never looks at. `cycle` is
+    None for "records cycle null", or MINTED for a new cycle this run started."""
+    assert err.count(LOST) == 1 and _notes(r).count(LOST) == 1
+    assert said in err and said in _notes(r)
+    assert r["round"] == round_no
+    if cycle is MINTED:
+        assert r["cycle"] and r["cycle"] == r["run_key"], "a new cycle, minted here"
+    else:
+        assert r["cycle"] == cycle
 
 
 def test_a_ledger_with_earlier_rounds_and_no_baseline_says_a_new_cycle_starts(
@@ -120,22 +139,17 @@ def test_a_ledger_with_earlier_rounds_and_no_baseline_says_a_new_cycle_starts(
     state it describes is the state recorded."""
     ledger = _ledger_at(tmp_path / "classes.json", 1)
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--class-ledger", ledger)
-    said = ("round 1 cannot continue this PR's cycle: no --baseline was given, though "
-            "the class ledger is at round 2 of this PR, so it starts a NEW panel cycle")
-    assert said in err
-    assert said in _notes(r)
-    assert r["round"] == 1 and r["cycle"], "a new cycle, minted here"
+    _assert_lost(err, r, "round 1 cannot continue this PR's cycle: no --baseline was "
+                 "given, though the class ledger is at round 2 of this PR, so it starts "
+                 "a NEW panel cycle", 1, MINTED)
 
 
 def test_a_later_round_with_no_baseline_records_cycle_null_and_says_so(
         monkeypatch, capsys, tmp_path):
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--round", "2",
                      "--max-rounds", "3")
-    said = ("round 2 cannot continue this PR's cycle: no --baseline was given, so it "
-            "records cycle null")
-    assert said in err
-    assert said in _notes(r)
-    assert r["cycle"] is None
+    _assert_lost(err, r, "round 2 cannot continue this PR's cycle: no --baseline was "
+                 "given, so it records cycle null", 2, None)
 
 
 def test_an_unusable_baseline_without_round_says_the_cycle_is_lost(
@@ -146,19 +160,29 @@ def test_an_unusable_baseline_without_round_says_the_cycle_is_lost(
     other.write_text(json.dumps({"github": "acme/board", "pr": 99, "round": 1,
                                  "cycle": "c-other"}))
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--baseline", str(other))
-    said = ("round 1 cannot continue this PR's cycle: none of its --baseline payloads "
-            "was accepted (see the baseline notes), so it starts a NEW panel cycle")
-    assert said in err
-    assert r["round"] == 1 and r["cycle"] != "c-other"
+    _assert_lost(err, r, "round 1 cannot continue this PR's cycle: none of its "
+                 "--baseline payloads was accepted (see the baseline notes), so it "
+                 "starts a NEW panel cycle", 1, MINTED)
 
 
 def test_a_non_utf8_baseline_is_reported_not_fatal(monkeypatch, capsys, tmp_path):
+    """Beside a good round 1, so the round is attributable and every baseline reader
+    runs over the bad file too, not only `load_baseline`."""
+    _cli(monkeypatch, capsys, tmp_path / "r1.json", "--max-rounds", "4")
     bad = tmp_path / "bad.json"
     bad.write_bytes(b"\xff\xfe{")
-    code, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--baseline", str(bad))
+    code, _, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
+                      "--baseline", str(tmp_path / "r1.json"), "--baseline", str(bad))
     assert code == 0
+    assert r["round"] == 2
     assert "unreadable (UnicodeDecodeError)" in _notes(r)
-    assert "none of its --baseline payloads was accepted" in err
+
+
+@pytest.mark.parametrize("reader", ["earlier_round_files", "earlier_round_registers"])
+def test_every_baseline_reader_skips_a_non_utf8_file(tmp_path, reader):
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b"\xff\xfe{")
+    getattr(panel, reader)([str(bad)], "acme/board", 34, 2, None)
 
 
 def test_a_baseline_with_no_round_field_is_round_1_for_inference_too(
@@ -197,8 +221,8 @@ def test_an_accepted_baseline_with_no_cycle_id_is_named_as_such(
     (tmp_path / "r1.json").write_text(json.dumps(base))
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
                      "--baseline", str(tmp_path / "r1.json"))
-    assert r["round"] == 2
-    assert "its --baseline payloads record no cycle id" in err
+    _assert_lost(err, r, "round 2 cannot continue this PR's cycle: its --baseline "
+                 "payloads record no cycle id, so it records cycle null", 2, None)
     assert "see the baseline notes" not in err
 
 
@@ -206,9 +230,9 @@ def test_one_lost_cycle_is_one_warning(monkeypatch, capsys, tmp_path):
     ledger = _ledger_at(tmp_path / "classes.json", 1)
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--class-ledger", ledger,
                      "--round", "2", "--max-rounds", "3")
-    assert err.count(LOST) == 1
-    assert _notes(r).count(LOST) == 1
-    assert "records cycle null" in err
+    _assert_lost(err, r, "round 2 cannot continue this PR's cycle: no --baseline was "
+                 "given, though the class ledger is at round 2 of this PR, so it records "
+                 "cycle null", 2, None)
 
 
 def test_a_round_inferred_past_the_cap_names_the_baseline_not_a_flag(
@@ -223,3 +247,72 @@ def test_a_round_inferred_past_the_cap_names_the_baseline_not_a_flag(
     else:
         raise AssertionError("round 4 of a 3-round cap ran")
     assert "--baseline (its latest round is 3), so round 4 is past the cap of 3" in said
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({}, 1), ({"round": None}, 1), ({"round": 0}, 1), ({"round": 2}, 2),
+    ({"round": True}, None), ({"round": "2"}, None), ({"round": -1}, None),
+])
+def test_one_reading_of_a_payloads_round(payload, expected):
+    assert panel_rounds.payload_round(payload) == expected
+
+
+def test_a_negative_round_is_malformed_not_a_round_to_follow(monkeypatch, capsys,
+                                                             tmp_path):
+    base = {"github": "acme/board", "pr": 34, "round": -5, "cycle": "c-1"}
+    (tmp_path / "b.json").write_text(json.dumps(base))
+    _, _, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
+                   "--baseline", str(tmp_path / "b.json"))
+    assert r["round"] == 2
+    assert "has a malformed round (-5) — counted as round 1" in _notes(r)
+
+
+def test_a_missing_round_reads_the_same_in_every_baseline_reader(tmp_path):
+    """A payload with no `round` is round 1 to `load_baseline`, so the readers beside
+    it must not skip it as unreadable."""
+    base = {"github": "acme/board", "pr": 34, "cycle": "c-1",
+            "coverage_declarations": [{"key": "ca-1", "declaration": "x"}]}
+    (tmp_path / "b.json").write_text(json.dumps(base))
+    declared = panel.earlier_round_registers([str(tmp_path / "b.json")], "acme/board",
+                                             34, 2, "c-1")
+    assert "ca-1" in json.dumps(declared, default=str)
+
+
+def test_continue_cycle_needs_only_the_baseline(monkeypatch, capsys, tmp_path):
+    """The relaxed refusal: `--continue-cycle --baseline r1.json` with no `--round`
+    continues the stopped cycle as round 2."""
+    _, _, r1 = _cli(monkeypatch, capsys, tmp_path / "r1.json", "--max-rounds", "4")
+    stopped = {"id": "run-1", "round": 1, "cycle": r1["cycle"], "head_sha": HEAD,
+               "ts": "2026-11-15T05:00:00+00:00", "stopped": True,
+               "stop_reason": "84% of new findings were introduced by the fix pass",
+               "stop_confident": False, "stop_veto": []}
+    _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json",
+                    "--baseline", str(tmp_path / "r1.json"), "--continue-cycle",
+                    "--answered-by", "owner", "--why", "run round 2", runs=[stopped])
+    assert r2["round"] == 2 and r2["cycle"] == r1["cycle"]
+    assert r2["stop_answered"]["by"] == "owner"
+
+
+def test_every_lost_cycle_warning_here_is_checked_through_assert_lost():
+    """The guard on `_assert_lost`: a test that names the warning's text without
+    calling it would be the text-only check the helper exists to rule out."""
+    import ast
+    tree = ast.parse(Path(__file__).read_text())
+    for fn in tree.body:
+        if not (isinstance(fn, ast.FunctionDef) and fn.name.startswith("test_")):
+            continue
+        texts = [n.value for n in ast.walk(fn)
+                 if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        calls = {n.func.id for n in ast.walk(fn)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+        if any(LOST in t for t in texts):
+            assert "_assert_lost" in calls, fn.name
+
+
+def test_no_message_tells_a_caller_round_is_required_beside_a_baseline():
+    """#866 made `--round` optional whenever a `--baseline` is accepted, and every
+    remedy that still demanded it was stale text in front of a caller."""
+    src = (Path(__file__).resolve().parent.parent / "panel.py").read_text()
+    for stale in ("with --round", "--round and --baseline alone",
+                  "(default 1). Round 2+"):
+        assert stale not in src, stale

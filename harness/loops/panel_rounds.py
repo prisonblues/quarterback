@@ -2556,6 +2556,24 @@ def _inherit_assessed(into: dict[str, Assessment], raw: object, was: int, path,
                 else ASSESSED_UNATTESTED)
 
 
+def payload_round(payload: dict) -> int | None:
+    """The round a panel payload is, read ONE way for every reader (#866): absent,
+    null or 0 is round 1 (a payload from before the field), a whole number from 1
+    up is itself, and anything else (a bool, a string, a negative) is None."""
+    was = payload.get("round") or 1
+    if isinstance(was, bool) or not isinstance(was, int) or was < 1:
+        return None
+    return was
+
+
+def payload_cycle(payload: dict) -> str:
+    """The cycle a panel payload belongs to, read one way for every reader: the id
+    the caller minted, or for a round 1 from before the field the ``run_key`` it
+    recorded itself under, which is unique to that process and just as stable. ""
+    for a payload that says neither, which conflicts with nothing."""
+    return str(payload.get("cycle") or payload.get("run_key") or "")
+
+
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     """Every finding earlier rounds of this PR already raised, from their
     ``--json-file`` payloads.
@@ -2660,9 +2678,8 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
             b.problems.append(f"baseline {path} is another review's — " + ", ".join(wrong)
                               + " — its findings were NOT counted as earlier rounds")
             continue
-        try:
-            was = int(payload.get("round") or 1)
-        except (TypeError, ValueError):
+        was = payload_round(payload)
+        if was is None:
             b.problems.append(f"baseline {path} has a malformed round "
                               f"({payload.get('round')!r}) — counted as round 1")
             was = 1
@@ -2672,12 +2689,8 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
                               "run actually is — its findings were NOT counted as earlier "
                               "rounds")
             continue
-        # A cycle id the caller minted, or — for a round 1 that predates the
-        # field — the run_key it recorded itself under, which is unique to that
-        # process and is exactly as stable. "" for a payload that says neither,
-        # which conflicts with nothing and inherits whatever the set decides.
-        usable.append((was, str(payload.get("cycle") or payload.get("run_key") or ""),
-                       path, payload))
+        # "" for a payload that says neither, which inherits whatever the set decides.
+        usable.append((was, payload_cycle(payload), path, payload))
 
     # The cycle named by the EARLIEST round that names one, keyed on the round
     # alone rather than by min() over the whole tuple: min() fell through to
@@ -9448,7 +9461,7 @@ __all__ = [
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
     "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
     "_introduced", "_trend_row",
-    "_inherit", "DECLINED_COST", "_inherit_declined", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
+    "_inherit", "DECLINED_COST", "_inherit_declined", "load_baseline", "payload_round", "payload_cycle", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
     "CI_NOT_APPLICABLE", "round_stop",
     "CLAIM_KEY_PREFIX", "CLAIM_KEY_RE", "_claim_norm", "claim_key",
     "is_claim_key", "Obligation", "CoverageRuling", "_coverage_ruling",

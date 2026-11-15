@@ -938,13 +938,14 @@ def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
             continue
         if payload.get("github") != gh_repo or payload.get("pr") != pr_number:
             continue
-        try:
-            was = int(payload.get("round"))
-        except (TypeError, ValueError):
+        # `load_baseline`'s own reading of the round and the cycle (#866): a
+        # parser of its own here skipped a payload with no `round` that
+        # `load_baseline` had accepted as round 1.
+        was = panel_rounds.payload_round(payload)
+        if was is None or was >= round_no:
             continue
-        if not 1 <= was < round_no:
-            continue
-        if cycle and payload.get("cycle") and payload.get("cycle") != cycle:
+        got = panel_rounds.payload_cycle(payload)
+        if cycle and got and got != cycle:
             continue
         # Set HERE, past every identity check and beside the union rather than at
         # the top of the loop: "readable" has to mean an earlier round OF THIS
@@ -1041,13 +1042,14 @@ def earlier_round_registers(paths: list[str], gh_repo: str, pr_number: int,
             continue
         if payload.get("github") != gh_repo or payload.get("pr") != pr_number:
             continue
-        try:
-            was = int(payload.get("round"))
-        except (TypeError, ValueError):
+        # `load_baseline`'s own reading of the round and the cycle (#866): a
+        # parser of its own here skipped a payload with no `round` that
+        # `load_baseline` had accepted as round 1.
+        was = panel_rounds.payload_round(payload)
+        if was is None or was >= round_no:
             continue
-        if not 1 <= was < round_no:
-            continue
-        if cycle and payload.get("cycle") and payload.get("cycle") != cycle:
+        got = panel_rounds.payload_cycle(payload)
+        if cycle and got and got != cycle:
             continue
         for row in payload.get("coverage_declarations") or []:
             if isinstance(row, dict) and row.get("key") and row.get("declaration"):
@@ -2380,11 +2382,12 @@ def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
     """Why this run cannot continue its PR's cycle, or "" when it can or need not.
 
     Said on stderr and in the config notes (#866), because a cycle lost by accident
-    otherwise reads exactly like a first review. Decided from what `load_baseline`
-    accepted, not from which flags were passed: a `--baseline` nobody could use
-    loses the cycle as surely as none. `new_cycle` is the caller starting one on
-    purpose, and a round 1 with no baseline and no earlier ledger round is a cycle's
-    real start."""
+    otherwise reads exactly like a first review. Whether the cycle continues is read
+    off what `load_baseline` accepted (`prior.cycle`), never off the flags: a
+    `--baseline` nobody could use loses the cycle as surely as none. The flags only
+    say whether a continuation was EXPECTED: a baseline given, a round past 1, or a
+    ledger with earlier rounds. `new_cycle` is the caller starting one on purpose,
+    and a round 1 with none of those is a cycle's real start."""
     if new_cycle or prior.cycle:
         return ""
     if not (baseline_given or round_no > 1 or ledger_round > 1):
@@ -2803,11 +2806,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                   "repo being reviewed — clear or move the dial on the board"
                   if round_cap_ceiling is not None and cap == round_cap_ceiling
                   else "raise the cap")
-        said = ("--round" if round_inferred_from is None
-                else "--baseline (its latest round is "
-                f"{round_inferred_from}), so round")
+        if round_inferred_from is None:
+            said, tail = "--round", ", or pass the round this run actually is"
+        else:
+            said, tail = (f"--baseline (its latest round is {round_inferred_from}), "
+                          "so round", "")
         sys.exit(f"panel: {said} {round_no} is past the cap of {cap}, from {blame}: "
-                 f"{remedy}, or pass the round this run actually is")
+                 f"{remedy}{tail}")
 
     # #55's spend ceiling, RESOLVED here and CHECKED further down. The two halves
     # are split because they cost different things and want different moments: this
@@ -3184,9 +3189,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # serialised a skipped round 2 as round 1 with a fresh id, which then
             # collided with the real round 1 over the round number and renamed
             # the cycle out from under every later round.
-            skip_prior = load_baseline(baseline or [],
-                                       {"repo": repo_name, "github": gh_repo,
-                                        "pr": pr_number, "round": round_no})
+            skip_prior = (inferred_prior if inferred_prior is not None else
+                          load_baseline(baseline or [],
+                                        {"repo": repo_name, "github": gh_repo,
+                                         "pr": pr_number, "round": round_no}))
             # A key this round was handed that the register does not already hold
             # is LOST here, and said so. The alternative — recording it — dates
             # the declaration to a round that reviewed nothing and writes it in
@@ -3505,7 +3511,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             raise SystemExit(
                 f"--continue-cycle answers a stop, and the board records none ending "
                 f"PR #{pr_number}'s cycle as it stands. Continue the cycle with "
-                "--round and --baseline alone")
+                "--baseline alone")
         # The board could not be asked. Best-effort, as every board read here is:
         # the round runs, and says it could not confirm what it was answering.
         stop_answered = {"by": answered_by, "why": answered_why,
@@ -9720,8 +9726,9 @@ def main() -> int:
     # for something this run does not do.
     ap.add_argument("--round", type=int, default=None, dest="round_no", metavar="N",
                     help="which panel/fix cycle this is (default: the round after the "
-                         "latest --baseline, or 1 without one). Round 2+ is the "
-                         "re-review of the fix commit — the one nobody reads otherwise")
+                         "latest --baseline payload that is accepted, else 1). Round 2+ "
+                         "is the re-review of the fix commit — the one nobody reads "
+                         "otherwise")
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
                     help="a previous round's --json-file payload, so this run can say "
                          "which findings no earlier round raised. Repeatable")
@@ -9835,7 +9842,8 @@ def main() -> int:
                     help="#846: the OWNER's answer to a stop. When the board says the "
                          "last round ENDED this cycle (a fix_injection stop, say), run "
                          "the NEXT round of the same cycle instead of refusing — pass "
-                         "its --round and --baseline as usual, so the baseline, "
+                         "its --baseline as usual (the round follows from it), so the "
+                         "baseline, "
                          "provenance and guards carry on. Needs --answered-by and "
                          "--why, recorded in the payload (`stop_answered`) and the "
                          "posted summary. It does not raise the round cap "
@@ -10066,7 +10074,8 @@ def main() -> int:
         if given:
             raise SystemExit(f"{flag} belongs to --ask — a PR review takes neither")
     # The sentinel has done its one job (telling `--ask --round 1` from `--ask`);
-    # from here down a round that was not named is round 1, exactly as before.
+    # from here down a round that was not named is round 1 until `run()` infers it
+    # from an accepted --baseline (`round_named`, #866).
     round_no = 1 if args.round_no is None else args.round_no
     if round_no < 1:
         raise SystemExit("--round: rounds are numbered from 1")
