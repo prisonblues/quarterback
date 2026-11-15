@@ -2375,6 +2375,14 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
                        duration_ms=elapsed())
 
 
+def warn_cycle_lost(notes: list[str], who: str, msg: str) -> None:
+    """A run that cannot continue its PR's cycle says so on stderr AND in the
+    config notes the report and the payload carry (#866): a cycle started by
+    accident otherwise reads exactly like a first review."""
+    notes.append(msg)
+    print(f"{who} ⚠️ {msg}", file=sys.stderr)
+
+
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
@@ -2441,7 +2449,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # #846's owner override, named at the call site for the reason above.
         continue_cycle: bool = False,
         answered_by: str = "",
-        answered_why: str = "") -> int:
+        answered_why: str = "",
+        # #866: False when the caller left `--round` out, so a `--baseline` names
+        # the round instead. True (the old meaning of `round_no`) for every other
+        # caller, which passes the round it means.
+        round_named: bool = True) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -2455,7 +2467,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # flag as evidence of a cycle (the shape this had for one round) produced
     # exactly what the comment above forbids: "round 1 of at most 2 — go again",
     # promising a re-review nothing will run.
-    in_cycle = max_rounds is not None or round_no > 1 or bool(baseline)
+    # A class ledger is one too (#866): it numbers this PR's rounds and spends a
+    # budget across them, so a ledger round that is not a cycle round records
+    # `cycle: null` and leaves its successor nothing to continue.
+    in_cycle = (max_rounds is not None or round_no > 1 or bool(baseline)
+                or bool(class_ledger))
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
@@ -2477,6 +2493,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # anyone who did not pass a flag they were never told to pass.
     repo_name = cfg.get("name") or repo_name
     gh_repo = cfg["github"]
+    # `--baseline` without `--round` is the round after the latest baseline (#866).
+    # Left at 1, `load_baseline` refused every baseline as "not earlier than this
+    # run's round 1", and each re-review started a new cycle with no history.
+    round_inferred_from = None
+    if not round_named and baseline:
+        round_inferred_from = panel_rounds.highest_baseline_round(
+            baseline, gh_repo, pr_number)
+        if round_inferred_from is not None:
+            round_no = round_inferred_from + 1
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
     # Every config diagnostic this run will report. Initialised HERE, not beside the
@@ -2490,6 +2515,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # because it is about where the dials came FROM and reads oddly after a
     # complaint about one of their values.
     notes: list[str] = board_dial_notes(cfg)
+    if round_inferred_from is not None:
+        notes.append(f"--round not given: this is round {round_no}, the round after "
+                     f"--baseline's round {round_inferred_from}")
     # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.
@@ -2658,6 +2686,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # round is the ledger's NEXT one, whatever the panel calls it, and the payload
     # carries that number for `panel_classes.py --payload` to record against.
     ledger_round = panel_classes.last_round(classes) + 1
+    if class_ledger and ledger_round > 1 and not baseline and not new_cycle:
+        # The ledger has earlier rounds of this PR and the panel was given none of
+        # them (#866): said out loud, because the panel then starts a NEW cycle and
+        # nothing in its own output would show the history it does not have.
+        warn_cycle_lost(notes, f"[{repo_name}#{pr_number}]",
+                        f"the class ledger is at round {ledger_round} of this PR, but "
+                        "this panel run has no --baseline, so it starts a NEW panel "
+                        "cycle: no earlier round's findings, provenance or fix_injection "
+                        "carry into it. To continue the cycle, pass --baseline <the last "
+                        "round's payload>")
     if class_ledger:
         class_refusal = panel_classes.budget_refusal(classes, ledger_round, class_strikes,
                                                      class_budget)
@@ -3681,6 +3719,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     prior = load_baseline(baseline or [],
                           {"repo": repo_name, "github": gh_repo, "pr": pr_number,
                            "round": round_no})
+    if round_no > 1 and not prior.cycle:
+        warn_cycle_lost(notes, f"[{repo_name}#{pr_number}]",
+                        f"round {round_no} found no earlier round's cycle to continue ("
+                        + ("no --baseline was given" if not baseline
+                           else "no --baseline it was given is usable — see the "
+                           "baseline notes")
+                        + "), so it records cycle null: the board cannot chain it to "
+                        "the rounds before it")
     want_scope = resolve_round_scope(scope, panel, notes)
     # `--since` wins over the baseline, and it is checked here rather than trusted:
     # the anchor is interpolated into a REST path, and a value carrying `..` or a
@@ -10117,7 +10163,8 @@ def main() -> int:
                assessed_by=args.assessed_by, no_history=args.no_history,
                class_ledger=args.class_ledger, class_wave=args.class_wave,
                class_rounds=args.class_rounds, continue_cycle=args.continue_cycle,
-               answered_by=args.answered_by, answered_why=args.answered_why)
+               answered_by=args.answered_by, answered_why=args.answered_why,
+               round_named=args.round_no is not None)
 
 
 if __name__ == "__main__":

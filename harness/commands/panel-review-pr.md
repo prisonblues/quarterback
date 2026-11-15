@@ -1010,6 +1010,12 @@ the ledger path, so every `panel_classes.py` command takes `--payload <that roun
 --json-file>` and nothing maps one numbering onto the other by hand. A `--round`,
 `--pr` or `--ledger` passed alongside it must agree with it or the command refuses.
 
+**Every re-review with a ledger still passes the earlier rounds' `--baseline`
+(#866).** The ledger numbers the rounds, but the PANEL's cycle (its id, provenance and
+`fix_injection`) is carried only by the baseline. Given `--baseline` and no `--round`,
+the run is the round after the latest baseline. A ledger with earlier rounds and no
+`--baseline` starts a new panel cycle and says so on stderr and in the summary.
+
 **After EVERY round, clean ones included, run
 `panel_classes.py mark --payload /tmp/tmp.AbC123/r<r>.json`.** A clean round records no
 sighting, so without it the next round would reuse its number. It is idempotent.
