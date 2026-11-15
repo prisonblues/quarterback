@@ -2851,9 +2851,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
     selected, override_note = select_reviewers(rev, reviewers)
-    # #874: wait for memory after every refusal that starts no seat, and before the PR is
-    # read, so a long wait cannot leave the round reviewing a head that has since moved.
-    # Held until the process exits.
+    # #874: wait for memory here, after the refusals that need no PR (enabled, unconfigured,
+    # the round cap) and before the PR is read, so a long wait cannot leave the round on a
+    # head that has since moved. Refusals decided FROM the PR (the title skip, the spend
+    # ceiling, mergeability, preflight) come after it, so such a round waits first and then
+    # reviews nothing. Held until the process exits.
     if memory_note := panel_slot.reserve(pr_number):
         notes.append(memory_note)
 
