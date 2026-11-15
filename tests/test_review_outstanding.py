@@ -61,7 +61,7 @@ def block(**over) -> dict:
     """``round_stop.outstanding`` as the panel spells it: a mixed round with real
     work, one escalation a fixer may never touch, and two below the floor."""
     disposal = {"fixable": ["k1", "k2"], "below_floor": ["k3", "k4"],
-                "escalated": ["k5"], "narrowed": [], "declined": ["k2"],
+                "escalated": ["k5"], "narrowed": [], "observed": [], "declined": ["k2"],
                 "handed_to": "fixer", "why": "a fix pass can clear them"}
     return {**disposal, **over}
 
@@ -124,7 +124,8 @@ async def test_the_disposal_survives_the_round_trip_on_both_views(client):
     got = await record(client, 7001)
     for row in (await detail(client, got["id"]), await listed(client, got["id"])):
         assert row["outstanding"] == {"fixable": 2, "below_floor": 2,
-                                      "escalated": 1, "narrowed": 0, "declined": 1}
+                                      "escalated": 1, "narrowed": 0, "declined": 1,
+                                      "observed": 0}
         assert row["handed_to"] == "fixer"
 
 
@@ -224,7 +225,8 @@ async def test_the_two_optional_buckets_do_not_cost_a_producer_its_disposal(clie
     """`narrowed` (#615) and `declined` (#665) postdate the block and no gate reads
     them, so a #42-era producer that sends neither still gets its three counted.
     Requiring them would refuse a whole disposal over two numbers nothing consults."""
-    early = {k: v for k, v in block().items() if k not in ("narrowed", "declined")}
+    early = {k: v for k, v in block().items()
+             if k not in ("narrowed", "declined", "observed")}
     got = await record(client, 7023, round_stop=stop(outstanding=early))
     assert "outstanding_dropped" not in got
     assert (await listed(client, got["id"]))["outstanding"] == {
@@ -242,7 +244,8 @@ async def test_an_unreadable_optional_bucket_is_stored_short_and_said_out_loud(c
     a value this board refused under the shape a #42-era producer legitimately sends.
     """
     got = await record(client, 7025,
-                       round_stop=stop(outstanding=block(narrowed=5, declined=None)))
+                       round_stop=stop(outstanding=block(narrowed=5, declined=None,
+                                                         observed=None)))
     assert "narrowed" in got["outstanding_dropped"]
     assert "declined" not in got["outstanding_dropped"]
     row = await listed(client, got["id"])
