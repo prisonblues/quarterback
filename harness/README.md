@@ -5771,7 +5771,7 @@ waits, first come first served. A reservation is an flock on a file in `/tmp/hea
 the kernel ends it however its holder exits: `heavy-slot run -- CMD` execs CMD holding it
 (with `HEAVY_SLOT_GRANT_BYTES`/`HEAVY_SLOT_UNITS` set), and `heavy-slot hold` prints the grant
 as JSON and holds it until its stdin closes. Config is `KEY=VALUE` in `/etc/heavy-slot.conf`,
-then `~/.config/heavy-slot.conf`, then `HEAVY_SLOT_<KEY>`. Usage and exits: `heavy-slot --help`.
+then `~/.config/heavy-slot.conf`, then `HEAVY_SLOT_<KEY>`. Usage and exits: `heavy-slot --help`. The queue directory is trusted: only the host's own users (rich, `github-runner` and their agents) write it, so a malformed record is ignored and nothing more is defended against.
 
 ### `qb-watch-pr` — hear about a PR instead of polling it (#822)
 
