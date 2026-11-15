@@ -8065,9 +8065,18 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # severity alone would put the gate issues back under it silently, which is how
     # this came back the first time.
     exempt = frozenset(c.key for c in outstanding if c.verdict == "sonar")
+    # #623: what the judge typed decides what blocks. A demonstrated regression or
+    # claim_miss blocks at any severity; an observation never does. An untyped
+    # finding (old payload, judge that did not answer) keeps the severity floors.
+    # `- demonstrated` is load-bearing: two findings can share a key, and a key a
+    # regression carries must not be subtracted because an observation carries it.
+    demonstrated = frozenset(c.key for c in outstanding
+                             if c.kind in DEMONSTRATED_KINDS)
+    observed = frozenset(c.key for c in outstanding
+                         if c.kind == "observation") - exempt - demonstrated
 
     def above(key: str, floor: str) -> bool:
-        return (key in exempt
+        return (key in exempt or key in demonstrated
                 or severity_at_least(severity.get(key, SEVERITIES[0]), floor))
 
     held = frozenset(k for k in escalated if k)
@@ -8137,7 +8146,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # decline to generalise?"). Folding them into one name would make an escalation
     # and a narrowing indistinguishable in the payload; keeping two subtractions would
     # be two places for the filter to fall out of step.
-    cleared_out = held | answered
+    cleared_out = held | answered | observed
     clearable_new = [k for k in new_keys if k not in cleared_out]
     clearable = [c for c in outstanding if c.key not in cleared_out]
     #: New findings that buy a round, and the ones that were raised and do not.
@@ -8356,6 +8365,8 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     else:
         stop, reason = True, ("dry — nothing raised that an earlier round had not"
                               if round_no > 1 else "dry — no findings to fix")
+        if observed:
+            reason += f" ({len(observed)} observation(s), none blocking)"
     # #84, and BEFORE the cap on purpose: both can be true of the same round, and
     # "the rounds stopped being about different things" is the more specific truth
     # than "the counter ran out". A cap reached is a cost bound; this is a futility
@@ -9107,6 +9118,9 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
         # owes are the caller's (`panel-review-pr.md`), and an issue is owed only where
         # the general form is itself a claim-miss.
         "narrowed": sorted(narrowed_cleared),
+        # #623: typed observations, subtracted with `held | answered` and listed
+        # so the round's finding count still reconciles.
+        "observed": sorted(observed),
         # "Nothing left to find" is a claim; "the counter hit zero" is not the
         # same claim, and the difference is exactly what a reader of a clean
         # verdict needs to see.
@@ -9442,6 +9456,7 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
             # against this block would find them nowhere and read the gap as a
             # dropped finding rather than as a fixer's declared decision.
             "narrowed": sorted(narrowed_cleared),
+            "observed": sorted(observed),
             # #665. In this block for the reason `escalated` and `narrowed` are: it
             # is the whole answer to "who gets what is left", and a known-unfixed
             # defect is left to whoever lands the PR. It is not a fourth disposal —

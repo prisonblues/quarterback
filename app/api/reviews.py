@@ -1985,7 +1985,8 @@ FIX_PASS_COUNTS = ("briefed", "placed", "cleared", "still_open",
 #: out here for :data:`FIX_PASS_COUNTS`' reason: the two halves cannot import each
 #: other, and ``tests/test_review_outstanding.py`` is where both are readable at
 #: once, which is where the drift check lives.
-OUTSTANDING_COUNTS = ("fixable", "below_floor", "escalated", "narrowed", "declined")
+OUTSTANDING_COUNTS = ("fixable", "below_floor", "escalated", "narrowed", "declined",
+                      "observed")
 #: The three of those a merge gate rules on, and therefore the three a stored
 #: disposal must carry to be stored at all (#717).
 #:
@@ -1997,10 +1998,10 @@ OUTSTANDING_COUNTS = ("fixable", "below_floor", "escalated", "narrowed", "declin
 #: round with no escalations — the one class of finding no fix pass may touch, gone
 #: in the flattering direction on the field that decides whether a PR may merge.
 #:
-#: ``narrowed`` and ``declined`` are counted when they arrive and not required.
-#: They are #615's and #665's, they postdate the block, and neither is read by a
-#: gate — so requiring them would refuse a #42-era producer's whole disposal over
-#: two numbers nothing consults.
+#: ``narrowed``, ``declined`` and ``observed`` (#623) are counted when they arrive
+#: and not required. They are #615's, #665's and #623's, they postdate the block,
+#: and no gate reads them — so requiring them would refuse a #42-era producer's
+#: whole disposal over numbers nothing consults.
 OUTSTANDING_REQUIRED = ("fixable", "below_floor", "escalated")
 #: Who a round that ENDED a cycle handed its remainder to (#42). Null on a round
 #: that went again, which is a different fact and not a fourth word.
