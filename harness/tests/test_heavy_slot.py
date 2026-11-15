@@ -222,6 +222,7 @@ def test_status_lists_holders_and_waiters(box):
     wait_for(lambda: len(queued(tmp)) == 1, "the waiter to queue")
     out = run(env, "status").stdout
     waiter.kill()
+    waiter.wait(timeout=10)
     release(first)
     assert "holds    10.0G" in out and "lexray zeus-1" in out
     assert "waits     4.0G" in out and "panel?#861" in out
@@ -260,16 +261,16 @@ def test_an_unreadable_meminfo_is_a_usage_error_not_a_traceback(box):
 
 def test_a_min_is_rounded_up_to_whole_units(box):
     env, _, _ = box
-    first, _ = hold(env, "--min", "9G")
-    r = run(env, "run", "--min", "3G", "--unit", "2G", "--timeout", "0.05", "--", "true")
-    release(first)
-    assert r.returncode == hs.EXIT_TIMEOUT  # 3G fits in the 3 left, its 4G of units does not
+    # 11G fits the 12G budget, but 11G in 5G units is 15G, which never can: refused at
+    # once. Unrounded, it would wait (the grant floors to 10G) until the timeout instead.
+    r = run(env, "run", "--min", "11G", "--unit", "5G", "--timeout", "0.05", "--", "true")
+    assert r.returncode == hs.EXIT_NEVER
 
 
 def test_config_files_are_read_in_order_and_the_environment_wins(tmp_path, monkeypatch):
     etc, user = tmp_path / "etc.conf", tmp_path / "user.conf"
-    etc.write_text("reserve = 10G\nbudget = 40G  # whole box\nbogus = 1\n")
-    user.write_text("reserve=8G\n")
+    etc.write_text("reserve = 10G\nbudget = 40G  # whole box\nmin_free = 1G\nbogus = 1\n")
+    user.write_text("reserve=8G\nmin_free=5G\n")
     monkeypatch.setattr(hs, "CONFIG_FILES", (str(etc), str(user)))
     cfg = hs.load_config({"HEAVY_SLOT_MIN_FREE": "3G"})
     assert (cfg["budget"], cfg["reserve"], cfg["min_free"]) == ("40G", "8G", "3G")
@@ -279,3 +280,34 @@ def test_config_files_are_read_in_order_and_the_environment_wins(tmp_path, monke
 def test_the_budget_defaults_to_memtotal_minus_the_reserve():
     assert hs.budget_of({"budget": "", "reserve": "12G"}, 61 * G) == 49 * G
     assert hs.budget_of({"budget": "30G", "reserve": "12G"}, 61 * G) == 30 * G
+
+
+def test_the_command_starts_with_sigpipe_and_sigxfsz_at_their_defaults(box):
+    env, _, _ = box
+    r = run(env, "run", "--min", "1G", "--", "grep", "SigIgn", "/proc/self/status")
+    ignored = int(r.stdout.split()[1], 16)
+    assert not ignored & (1 << (signal.SIGPIPE - 1) | 1 << (signal.SIGXFSZ - 1)), r.stdout
+
+
+def test_a_command_that_cannot_start_leaves_no_reservation_behind(box):
+    env, _, tmp = box
+    assert run(env, "run", "--min", "1G", "--", "/nonexistent/tool").returncode == 127
+    assert not [f for f in os.listdir(tmp / "q") if f.startswith("res-")]
+
+
+def test_a_fifo_planted_in_the_queue_cannot_block_a_reader(box):
+    env, _, tmp = box
+    run(env, "status")
+    os.mkfifo(tmp / "q" / "res-planted")
+    assert run(env, "status", "--json", timeout=5).returncode == 0
+
+
+def test_a_long_label_still_leaves_a_record_a_reader_can_parse(box):
+    env, _, _ = box
+    first, _ = hold(env, "--min", "2G", "--label", "x" * 10000)
+    try:
+        (holder,) = json.loads(run(env, "status", "--json").stdout)["holders"]
+        assert holder["bytes"] == 2 * G and len(holder["label"]) == hs.LABEL_MAX
+    finally:
+        release(first)
+

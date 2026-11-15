@@ -10,7 +10,7 @@ A job asks for memory and waits until it fits; see "heavy-slot" in harness/READM
       Prints the grant as one JSON line and holds it until its stdin closes.
   heavy-slot status [--json]
 
-Exits: 0 granted, 2 usage or an unreadable meminfo, 3 the min can never fit the budget,
+Exits: 0 granted, 2 usage or an unreadable config, meminfo or queue, 3 the min can never fit,
 4 the wait timed out, 126/127 CMD cannot be run. After the exec, `run` exits as CMD does.
 """
 
@@ -22,6 +22,8 @@ import json
 import math
 import os
 import re
+import signal
+import stat
 import sys
 import time
 
@@ -29,6 +31,8 @@ EXIT_USAGE, EXIT_NEVER, EXIT_TIMEOUT = 2, 3, 4
 DEFAULTS = {"dir": "/tmp/heavy-slot", "budget": "", "reserve": "12G", "min_free": "2G"}
 CONFIG_FILES = ("/etc/heavy-slot.conf", "~/.config/heavy-slot.conf")
 POLL_SECONDS = 2.0
+LABEL_MAX = 200  # keeps every record well inside the RECORD_MAX a reader takes
+RECORD_MAX = 4096
 SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*$", re.IGNORECASE)
 SCALE = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
@@ -52,7 +56,7 @@ def load_config(env: dict) -> dict:
         try:
             with open(os.path.expanduser(path), encoding="utf-8") as f:
                 lines = f.read().splitlines()
-        except OSError:
+        except FileNotFoundError:
             continue
         for line in lines:
             key, sep, value = line.split("#", 1)[0].partition("=")
@@ -105,14 +109,13 @@ def live(d: str, prefix: str) -> list[dict]:
         if not name.startswith(prefix):
             continue
         path = os.path.join(d, name)
-        try:
-            fd = os.open(path, os.O_RDONLY)
-        except OSError:
+        fd = _open_regular(path)
+        if fd is None:
             continue
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
-            out.append({**_fields(os.pread(fd, 4096, 0)), "file": name})
+            out.append({**_fields(os.pread(fd, RECORD_MAX, 0)), "file": name})
             continue
         finally:
             os.close(fd)
@@ -121,6 +124,19 @@ def live(d: str, prefix: str) -> list[dict]:
         except OSError:
             pass
     return out
+
+
+def _open_regular(path: str) -> int | None:
+    """Open a queue file to read, or None. Anyone can create entries here, so a FIFO, a
+    device or a symlink must not block or redirect the reader."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    if stat.S_ISREG(os.fstat(fd).st_mode):
+        return fd
+    os.close(fd)
+    return None
 
 
 def _publish(d: str, name: str, fields: dict) -> int:
@@ -140,15 +156,14 @@ def _open_admit(d: str) -> int:
     another user's file in a sticky directory is refused (fs.protected_regular)."""
     path = os.path.join(d, ".admit")
     try:
-        return os.open(path, os.O_RDONLY)
-    except FileNotFoundError:
-        pass
-    try:
         fd = os.open(path, os.O_RDONLY | os.O_CREAT | os.O_EXCL, 0o644)
         os.fchmod(fd, 0o644)
         return fd
     except FileExistsError:
-        return os.open(path, os.O_RDONLY)
+        fd = _open_regular(path)
+    if fd is None:
+        raise ValueError(f"{path} is not a regular file")
+    return fd
 
 
 def open_dir(cfg: dict) -> str:
@@ -179,7 +194,9 @@ def grant_for(want_min: int, want_max: int, unit: int, free: int) -> int:
 def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
     """Wait for and take a reservation. Returns (lock fd, its file, granted bytes)."""
     d = open_dir(cfg)
-    budget = budget_of(cfg, meminfo(env)[0])
+    total = meminfo(env)[0]
+    # MemAvailable never exceeds MemTotal, so no grant can be bigger than this.
+    budget = min(budget_of(cfg, total), total - parse_size(cfg["min_free"]))
     if args.min > budget:
         print(f"heavy-slot: {args.label} wants at least {fmt(args.min)}, more than the whole "
               f"budget of {fmt(budget)}", file=sys.stderr)
@@ -187,7 +204,7 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
     # CLOCK_MONOTONIC is one clock for every process on the host, and never steps back.
     me = f"wait-{time.monotonic_ns():020d}-{os.getpid()}"
     fields = {"pid": os.getpid(), "uid": os.getuid(), "label": args.label, "min": args.min,
-              "max": args.max, "since": time.strftime("%H:%M:%S")}
+              "max": args.max, "since": time.strftime("%Y-%m-%d %H:%M:%S")}
     wait_fd = _publish(d, me, fields)
     deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
     said = False
@@ -202,9 +219,10 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
                 first = bool(waiters) and waiters[0]["file"] == me
                 grant = grant_for(args.min, args.max, args.unit, free) if first else 0
                 if grant:
-                    res = os.path.join(d, f"res-{me[5:]}")
-                    return _publish(d, os.path.basename(res), {**fields, "bytes": grant}), \
-                        res, grant
+                    name = f"res-{me[5:]}"
+                    fd = _publish(d, name, {**fields, "bytes": grant})
+                    os.unlink(os.path.join(d, me))  # under the lock: no one sees both
+                    return fd, os.path.join(d, name), grant
                 if deadline and time.monotonic() > deadline:
                     print(f"heavy-slot: {args.label} gave up after {args.timeout:g} min",
                           file=sys.stderr)
@@ -232,13 +250,17 @@ def cmd_run(args, cfg, env) -> int:
     if not args.cmd:
         print("heavy-slot run: nothing to run after --", file=sys.stderr)
         return EXIT_USAGE
-    fd, _, grant = acquire(args, cfg, env)
+    fd, res, grant = acquire(args, cfg, env)
     env["HEAVY_SLOT_GRANT_BYTES"] = str(grant)
     env["HEAVY_SLOT_UNITS"] = str(grant // args.unit if args.unit else 0)
     os.set_inheritable(fd, True)
+    # Python ignores these at start-up, and an ignored signal survives exec.
+    for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+        signal.signal(sig, signal.SIG_DFL)
     try:
         os.execvpe(args.cmd[0], args.cmd, env)
     except OSError as e:
+        os.unlink(res)
         print(f"heavy-slot run: cannot run {args.cmd[0]}: {e.strerror}", file=sys.stderr)
         return 127 if isinstance(e, FileNotFoundError) else 126
 
@@ -280,7 +302,8 @@ def _size(text: str) -> int:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="heavy-slot", description=__doc__.split("\n\n")[0])
+    p = argparse.ArgumentParser(prog="heavy-slot", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command", required=True)
     for name in ("run", "hold"):
         s = sub.add_parser(name)
@@ -304,7 +327,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.min <= 0 or args.max < args.min or not 0 <= args.timeout < math.inf:
         p.error("need 0 < --min <= --max (in whole --units), and a finite --timeout >= 0")
     label = args.label or (args.cmd[0] if args.cmd else f"pid {os.getppid()}")
-    args.label = "".join(c if c.isprintable() else "?" for c in label)
+    args.label = "".join(c if c.isprintable() else "?" for c in label)[:LABEL_MAX]
     return args
 
 
@@ -315,7 +338,7 @@ def main(argv: list[str]) -> int:
         cfg = load_config(env)
         return {"run": cmd_run, "hold": cmd_hold, "status": cmd_status}[args.command](
             args, cfg, env)
-    except ValueError as e:  # a bad size in the config, or an unreadable meminfo
+    except (ValueError, OSError) as e:  # bad config, meminfo or queue directory
         print(f"heavy-slot: {e}", file=sys.stderr)
         return EXIT_USAGE
 
