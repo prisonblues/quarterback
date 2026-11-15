@@ -159,17 +159,22 @@ def test_a_failed_result_with_only_a_reason_code_still_says_why():
     assert "print_timeout" in panel_seats.error_text(stream)
 
 
-@pytest.mark.parametrize("result", [
-    {"status": "CANCELLED"},
-    {"status": "CANCELLED", "error": {"not": "a string"}, "finished_reason": "interrupted"},
+@pytest.mark.parametrize("result, message", [
+    ({"status": "CANCELLED"}, "CANCELLED"),
+    ({"status": "CANCELLED", "error": {"not": "a string"}, "finished_reason": "interrupted"},
+     "interrupted"),
+    ({"status": "CANCELLED", "error": "   "}, "CANCELLED"),
+    ({}, "failed"),
+    ({"status": None}, "failed"),
+    ({"status": False}, "failed"),
+    ({"status": ""}, "failed"),
 ])
-def test_a_failed_result_always_reaches_the_diagnosis(result):
-    """A failure with no reason text still says what it was; a non-string `error`
-    neither becomes the message nor hides a usable `finished_reason`."""
+def test_a_failed_result_always_reaches_the_diagnosis(result, message):
+    """Whatever a non-SUCCESS result carries, the diagnosis gets a non-empty message:
+    the first non-blank string among error, finished_reason and status, else "failed"."""
     stream = json.dumps({"event": "result", "result": result})
-    text = panel_seats.error_text(stream)
-    assert text, "the failed result was dropped from the diagnosis"
-    assert panel_seats._error_body(json.loads(stream))["message"] in ("CANCELLED", "interrupted")
+    assert panel_seats.error_text(stream), "the failed result was dropped from the diagnosis"
+    assert panel_seats._error_body(json.loads(stream))["message"] == message
 
 
 def test_a_success_with_trailing_blank_lines_is_still_a_reply():
