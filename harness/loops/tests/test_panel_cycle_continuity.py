@@ -318,10 +318,12 @@ def test_no_message_tells_a_caller_round_is_required_beside_a_baseline():
         assert stale not in src, stale
 
 
-def test_an_inferred_round_loads_its_baseline_with_the_explicit_rounds_identity(
-        monkeypatch, capsys, tmp_path):
-    """#868: the inferred-round read and the explicit-round read name the review the
-    same way, so a check added to one cannot silently skip the other."""
+@pytest.mark.parametrize("round_flag", [[], ["--round", "2"]],
+                         ids=["inferred", "explicit"])
+def test_every_run_reads_its_baseline_once_with_one_identity(
+        monkeypatch, capsys, tmp_path, round_flag):
+    """#868: the inferred-round run and the explicit-round run read the baseline ONCE
+    each, naming the review the same way, so the two cannot drift apart."""
     _cli(monkeypatch, capsys, tmp_path / "r1.json", "--max-rounds", "4")
     seen = []
     real = panel.load_baseline
@@ -331,21 +333,29 @@ def test_an_inferred_round_loads_its_baseline_with_the_explicit_rounds_identity(
         return real(paths, expect)
 
     monkeypatch.setattr(panel, "load_baseline", spy)
-    _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json",
+    _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json", *round_flag,
                     "--baseline", str(tmp_path / "r1.json"))
     assert r2["round"] == 2
-    assert seen and all(s == seen[0] for s in seen), seen
-    assert set(seen[0]) == {"repo", "github", "pr"}
+    assert seen == [{"repo": "board", "github": "acme/board", "pr": 34}]
 
 
-def test_baselines_with_no_cycle_id_are_not_told_to_pass_them_again(
-        monkeypatch, capsys, tmp_path):
-    """#868: re-passing payloads that record no cycle reproduces the same loss, so
-    that branch names the honest way on instead of the remedy that just failed."""
+@pytest.mark.parametrize("extra", [[], ["refused"]], ids=["all-accepted", "one-refused"])
+def test_accepted_baselines_with_no_cycle_id_say_their_findings_still_count(
+        monkeypatch, capsys, tmp_path, extra):
+    """#868: payloads that were accepted but record no cycle id still carry their
+    findings, so the warning must not say nothing carries, nor send the caller to
+    re-pass them or drop them for --new-cycle, neither of which supplies the id."""
     base = {"github": "acme/board", "pr": 34, "round": 1, "reviewed": True}
     (tmp_path / "r1.json").write_text(json.dumps(base))
-    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
-                     "--baseline", str(tmp_path / "r1.json"))
-    _assert_lost(err, r, "its --baseline payloads record no cycle id", 2, None)
+    args = ["--baseline", str(tmp_path / "r1.json")]
+    if extra:
+        (tmp_path / "other.json").write_text(json.dumps({**base, "pr": 99}))
+        args += ["--baseline", str(tmp_path / "other.json")]
+    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", *args)
+    _assert_lost(err, r, "its --baseline payloads record no cycle id, so it records "
+                 "cycle null", 2, None)
+    assert r["prior_rounds"] == 1
+    assert "Their findings still count as earlier rounds" in err
+    assert "No earlier round's findings" not in err
     assert "pass every earlier round's payload" not in err
-    assert "--new-cycle" in err
+    assert "--new-cycle" not in err
