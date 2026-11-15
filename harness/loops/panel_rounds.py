@@ -2574,6 +2574,11 @@ def payload_cycle(payload: dict) -> str:
     return str(payload.get("cycle") or payload.get("run_key") or "")
 
 
+#: The fields that name the review a baseline must be from, and the only identity
+#: `load_baseline` checks (#868). Callers build their expectation from this tuple.
+BASELINE_IDENTITY = ("github", "pr")
+
+
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     """Every finding earlier rounds of this PR already raised, from their
     ``--json-file`` payloads.
@@ -2665,7 +2670,7 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # throwaway worktree, so that is the normal case rather than a corner.
         # Checking it would reject a baseline for having been written somewhere
         # else, which is not a property of the review at all.
-        checked = [k for k in ("github", "pr") if want.get(k) is not None]
+        checked = [k for k in BASELINE_IDENTITY if want.get(k) is not None]
         missing = [k for k in checked if payload.get(k) is None]
         wrong = [f"{k}={payload.get(k)!r} (this run: {want[k]!r})"
                  for k in checked if payload.get(k) is not None and payload.get(k) != want[k]]

@@ -1018,9 +1018,9 @@ the ledger path, so every `panel_classes.py` command takes `--payload <that roun
 **Every re-review with a ledger still passes the earlier rounds' `--baseline`
 (#866).** The ledger numbers the rounds, but the PANEL's cycle (its id, provenance and
 `fix_injection`) is carried only by the baseline. Given `--baseline` and no `--round`,
-the run is the round after the latest baseline payload `load_baseline` accepts; one it
-refuses (unreadable, or another review's) leaves the run at round 1, and it says so. A ledger with earlier rounds and no
-`--baseline` starts a new panel cycle and says so on stderr and in the summary.
+the run is the round after the latest baseline payload `load_baseline` accepts. One it
+refuses (unreadable, or another review's) is not counted and is named in the notes.
+When the cycle cannot continue, the run says why on stderr and in the summary.
 
 **After EVERY round, clean ones included, run
 `panel_classes.py mark --payload /tmp/tmp.AbC123/r<r>.json`.** A clean round records no

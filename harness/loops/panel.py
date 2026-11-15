@@ -2379,33 +2379,32 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
 
 def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
                ledger_round: int, new_cycle: bool) -> str:
-    """Why this run cannot continue its PR's cycle, or "" when it can or need not.
-
-    Said on stderr and in the config notes (#866), because a cycle lost by accident
-    otherwise reads exactly like a first review. Whether the cycle continues is read
-    off what `load_baseline` accepted (`prior.cycle`), never off the flags: a
-    `--baseline` nobody could use loses the cycle as surely as none. The flags only
-    say whether a continuation was EXPECTED: a baseline given, a round past 1, or a
-    ledger with earlier rounds. `new_cycle` is the caller starting one on purpose,
-    and a round 1 with none of those is a cycle's real start."""
+    """Why this run cannot continue its PR's cycle, or "" when it can or need not
+    (#866). Each branch's text is pinned by
+    `test_every_lost_cycle_branch_says_what_its_state_is`."""
     if new_cycle or prior.cycle:
         return ""
     if not (baseline_given or round_no > 1 or ledger_round > 1):
         return ""
     if not baseline_given:
         why = "no --baseline was given"
+        carried = ("No earlier round's findings, provenance or fix_injection carry "
+                   "into it. To continue the cycle, pass every earlier round's "
+                   "payload with --baseline")
     elif not prior.rounds:
-        why = "none of its --baseline payloads was accepted (see the baseline notes)"
+        why = "none of its --baseline payloads was accepted"
+        carried = ("No earlier round's findings, provenance or fix_injection carry "
+                   "into it. The baseline notes say why each payload was refused")
     else:
         why = "its --baseline payloads record no cycle id"
+        carried = ("Their findings still count as earlier rounds; only the cycle id "
+                   "is missing, and no flag can supply it")
     if ledger_round > 1:
         why += f", though the class ledger is at round {ledger_round} of this PR"
     then = ("so it starts a NEW panel cycle" if round_no == 1
             else "so it records cycle null, and the board cannot chain it to the "
             "rounds before it")
-    return (f"round {round_no} cannot continue this PR's cycle: {why}, {then}. No "
-            "earlier round's findings, provenance or fix_injection carry into it. To "
-            "continue the cycle, pass every earlier round's payload with --baseline")
+    return f"round {round_no} cannot continue this PR's cycle: {why}, {then}. {carried}"
 
 
 def shell_seats(reviewer_meta: dict) -> list[str]:
@@ -2532,13 +2531,16 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # than, so the two cannot disagree about a payload's round or its cycle, and
     # that same read is this run's baseline: every accepted round is earlier than
     # the one after the latest of them.
-    inferred_prior = None
+    known = {"github": gh_repo, "pr": pr_number}
+    identity = {k: known[k] for k in panel_rounds.BASELINE_IDENTITY}
     round_inferred_from = None
     if not round_named and baseline:
-        inferred_prior = load_baseline(baseline, {"github": gh_repo, "pr": pr_number})
-        if inferred_prior.rounds:
-            round_inferred_from = max(inferred_prior.rounds)
+        prior = load_baseline(baseline, identity)
+        if prior.rounds:
+            round_inferred_from = max(prior.rounds)
             round_no = round_inferred_from + 1
+    else:
+        prior = load_baseline(baseline or [], {**identity, "round": round_no})
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
     # Every config diagnostic this run will report. Initialised HERE, not beside the
@@ -3196,10 +3198,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # serialised a skipped round 2 as round 1 with a fresh id, which then
             # collided with the real round 1 over the round number and renamed
             # the cycle out from under every later round.
-            skip_prior = (inferred_prior if inferred_prior is not None else
-                          load_baseline(baseline or [],
-                                        {"repo": repo_name, "github": gh_repo,
-                                         "pr": pr_number, "round": round_no}))
+            skip_prior = prior
             # A key this round was handed that the register does not already hold
             # is LOST here, and said so. The alternative — recording it — dates
             # the declaration to a round that reviewed nothing and writes it in
@@ -3571,13 +3570,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 "is a number a person set on the board for the fleet, and a local "
                 "flag that switched it off would make it advice again")
     elif ended and continue_cycle:
-        # #846: the OWNER answered the stop and said go on. This is the same cycle's
-        # next round — the caller passes its `--round` and `--baseline`, so the
-        # baseline, provenance and every guard measured from them carry on, which is
-        # what `--new-cycle` throws away. The answer is recorded with who gave it,
-        # when and why, because "the tool chose to run" and "a person overrode the
-        # tool" must never look alike. It moves THIS gate only: the spend ceiling
-        # above and the round cap in `round_stop` are other controls.
+        # #846: the OWNER answered the stop and said go on, with the cycle's
+        # `--baseline` payloads. The answer is recorded with who gave it, when and
+        # why, so "the tool chose to run" and "a person overrode the tool" never
+        # look alike. It moves THIS gate only, not the spend ceiling or round cap.
         stop_answered = {
             "by": answered_by, "why": answered_why,
             "at": _now_iso(),
@@ -3749,9 +3745,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the fixer wrote since the last round read it, with the PR behind it as
     # context. Decided here, before budgets, because scope is what the budgets are
     # then spent on.
-    prior = inferred_prior if inferred_prior is not None else load_baseline(
-        baseline or [], {"repo": repo_name, "github": gh_repo, "pr": pr_number,
-                         "round": round_no})
     lost = cycle_lost(prior, round_no, bool(baseline),
                       ledger_round if class_ledger else 0, new_cycle)
     if lost:
