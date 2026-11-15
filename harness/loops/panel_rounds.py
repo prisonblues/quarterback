@@ -8068,10 +8068,12 @@ def round_stop(round_no: int, max_rounds: int, new_keys: list[str],
     # #623: what the judge typed decides what blocks. A demonstrated regression or
     # claim_miss blocks at any severity; an observation never does. An untyped
     # finding (old payload, judge that did not answer) keeps the severity floors.
+    # `- demonstrated` is load-bearing: two findings can share a key, and a key a
+    # regression carries must not be subtracted because an observation carries it.
     demonstrated = frozenset(c.key for c in outstanding
                              if c.kind in DEMONSTRATED_KINDS)
     observed = frozenset(c.key for c in outstanding
-                         if c.kind == "observation") - exempt
+                         if c.kind == "observation") - exempt - demonstrated
 
     def above(key: str, floor: str) -> bool:
         return (key in exempt or key in demonstrated

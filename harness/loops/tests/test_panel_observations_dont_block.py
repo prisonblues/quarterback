@@ -124,3 +124,13 @@ def test_a_p4_claim_miss_buys_a_round_too():
 def test_a_dry_stop_says_how_many_observations_it_held():
     d = panel.round_stop(1, 5, [], [_finding("P2", "observation")], [])
     assert d["stop"] is True and "1 observation(s), none blocking" in d["reason"]
+
+
+def test_an_observation_sharing_a_key_with_a_regression_does_not_hide_it():
+    """879 round 2, F01: keys are file + title, so two findings can share one, and
+    the regression's must survive the subtraction."""
+    reg, obs = _finding("P4", "regression"), _finding("P4", "observation")
+    assert reg.key == obs.key
+    d = panel.round_stop(2, 5, [reg.key], [reg, obs], [],
+                         trigger_floor="P2", cleared_floor="P2")
+    assert d["stop"] is False and d["observed"] == []

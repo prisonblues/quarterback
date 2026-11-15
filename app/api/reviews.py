@@ -1999,10 +1999,9 @@ OUTSTANDING_COUNTS = ("fixable", "below_floor", "escalated", "narrowed", "declin
 #: in the flattering direction on the field that decides whether a PR may merge.
 #:
 #: ``narrowed``, ``declined`` and ``observed`` (#623) are counted when they arrive
-#: and not required.
-#: They are #615's and #665's, they postdate the block, and neither is read by a
-#: gate — so requiring them would refuse a #42-era producer's whole disposal over
-#: two numbers nothing consults.
+#: and not required. They are #615's, #665's and #623's, they postdate the block,
+#: and no gate reads them — so requiring them would refuse a #42-era producer's
+#: whole disposal over numbers nothing consults.
 OUTSTANDING_REQUIRED = ("fixable", "below_floor", "escalated")
 #: Who a round that ENDED a cycle handed its remainder to (#42). Null on a round
 #: that went again, which is a different fact and not a fourth word.
