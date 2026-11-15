@@ -4616,11 +4616,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
     def prompt_for(budget: int | None, reads_code: bool = False,
                    runs: bool = False) -> str:
-        # `reads_code` defaults False so the one-argument callers keep working.
-        # antigravity's argv clamp (`argv_clamp(agy_render, …)` below) renders
-        # through this too, and since it can be a tool-running seat
-        # (SEAT_RUNS_CODE) that render keeps the longer of both briefs. `runs` picks CODE_EXEC_BRIEF over
-        # CODE_ACCESS_BRIEF for a seat that was given a shell with the tree.
+        # `reads_code` and `runs` default False so the one-argument callers keep
+        # working; `agy_render` below is the one that passes both.
         # The slot is EITHER brief, never empty: a seat that gets the tree is told
         # to use it, and a seat that does not is told there is nothing to look at
         # and what to do instead (#458). Empty was the hole — it left the seats
@@ -4719,8 +4716,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             blind_text = prompt_for(budget)
             if not agy_may_run:
                 return blind_text
-            return max(blind_text, prompt_for(budget, True, True),
-                       key=lambda t: len(t.encode()))
+            # At the size run_seat will send: the slot filled to SEAT_DIR_RESERVE.
+            exec_text = prompt_for(budget, True, True).replace(
+                CODE_EXEC_BRIEF, exec_brief(""), 1)
+            return max(blind_text, exec_text, key=lambda t: len(t.encode()))
         fitted, cut_by_kernel = argv_clamp(agy_render, sendable, asked)
         if fitted < want:
             notes.append(

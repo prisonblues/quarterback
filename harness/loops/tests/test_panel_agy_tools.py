@@ -116,7 +116,7 @@ def test_an_executing_seat_runs_in_its_own_copy_with_the_flag_and_overlay(monkey
     assert got.code_blind is False
     env = seen["env"]
     assert env and ".invalid" in env["DATABASE_URL"] and ".invalid" in env["PGHOST"]
-    assert env["GH_TOKEN"] is None and seen["gh_empty"] is True
+    assert seen["gh_empty"] is True
 
 
 def test_the_executing_brief_names_the_seat_copy(monkeypatch, tmp_path):
@@ -134,16 +134,44 @@ def test_the_executing_brief_names_the_seat_copy(monkeypatch, tmp_path):
     assert seen["cwd"] in sent
 
 
-def test_runs_code_env_drops_inherited_credentials(tmp_path):
-    base = {"PATH": "/bin", "HOME": "/h", "SSH_AUTH_SOCK": "/agent", "OPENAI_API_KEY": "k",
-            "QUARTERBACK_TOKEN": "t", "PGUSER": "u", "PGPASSWORD": "p",
-            "GEMINI_API_KEY": "g"}
+def test_a_quoted_slot_before_the_brief_is_left_alone(monkeypatch, tmp_path):
+    """Model-authored blocks precede the brief; a finding quoting the slot must not be
+    the occurrence that gets the path, leaving the brief without one."""
+    tree = _tree(tmp_path / "src", {"app/main.py": "x = 1"})
+    seen = _seat_run(monkeypatch)
+    quoted = f"a finding about {panel_core.SEAT_DIR_SLOT}\n"
+    panel.review_llm("antigravity", "m", quoted + panel_core.CODE_EXEC_BRIEF,
+                     code_tree=tree, runs_code=True)
+    sent = seen["args"][seen["args"].index("-p") + 1]
+    assert sent.startswith(quoted)
+    assert seen["cwd"] in sent
+
+
+def test_the_filled_brief_is_exactly_the_size_the_clamp_measured():
+    """By construction: whatever the path, the brief run_seat sends is the brief the
+    argv clamp measured, byte for byte in length."""
+    measured = len(panel_core.exec_brief("").encode())
+    for path in ("/tmp/panel-antigravity-abcd1234/seat", "/" + "x" * 4000, "/tmp/é"):
+        assert len(panel_core.exec_brief(path).encode()) == measured
+    with pytest.raises(ValueError):
+        panel_core.exec_brief("/" + "x" * panel_core.SEAT_DIR_RESERVE)
+
+
+def test_runs_code_env_lets_through_only_the_allowlist(tmp_path):
+    """An allowlist, not a list of credential names: anything not named is removed,
+    including the families a denylist missed (#861 round 2)."""
+    base = {"PATH": "/bin", "HOME": "/h", "LANG": "C", "LC_ALL": "C", "XDG_RUNTIME_DIR": "/r",
+            "NIX_SSL_CERT_FILE": "/c", "TERM": "xterm", "QB_SANDBOX": "1",
+            "SSH_AUTH_SOCK": "/agent", "OPENAI_API_KEY": "k", "AWS_ACCESS_KEY_ID": "a",
+            "KUBECONFIG": "/k", "PGHOSTADDR": "10.0.0.1", "TEST_DATABASE_URL": "pg://x",
+            "GOOGLE_APPLICATION_CREDENTIALS": "/g", "GEMINI_API_KEY": "g", "WHATEVER": "w"}
     env = panel_seats.runs_code_env(tmp_path, base)
-    for gone in ("SSH_AUTH_SOCK", "OPENAI_API_KEY", "QUARTERBACK_TOKEN", "PGUSER",
-                 "PGPASSWORD", "GH_TOKEN", "GITHUB_TOKEN"):
-        assert env[gone] is None, gone
-    # agy's own auth may live in one of these; the seat must still start.
-    assert "GEMINI_API_KEY" not in env and "PATH" not in env and "HOME" not in env
+    kept = {"PATH", "HOME", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "NIX_SSL_CERT_FILE",
+            "TERM", "QB_SANDBOX"}
+    for k in base:
+        assert (k not in env) is (k in kept), k
+        if k not in kept:
+            assert env[k] is None, k
 
 
 def test_run_cli_merges_the_overlay_into_the_child_env(monkeypatch, tmp_path):

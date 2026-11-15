@@ -545,8 +545,7 @@ DEFAULTS: dict = {
         # a SEAT_RUNS_CODE seat whose `reviewers.<seat>.tools` is on (antigravity,
         # by the owner's call): it gets the same stripped copy WITH a shell, and
         # turning this setting off takes the tree from it too. Which seats actually
-        # got it is
-        # recorded per seat in the payload (`reviewers.<name>.code_blind`), because
+        # got it is recorded per seat in the payload (`reviewers.<name>.code_blind`), because
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.
         "reviewer_code_access": True,

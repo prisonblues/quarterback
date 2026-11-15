@@ -299,8 +299,8 @@ like a full panel.
 default) it gets a shell (`agy --dangerously-skip-permissions`) and is pointed at a
 throwaway copy of the PR's tree, where it may run targeted tests or scripts. The
 summary's **Code access** line says when it had one. Nothing confines it to the copy:
-the database variables, `gh` and inherited credentials are taken out of its
-environment, and that is accident prevention, not a sandbox. Set `"tools": false` in
+it starts with an allowlisted environment (no inherited credentials, database URLs or
+ssh agent), and that is accident prevention, not a sandbox. Set `"tools": false` in
 `.harness-rules.sample` for the diff-only seat, which is what a repo taking untrusted
 contributions wants alongside `reviewer_code_access: false`.
 

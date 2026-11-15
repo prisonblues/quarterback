@@ -591,8 +591,8 @@ NESTED_SCAN_UNSUPPORTED = {
 #: Per block, and — like :data:`DROPPED_BY_DESIGN` — **written out, not computed**,
 #: with the reason on each line. The test reads the union of one block's set.
 #:
-#: Two blocks are absent from this mapping and that is the assertion: ``code_access``
-#: and ``pr_claim`` send exactly what their models bind, and
+#: One block is absent from this mapping and that is the assertion: ``pr_claim``
+#: sends exactly what its model binds, and
 #: :func:`test_a_block_with_nothing_dropped_says_so_by_having_no_entry` is what
 #: stops an empty set here from being mistaken for a block nobody checked.
 NESTED_DROPPED_BY_DESIGN = {

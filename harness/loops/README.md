@@ -871,7 +871,8 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     boundary of its own; codex's `-c` knobs only REMOVE tools and its single read path
     is the shell, so granting reads grants execution and re-opens the tool-hunt that
     once spent 99% of a run; pi's `--no-tools` is all-or-nothing over read/bash/edit/
-    write; antigravity has no tool mechanism at all. A seat that cannot read keeps its
+    write; antigravity's one per-run switch grants every tool, so it reads only with a
+    shell (next point). A seat that cannot read keeps its
     empty sandbox — standing in a checkout it cannot open buys the instruction-file
     channel for nothing.
   - **The one seat that is given a shell: antigravity, with `tools` on** (the default
@@ -884,11 +885,11 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     where the model says, by default in its own scratch directory, and on #861's first
     live round, before it was given the path, the seat ran `find /home/rich -maxdepth
     3`, found the PR's real worktree and read and tested it there (read-only; the
-    worktree came out clean). `runs_code_env` points the database variables at an
-    unresolvable host, gives `gh` an empty config and no token, and removes inherited
-    credentials and the ssh agent from the seat's environment. That prevents
-    accidents by a cooperative model; a prompt-injected one can undo it. The
-    filesystem and the network are open, which is the trade the owner accepted.
+    worktree came out clean); told the path, round 2's seat ran all 214 commands in the
+    copy. `runs_code_env` starts it with an allowlisted environment (PATH, HOME,
+    locale, XDG and certificate variables, nothing else), plus database variables
+    naming an unresolvable host and an empty `gh` config. Files under HOME, the
+    filesystem and the network stay reachable, which is the trade the owner accepted.
     `"reviewers": {"antigravity": {"tools": false}}` in
     `.harness-rules.sample` restores the diff-only seat, and `reviewer_code_access:
     false` or `--no-code-access` takes the tree (and so the shell) from it too.

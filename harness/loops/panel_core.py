@@ -1419,10 +1419,14 @@ coverage gap and none is a finding — they are how this checkout is built:
 #: claim the diff cannot) and what it must not do. Nothing enforces the "must not"
 #: list — `runs_code_env` only makes the accidents unlikely (see SEAT_RUNS_CODE) —
 #: so the brief is what keeps a cooperative reviewer in its copy and off the full
-#: suite. SEAT_DIR_SLOT is replaced with the copy's absolute path by `run_seat`,
-#: because agy runs commands where the model says, and a model not told the path
-#: was measured going to find the real checkout instead (#861).
+#: suite. agy runs commands where the model says, and a model not told its path was
+#: measured going to find the real checkout instead (#861), so `run_seat` fills the
+#: path in through :func:`exec_brief`.
 SEAT_DIR_SLOT = "<<<SEAT_DIR>>>"
+#: Bytes reserved for that path: Linux's PATH_MAX, so no real path can overrun it. The
+#: argv clamp measures the brief at this size and :func:`exec_brief` never exceeds it,
+#: so the prompt agy is handed is never larger than the one the clamp cleared.
+SEAT_DIR_RESERVE = 4096
 CODE_EXEC_BRIEF = """YOU HAVE THE CODE, AND A SHELL. A throwaway copy of this PR at its head commit —
 the same code the diff below was taken from — is at:
 
@@ -1456,6 +1460,17 @@ limit, and a review that runs out of it returns nothing.
 `could_not_assess` means what you could not resolve with the code and the commands
 in front of you.
 """
+
+
+def exec_brief(seat_dir: str) -> str:
+    """CODE_EXEC_BRIEF with the seat's path in its slot, and as long as it would be
+    with a SEAT_DIR_RESERVE-byte path. A path longer than the reserve cannot exist on Linux; one that did would be
+    refused here rather than handed to an argv the clamp did not measure."""
+    pad = SEAT_DIR_RESERVE - len(seat_dir.encode())
+    if pad < 0:
+        raise ValueError(f"seat path is {-pad} bytes over SEAT_DIR_RESERVE")
+    # Padded at the END, where trailing blanks cost the model nothing to read.
+    return CODE_EXEC_BRIEF.replace(SEAT_DIR_SLOT, seat_dir, 1) + " " * pad
 
 #: The other half of the same slot, and the reason it is prose. Every seat wants to go
 #: looking for the code — `codex_args` measured it at five runs in seven — and the answer
@@ -3548,6 +3563,8 @@ __all__ = [
     "CODE_ACCESS_BRIEF",
     "CODE_EXEC_BRIEF",
     "SEAT_DIR_SLOT",
+    "SEAT_DIR_RESERVE",
+    "exec_brief",
     "NO_TOOLS_BRIEF",
     "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "JUDGE_SCHEMA", "JUDGE_NO_CODE_BRIEF", "ASK_PROMPT", "Finding", "ReviewerRun",

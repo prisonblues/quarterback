@@ -98,10 +98,9 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #:   of an already-in-prompt diff over CLI_TIMEOUT and cost the panel the vendor.
 #: * **pi** — `--no-tools` is all-or-nothing, and what it would restore is
 #:   read/bash/edit/write. There is no read-only subset to ask for.
-#: * **antigravity** — has no tool mechanism to configure. What keeps it off the
-#:   tree is that headless print mode cannot prompt for a permission, so any tool
-#:   needing one is auto-denied; `antigravity_args` is explicit that `--mode plan`
-#:   is not the guarantee.
+#: * **antigravity** — its one per-run switch grants every tool, so it cannot be a
+#:   reader without being an executor; with `tools` on it is one, as
+#:   :data:`SEAT_RUNS_CODE` describes.
 #: * **grok** — the only absence here that is not about the mechanism. `--tools`
 #:   names an exact read-only set (`read_file,grep,list_dir`) and `--sandbox
 #:   strict` bounds READS to the cwd under Landlock — verified on 1.0.3, a read
@@ -138,11 +137,10 @@ SEAT_READS_CODE = frozenset({"claude"})
 #: than the process cwd. On PR #861's first live round, before the seat was told its
 #: path, it ran `find /home/rich -maxdepth 3`, found the PR's real worktree, and ran
 #: its `git diff`s and a pytest file there — all read-only, the worktree came out
-#: clean, and nothing stopped it from writing. :func:`runs_code_env` takes the
-#: database, `gh` and inherited credentials out of the seat's environment, which a
-#: cooperative model will not undo and a prompt-injected one can (the files they
-#: point at are still readable). The filesystem and the network are open: the trade
-#: the owner accepted. `"tools": false` restores the diff-only seat.
+#: clean, and nothing stopped it from writing. Told the path, round 2's seat ran all
+#: 214 of its commands in the copy. :func:`runs_code_env` starts it with an allowlisted
+#: environment. Files under HOME, the filesystem and the network stay reachable: the
+#: trade the owner accepted. `"tools": false` restores the diff-only seat.
 SEAT_RUNS_CODE = frozenset({"antigravity"})
 
 
@@ -154,40 +152,39 @@ def tool_seats(reviewers: dict) -> frozenset[str]:
         n for n in SEAT_RUNS_CODE if (reviewers.get(n) or {}).get("tools") is True)
 
 
-#: Inherited variables a tool-running seat is launched WITHOUT: anything that reads as
-#: a credential, the ssh agent, and the libpq connection defaults. agy's own auth is
-#: an OAuth file under ~/.gemini, not a variable, so the vendor prefixes in
-#: _SEAT_ENV_KEEP are kept only so an env-authenticated install still starts.
-_SEAT_ENV_DROP = re.compile(r"TOKEN|SECRET|PASSW|API_?KEY|CREDENTIAL|^SSH_AUTH_SOCK$"
-                            r"|^PG(USER|PORT|SERVICE|PASSFILE)$", re.IGNORECASE)
-_SEAT_ENV_KEEP = ("GEMINI_", "GOOGLE_", "ANTIGRAVITY_", "AGY_")
+#: The ONLY inherited variables a tool-running seat starts with. An allowlist because
+#: a denylist of credential names was found short twice in one review (#861: AWS keys,
+#: kubeconfig, PGHOSTADDR, *_DATABASE_URI), and every miss is a credential handed to a
+#: shell. Measured 2026-11-15: agy 1.1.24 authenticates and runs commands with exactly
+#: this set — its auth is a file under HOME, not a variable.
+_SEAT_ENV_ALLOW = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TZ|TZDIR"
+                             r"|TMPDIR|XDG_\w+|LOCALE_ARCHIVE|\w*_CERT_(FILE|DIR))$")
 
 
 def runs_code_env(home: Path, base: dict[str, str] | None = None) -> dict[str, str | None]:
     """Environment overlay for a seat that may execute, on top of :func:`sandbox_env`.
     A None value means "remove this variable" (see `run_cli`).
 
-    Accident prevention for a cooperative model, NOT a boundary — a shell can set any
-    of these back, and the files they pointed at are still on disk (see
-    :data:`SEAT_RUNS_CODE`). Within that: every database variable a test run would
-    read points at a host that cannot resolve, so a DB-backed test fails to connect
-    rather than reaching a live database (the tarball copy has no `.env`, so a suite
-    falls back to its defaults); `gh` gets an empty config dir and no token; and every
-    inherited variable :data:`_SEAT_ENV_DROP` matches is removed.
+    Every inherited variable outside :data:`_SEAT_ENV_ALLOW` is removed, so no
+    credential, database URL or agent socket in the panel's environment reaches the
+    seat. :data:`SANDBOX_ENV` survives because it is applied, not inherited. Three are
+    then SET, because a test suite falls back to defaults that are a live database on
+    this box and `gh` to the user's config: the database variables name a host that
+    cannot resolve, and `gh` gets an empty config dir. What this does not do is hide
+    the FILES under HOME — see :data:`SEAT_RUNS_CODE`.
 
     `base` defaults to the live `os.environ`, a parameter only so a test can hand in
     a known one."""
     gh = home / "gh-config"
     gh.mkdir(exist_ok=True)
     env = os.environ if base is None else base
-    dropped: dict[str, str | None] = {
-        k: None for k in env
-        if _SEAT_ENV_DROP.search(k) and not k.upper().startswith(_SEAT_ENV_KEEP)}
-    return {**dropped,
+    removed: dict[str, str | None] = {
+        k: None for k in env if not _SEAT_ENV_ALLOW.match(k) and k not in SANDBOX_ENV}
+    return {**removed,
             "DATABASE_URL": "postgresql://panel-seat-no-database.invalid/none",
             "PGHOST": "panel-seat-no-database.invalid",
             "PGDATABASE": "panel_seat_no_database",
-            "GH_CONFIG_DIR": str(gh), "GH_TOKEN": None, "GITHUB_TOKEN": None}
+            "GH_CONFIG_DIR": str(gh)}
 
 #: Files and directories a vendor CLI loads as instructions from its working
 #: directory, removed from the tree before any seat is pointed at it.
@@ -1131,8 +1128,7 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
             on_output: Callable[[str | None], None] | None = None,
             replied: Callable[[], bool] | None = None,
             cwd: str | None = None,
-            env_extra: dict[str, str | None] | None = None,
-            ) -> tuple[str | None, str | None]:
+            env_extra: dict[str, str | None] | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
@@ -4921,10 +4917,10 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: stage is the old no-tools seat, flag and all, and gets no overlay.
         executes = reads_code and runs_code and cmd_name in SEAT_RUNS_CODE
         if executes:
-            # Its copy's absolute path, which the brief could not know when it was
-            # composed. Told so the seat works HERE and not in a checkout it went
-            # looking for: agy's commands default to its own scratch dir, not the cwd.
-            prompt = prompt.replace(SEAT_DIR_SLOT, sandbox, 1)
+            # Its copy's path, unknown when the brief was composed. Replaced INSIDE the
+            # brief, so a model-authored block quoting the slot is left alone, and
+            # padded to SEAT_DIR_RESERVE so the prompt is the size the clamp measured.
+            prompt = prompt.replace(CODE_EXEC_BRIEF, exec_brief(sandbox), 1)
         #: Passed only when there is something to pass, so `run_cli`'s many test
         #: doubles that name its keywords need not learn this one.
         cli_env = {"env_extra": runs_code_env(tmpdir)} if executes else {}
