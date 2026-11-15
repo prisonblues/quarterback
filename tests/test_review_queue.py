@@ -789,3 +789,31 @@ async def test_an_entry_carries_everything_the_ordering_rules_read(client):
     }
     assert reads == set(available), f"Candidate grew a field the queue does not carry: {reads}"
     assert available["ci"] == "PASS" and available["outstanding_findings"] == 1
+
+
+async def test_a_confirmed_observation_does_not_hold_the_pr(client):
+    """#623: a judge-typed observation is recorded and counted in `confirmed`, and
+    never in `outstanding`, so a round left with only observations is ready."""
+    await record(client, 7623, findings=0, head_sha=SHA_A, round=2,
+                 to_fix=[{**FINDING, "title": "could be more general",
+                          "kind": "observation"}],
+                 round_stop={"stop": True, "reason": "dry", "confident": True})
+    got = entry(await ask(client, [snapshot(7623)]), 7623)
+    assert got["state"] == "ready"
+    assert got["last_run"]["outstanding"] == 0
+    assert got["last_run"]["confirmed"] == 1
+    assert got["last_run"]["observed"] == 1
+
+
+async def test_a_typed_regression_and_an_untyped_finding_still_hold_the_pr(client):
+    await record(client, 7624, findings=0, head_sha=SHA_A, round=2,
+                 to_fix=[{**FINDING, "title": "breaks y", "kind": "regression",
+                          "evidence": "test_y fails"},
+                         {**FINDING, "title": "no kind at all"},
+                         {**FINDING, "title": "style", "kind": "observation"}],
+                 round_stop={"stop": True, "reason": "round cap (2) reached",
+                             "confident": True})
+    got = entry(await ask(client, [snapshot(7624)]), 7624)
+    assert got["last_run"]["outstanding"] == 2
+    assert got["state"] == "unresolved"
+    assert "1 observation(s) not counted" in got["reason"]

@@ -54,7 +54,13 @@ from app.db import get_session
 from app.models.merge_queue import MergeQueueEntry
 from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
-from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun
+from app.models.review import (
+    NON_BLOCKING_KIND,
+    ReviewFinding,
+    ReviewFindingOutcome,
+    ReviewRun,
+    finding_blocks,
+)
 from app.review_queue import (
     ACTIONS,
     AGE_BASES,
@@ -219,7 +225,23 @@ async def _cleared(session: AsyncSession, repo: str,
             & ReviewFindingOutcome.outcome.in_(sorted(CLEARING_OUTCOMES)),
         )
         .where(ReviewFinding.run_id.in_(list(run_ids.values())),
-               ReviewFinding.verdict == "confirmed")
+               ReviewFinding.verdict == "confirmed", finding_blocks())
+        .group_by(ReviewRun.pr)
+    )
+    return {pr: n for pr, n in (await session.execute(stmt)).all()}
+
+
+async def _observed(session: AsyncSession, run_ids: dict[int, int]) -> dict[int, int]:
+    """Per PR, the newest run's confirmed findings typed ``observation`` (#623)."""
+    if not run_ids:
+        return {}
+    stmt = (
+        select(ReviewRun.pr, func.count(ReviewFinding.id))
+        .select_from(ReviewFinding)
+        .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
+        .where(ReviewFinding.run_id.in_(list(run_ids.values())),
+               ReviewFinding.verdict == "confirmed",
+               ReviewFinding.kind == NON_BLOCKING_KIND)
         .group_by(ReviewRun.pr)
     )
     return {pr: n for pr, n in (await session.execute(stmt)).all()}
@@ -411,8 +433,9 @@ def _cycle_rounds(run: ReviewRun, total: int) -> int:
     return run.round if run.round else total
 
 
-def _last_run_view(run: ReviewRun, cleared: int) -> LastRun:
+def _last_run_view(run: ReviewRun, cleared: int, observed: int = 0) -> LastRun:
     confirmed = run.n_confirmed or 0
+    blocking = max(0, confirmed - observed)
     return LastRun(
         run_id=run.id,
         ts=_aware(run.ts) or _utcnow(),
@@ -425,8 +448,9 @@ def _last_run_view(run: ReviewRun, cleared: int) -> LastRun:
         pr_state=run.pr_state,
         ci_status=run.ci_status,
         confirmed=confirmed,
-        outstanding=max(0, confirmed - cleared),
-        cleared=min(cleared, confirmed),
+        outstanding=max(0, blocking - cleared),
+        cleared=min(cleared, blocking),
+        observed=min(observed, confirmed),
     )
 
 
@@ -474,6 +498,7 @@ def _entry(repo: str, pr: PullRequestIn, verdict: Verdict, run: LastRun | None,
             "confirmed": run.confirmed,
             "cleared": run.cleared,
             "outstanding": run.outstanding,
+            "observed": run.observed,
         },
         # The count and the age only. `GET /review/needs-human?repo=&pr=` is the
         # authority for WHICH judgement each defect wants (#279).
@@ -580,6 +605,7 @@ async def review_queue(
 
     newest, rounds = await _last_runs(session, repo, numbers)
     cleared = await _cleared(session, repo, {pr: r.id for pr, r in newest.items()})
+    observed = await _observed(session, {pr: r.id for pr, r in newest.items()})
     items = await _plan_items(session, repo, numbers)
     exempt = _exemptions(items, now)
     human = await _needs_human(session, repo, numbers)
@@ -589,7 +615,8 @@ async def review_queue(
     entries: list[dict] = []
     for p in sorted(body.prs, key=lambda x: x.number):
         run = newest.get(p.number)
-        last = _last_run_view(run, cleared.get(p.number, 0)) if run is not None else None
+        last = (_last_run_view(run, cleared.get(p.number, 0), observed.get(p.number, 0))
+                if run is not None else None)
         total = rounds.get(p.number, 0)
         cycle = _cycle_rounds(run, total) if run is not None else 0
         verdict = classify(

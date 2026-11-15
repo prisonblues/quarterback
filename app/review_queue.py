@@ -401,11 +401,15 @@ class LastRun:
     pr_state: str | None
     ci_status: str | None
     confirmed: int
-    #: ``confirmed`` less every finding with a recorded outcome. The two are both
-    #: published: the issue's own acceptance criterion is about ``confirmed``, and
-    #: ``outstanding`` is what decides whether a fix pass is owed.
+    #: ``confirmed`` less every observation (#623) and every finding with a recorded
+    #: outcome. The two are both published: the issue's own acceptance criterion is
+    #: about ``confirmed``, and ``outstanding`` is what decides whether a fix pass is
+    #: owed.
     outstanding: int
     cleared: int
+    #: Confirmed findings the judge typed ``observation`` (#623): counted in
+    #: ``confirmed``, never in ``outstanding``, because an observation blocks nothing.
+    observed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -505,6 +509,14 @@ def _norm_mergeable(value: str | None) -> str:
     return (value or "").strip().upper() or UNKNOWN
 
 
+def _accounted(run: LastRun) -> str:
+    """The parenthetical that says why ``outstanding`` is less than ``confirmed``,
+    naming only the parts that are non-zero."""
+    parts = [f"{n} {what}" for n, what in ((run.observed, "observation(s) not counted"),
+                                           (run.cleared, "cleared")) if n]
+    return f" ({run.confirmed} confirmed, {', '.join(parts)})" if parts else ""
+
+
 def _review_state(pr: PullRequest, run: LastRun | None) -> tuple[str, str, str]:
     """``(state, action, reason)`` from the review record alone.
 
@@ -544,8 +556,7 @@ def _review_state(pr: PullRequest, run: LastRun | None) -> tuple[str, str, str]:
             "unresolved",
             "fix",
             f"{run.outstanding} confirmed finding(s) outstanding at the current head"
-            + (f" ({run.confirmed} confirmed, {run.cleared} cleared)"
-               if run.cleared else ""),
+            + _accounted(run),
         )
     if run.stopped is True and run.stop_confident is not True:
         # `stop_confident` is the column that exists so a clean verdict can be

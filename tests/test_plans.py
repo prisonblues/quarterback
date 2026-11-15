@@ -544,7 +544,7 @@ class _SyncBoard:
         return r.json()
 
 
-async def test_the_DASHBOARD_reads_a_co_tenants_held_plan_as_held(client):
+async def test_the_DASHBOARD_reads_a_co_tenants_held_plan_as_held(client, monkeypatch):
     """#394, and it is the read path's half of #142's rule.
 
     `qbdata.fetch_plan` sent no `session`, so `GET /plan` answered it by machine —
@@ -562,6 +562,10 @@ async def test_the_DASHBOARD_reads_a_co_tenants_held_plan_as_held(client):
     import anyio
     import qbdata as qd
 
+    # The read is fleet-wide and capped at PLAN_LIMIT from the top of the order, so
+    # in a suite that shares one database this repo's item would otherwise fall off
+    # the end whenever enough other tests have planned repos that sort before it.
+    monkeypatch.setattr(qd, "PLAN_LIMIT", 1000)
     repo = "acme/plandashcotenant"
     await submitted(client, repo, "theirs", [item(254)], session="s-neighbour",
                     headers=LAPTOP)

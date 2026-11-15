@@ -1460,6 +1460,11 @@ class ReviewFinding(Base):
     #: regression of the same shape in the same commit as a docstring stating the
     #: invariant it broke.
     premise_verdict: Mapped[str | None] = mapped_column(Text)
+    #: What the judge typed this finding as (#623): regression, claim_miss or
+    #: observation. A confirmed observation blocks nothing; NULL, every finding
+    #: recorded before the type existed, blocks by verdict as it always did.
+    kind: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),
@@ -1526,6 +1531,17 @@ class ReviewFinding(Base):
             name="ck_review_findings_recurs_of_revisited",
         ),
     )
+
+
+#: The kind a confirmed finding can carry and still block nothing (#623).
+NON_BLOCKING_KIND = "observation"
+
+
+def finding_blocks():
+    """The one SQL test for "can this finding hold a PR" (#623): anything not typed
+    an observation. NULL (no kind recorded) blocks, as every finding did before.
+    The review queue and the plan's ordering both read it, so they cannot disagree."""
+    return ReviewFinding.kind.is_(None) | (ReviewFinding.kind != NON_BLOCKING_KIND)
 
 
 class ReviewFindingReport(Base):
