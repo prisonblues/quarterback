@@ -316,3 +316,36 @@ def test_no_message_tells_a_caller_round_is_required_beside_a_baseline():
     for stale in ("with --round", "--round and --baseline alone",
                   "(default 1). Round 2+"):
         assert stale not in src, stale
+
+
+def test_an_inferred_round_loads_its_baseline_with_the_explicit_rounds_identity(
+        monkeypatch, capsys, tmp_path):
+    """#868: the inferred-round read and the explicit-round read name the review the
+    same way, so a check added to one cannot silently skip the other."""
+    _cli(monkeypatch, capsys, tmp_path / "r1.json", "--max-rounds", "4")
+    seen = []
+    real = panel.load_baseline
+
+    def spy(paths, expect=None):
+        seen.append({k: v for k, v in (expect or {}).items() if k != "round"})
+        return real(paths, expect)
+
+    monkeypatch.setattr(panel, "load_baseline", spy)
+    _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json",
+                    "--baseline", str(tmp_path / "r1.json"))
+    assert r2["round"] == 2
+    assert seen and all(s == seen[0] for s in seen), seen
+    assert set(seen[0]) == {"repo", "github", "pr"}
+
+
+def test_baselines_with_no_cycle_id_are_not_told_to_pass_them_again(
+        monkeypatch, capsys, tmp_path):
+    """#868: re-passing payloads that record no cycle reproduces the same loss, so
+    that branch names the honest way on instead of the remedy that just failed."""
+    base = {"github": "acme/board", "pr": 34, "round": 1, "reviewed": True}
+    (tmp_path / "r1.json").write_text(json.dumps(base))
+    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
+                     "--baseline", str(tmp_path / "r1.json"))
+    _assert_lost(err, r, "its --baseline payloads record no cycle id", 2, None)
+    assert "pass every earlier round's payload" not in err
+    assert "--new-cycle" in err
