@@ -878,13 +878,18 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     since 2026-11-14, by the owner's call; `SEAT_RUNS_CODE`). In the no-tools mode a
     model that ignores the brief and probes `echo …` has the command auto-denied, and
     that denial ends the `agy` session with exit 0 and no output — the seat is lost for
-    the round (#853). With `tools` on it runs `agy --dangerously-skip-permissions` in
-    its own stripped copy of the PR's tree (measured: commands run in the cwd), told so
-    by `CODE_EXEC_BRIEF`. The copy has no remote and is deleted with the seat; the
-    database variables point at an unresolvable host and `gh` at an empty config, so a
-    test run cannot reach a live database and a PR cannot talk its reviewer into a
-    merge. What it does NOT bound is the rest of the filesystem and the network — the
-    accepted trade. `"reviewers": {"antigravity": {"tools": false}}` in
+    the round (#853). With `tools` on it runs `agy --dangerously-skip-permissions`,
+    standing in its own stripped copy of the PR's tree and told that copy's absolute
+    path by `CODE_EXEC_BRIEF`. **None of that is a boundary**: agy runs a command
+    where the model says, by default in its own scratch directory, and on #861's first
+    live round, before it was given the path, the seat ran `find /home/rich -maxdepth
+    3`, found the PR's real worktree and read and tested it there (read-only; the
+    worktree came out clean). `runs_code_env` points the database variables at an
+    unresolvable host, gives `gh` an empty config and no token, and removes inherited
+    credentials and the ssh agent from the seat's environment. That prevents
+    accidents by a cooperative model; a prompt-injected one can undo it. The
+    filesystem and the network are open, which is the trade the owner accepted.
+    `"reviewers": {"antigravity": {"tools": false}}` in
     `.harness-rules.sample` restores the diff-only seat, and `reviewer_code_access:
     false` or `--no-code-access` takes the tree (and so the shell) from it too.
   - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,

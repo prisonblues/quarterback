@@ -530,7 +530,7 @@ def test_a_skipped_round_records_nulls_rather_than_a_setting_it_never_read(monke
     assert panel.run("board", 34, post=False, json_file=str(out), record=False) == 0
     capsys.readouterr()
     access = json.loads(out.read_text())["code_access"]
-    assert access == {"setting": None, "seats": None,
+    assert access == {"setting": None, "seats": None, "shell_seats": None,
                       "convention_files_removed": None}
 
 

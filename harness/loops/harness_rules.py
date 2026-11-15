@@ -333,12 +333,13 @@ DEFAULTS: dict = {
         # model slug too — gemini-3.7-flash-high/-medium/-low are three separate
         # models. Pin it in the slug OR in `effort`, not both; two ways to say
         # the same thing is how they come to disagree.
-        # `tools`: ON — the seat reviews from a throwaway copy of the PR's tree and
-        # may run commands there (`--dangerously-skip-permissions`; see
-        # SEAT_RUNS_CODE). The owner's call, 2026-11-14, after a model that probed
-        # `echo` in the no-tools mode ended its own session and cost a round the
-        # seat. `false` restores the diff-only seat. Policy, so it is set in
-        # `.harness-rules.sample`, never in a per-box overlay.
+        # `tools`: ON — the seat gets a shell (`--dangerously-skip-permissions`) and
+        # is pointed at a throwaway copy of the PR's tree; see SEAT_RUNS_CODE for
+        # what does and does not confine it. The owner's call, 2026-11-14, after a
+        # model that probed `echo` in the no-tools mode ended its own session and
+        # cost a round the seat. `false` restores the diff-only seat. Policy, so it
+        # belongs in `.harness-rules.sample`; a per-box overlay carrying it is
+        # ignored with a warning, because the overlay holds `_LOCAL_KEYS` only.
         "antigravity": {"enabled": False, "model": "", "effort": "", "tools": True},
         # Off by default for the same reason as antigravity — `pi` is a workstation
         # package, not on every box. It is the widest-reach member when enabled:
@@ -543,7 +544,8 @@ DEFAULTS: dict = {
         # and for those seats that is unchanged: this is reading. The exception is
         # a SEAT_RUNS_CODE seat whose `reviewers.<seat>.tools` is on (antigravity,
         # by the owner's call): it gets the same stripped copy WITH a shell, and
-        # turning this setting off takes the tree from it too. Which seats actually got it is
+        # turning this setting off takes the tree from it too. Which seats actually
+        # got it is
         # recorded per seat in the payload (`reviewers.<name>.code_blind`), because
         # a seat that can read the tree while another cannot is a bigger confound
         # than an unpinned model.

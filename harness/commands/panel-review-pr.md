@@ -296,12 +296,13 @@ the fixer — surface that in §6 rather than letting a one-vendor review read
 like a full panel.
 
 **antigravity runs commands by default.** With `reviewers.antigravity.tools` on (the
-default) it reviews from a throwaway copy of the PR's tree with a shell
-(`agy --dangerously-skip-permissions`), may run targeted tests or scripts there, and
-the round's config notes say so. The copy has no remote, and the database variables and
-`gh` point at nothing. Set `"tools": false` in `.harness-rules.sample` for the
-diff-only seat, which is what a repo taking untrusted contributions wants alongside
-`reviewer_code_access: false`.
+default) it gets a shell (`agy --dangerously-skip-permissions`) and is pointed at a
+throwaway copy of the PR's tree, where it may run targeted tests or scripts. The
+summary's **Code access** line says when it had one. Nothing confines it to the copy:
+the database variables, `gh` and inherited credentials are taken out of its
+environment, and that is accident prevention, not a sandbox. Set `"tools": false` in
+`.harness-rules.sample` for the diff-only seat, which is what a repo taking untrusted
+contributions wants alongside `reviewer_code_access: false`.
 
 From its output collect:
 - **Panel dials** — the line the report prints under that name, naming `review_panel`.

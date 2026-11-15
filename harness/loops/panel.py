@@ -1941,7 +1941,7 @@ def _payload_defaults() -> dict:
         # round would read as "code access was available and no seat used it",
         # which is a finding about the panel rather than about a round that never
         # ran one.
-        "code_access": {"setting": None, "seats": None,
+        "code_access": {"setting": None, "seats": None, "shell_seats": None,
                         "convention_files_removed": None},
         # Nulls for `code_access`' reason one line up (#550): a round that dispatched
         # no seat did not decline to prime one, and `sent: false` there would put a
@@ -2373,6 +2373,16 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
                        # other way of coming up short.
                        code_blind=not sources,
                        duration_ms=elapsed())
+
+
+def shell_seats(reviewer_meta: dict) -> list[str]:
+    """The seats that reviewed with a shell this round, read off what they DID.
+
+    A SEAT_RUNS_CODE seat that ran with the tree is one `run_seat` launched with
+    `--dangerously-skip-permissions`; one that is absent, crashed, or whose copy failed
+    to stage records `ran` False or `code_blind` True and is not listed."""
+    return sorted(n for n, m in reviewer_meta.items()
+                  if n in SEAT_RUNS_CODE and m.get("ran") and m.get("code_blind") is False)
 
 
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
@@ -4606,10 +4616,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
     def prompt_for(budget: int | None, reads_code: bool = False,
                    runs: bool = False) -> str:
-        # `reads_code` defaults False so the one-argument callers keep working —
-        # `fit_argv_budget` takes this as a single-arg render. Since antigravity can
-        # be a tool-running seat (SEAT_RUNS_CODE), its clamp renders both briefs and
-        # keeps the longer; see the clamp below. `runs` picks CODE_EXEC_BRIEF over
+        # `reads_code` defaults False so the one-argument callers keep working.
+        # antigravity's argv clamp (`argv_clamp(agy_render, …)` below) renders
+        # through this too, and since it can be a tool-running seat
+        # (SEAT_RUNS_CODE) that render keeps the longer of both briefs. `runs` picks CODE_EXEC_BRIEF over
         # CODE_ACCESS_BRIEF for a seat that was given a shell with the tree.
         # The slot is EITHER brief, never empty: a seat that gets the tree is told
         # to use it, and a seat that does not is told there is nothing to look at
@@ -4699,10 +4709,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         want = sendable if asked is None else asked
         # Whether this seat gets the tree is not known until the fetch below, so
         # the clamp is measured against the LONGER of the two prompts it could be
-        # sent: the budget has to fit whichever one it turns out to be.
+        # sent: the budget has to fit whichever one it turns out to be. Only when it
+        # COULD be sent the exec prompt — `tools` on and code access wanted — so a
+        # round with code access off is not clamped for a shell it cannot have. A
+        # throwaway notes list: the real call below reports the setting once.
+        agy_may_run = ("antigravity" in tool_seats(rev)
+                       and code_access_wanted(panel, no_code_access, []))
         def agy_render(budget: int | None) -> str:
             blind_text = prompt_for(budget)
-            if "antigravity" not in tool_seats(rev):
+            if not agy_may_run:
                 return blind_text
             return max(blind_text, prompt_for(budget, True, True),
                        key=lambda t: len(t.encode()))
@@ -4871,10 +4886,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "it — see SEAT_READS_CODE; only claude can be given read tools "
                      "without also being given a shell, and a SEAT_RUNS_CODE seat "
                      "takes the tree only with `tools` on")
-    executing = [n for n in code_seats if n in SEAT_RUNS_CODE] if code_tree else []
-    if executing:
-        notes.append(f"{', '.join(executing)} reviewed with a shell in a throwaway copy of "
-                     "the PR's tree (`reviewers.<seat>.tools`): it may have run commands")
     if stripped:
         # Said out loud, per round. A silent strip makes a PR that shipped an
         # `AGENTS.md` indistinguishable from one that did not, on the single axis
@@ -7938,6 +7949,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "setting": want_code,
             "seats": sorted(n for n, m in reviewer_meta.items()
                             if m.get("ran") and m.get("code_blind") is False),
+            # The seats that had a SHELL in that tree, from what each seat did rather
+            # than what was planned: a SEAT_RUNS_CODE seat with the tree is one that
+            # ran with `--dangerously-skip-permissions` (see run_seat's `executes`).
+            "shell_seats": shell_seats(reviewer_meta),
             # What the strip took out of the reviewers' checkout. `[]` is "the PR
             # carried none", which is a different fact from the null a round that
             # never fetched a tree records.
@@ -9019,9 +9034,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                        if m.get("ran") and m.get("code_blind") is False)
     diff_only = sorted(n for n, m in reviewer_meta.items()
                        if m.get("ran") and m.get("code_blind"))
+    shells = shell_seats(reviewer_meta)
     if read_code:
         lines.append(f"**Code access:** {', '.join(read_code)} read the PR's tree at "
                      f"{(meta.get('headRefOid') or '')[:8]}"
+                     + (f" ({', '.join(shells)} with a shell, so "
+                        f"{'it' if len(shells) == 1 else 'they'} may have run commands)"
+                        if shells else "")
                      + (f"; {', '.join(diff_only)} reviewed the diff alone"
                         if diff_only else "")
                      + " — a seat's own `could_not_assess` counts against the round "

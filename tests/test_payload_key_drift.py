@@ -734,6 +734,12 @@ NESTED_DROPPED_BY_DESIGN = {
         "prior_round",       # which round the complement was taken against
         "prior_dispatched",  # ...and what it dispatched; null for "nothing recorded"
     }),
+    "code_access": frozenset({
+        # Which seats had a SHELL this round: the PR comment's Code access line
+        # carries it and the payload keeps it for the next reader, but the board
+        # has no consumer for it yet. A column would be added with one, not before.
+        "shell_seats",
+    }),
 }
 
 
