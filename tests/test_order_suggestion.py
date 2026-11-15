@@ -1332,3 +1332,15 @@ async def test_the_cap_refuses_rather_than_truncating_and_does_so_on_both_reads(
     # And it is the cap that refused, not the plan being broken: raise it back and
     # the same scope answers.
     assert (await order(client, repo))["counts"]["entries"] == 2
+
+
+async def test_an_observation_does_not_hold_an_item_at_the_head(client):
+    """880-F01: the plan's ordering and the review queue read one blocking test
+    (#623), so a PR whose newest round left only observations is not open work."""
+    repo = "acme/ord-observation"
+    item = await add(client, repo, "under review", ref_kind="pr", ref_value="13")
+    await add(client, repo, "quiet")
+    await review(client, repo, 13, to_fix=[finding("ob1", kind="observation")])
+    e = entry(await order(client, repo), item["item_id"])
+    assert e["inputs"]["open_work"] is False
+    assert e["run"]["outstanding_findings"] == 0

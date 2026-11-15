@@ -401,9 +401,10 @@ class LastRun:
     pr_state: str | None
     ci_status: str | None
     confirmed: int
-    #: ``confirmed`` less every finding with a recorded outcome. The two are both
-    #: published: the issue's own acceptance criterion is about ``confirmed``, and
-    #: ``outstanding`` is what decides whether a fix pass is owed.
+    #: ``confirmed`` less every observation (#623) and every finding with a recorded
+    #: outcome. The two are both published: the issue's own acceptance criterion is
+    #: about ``confirmed``, and ``outstanding`` is what decides whether a fix pass is
+    #: owed.
     outstanding: int
     cleared: int
     #: Confirmed findings the judge typed ``observation`` (#623): counted in
@@ -547,9 +548,9 @@ def _review_state(pr: PullRequest, run: LastRun | None) -> tuple[str, str, str]:
             "unresolved",
             "fix",
             f"{run.outstanding} confirmed finding(s) outstanding at the current head"
-            + (f" ({run.confirmed} confirmed, {run.cleared} cleared)"
-               if run.cleared else "")
-            + (f", {run.observed} observation(s) not counted" if run.observed else ""),
+            + (f" ({run.confirmed} confirmed, {run.observed} observation(s) not "
+               f"counted, {run.cleared} cleared)"
+               if run.cleared or run.observed else ""),
         )
     if run.stopped is True and run.stop_confident is not True:
         # `stop_confident` is the column that exists so a clean verdict can be

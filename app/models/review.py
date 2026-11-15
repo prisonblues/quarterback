@@ -1533,6 +1533,17 @@ class ReviewFinding(Base):
     )
 
 
+#: The kind a confirmed finding can carry and still block nothing (#623).
+NON_BLOCKING_KIND = "observation"
+
+
+def finding_blocks():
+    """The one SQL test for "can this finding hold a PR" (#623): anything not typed
+    an observation. NULL (no kind recorded) blocks, as every finding did before.
+    The review queue and the plan's ordering both read it, so they cannot disagree."""
+    return ReviewFinding.kind.is_(None) | (ReviewFinding.kind != NON_BLOCKING_KIND)
+
+
 class ReviewFindingReport(Base):
     """What one reviewer actually said about one finding — verbatim.
 

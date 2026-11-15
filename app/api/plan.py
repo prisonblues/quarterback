@@ -98,7 +98,7 @@ from app.models.plan_reconcile_pass import PlanReconcilePass
 from app.models.plan_scope import PlanScope
 from app.models.post import Post
 from app.models.resource_lease import ResourceLease
-from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun
+from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun, finding_blocks
 from app.needs_human import label_for
 from app.ordering import BASES, Candidate, Ordering, moves_between, suggest_order
 from app.review_queue import (
@@ -3554,7 +3554,7 @@ async def _pr_evidence(session: AsyncSession,
         for run_id, key in await session.execute(
             select(ReviewFinding.run_id, ReviewFinding.finding_key)
             .where(ReviewFinding.run_id.in_([r.id for r in runs]),
-                   ReviewFinding.verdict == "confirmed")
+                   ReviewFinding.verdict == "confirmed", finding_blocks())
         ):
             confirmed.setdefault(run_id, set()).add(key)
     answered: set[tuple[str, int, str]] = set()

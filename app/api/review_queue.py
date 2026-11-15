@@ -54,7 +54,13 @@ from app.db import get_session
 from app.models.merge_queue import MergeQueueEntry
 from app.models.plan_item import PlanItem
 from app.models.resource_lease import ResourceLease
-from app.models.review import ReviewFinding, ReviewFindingOutcome, ReviewRun
+from app.models.review import (
+    NON_BLOCKING_KIND,
+    ReviewFinding,
+    ReviewFindingOutcome,
+    ReviewRun,
+    finding_blocks,
+)
 from app.review_queue import (
     ACTIONS,
     AGE_BASES,
@@ -219,16 +225,10 @@ async def _cleared(session: AsyncSession, repo: str,
             & ReviewFindingOutcome.outcome.in_(sorted(CLEARING_OUTCOMES)),
         )
         .where(ReviewFinding.run_id.in_(list(run_ids.values())),
-               ReviewFinding.verdict == "confirmed", _blocks())
+               ReviewFinding.verdict == "confirmed", finding_blocks())
         .group_by(ReviewRun.pr)
     )
     return {pr: n for pr, n in (await session.execute(stmt)).all()}
-
-
-def _blocks():
-    """A finding that can hold a PR: anything not typed ``observation`` (#623).
-    NULL is every finding recorded before the type existed, and keeps blocking."""
-    return ReviewFinding.kind.is_(None) | (ReviewFinding.kind != "observation")
 
 
 async def _observed(session: AsyncSession, run_ids: dict[int, int]) -> dict[int, int]:
@@ -241,7 +241,7 @@ async def _observed(session: AsyncSession, run_ids: dict[int, int]) -> dict[int,
         .join(ReviewRun, ReviewRun.id == ReviewFinding.run_id)
         .where(ReviewFinding.run_id.in_(list(run_ids.values())),
                ReviewFinding.verdict == "confirmed",
-               ReviewFinding.kind == "observation")
+               ReviewFinding.kind == NON_BLOCKING_KIND)
         .group_by(ReviewRun.pr)
     )
     return {pr: n for pr, n in (await session.execute(stmt)).all()}
