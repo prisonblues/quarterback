@@ -10,6 +10,7 @@ Run: pytest harness/tests/test_heavy_slot.py
 
 from __future__ import annotations
 
+import ast
 import fcntl
 import importlib.machinery
 import importlib.util
@@ -123,18 +124,20 @@ def test_a_job_whose_min_does_not_fit_waits_says_so_once_and_runs_when_room_free
 def test_a_small_job_does_not_overtake_a_big_one_already_waiting(box):
     env, _, tmp = box
     first, _ = hold(env, "--min", "8G")
-    order = tmp / "order"
-    big = spawn(env, "run", "--min", "6G", "--", "sh", "-c", f"echo big >> {order}; sleep 2",
-                stderr=subprocess.DEVNULL)
+    pipes = {"stdin": subprocess.PIPE, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
+    big = spawn(env, "hold", "--min", "6G", "--label", "big", **pipes)
     wait_for(lambda: len(queued(tmp)) == 1, "big to queue")
-    small = spawn(env, "run", "--min", "2G", "--", "sh", "-c", f"echo small >> {order}",
-                  stderr=subprocess.DEVNULL)
+    small = spawn(env, "hold", "--min", "2G", "--label", "small", **pipes)
     wait_for(lambda: len(queued(tmp)) == 2, "small to queue behind big")
     time.sleep(2 * hs.POLL_SECONDS + 0.5)  # two polls in which small could have gone
-    assert not order.exists(), "2G was free, but small must wait behind big"
+    held = json.loads(run(env, "status", "--json").stdout)["holders"]
+    assert [h["label"] for h in held] == [first.args[-1]] or len(held) == 1, held
     release(first)
-    assert big.wait(timeout=15) == 0 and small.wait(timeout=15) == 0
-    assert order.read_text().split() == ["big", "small"]
+    big.stdout.readline(), small.stdout.readline()
+    held = json.loads(run(env, "status", "--json").stdout)["holders"]
+    granted_at = {h["label"]: os.stat(tmp / "q" / h["file"]).st_ctime_ns for h in held}
+    release(big), release(small)
+    assert granted_at["big"] < granted_at["small"], granted_at
 
 
 def test_low_memavailable_holds_a_job_back_even_inside_the_budget(box):
@@ -160,10 +163,13 @@ def test_a_released_hold_frees_its_memory_and_removes_its_file(box):
 
 
 def test_run_becomes_its_command_which_holds_the_reservation_until_it_exits(box):
-    env, _, _ = box
-    job = spawn(env, "run", "--min", "4G", "--", "sleep", "30")
-    wait_for(lambda: reserved(env) == 4 * G, "the run to be granted")
-    job.kill()  # no wrapper is left to outlive or proxy it: the pid IS the command
+    env, _, tmp = box
+    pidfile = tmp / "pid"
+    job = spawn(env, "run", "--min", "4G", "--", "sh", "-c", f"echo $$ > {pidfile}; exec sleep 30")
+    wait_for(lambda: pidfile.exists() and pidfile.read_text().strip(), "the command to start")
+    assert int(pidfile.read_text()) == job.pid  # no wrapper: the run's pid IS the command
+    assert reserved(env) == 4 * G
+    job.kill()
     job.wait(timeout=10)
     assert reserved(env) == 0
 
@@ -297,45 +303,70 @@ def test_the_command_gets_the_signal_dispositions_a_plain_launch_would(box, igno
     assert via_run and via_run == _signal_masks(probe, env, ignore_int)
 
 
-def test_a_caller_with_fds_0_to_2_closed_does_not_hand_the_command_its_lock_as_one(box):
+def _closed_std():
+    for fd in (0, 1, 2):
+        os.close(fd)
+
+
+def test_a_caller_with_fds_0_to_2_closed_hands_the_command_its_lock_above_them(box):
     env, _, tmp = box
     out = tmp / "fds"
-
-    def close_std():
-        for fd in (0, 1, 2):
-            os.close(fd)
     subprocess.run([sys.executable, str(SCRIPT), "run", "--min", "1G", "--", "sh", "-c",
-                    f"for f in 0 1 2; do readlink /proc/$$/fd/$f; done > {out}"],
-                   env=env, preexec_fn=close_std, timeout=20)
-    assert "res-" not in out.read_text()
+                    f"for f in 0 1 2 3; do echo $f $(readlink /proc/$$/fd/$f); done > {out}"],
+                   env=env, preexec_fn=_closed_std, timeout=20)
+    fds = dict(line.split(" ", 1) for line in out.read_text().splitlines())
+    assert not any("res-" in fds.get(f, "") for f in "012") and "res-" in fds["3"], fds
+
+
+@pytest.mark.parametrize(("args", "status"), [
+    (["run", "--min", "13G", "--", "true"], 3),  # its "can never fit" message has nowhere to go
+    (["run", "--min", "1G", "--", "/nonexistent/tool"], 127),
+    (["hold", "--min", "1G"], 2),  # a grant nobody can read is not held
+])
+def test_closed_standard_fds_cost_the_message_never_the_exit_status(box, args, status):
+    env, _, _ = box
+    r = subprocess.run([sys.executable, str(SCRIPT), *args], env=env, preexec_fn=_closed_std,
+                       timeout=20)
+    assert r.returncode == status
+
+
+def _plant(tmp, name, raw):
+    fd = os.open(tmp / "q" / name, os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, raw)
+    return fd
 
 
 @pytest.mark.parametrize("raw", [
     b"[" * 4096,
-    b'{"bytes": "lots"}',
-    b'{"bytes": -5368709120}',
-    b'{"bytes": true}',
     b"\xff\xfe",
+    b'{"bytes": "lots"}',
+    b'{"bytes": 1, "min": true, "max": 1, "pid": 1, "uid": 0, "label": "", "since": ""}',
+    b'{"bytes": 1000000000000000000000000000000}',  # an int no formatter should meet
+    b'{"min": 4, "max": 2, "pid": 1, "uid": 0, "label": "", "since": ""}',
 ])
-def test_a_hostile_record_counts_for_nothing_and_crashes_no_reader(box, raw):
+def test_a_hostile_record_counts_for_nothing_holds_no_place_and_crashes_no_reader(box, raw):
     env, _, tmp = box
     run(env, "status")
-    fd = os.open(tmp / "q" / "res-hostile", os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    os.write(fd, raw)
+    fds = [_plant(tmp, "res-hostile", raw), _plant(tmp, f"wait-{0:020d}-1", raw)]
     try:
-        r = run(env, "status", "--json")
-        assert r.returncode == 0 and json.loads(r.stdout)["reserved"] == 0, r.stderr
+        status = run(env, "status", "--json")
+        assert status.returncode == 0 and json.loads(status.stdout)["reserved"] == 0
+        assert json.loads(status.stdout)["waiters"] == []
+        assert run(env, "status").returncode == 0
+        # the planted wait- file sorts first; a job queued behind it would never go
+        assert run(env, "run", "--min", "1G", "--timeout", "0.1", "--", "true").returncode == 0
     finally:
-        os.close(fd)
+        for fd in fds:
+            os.close(fd)
 
 
 def test_a_planted_label_reaches_status_as_printable_text(box):
     env, _, tmp = box
     run(env, "status")
-    fd = os.open(tmp / "q" / "res-planted", os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    os.write(fd, json.dumps({"bytes": 1, "label": "\x1b]0;owned\x07\x1b[2J"}).encode())
+    fd = _plant(tmp, "res-planted", json.dumps({
+        "bytes": 1, "min": 1, "max": 1, "pid": 1, "uid": 0, "since": "",
+        "label": "\x1b]0;owned\x07\x1b[2J"}).encode())
     try:
         out = run(env, "status").stdout
         assert "\x1b" not in out and "?]0;owned??[2J" in out
@@ -365,3 +396,10 @@ def test_a_long_label_still_leaves_a_record_a_reader_can_parse(box):
     finally:
         release(first)
 
+
+
+def test_every_message_goes_through_the_closed_fd_safe_writer():
+    tree = ast.parse(SCRIPT.read_text())
+    prints = [n.lineno for n in ast.walk(tree)
+              if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "print"]
+    assert prints == [], f"print() at lines {prints}: use _say, which survives a closed fd"

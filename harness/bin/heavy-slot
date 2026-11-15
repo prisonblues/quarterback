@@ -93,31 +93,47 @@ def budget_of(cfg: dict, total: int) -> int:
     return max(0, total - parse_size(cfg["reserve"]))
 
 
-#: The one schema a queue record is read through. Anyone can write the directory, so a
-#: field that is missing, mistyped or hostile reads as its zero value, never as itself.
-RECORD = {"pid": 0, "uid": -1, "bytes": 0, "min": 0, "max": 0, "label": "", "since": ""}
+#: Bigger than any host's memory, and small enough that every size is safe to add and print.
+SIZE_MAX = 1 << 50
 
 
 def _clean(text: str) -> str:
     return "".join(c if c.isprintable() else "?" for c in text)[:LABEL_MAX]
 
 
-def _fields(raw: bytes) -> dict:
-    """An entry's fields, each of RECORD's type or its zero value."""
+def _sized(value, low: int = 1) -> bool:
+    return type(value) is int and low <= value <= SIZE_MAX
+
+
+def _record(raw: bytes, prefix: str) -> dict | None:
+    """A queue record, or None when it is not one this tool could have written.
+
+    Anyone can write the directory, so this is the one place a record is judged: a record
+    is whole and in bounds, or it does not exist. A None neither counts toward the budget
+    nor takes a place in the queue."""
     try:
-        entry = json.loads(raw)
+        r = json.loads(raw)
     except (ValueError, RecursionError):
-        entry = None
-    entry = entry if isinstance(entry, dict) else {}
-    out = {}
-    for key, zero in RECORD.items():
-        value = entry.get(key)
-        if isinstance(zero, int):
-            ok = type(value) is int and (value >= 0 or zero < 0)
-            out[key] = value if ok else zero
-        else:
-            out[key] = _clean(value) if isinstance(value, str) else zero
-    return out
+        return None
+    if not isinstance(r, dict):
+        return None
+    sized = ("min", "max", "bytes") if prefix == "res-" else ("min", "max")
+    if not (all(_sized(r.get(k)) for k in sized) and r["min"] <= r["max"]
+            and _sized(r.get("pid")) and _sized(r.get("uid"), 0)
+            and isinstance(r.get("label"), str) and isinstance(r.get("since"), str)):
+        return None
+    return {k: r[k] for k in ("pid", "uid", *sized)} | {
+        "label": _clean(r["label"]), "since": _clean(r["since"]), "bytes": r.get("bytes", 0)}
+
+
+def _say(text: str, fd: int = 2) -> bool:
+    """Write one line to fd, which a caller may have closed. Every message goes through
+    here, so a closed fd 1 or 2 costs the message and never the exit status."""
+    try:
+        os.write(fd, (text + "\n").encode())
+        return True
+    except OSError:
+        return False
 
 
 def live(d: str, prefix: str) -> list[dict]:
@@ -134,7 +150,9 @@ def live(d: str, prefix: str) -> list[dict]:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
-            out.append({**_fields(os.pread(fd, RECORD_MAX, 0)), "file": name})
+            record = _record(os.pread(fd, RECORD_MAX, 0), prefix)
+            if record is not None:
+                out.append({**record, "file": name})
             continue
         finally:
             os.close(fd)
@@ -216,8 +234,8 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
     # MemAvailable never exceeds MemTotal, so no grant can be bigger than this.
     budget = min(budget_of(cfg, total), total - parse_size(cfg["min_free"]))
     if args.min > budget:
-        print(f"heavy-slot: {args.label} wants at least {fmt(args.min)}, more than this host "
-              f"can ever grant ({fmt(budget)})", file=sys.stderr)
+        _say(f"heavy-slot: {args.label} wants at least {fmt(args.min)}, more than this host "
+             f"can ever grant ({fmt(budget)})")
         sys.exit(EXIT_NEVER)
     # CLOCK_MONOTONIC is one clock for every process on the host, and never steps back.
     me = f"wait-{time.monotonic_ns():020d}-{os.getpid()}"
@@ -242,17 +260,16 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
                     os.unlink(os.path.join(d, me))  # under the lock: no one sees both
                     return fd, os.path.join(d, name), grant
                 if deadline and time.monotonic() > deadline:
-                    print(f"heavy-slot: {args.label} gave up after {args.timeout:g} min",
-                          file=sys.stderr)
+                    _say(f"heavy-slot: {args.label} gave up after {args.timeout:g} min")
                     sys.exit(EXIT_TIMEOUT)
             finally:
                 fcntl.flock(admit, fcntl.LOCK_UN)
             if not said:
                 ahead = next((i for i, w in enumerate(waiters) if w["file"] == me), 0)
-                print(f"heavy-slot: {args.label} waiting for {fmt(args.min)}: budget "
+                _say(f"heavy-slot: {args.label} waiting for {fmt(args.min)}: budget "
                       f"{fmt(why['budget'])}, {fmt(why['reserved'])} reserved by "
                       f"{len(holders)} holder(s), MemAvailable {fmt(why['available'])}, "
-                      f"{ahead} ahead", file=sys.stderr, flush=True)
+                      f"{ahead} ahead")
                 said = True
             time.sleep(POLL_SECONDS)
     finally:
@@ -266,7 +283,7 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
 
 def cmd_run(args, cfg, env) -> int:
     if not args.cmd:
-        print("heavy-slot run: nothing to run after --", file=sys.stderr)
+        _say("heavy-slot run: nothing to run after --")
         return EXIT_USAGE
     fd, res, grant = acquire(args, cfg, env)
     env["HEAVY_SLOT_GRANT_BYTES"] = str(grant)
@@ -284,20 +301,28 @@ def cmd_run(args, cfg, env) -> int:
         for sig in RESET_AT_EXEC:
             signal.signal(sig, signal.SIG_IGN)  # so the message below cannot SIGPIPE us
         os.unlink(res)
-        print(f"heavy-slot run: cannot run {args.cmd[0]}: {e.strerror}", file=sys.stderr)
+        _say(f"heavy-slot run: cannot run {args.cmd[0]}: {e.strerror}")
         return 127 if isinstance(e, FileNotFoundError) else 126
 
 
 def cmd_hold(args, cfg, env) -> int:
     _, res, grant = acquire(args, cfg, env)
     try:
-        print(json.dumps({"grant_bytes": grant,
-                          "units": grant // args.unit if args.unit else 0}), flush=True)
-        while sys.stdin.buffer.read(4096):
+        if not _say(json.dumps({"grant_bytes": grant,
+                                "units": grant // args.unit if args.unit else 0}), 1):
+            return EXIT_USAGE  # a grant nobody can read is not held for anyone
+        while _read_some(0):
             pass  # held until the caller closes our stdin, or dies and the pipe closes
     finally:
         os.unlink(res)
     return 0
+
+
+def _read_some(fd: int) -> bytes:
+    try:
+        return os.read(fd, 4096)
+    except OSError:
+        return b""  # a closed stdin ends the hold, as EOF does
 
 
 def cmd_status(args, cfg, env) -> int:
@@ -305,14 +330,14 @@ def cmd_status(args, cfg, env) -> int:
     holders, waiters = live(d, "res-"), live(d, "wait-")
     free, why = room(cfg, env, holders)
     if args.json:
-        print(json.dumps({**why, "free": free, "holders": holders, "waiters": waiters}))
+        _say(json.dumps({**why, "free": free, "holders": holders, "waiters": waiters}), 1)
         return 0
-    print(f"budget {fmt(why['budget'])}  reserved {fmt(why['reserved'])}  "
-          f"MemAvailable {fmt(why['available'])}  grantable {fmt(free)}")
+    _say(f"budget {fmt(why['budget'])}  reserved {fmt(why['reserved'])}  "
+         f"MemAvailable {fmt(why['available'])}  grantable {fmt(free)}", 1)
     for kind, entries, size in (("holds", holders, "bytes"), ("waits", waiters, "min")):
         for e in entries:
-            print(f"  {kind}  {fmt(e[size]):>7}  pid {e['pid']}  uid {e['uid']}  "
-                  f"{e['label']}  since {e['since']}")
+            _say(f"  {kind}  {fmt(e[size]):>7}  pid {e['pid']}  uid {e['uid']}  "
+                 f"{e['label']}  since {e['since']}", 1)
     return 0
 
 
@@ -361,7 +386,7 @@ def main(argv: list[str]) -> int:
         return {"run": cmd_run, "hold": cmd_hold, "status": cmd_status}[args.command](
             args, cfg, env)
     except (ValueError, OSError) as e:  # bad config, meminfo or queue directory
-        print(f"heavy-slot: {e}", file=sys.stderr)
+        _say(f"heavy-slot: {e}")
         return EXIT_USAGE
 
 
