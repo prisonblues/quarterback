@@ -191,7 +191,14 @@ def test_run_exits_as_its_command_does(box, cmd, status):
 def test_a_min_bigger_than_the_whole_budget_is_refused_at_once(box):
     env, _, _ = box
     r = run(env, "run", "--min", "13G", "--", "true", timeout=5)
-    assert r.returncode == hs.EXIT_NEVER and "more than the whole budget of 12.0G" in r.stderr
+    assert r.returncode == hs.EXIT_NEVER and "more than this host can ever grant (12.0G)" in r.stderr
+
+
+def test_a_fixed_budget_above_the_box_is_capped_by_memtotal_less_the_floor(box):
+    env, _, _ = box
+    env["HEAVY_SLOT_BUDGET"] = "40G"  # MemTotal 16G - min_free 2G: 14G is the most ever free
+    r = run(env, "run", "--min", "15G", "--timeout", "0.05", "--", "true", timeout=5)
+    assert r.returncode == hs.EXIT_NEVER and "(14.0G)" in r.stderr
 
 
 def test_a_timed_out_waiter_leaves_no_queue_entry_behind(box):
@@ -226,18 +233,6 @@ def test_status_lists_holders_and_waiters(box):
     release(first)
     assert "holds    10.0G" in out and "lexray zeus-1" in out
     assert "waits     4.0G" in out and "panel?#861" in out
-
-
-def test_an_entry_that_is_not_a_json_object_counts_for_nothing(box):
-    env, _, tmp = box
-    run(env, "status")  # creates the queue directory
-    fd = os.open(tmp / "q" / "res-junk", os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(fd, fcntl.LOCK_EX)
-    os.write(fd, b"\xff[1, 2]")
-    try:
-        assert reserved(env) == 0
-    finally:
-        os.close(fd)
 
 
 @pytest.mark.parametrize("args", [
@@ -282,11 +277,70 @@ def test_the_budget_defaults_to_memtotal_minus_the_reserve():
     assert hs.budget_of({"budget": "30G", "reserve": "12G"}, 61 * G) == 30 * G
 
 
-def test_the_command_starts_with_sigpipe_and_sigxfsz_at_their_defaults(box):
+def _signal_masks(cmd, env, ignore_int):
+    """SigIgn/SigCgt of a process `cmd` starts, launched with SIGINT ignored or not."""
+    def setup():
+        signal.signal(signal.SIGINT, signal.SIG_IGN if ignore_int else signal.SIG_DFL)
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True, preexec_fn=setup,
+                         timeout=20).stdout
+    return [line for line in out.splitlines() if line.startswith(("SigIgn", "SigCgt"))]
+
+
+@pytest.mark.parametrize("ignore_int", [False, True])
+def test_the_command_gets_the_signal_dispositions_a_plain_launch_would(box, ignore_int):
+    """`run` is as transparent as subprocess: what the caller ignored stays ignored, and the
+    two signals CPython ignores at start-up go back to default."""
     env, _, _ = box
-    r = run(env, "run", "--min", "1G", "--", "grep", "SigIgn", "/proc/self/status")
-    ignored = int(r.stdout.split()[1], 16)
-    assert not ignored & (1 << (signal.SIGPIPE - 1) | 1 << (signal.SIGXFSZ - 1)), r.stdout
+    probe = ["grep", "^Sig\\(Ign\\|Cgt\\)", "/proc/self/status"]
+    via_run = _signal_masks([sys.executable, str(SCRIPT), "run", "--min", "1G", "--", *probe],
+                            env, ignore_int)
+    assert via_run and via_run == _signal_masks(probe, env, ignore_int)
+
+
+def test_a_caller_with_fds_0_to_2_closed_does_not_hand_the_command_its_lock_as_one(box):
+    env, _, tmp = box
+    out = tmp / "fds"
+
+    def close_std():
+        for fd in (0, 1, 2):
+            os.close(fd)
+    subprocess.run([sys.executable, str(SCRIPT), "run", "--min", "1G", "--", "sh", "-c",
+                    f"for f in 0 1 2; do readlink /proc/$$/fd/$f; done > {out}"],
+                   env=env, preexec_fn=close_std, timeout=20)
+    assert "res-" not in out.read_text()
+
+
+@pytest.mark.parametrize("raw", [
+    b"[" * 4096,
+    b'{"bytes": "lots"}',
+    b'{"bytes": -5368709120}',
+    b'{"bytes": true}',
+    b"\xff\xfe",
+])
+def test_a_hostile_record_counts_for_nothing_and_crashes_no_reader(box, raw):
+    env, _, tmp = box
+    run(env, "status")
+    fd = os.open(tmp / "q" / "res-hostile", os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, raw)
+    try:
+        r = run(env, "status", "--json")
+        assert r.returncode == 0 and json.loads(r.stdout)["reserved"] == 0, r.stderr
+    finally:
+        os.close(fd)
+
+
+def test_a_planted_label_reaches_status_as_printable_text(box):
+    env, _, tmp = box
+    run(env, "status")
+    fd = os.open(tmp / "q" / "res-planted", os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, json.dumps({"bytes": 1, "label": "\x1b]0;owned\x07\x1b[2J"}).encode())
+    try:
+        out = run(env, "status").stdout
+        assert "\x1b" not in out and "?]0;owned??[2J" in out
+    finally:
+        os.close(fd)
 
 
 def test_a_command_that_cannot_start_leaves_no_reservation_behind(box):

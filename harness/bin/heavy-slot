@@ -31,6 +31,7 @@ EXIT_USAGE, EXIT_NEVER, EXIT_TIMEOUT = 2, 3, 4
 DEFAULTS = {"dir": "/tmp/heavy-slot", "budget": "", "reserve": "12G", "min_free": "2G"}
 CONFIG_FILES = ("/etc/heavy-slot.conf", "~/.config/heavy-slot.conf")
 POLL_SECONDS = 2.0
+RESET_AT_EXEC = (signal.SIGPIPE, signal.SIGXFSZ)
 LABEL_MAX = 200  # keeps every record well inside the RECORD_MAX a reader takes
 RECORD_MAX = 4096
 SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*$", re.IGNORECASE)
@@ -92,13 +93,31 @@ def budget_of(cfg: dict, total: int) -> int:
     return max(0, total - parse_size(cfg["reserve"]))
 
 
+#: The one schema a queue record is read through. Anyone can write the directory, so a
+#: field that is missing, mistyped or hostile reads as its zero value, never as itself.
+RECORD = {"pid": 0, "uid": -1, "bytes": 0, "min": 0, "max": 0, "label": "", "since": ""}
+
+
+def _clean(text: str) -> str:
+    return "".join(c if c.isprintable() else "?" for c in text)[:LABEL_MAX]
+
+
 def _fields(raw: bytes) -> dict:
-    """An entry's recorded fields, or none when they are not a JSON object."""
+    """An entry's fields, each of RECORD's type or its zero value."""
     try:
         entry = json.loads(raw)
-    except ValueError:
-        return {}
-    return entry if isinstance(entry, dict) else {}
+    except (ValueError, RecursionError):
+        entry = None
+    entry = entry if isinstance(entry, dict) else {}
+    out = {}
+    for key, zero in RECORD.items():
+        value = entry.get(key)
+        if isinstance(zero, int):
+            ok = type(value) is int and (value >= 0 or zero < 0)
+            out[key] = value if ok else zero
+        else:
+            out[key] = _clean(value) if isinstance(value, str) else zero
+    return out
 
 
 def live(d: str, prefix: str) -> list[dict]:
@@ -177,8 +196,7 @@ def open_dir(cfg: dict) -> str:
 def room(cfg: dict, env: dict, holders: list[dict]) -> tuple[int, dict]:
     total, available = meminfo(env)
     budget = budget_of(cfg, total)
-    reserved = sum(h["bytes"] for h in holders
-                   if isinstance(h.get("bytes"), int) and h["bytes"] > 0)
+    reserved = sum(h["bytes"] for h in holders)
     free = min(budget - reserved, available - parse_size(cfg["min_free"]))
     return max(0, free), {"budget": budget, "reserved": reserved, "available": available}
 
@@ -198,13 +216,13 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
     # MemAvailable never exceeds MemTotal, so no grant can be bigger than this.
     budget = min(budget_of(cfg, total), total - parse_size(cfg["min_free"]))
     if args.min > budget:
-        print(f"heavy-slot: {args.label} wants at least {fmt(args.min)}, more than the whole "
-              f"budget of {fmt(budget)}", file=sys.stderr)
+        print(f"heavy-slot: {args.label} wants at least {fmt(args.min)}, more than this host "
+              f"can ever grant ({fmt(budget)})", file=sys.stderr)
         sys.exit(EXIT_NEVER)
     # CLOCK_MONOTONIC is one clock for every process on the host, and never steps back.
     me = f"wait-{time.monotonic_ns():020d}-{os.getpid()}"
     fields = {"pid": os.getpid(), "uid": os.getuid(), "label": args.label, "min": args.min,
-              "max": args.max, "since": time.strftime("%Y-%m-%d %H:%M:%S")}
+              "max": args.max, "since": time.strftime("%Y-%m-%d %H:%M:%S %z")}
     wait_fd = _publish(d, me, fields)
     deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
     said = False
@@ -253,13 +271,18 @@ def cmd_run(args, cfg, env) -> int:
     fd, res, grant = acquire(args, cfg, env)
     env["HEAVY_SLOT_GRANT_BYTES"] = str(grant)
     env["HEAVY_SLOT_UNITS"] = str(grant // args.unit if args.unit else 0)
+    if fd < 3:  # fds 0-2 were closed by our caller; CMD must not get the lock as one
+        fd = fcntl.fcntl(fd, fcntl.F_DUPFD, 3)
     os.set_inheritable(fd, True)
-    # Python ignores these at start-up, and an ignored signal survives exec.
-    for sig in (signal.SIGPIPE, signal.SIGXFSZ):
+    # CMD gets the dispositions our caller gave us, except the two CPython ignores at
+    # start-up, which go back to default as subprocess's restore_signals does.
+    for sig in RESET_AT_EXEC:
         signal.signal(sig, signal.SIG_DFL)
     try:
         os.execvpe(args.cmd[0], args.cmd, env)
     except OSError as e:
+        for sig in RESET_AT_EXEC:
+            signal.signal(sig, signal.SIG_IGN)  # so the message below cannot SIGPIPE us
         os.unlink(res)
         print(f"heavy-slot run: cannot run {args.cmd[0]}: {e.strerror}", file=sys.stderr)
         return 127 if isinstance(e, FileNotFoundError) else 126
@@ -288,9 +311,8 @@ def cmd_status(args, cfg, env) -> int:
           f"MemAvailable {fmt(why['available'])}  grantable {fmt(free)}")
     for kind, entries, size in (("holds", holders, "bytes"), ("waits", waiters, "min")):
         for e in entries:
-            n = e.get(size) if isinstance(e.get(size), int) else 0
-            print(f"  {kind}  {fmt(n):>7}  pid {e.get('pid')}  uid {e.get('uid')}  "
-                  f"{e.get('label')}  since {e.get('since')}")
+            print(f"  {kind}  {fmt(e[size]):>7}  pid {e['pid']}  uid {e['uid']}  "
+                  f"{e['label']}  since {e['since']}")
     return 0
 
 
@@ -327,7 +349,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.min <= 0 or args.max < args.min or not 0 <= args.timeout < math.inf:
         p.error("need 0 < --min <= --max (in whole --units), and a finite --timeout >= 0")
     label = args.label or (args.cmd[0] if args.cmd else f"pid {os.getppid()}")
-    args.label = "".join(c if c.isprintable() else "?" for c in label)[:LABEL_MAX]
+    args.label = _clean(label)
     return args
 
 
