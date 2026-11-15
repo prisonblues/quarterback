@@ -2377,6 +2377,21 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
                        duration_ms=elapsed())
 
 
+def kind_line(findings: list[Canonical]) -> str:
+    """One summary line counting what the judge said the findings ARE (#623).
+
+    Recorded and nothing more: no rule reads the kind yet. ``""`` when the judge
+    typed nothing, so a round whose judge did not answer reads as it always did."""
+    tally = Counter(c.kind or "untyped" for c in findings)
+    if len(findings) == tally["untyped"]:
+        return ""
+    parts = [f"{tally[k]} {k}" for k in (*FINDING_KINDS, "untyped") if tally[k]]
+    unbacked = sum(1 for c in findings if c.kind_said != c.kind)
+    tail = (f"; {unbacked} said to be a regression or claim_miss without evidence, so "
+            "counted as an observation" if unbacked else "")
+    return f"_Kinds: {', '.join(parts)}{tail}. Recorded only; nothing stops on it yet._"
+
+
 def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
                ledger_round: int, new_cycle: bool) -> str:
     """Why this run cannot continue its PR's cycle, or "" when it can or need not
@@ -9104,6 +9119,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     lines.append(f"\n### To fix ({len(for_fix)}) — {counted}"
                  + (f", {dials.fix_floor} and above"
                     if under_floor else ""))
+    if kinds := kind_line(to_fix):
+        lines.append(kinds)
     # #624, said to the fixer and not only recorded about it. The budget note below is
     # conditional on a budget being in force; this is not, because the record is made
     # of every pass — so a repo with no budget written would otherwise have a fixer
@@ -9241,7 +9258,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             again = (" ↻ _fix needs re-reading (" + ", ".join(c.rereview_by) + ")_"
                      if c.needs_rereview else "")
             paid = "💸 " if budgeted(c) else ""
-            lines.append(f"- {paid}**{c.severity}**{fresh}{whence(c)} `{loc(c)}` "
+            kind = f" _{c.kind}_" if c.kind else ""
+            lines.append(f"- {paid}**{c.severity}**{kind}{fresh}{whence(c)} `{loc(c)}` "
                          f"[{c.id}] — {c.synthesis}"
                          f"{conf(c)}{unruled}{tail}{rel}{again}{escalation(c)}"
                          f"{declination(c)}")

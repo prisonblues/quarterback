@@ -437,6 +437,14 @@ class Canonical:
     #: severity and the synthesis, and dropping it here would mean parsing the
     #: judge's answer twice.
     premise_verdict: str = ""
+    #: What the judge said this finding IS (#623): one of
+    #: :data:`panel_core.FINDING_KINDS`, or ``""`` when it said nothing readable,
+    #: which is every unjudged finding. ``kind_said`` is the judge's own word, and
+    #: differs from ``kind`` only where a regression or claim_miss came without the
+    #: ``evidence`` that has to back it — see :func:`panel_core._finding_kind`.
+    kind: str = ""
+    kind_said: str = ""
+    evidence: str = ""
 
     @property
     def reviewers(self) -> list[str]:
@@ -525,6 +533,9 @@ class Canonical:
             "related": self.related,
             "rationale": self.rationale,
             "premise_verdict": self.premise_verdict,
+            "kind": self.kind,
+            "kind_said": self.kind_said,
+            "evidence": self.evidence,
         }
 
 
@@ -645,6 +656,7 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
         # would put a detail — up to RAW_DETAIL_CHARS of it — in the synthesis,
         # which the board stores as the title.
         synthesis = str(v.get("synthesis") or v.get("title") or "").strip()
+        kind, kind_said, evidence = _finding_kind(v.get("kind"), v.get("evidence"))
         c = Canonical(
             id=_finding_id(pr, len(out) + 1),
             severity=_severity(v.get("severity"), rep.severity),
@@ -659,6 +671,7 @@ def _parse_verdicts(parsed: list, flat: list[Finding], pr: int,
             # prompt — a judge that was never asked cannot answer, and a stray key
             # on a round-1 reply normalises to "" like any other unreadable value.
             premise_verdict=_premise_verdict(v.get("premise")) if asked else "",
+            kind=kind, kind_said=kind_said, evidence=evidence,
         )
         out.append(c)
         rel = v.get("related")

@@ -1321,6 +1321,16 @@ JUDGE_RECURRENCE_SLOT = "<<<RECURRENCE_BRIEF>>>"
 #: the findings that most needed a shrug.
 PREMISE_VERDICTS = ("invalidates", "separate", "unclear")
 
+#: What a judge may say a finding IS (#623). The first two are what a change owes:
+#: it broke something that worked, or it does not do what it claims. The third is
+#: everything else, and is the default. ``""`` (unsaid or unreadable) is a fourth
+#: state and is kept apart from ``observation``, so an old payload or a judge that
+#: did not answer is never counted as having typed anything.
+FINDING_KINDS = ("regression", "claim_miss", "observation")
+
+#: The two kinds that need a demonstration before they are believed.
+DEMONSTRATED_KINDS = ("regression", "claim_miss")
+
 #: What a judge is told when there IS an earlier round, and what it is asked on
 #: top of its ordinary ruling.
 #:
@@ -1495,6 +1505,19 @@ flagged by only ONE reviewer MUST be marked real — never dismiss it because th
 Mark real=false ONLY when the issue is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
+KIND. Separately from real and severity, say what each issue IS, in `kind` (#623):
+- "regression" — something that worked before this change no longer works, AND it is
+  DEMONSTRATED: a failing test or check, a command and its wrong output, or a concrete input whose
+  result this diff changes for the worse. Put that demonstration in `evidence`. "This could break
+  X" is not a regression until someone shows X breaking; until then it is an observation.
+- "claim_miss" — the change does not do what it says it is for. Quote the claim (from the author's
+  claim block or the PR title) in `evidence`, and say in `reason` how the diff fails it.
+- "observation" — everything else: generality, robustness the change never promised, test
+  style, naming, docs, simplification, and any defect that was just as true before this change.
+  THIS IS THE DEFAULT AND THE COMMON CASE. A real, well-argued issue is still usually this.
+Kind and severity are independent: a P2 can be an observation and a P4 can be a regression. A
+regression or claim_miss with no `evidence` is recorded as an observation.
+
 Return one `verdicts` entry per REAL-WORLD ISSUE, covering every report id, in this shape:
   {{"verdicts": [{{"id": "F01",
                   "members": [<the bracketed report NUMBERS merged into this issue, e.g. 0, 3>],
@@ -1503,6 +1526,8 @@ Return one `verdicts` entry per REAL-WORLD ISSUE, covering every report id, in t
                   "file": "path", "line": <int|null>,
                   "synthesis": "the merged statement of the issue",
                   "related": ["F03"],
+                  "kind": "regression|claim_miss|observation",
+                  "evidence": "the failing check, or the quoted claim",
                   "reason": "why real or a false positive"}}],
    "coverage_rulings": [{{"declarations": [<the bracketed declaration NUMBERS this claim merges, e.g. 0, 2>],
                   "claim": "what nobody settled, in one line",
@@ -1571,6 +1596,8 @@ JUDGE_SCHEMA = {
                 "line": {"type": ["integer", "null"]},
                 "synthesis": {"type": "string"},
                 "related": {"type": "array", "items": {"type": "string"}},
+                "kind": {"type": "string", "enum": list(FINDING_KINDS)},
+                "evidence": {"type": "string"},
                 "reason": {"type": "string"},
             },
             "required": ["id", "members", "real", "severity", "synthesis", "reason"],
@@ -2920,6 +2947,23 @@ def _premise_verdict(raw) -> str:
     return said if said in PREMISE_VERDICTS else ""
 
 
+def _finding_kind(raw_kind, raw_evidence) -> tuple[str, str, str]:
+    """``(kind, kind_said, evidence)`` from one judge verdict (#623).
+
+    ``kind_said`` is the judge's word whenever it was one of :data:`FINDING_KINDS`;
+    ``kind`` is what is counted. They differ in exactly one case: a ``regression`` or
+    ``claim_miss`` with no evidence is counted as an ``observation``, because the
+    decided rule is that a finding is a regression only on a demonstrated failure,
+    and keeping the judge's word beside it shows how often that rule bit."""
+    said = raw_kind.strip().lower() if isinstance(raw_kind, str) else ""
+    if said not in FINDING_KINDS:
+        return "", "", ""
+    evidence = raw_evidence.strip() if isinstance(raw_evidence, str) else ""
+    if said in DEMONSTRATED_KINDS and not evidence:
+        return "observation", said, ""
+    return said, said, evidence
+
+
 def _ruling(raw) -> str:
     """The judge's verdict on one issue, from its ``real`` flag.
 
@@ -3497,7 +3541,7 @@ __all__ = [
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
     "JUDGE_RECURRENCE_SLOT", "PREMISE_VERDICTS", "RECURRENCE_BRIEF",
-    "_premise_verdict",
+    "_premise_verdict", "FINDING_KINDS", "DEMONSTRATED_KINDS", "_finding_kind",
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
