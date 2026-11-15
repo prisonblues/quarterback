@@ -1464,47 +1464,6 @@ def test_a_partial_meta_dict_still_vetoes_its_declarations():
         "claude could not assess: the caller"]
 
 
-def test_the_kernel_ceiling_is_reported_without_vetoing():
-    """`agy`'s prompt travels in argv and the kernel caps one element, so on a
-    large diff that seat structurally cannot be handed all of it — on PR #160,
-    116,771 of 175,547 chars, 66.5%. Constant, like an absent CLI: it is true of
-    every round on this box at this diff size, so it cannot separate a quiet round
-    from a broken one.
-
-    A BUDGET is a different fact. Someone typed it, it can be raised, and
-    `diff_budget` honours it precisely so the consequence gets surfaced — so
-    truncation by config still vetoes. `argv_capped` is what tells the two
-    apart."""
-    kernel = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
-                              "max_diff_chars": 116_771, "code_blind": True},
-              "claude": {"ran": True, "code_blind": True}}
-    assert panel.coverage_veto(kernel, None, 0, 175_547, ci_status="PASS") == []
-    budget = {"antigravity": {"ran": True, "truncated": True, "argv_capped": False,
-                              "max_diff_chars": 6_000, "code_blind": True},
-              "claude": {"ran": True, "code_blind": True}}
-    assert panel.coverage_veto(budget, None, 0, 175_547, ci_status="PASS") == [
-        "antigravity saw 6,000 of 175,547 diff chars"]
-
-
-def test_a_panel_whose_every_running_seat_was_argv_capped_cannot_stop_confidently():
-    """The floor under the exemption above, and it is the same floor the absent
-    seats needed. Exempting per seat means a panel whose ONLY running seat is the
-    argv-bound one produces an empty veto list — and `confident` is `not veto`, so
-    the round claims a confident stop on a diff nothing saw whole. Reachable by
-    `--reviewers antigravity`, or by a repo that switched the others off, and it
-    lands on the unattended loops where the claim is believed."""
-    alone = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
-                             "max_diff_chars": 116_771, "code_blind": True}}
-    veto = panel.coverage_veto(alone, None, 0, 175_547, ci_status="PASS")
-    assert veto == ["every reviewer that ran was cut by the argv ceiling — "
-                    "nothing read this diff whole"]
-    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
-    # One seat that saw the whole thing is enough to lift it — that seat's reading
-    # is what the round rests on, and it is not truncated.
-    beside = dict(alone, claude={"ran": True, "code_blind": True})
-    assert panel.coverage_veto(beside, None, 0, 175_547, ci_status="PASS") == []
-
-
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():
     meta = {"claude": {"ran": True, "truncated": False, "could_not_assess": []}}
     assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS") == []
@@ -2180,33 +2139,6 @@ def test_a_seat_that_can_read_the_code_puts_its_gaps_back_in_the_veto(
     assert any("could not assess: migrations/versions/" in v for v in stop["veto"])
     # The reader-facing note belongs to the blind case and must not appear here.
     assert "did not cost the round its confidence" not in report
-
-
-def test_sonarqube_cannot_switch_off_the_argv_floor():
-    """The floor counts LLM seats only, and the second model that read this diff was
-    right that counting everything was too permissive.
-
-    `sonarqube` shares `reviewer_meta` and carries no `truncated` key, so an `all()`
-    over every entry was False the moment sonar ran — switching the floor off. A
-    round could then stop confidently with `--reviewers antigravity` and sonar
-    enabled and no LLM having read the diff whole. Sonar is the hard gate alongside
-    the panel, not a reviewer reading the change, so it cannot stand in for one.
-
-    Note the floor above this one asks a different question — "did ANYTHING run?" —
-    and counts sonar deliberately. That is why they are separate tests as well as
-    separate branches."""
-    capped = {"antigravity": {"ran": True, "truncated": True, "argv_capped": True,
-                              "max_diff_chars": 116_771, "code_blind": True},
-              "sonarqube": {"ran": True, "skip": None}}
-    veto = panel.coverage_veto(capped, None, 0, 175_547, ci_status="PASS")
-    assert any("nothing read this diff whole" in v for v in veto), (
-        "a running sonarqube suppressed the floor")
-    assert panel.round_stop(1, 2, [], [], veto)["confident"] is False
-
-    # An LLM seat that saw the whole diff still lifts it — that seat's reading is
-    # what the round rests on.
-    with_reader = dict(capped, claude={"ran": True, "code_blind": True})
-    assert panel.coverage_veto(with_reader, None, 0, 175_547, ci_status="PASS") == []
 
 
 # ------------------------------------------- #546: nothing executed vs a green suite

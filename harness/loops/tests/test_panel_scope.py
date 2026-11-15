@@ -130,8 +130,7 @@ def test_a_negative_budget_is_no_capacity_rather_than_a_backwards_slice():
 
 
 def test_fitting_is_monotone_in_the_budget():
-    """A non-monotone allocation would let `fit_argv_budget`, which shrinks a
-    budget until the rendered prompt fits, settle on a size that does not."""
+    """A larger budget never buys less text."""
     parts = ["aaaa", "bbbb", "cccc"]
     sizes = [sum(len(p) for p in panel._fit_parts(parts, b)) for b in range(0, 15)]
     assert sizes == sorted(sizes)

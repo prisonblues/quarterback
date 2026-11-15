@@ -75,35 +75,34 @@ def test_a_repo_missing_a_reviewer_block_entirely_is_fine():
 
 # ----------------------------------------------------------- antigravity argv
 
-def test_antigravity_runs_headless_with_the_prompt_in_argv():
-    """-p is the non-interactive mode, and this is the ONE seat whose prompt has
-    to travel in argv — agy reads one from nowhere else."""
-    args = panel.antigravity_args("", "", "review this", timeout=1800)
+def test_antigravity_runs_headless_with_the_prompt_on_stdin():
+    """The prompt is not in argv at all: stream-json in and out is agy's one
+    stdin path, and argv capped a prompt at 128 KiB."""
+    args = panel.antigravity_args("", "", timeout=1800)
     assert args == ["agy", "--mode", "plan", "--print-timeout", "1800s",
-                    "-p", "review this"]
+                    "--input-format", "stream-json", "--output-format", "stream-json"]
 
 
 def test_antigravity_is_told_the_same_deadline_the_panel_is_waiting():
     """agy self-aborts at its own --print-timeout (default 5m0s) regardless of
     how long run_cli is prepared to wait. Unset, the seat reviews on a
     five-minute clock while the report claims the panel's full budget."""
-    args = panel.antigravity_args("", "", "p", timeout=900)
+    args = panel.antigravity_args("", "", timeout=900)
     assert args[args.index("--print-timeout") + 1] == "900s"
-    assert panel.antigravity_args("", "", "p")[
-        panel.antigravity_args("", "", "p").index("--print-timeout") + 1
-    ] == f"{panel.CLI_TIMEOUT}s"
+    default = panel.antigravity_args("", "")
+    assert default[default.index("--print-timeout") + 1] == f"{panel.CLI_TIMEOUT}s"
 
 
 def test_antigravity_pins_model_and_effort():
     """agy spells these --model/--effort. Getting either wrong costs a whole
     vendor at runtime, and the CLI is absent on some fleet machines, so the
     failure would look like 'skipped' rather than 'you passed a bad flag'."""
-    args = panel.antigravity_args("gemini-3-pro", "high", "p")
+    args = panel.antigravity_args("gemini-3-pro", "high")
     assert args[-4:] == ["--model", "gemini-3-pro", "--effort", "high"]
 
 
 def test_unpinned_antigravity_passes_neither_flag():
-    args = panel.antigravity_args("", "", "p")
+    args = panel.antigravity_args("", "")
     assert "--model" not in args and "--effort" not in args
 
 
@@ -111,4 +110,4 @@ def test_antigravity_binary_is_agy_not_the_reviewer_name():
     """The seat is named for the vendor; the executable is `agy`. A which() on
     the reviewer name would report every host as 'CLI absent'."""
     assert panel.CLI_BIN["antigravity"] == "agy"
-    assert panel.antigravity_args("", "", "p")[0] == "agy"
+    assert panel.antigravity_args("", "", timeout=600)[0] == "agy"

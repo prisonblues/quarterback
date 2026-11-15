@@ -1058,14 +1058,10 @@ def test_the_diff_only_seats_are_told_they_have_no_tools(monkeypatch, tmp_path, 
         assert "What you would have opened a file to settle" in prompt
 
 
-def test_the_no_tools_brief_reaches_the_seat_in_its_argv(monkeypatch):
-    """The real dispatch, not a prompt this test formatted itself (#459).
-
-    `antigravity` is the seat this brief exists for and the only one whose prompt
-    travels in argv, so what matters is the argv element `run_cli` is handed. A
-    test that builds `REVIEW_PROMPT` itself proves the constant interpolates,
-    which was never in doubt — the hole was in the composition.
-    """
+def test_the_no_tools_brief_reaches_the_seat(monkeypatch):
+    """The real dispatch, not a prompt this test formatted itself (#459):
+    `antigravity` is the seat this brief exists for, so what matters is the
+    stream-json message `run_cli` hands it on stdin."""
     seen = _seat_run(monkeypatch)
     prompt = panel.REVIEW_PROMPT.format(n=1, repo="a/b", base="main", ci="",
                                         code=panel_core.NO_TOOLS_BRIEF, diff="+x")
@@ -1073,71 +1069,8 @@ def test_the_no_tools_brief_reaches_the_seat_in_its_argv(monkeypatch):
     panel.review_llm("antigravity", "gemini-3.7-flash-high", prompt)
 
     assert seen["args"][0] == "agy", seen["args"]
-    assert any("YOU HAVE NO TOOLS" in a for a in seen["args"]), (
+    assert "YOU HAVE NO TOOLS" in seen["stdin"], (
         "the seat was launched without the brief that keeps it off the tree")
-
-
-def test_the_brief_is_inside_what_the_argv_clamp_measured(monkeypatch, tmp_path, capsys):
-    """It has to be in the RENDER, not bolted on in `antigravity_args` (#459).
-
-    `fit_argv_budget`'s ceiling applies to the whole prompt — "the template
-    counts" — and antigravity is both the seat this brief is for and the only seat
-    the kernel can veto. A brief added after the clamp is over a kilobyte past the
-    number the clamp just cleared, and the failure mode is the one that clamp
-    exists to prevent: honouring a budget right up to execve and dying there.
-
-    Driven with the cap dropped low enough to BITE, so the clamp is doing real
-    work rather than passing everything through, and asserted on the argv element
-    the seat would actually be handed.
-    """
-    # Derived, not picked: the ceiling has to sit ABOVE the template, the brief and
-    # the PR's own claim — `fit_argv_budget` can only cut the diff, and a cap under
-    # the uncuttable frame starves the prompt to nothing and fails for that reason
-    # instead of this one — and far enough below the whole prompt that the clamp does
-    # real work. Recomputed from the prose so an edit to either cannot silently turn
-    # this into a test that never clamps. The claim block (#550) rides in the `{diff}`
-    # slot ahead of the material, so it is part of the frame rather than of the diff.
-    empty = panel.REVIEW_PROMPT.format(n=1, repo="a/b", base="main", ci="",
-                                       code=panel_core.NO_TOOLS_BRIEF,
-                                       diff=panel.pr_claim("feat: x", ""))
-    cap = len(empty.encode()) + 2_000
-    monkeypatch.setattr(panel_core, "ARGV_PROMPT_MAX_BYTES", cap)
-    monkeypatch.setattr(panel_seats, "ARGV_PROMPT_MAX_BYTES", cap)
-    monkeypatch.setattr(panel, "ARGV_PROMPT_MAX_BYTES", cap, raising=False)
-
-    prompts: dict[str, str] = {}
-    cfg = json.loads(json.dumps(CFG))
-    cfg["reviewers"] = {"antigravity": {"enabled": True,
-                                        "model": "gemini-3.7-flash-high",
-                                        "effort": "high"}}
-    cfg["review_panel"] = dict(cfg.get("review_panel", {}), reviewer_code_access=False)
-    monkeypatch.setattr(panel, "load_repo_cfg", lambda _n: cfg)
-    monkeypatch.setattr(panel_core, "sh", gh_stub(
-        meta={"title": "feat: x", "additions": 300, "deletions": 1,
-              "headRefOid": "abcdef1234"},
-        diff="diff --git a/a.py b/a.py\n" + "+x\n" * 4000))
-    monkeypatch.setattr(panel, "review_llm",
-                        lambda name, model, prompt, *a, **k: (
-                            prompts.setdefault(name, prompt),
-                            panel.ReviewerRun([], None, 10, [], code_blind=True))[1])
-    monkeypatch.setattr(panel, "review_ci", lambda *a: ("PASS", [], None))
-    monkeypatch.setattr(panel, "adjudicate", lambda *a, **k: ([], "", panel.CoverageRuling()))
-
-    assert panel.run("board", 34, post=False, json_file=str(tmp_path / "p.json"),
-                     record=False) == 0
-    capsys.readouterr()
-
-    prompt = prompts.get("antigravity")
-    assert prompt, "antigravity was never dispatched"
-    assert "YOU HAVE NO TOOLS" in prompt
-    # The argv element the kernel would have to carry, built the way the seat
-    # builds it. Over the cap here means the clamp measured a prompt smaller than
-    # the one being sent — which is the bug this pins, not a tight fit.
-    argv = panel_seats.antigravity_args("gemini-3.7-flash-high", "high", prompt)
-    element = max(argv, key=len)
-    assert len(element.encode()) <= cap, (
-        f"the seat is handed {len(element.encode()):,} bytes against a "
-        f"{cap:,} byte clamp — the brief was added after the measurement")
 
 
 def test_a_seat_with_no_tools_is_not_told_to_search_the_codebase():

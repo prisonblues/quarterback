@@ -103,9 +103,9 @@ same zero; those two columns are what tell them apart, on the PR comment and on 
 
 Before any of that, the panel **rules on whether the round is worth running**. It used to
 dispatch every configured seat at full effort whatever the diff, and on PR #137 that meant
-four seats against 763,375 chars — 6.4× the argv ceiling of the one seat whose prompt travels
-in argv — on a change that was a *pure move*, `panel.py` split into six modules with nothing
-retyped. Every relocated line appears twice in a diff, so the bulk of that was code nobody
+four seats against 763,375 chars — 6.4× the argv ceiling of the one seat whose prompt then
+travelled in argv — on a change that was a *pure move*, `panel.py` split into six modules
+with nothing retyped. Every relocated line appears twice in a diff, so the bulk of that was code nobody
 changed, and a finding about it is a finding about the base branch. The token cost was the
 second problem; the first is that a truncated read which produces findings is worse than no
 review, because the next step briefs a fixer to resolve every one of them.

@@ -533,8 +533,7 @@ python3 appetite.py file --title "..." --run $SESSION --record   # I did
   a different model, through a different account, than the report names. `grok
   models` lists what is servable. `effort` is `low|medium|high|xhigh`, validated by
   the CLI before the turn starts, so a typo costs a startup rather than a turn.
-  Unlike `agy` its prompt travels in a **file**, so the argv ceiling below does not
-  apply to it.
+  Its prompt travels in a **file**, so the kernel's argv limit does not bind it.
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
 - `slop` — the deterministic seat (#780), and the only member with no brain, no
@@ -619,10 +618,9 @@ at what budget, which is worth knowing when two reviewers disagree and only one
 of them saw the whole change. Only a value that cannot be a budget at all — not a
 number, or `<= 0` — falls back, with a ⚠️ config line in the report saying so.
 
-One seat is capped whatever you configure: `agy` takes its prompt in argv, so the
-kernel bounds it. The panel clamps that seat to what `execve` will carry and
-reports it as ordinary truncation rather than dying at exec — which is what it
-used to do, reporting "LLM reviewers ran: none" as a clean review.
+`agy` was the last seat to take its prompt in argv, where the kernel capped it at
+128 KiB; it now takes one stream-json message on stdin, so no seat is capped unless
+you configure it.
 
 `review_panel.refuse_over_cap_multiple` (default: **3**) — how many times over the
 **tightest seat ceiling** a diff may be before the round is *refused* instead of
@@ -914,7 +912,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     input tokens **7,879,643 vs 159,520** (49×, though 97% of the larger figure was
     cached so the billed multiple is well below that), output 71,674 vs 36,364.
     Against that: `could_not_assess` went **4 → 0**, and the blind run filed a FALSE
-    finding the sighted one did not — it saw a diff line mentioning `argv_capped`,
+    finding the sighted one did not — it saw a diff line mentioning a payload field,
     could not tell which function it belonged to, guessed `accounts()`, and concluded
     the name was undefined. That is #90's failure mode reproduced unprompted.
     The cost lands per seat per round, and `/panel-review-pr` fans out up to four
@@ -933,9 +931,9 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     run **after** `adjudicate`, or the judge gets a path to a deleted directory,
     degrades to an empty sandbox, and reviews blind with the setting still reading
     true — the silent failure that the degrade path's own correctness makes possible.
-  - **The board stores it, rather than dropping it at ingest.** `absent`,
-    `code_blind` and `argv_capped` per reviewer, plus `code_access` and
-    `convention_files_removed` per run (migration `0024`), read back out of
+  - **The board stores it, rather than dropping it at ingest.** `absent` and
+    `code_blind` per reviewer, plus `code_access` and `convention_files_removed` per
+    run (migration `0024`), read back out of
     `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
     silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
     the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`
@@ -1016,7 +1014,8 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   does not begin raising `KeyError` on exactly the boxes this is for.
   `load_baseline` banks a round as truncated on `truncated and not argv_capped and
   not absent` — both exemptions, each keyed on its own recorded field — because
-  baselines written before either release still carry the old pairings. Its sibling
+  baselines written before either release still carry the old pairings; only
+  payloads from before agy moved to stdin carry `argv_capped`. Its sibling
   `truncated_any`, which decides whether a round may **close** every earlier round's
   gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
   saw a prefix, so the round did not read its target whole and cannot be the one that
@@ -1030,27 +1029,15 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   `ran and truncated`: `ran` is false for *every* way of not running, so that would
   also drop the truncation of a seat that was installed, read a real prefix and then
   crashed — a genuine coverage gap, and the fail-open direction.
-- **A constant never vetoes, and three of them used to** (#113). The rule
-  generalises the absent-CLI exemption above: an observation that is true of every
-  round cannot tell a quiet round from a broken one, and because `confident` is
-  `not veto`, leaving it in makes a confident stop unreachable rather than rare.
-  The three are an absent CLI (above), a seat that **cannot read the code**
-  (`ReviewerRun.code_blind` — see the coverage bullet below), and the **argv
-  ceiling** on antigravity: its prompt travels in argv, the kernel caps one element
-  at 120,000 bytes, and on a large diff it structurally cannot be handed all of it
-  (measured on PR #160: 116,771 of 175,547 chars, 66.5%). Each is exempted off
-  recorded state, never off the wording of a message; each is still reported; and
-  each has a floor so that exempting seats one at a time cannot empty the veto list
-  on a round where nothing was read whole. Truncation by a **budget** still vetoes —
-  someone typed that number and can raise it, so it is a fact about the round.
-  The argv exemption is applied in **two** places, and the second is easy to miss: the
-  baseline loader carries an earlier round's truncation forward (increment scope never
-  returns to what round 1 was cut off from), and a kernel-capped seat was not going to
-  be closed by a later round either — so carrying it reintroduces the constant one
-  round later and leaves it standing for the rest of the cycle, with round 1's veto
-  list looking fixed. `/panel-review-pr` drives several rounds, so exempting only
-  `coverage_veto` would have undone the change exactly where it matters. A budget
-  truncation still carries: raise the number and the next round really does read it.
+- **A constant never vetoes** (#113). The rule generalises the absent-CLI exemption
+  above: an observation that is true of every round cannot tell a quiet round from a
+  broken one, and because `confident` is `not veto`, leaving it in makes a confident
+  stop unreachable rather than rare. The two are an absent CLI (above) and a seat
+  that **cannot read the code** (`ReviewerRun.code_blind` — see the coverage bullet
+  below). Each is exempted off recorded state, never off the wording of a message,
+  and each is still reported; a round where no reviewer ran still vetoes. Truncation
+  by a **budget** still vetoes — someone typed that number and can raise it, so it
+  is a fact about the round.
 - **No settled CI result is its own veto, and it is not the same as nothing read**
   (#546). Every bullet above asks whether a seat read the diff; a round can satisfy
   all of them and still have had no test run against the code. `ci_status` used to
@@ -1568,17 +1555,10 @@ it measured, and why the substitution did not happen. An empty `reason` on a `ru
 "nothing objected", and only that.
 
 **Every ceiling carries its unit, and the one that binds is chosen by ratio rather than by
-number.** A configured `max_diff_chars` is characters; the kernel's argv limit is *bytes*, and
-the two differ by the diff's non-ASCII density — this repo's own diffs are full of em-dashes
-and arrows. Those are not two sizes of the same thing, so `min()` across them had no defined
-answer: a repo setting `antigravity.max_diff_chars: 100_000` hid the 120,000-**byte** argv
-ceiling behind the smaller integer, and at two bytes per character that seat's real ceiling is
-~60,000 characters — tighter than the one that won. So `agy` with a configured cap declares
-**two** ceilings, each is measured against the diff in its own unit, and the tightest *ratio*
-decides. `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
-which of them `cap` and `over_cap` are in, so the multiple can be checked by hand rather than
-assumed — and every renderer of the verdict (the refusal notice, the manifest banner, the
-`--force` banner, each seat's skip reason) states the unit it measured in.
+number.** `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
+which of them `cap` and `over_cap` are in, so the multiple can be checked by hand, and every
+renderer of the verdict states the unit it measured in. Every ceiling a seat declares today
+is in characters.
 
 **The judge's `judge_max_diff_chars` is deliberately not one of the ceilings.** This verdict
 decides whether to dispatch the *seats* and what to hand them; that key says what adjudication
@@ -1591,10 +1571,9 @@ include `judge` — that is the budget record, not the ceiling list.)
 **A seat whose CLI this box does not carry declares no ceiling here.** That is the same
 host-versus-round distinction the coverage veto makes for an absent seat, and it matters most
 where it is least visible: `agy` is a workstation package, so on a headless box this repo's own
-rules enable a seat that records "antigravity: CLI absent" and never runs. Counting its argv
+rules enable a seat that records "antigravity: CLI absent" and never runs. Counting its
 ceiling would refuse rounds on behalf of a reviewer that was never going to read anything, on
-exactly the unattended hosts where nobody is watching to pass `--force`, while the seats that
-did run were reading off stdin with no cap at all. A box carrying no seat at all therefore has
+exactly the unattended hosts where nobody is watching to pass `--force`. A box carrying no seat at all therefore has
 no ceiling and refuses nothing — the round runs and `coverage_veto` says "no reviewer ran",
 which is the existing and correct answer.
 
@@ -1688,9 +1667,9 @@ evidence about the writer, not about the round.
 **This is not a diff budget, and that distinction is the whole design.** v2.16 refused a
 default budget on evidence — truncating when nothing forces it biases toward false
 positives — and that reasoning is untouched. A budget answers *what to send*; this answers
-*whether to start*, and only ever against a ceiling that already exists. **On a repo with
-`max_diff_chars` unset and no argv-bound seat enabled there is no ceiling, so none of this
-ever fires** and no number it invented reaches anyone's diff.
+*whether to start*, and only ever against a ceiling that already exists. **On a repo
+with `max_diff_chars` unset there is no ceiling, so none of this ever fires** and no
+number it invented reaches anyone's diff.
 
 **Nor is it a silent skip.** A panel that quietly declines is a merge gate trusting a proxy.
 A refusal:
