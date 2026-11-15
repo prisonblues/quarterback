@@ -533,8 +533,7 @@ python3 appetite.py file --title "..." --run $SESSION --record   # I did
   a different model, through a different account, than the report names. `grok
   models` lists what is servable. `effort` is `low|medium|high|xhigh`, validated by
   the CLI before the turn starts, so a typo costs a startup rather than a turn.
-  Unlike `agy` its prompt travels in a **file**, so the argv ceiling below does not
-  apply to it.
+  Its prompt travels in a **file**, so the kernel's argv limit does not bind it.
 - `sonarqube` — deterministic static-analysis **hard gate**. `project_key`,
   `organization` and `host` are non-secret and belong here; the token does not.
 - `slop` — the deterministic seat (#780), and the only member with no brain, no
@@ -880,14 +879,12 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     (#853). With it, `agy` runs with `--dangerously-skip-permissions` in its own
     stripped copy of the PR's tree, and the prompt's last line gives that copy's path;
     a copy that fails to stage sits the seat out. **This is accident prevention, not a
-    sandbox.** Nothing confines the seat's commands to the copy. It starts with only
-    PATH, HOME, locale, XDG base-directory and certificate variables, so no other
-    inherited variable — credentials, database URLs, the ssh agent, the session bus —
-    reaches it; the database variables name a host that cannot resolve and `gh` gets
-    an empty config. Files under HOME, the rest of the filesystem and the network stay
-    reachable. That is the trade the owner accepted; `"tools": false` in
-    `.harness-rules.sample` keeps the seat diff-only, and `reviewer_code_access: false`
-    takes the tree from it as from claude.
+    sandbox.** Nothing confines the seat's commands to the copy. Its environment is
+    an allowlist (`_SEAT_ENV_ALLOW`); the database variables name a host that cannot
+    resolve and `gh` gets an empty config. Files under HOME, the rest of the
+    filesystem and the network stay reachable. That is the trade the owner accepted;
+    `"tools": false` in `.harness-rules.sample` keeps the seat diff-only, and
+    `reviewer_code_access: false` takes the tree from it as from claude.
   - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,
     `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/` and the rest of
     `CONVENTION_FILES`/`CONVENTION_DIRS`, at every depth, because a nested one is
@@ -928,7 +925,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     input tokens **7,879,643 vs 159,520** (49×, though 97% of the larger figure was
     cached so the billed multiple is well below that), output 71,674 vs 36,364.
     Against that: `could_not_assess` went **4 → 0**, and the blind run filed a FALSE
-    finding the sighted one did not — it saw a diff line mentioning `argv_capped`,
+    finding the sighted one did not — it saw a diff line mentioning a payload field,
     could not tell which function it belonged to, guessed `accounts()`, and concluded
     the name was undefined. That is #90's failure mode reproduced unprompted.
     The cost lands per seat per round, and `/panel-review-pr` fans out up to four
@@ -948,9 +945,8 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     degrades to an empty sandbox, and reviews blind with the setting still reading
     true — the silent failure that the degrade path's own correctness makes possible.
   - **The board stores it, rather than dropping it at ingest.** `absent` and
-    `code_blind` per reviewer (and `argv_capped`, which the panel stopped sending
-    when agy moved to stdin), plus `code_access` and
-    `convention_files_removed` per run (migration `0024`), read back out of
+    `code_blind` per reviewer, plus `code_access` and `convention_files_removed` per
+    run (migration `0024`), read back out of
     `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
     silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
     the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`
@@ -1031,7 +1027,7 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   does not begin raising `KeyError` on exactly the boxes this is for.
   `load_baseline` banks a round as truncated on `truncated and not argv_capped and
   not absent` — both exemptions, each keyed on its own recorded field — because
-  baselines written before either release still carry the old pairings. Only
+  baselines written before either release still carry the old pairings; only
   payloads from before agy moved to stdin carry `argv_capped`. Its sibling
   `truncated_any`, which decides whether a round may **close** every earlier round's
   gap, exempts `absent` and deliberately **not** `argv_capped`: a capped seat ran and
@@ -1051,13 +1047,10 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   broken one, and because `confident` is `not veto`, leaving it in makes a confident
   stop unreachable rather than rare. The two are an absent CLI (above) and a seat
   that **cannot read the code** (`ReviewerRun.code_blind` — see the coverage bullet
-  below). Each is exempted off recorded state, never off the wording of a message;
-  each is still reported; and each has a floor so that exempting seats one at a time
-  cannot empty the veto list on a round where nothing was read whole. Truncation by a
-  **budget** still vetoes — someone typed that number and can raise it, so it is a
-  fact about the round. A third constant, the argv ceiling antigravity had while its
-  prompt travelled in argv, went when agy moved to stdin; the baseline loader still
-  reads its flag off older payloads, as described above.
+  below). Each is exempted off recorded state, never off the wording of a message,
+  and each is still reported; a round where no reviewer ran still vetoes. Truncation
+  by a **budget** still vetoes — someone typed that number and can raise it, so it
+  is a fact about the round.
 - **No settled CI result is its own veto, and it is not the same as nothing read**
   (#546). Every bullet above asks whether a seat read the diff; a round can satisfy
   all of them and still have had no test run against the code. `ci_status` used to
@@ -1575,18 +1568,10 @@ it measured, and why the substitution did not happen. An empty `reason` on a `ru
 "nothing objected", and only that.
 
 **Every ceiling carries its unit, and the one that binds is chosen by ratio rather than by
-number.** A configured `max_diff_chars` is characters; the kernel's argv limit is *bytes*, and
-the two differ by the diff's non-ASCII density — this repo's own diffs are full of em-dashes
-and arrows. Those are not two sizes of the same thing, so `min()` across them had no defined
-answer: a repo setting `antigravity.max_diff_chars: 100_000` hid the 120,000-**byte** argv
-ceiling behind the smaller integer, and at two bytes per character that seat's real ceiling is
-~60,000 characters — tighter than the one that won. So `agy` with a configured cap declares
-**two** ceilings, each is measured against the diff in its own unit, and the tightest *ratio*
-decides. `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
-which of them `cap` and `over_cap` are in, so the multiple can be checked by hand rather than
-assumed — and every renderer of the verdict (the refusal notice, the manifest banner, the
-`--force` banner, each seat's skip reason) states the unit it measured in. Since `agy` moved
-to stdin no seat declares the byte ceiling, so today every ceiling is in characters.
+number.** `preflight.shape` carries `chars` and `bytes` both and `preflight.cap_unit` names
+which of them `cap` and `over_cap` are in, so the multiple can be checked by hand, and every
+renderer of the verdict states the unit it measured in. Every ceiling a seat declares today
+is in characters.
 
 **The judge's `judge_max_diff_chars` is deliberately not one of the ceilings.** This verdict
 decides whether to dispatch the *seats* and what to hand them; that key says what adjudication

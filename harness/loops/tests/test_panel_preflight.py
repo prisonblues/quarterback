@@ -295,8 +295,8 @@ def test_the_host_predicate_is_resolved_in_the_BODY_so_it_can_be_replaced(monkey
 
 def test_seat_installed_asks_about_the_COMMAND_not_the_seat_name(monkeypatch):
     """The reviewer is `antigravity`; the command is `agy`. Asking PATH for
-    "antigravity" would report the one seat that IS argv-bound as absent on every
-    box, which is the direction that quietly switches the ceiling off."""
+    "antigravity" would report that seat absent on every box, which quietly
+    switches its configured ceiling off."""
     asked = []
     monkeypatch.setattr(panel_core.shutil, "which", lambda c: asked.append(c) or "/x/bin/agy")
     assert pf.seat_installed("antigravity") is True
@@ -1769,8 +1769,7 @@ def test_a_reviewed_round_records_the_verdict_it_passed(monkeypatch, tmp_path):
 
 def test_an_uncapped_repo_behaves_exactly_as_it_did_before(monkeypatch, tmp_path):
     """The claim that this is not the default diff budget #49 refused. A repo that
-    configured no ceiling and enables no argv-bound seat gets its whole diff, at
-    any size."""
+    configured no ceiling gets its whole diff, at any size."""
     big = FRESH * 50
     _, got, seen = _run(monkeypatch, tmp_path, big, _panel())
     assert got["preflight"]["verdict"] == "run"

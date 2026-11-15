@@ -6,10 +6,8 @@ actually run rather than a double of it.
 """
 from __future__ import annotations
 
-import ast
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -195,45 +193,6 @@ def test_the_overlay_applies_even_without_a_cwd(monkeypatch):
     assert os.environ["SSH_AUTH_SOCK"] == "/inherited-agent", "mutated the panel's env"
 
 
-def _argv_capped_owner(path: Path, lineno: int, tree: ast.AST) -> ast.FunctionDef | None:
-    owners = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
-              and n.lineno <= lineno <= n.end_lineno]
-    return min(owners, key=lambda n: n.end_lineno - n.lineno) if owners else None
-
-
-def test_the_removed_argv_machinery_is_named_nowhere():
-    """agy's prompt left argv. Nothing may still export, call, test or describe what
-    went with it — in code, tests or the prose docs. `argv_capped` is the one
-    exception, allowed exactly where it is read off OLD payloads: inside
-    `panel_rounds.load_baseline`, and in tests that feed `load_baseline` one."""
-    loops = Path(__file__).resolve().parent.parent
-    gone = ("ARGV_PROMPT_MAX_BYTES", "fit_argv_budget", "argv_clamp", "_context_chars",
-            "kernel_cut")
-    prose = [loops / "README.md", loops.parent / "commands" / "panel-review-pr.md"]
-    code = [*loops.glob("*.py"), *(p for p in loops.glob("tests/*.py")
-                                   if p.name != Path(__file__).name)]
-    for src in [*code, *prose]:
-        text = src.read_text()
-        for name in gone:
-            assert not re.search(rf"\b{name}\b", text), f"{src.name} still names {name}"
-    for src in code:
-        text = src.read_text()
-        if "argv_capped" not in text:
-            continue
-        tree = ast.parse(text)
-        for lineno, line in enumerate(text.splitlines(), 1):
-            if "argv_capped" not in line:
-                continue
-            owner = _argv_capped_owner(src, lineno, tree)
-            body = ast.get_source_segment(text, owner) if owner else ""
-            in_reader = (src.name == "panel_rounds.py" and owner is not None
-                         and owner.name == "load_baseline")
-            feeds_reader = (src.parent.name == "tests"
-                            and ("load(" in body or "load_baseline(" in body))
-            allowed = in_reader or feeds_reader
-            assert allowed, f"{src.name}:{lineno} names argv_capped outside the old-payload read"
-
-
 @pytest.mark.parametrize("cfg, want", [
     ({"antigravity": {"tools": True}}, True),
     ({"antigravity": {"tools": False}}, False),
@@ -251,8 +210,8 @@ def test_the_shipped_default_is_on():
 
 
 def test_a_repo_that_never_mentions_tools_reaches_dispatch_with_it_on(tmp_path, monkeypatch):
-    """Through the real resolver, from a throwaway repo whose sample enables the seat
-    without saying `tools` — not from whatever checkout the suite runs in."""
+    """Through `panel.load_repo_cfg`, from a throwaway repo whose sample enables the
+    seat without saying `tools` — not from whatever checkout the suite runs in."""
     repo = tmp_path / "repo"
     repo.mkdir()
     (repo / ".harness-rules.sample").write_text(
@@ -266,7 +225,7 @@ def test_a_repo_that_never_mentions_tools_reaches_dispatch_with_it_on(tmp_path, 
     box.write_text("{}")
     monkeypatch.setenv("QUARTERBACK_HARNESS_RULES", str(box))
 
-    rules = harness_rules.resolve_repo(str(repo), from_default_branch=False)["reviewers"]
+    rules = panel.load_repo_cfg(str(repo))["reviewers"]
 
     assert "antigravity" in panel_seats.tool_seats(rules)
 

@@ -3903,7 +3903,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Read ONCE per round rather than per consumer. `run_seat` asks the same
     # predicate again when the seat is dispatched, and two independently-timed PATH
     # reads can disagree; a snapshot is what makes the consumers below — the
-    # budget, the argv clamp, the prompt, the payload — describe one host.
+    # budget, the prompt, the payload — describe one host.
     #
     # This set is now the round's ONE answer to "which seats are here": a seat it
     # excludes is never dispatched, so `run_seat`'s own PATH read cannot contradict
@@ -7870,7 +7870,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # Every SELECTED seat still has a key here, as it always has — a seat this
         # box cannot run records `null` rather than vanishing (#222). The internal
         # `budgets` dict genuinely OMITS it, and has to: everything that iterates
-        # that dict (`composed`, `truncated_for`, the argv clamp) reads a null as
+        # that dict (`composed`, `truncated_for`) reads a null as
         # "uncapped" and would compose the whole diff for a seat that never ran.
         # The payload has no such reader and one shape to keep — a board or
         # dashboard doing `payload["diff_budgets"][name]` for a configured seat

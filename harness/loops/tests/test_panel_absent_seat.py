@@ -174,8 +174,7 @@ def _record_run(seen):
 
 def test_seat_installed_asks_about_the_COMMAND_not_the_seat_name(monkeypatch):
     """The reviewer is `antigravity`; the command is `agy`. Asking PATH for
-    "antigravity" reports the one argv-bound seat absent on every box — the
-    direction that silently switches its ceiling off everywhere."""
+    "antigravity" reports that seat absent on every box."""
     asked = []
     monkeypatch.setattr(panel_core.shutil, "which",
                         lambda c: asked.append(c) or "/x/bin/agy")

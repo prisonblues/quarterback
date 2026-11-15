@@ -2768,13 +2768,13 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # `cut` — does this round leave an inherited veto? Here two exemptions
         # apply, for two different reasons, and neither subsumes the other.
         #
-        # `argv_capped` (#113), which only payloads written while agy's prompt went in
-        # argv carry — the one read of it kept: a seat the KERNEL cut was never going
-        # to be closed by a later round either, on this box, at this diff size. The veto it buys
-        # is not "a gap this cheaper round failed to re-read", it is the same
-        # constant arriving one round later and standing for the rest of the cycle
-        # — `/panel-review-pr` drives multiple rounds, so the loop would go right
-        # back to never stopping confidently. Truncation by a BUDGET still carries,
+        # `argv_capped` (#113), carried only by payloads written while agy's prompt
+        # went in argv: a seat the KERNEL cut was never going to be closed by a later
+        # round either, on this box, at this diff size. The veto it buys is not "a gap
+        # this cheaper round failed to re-read", it is the same constant arriving one
+        # round later and standing for the rest of the cycle — `/panel-review-pr`
+        # drives multiple rounds, so the loop would go right back to never stopping
+        # confidently. Truncation by a BUDGET still carries,
         # which is the whole point of telling them apart: raise the number and the
         # next round genuinely does read what this one could not.
         #
@@ -3444,8 +3444,8 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     signal everything: a reviewer whose CLI this box does not carry
     (:attr:`ReviewerRun.absent`), and a seat that cannot read the code it is
     reviewing (:attr:`ReviewerRun.code_blind`, whose `could_not_assess` entries are
-    therefore reported and not counted). Both are
-    facts about the HOST or about the panel's DESIGN. Because `round_stop`
+    therefore reported and not counted). Both are facts about the HOST or about the
+    panel's DESIGN. Because `round_stop`
     computes `confident` as `not veto`, leaving them in made a confident stop
     unreachable — permanently on a headless box, and on any PR that so much as
     mentions a file it does not change. A signal that is never positive carries no
@@ -3453,8 +3453,7 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     emitting it.
 
     Each is exempted off RECORDED STATE, never off the wording of a message or a
-    declaration, and each has a floor beneath it so that exempting seats one at a
-    time cannot empty the list on a round where nothing was read. Every other way
+    declaration, and a round where no reviewer ran still vetoes. Every other way
     of coming up short — a crash, a timeout, a budget someone typed, a reply that
     would not parse — is about THIS run and still vetoes.
 
@@ -3517,7 +3516,7 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     nothing about the repo's rules has not been told CI is inapplicable, and must
     not assume it.
 
-    **The fourth constant, and the one this function was itself producing** (#547).
+    **Another constant, and the one this function was itself producing** (#547).
     A declaration that no seat here could have settled — the claim needs a running
     database, a browser, a deployed system — is true of every round of every PR
     about runtime behaviour, so as a veto it distinguishes nothing and makes a

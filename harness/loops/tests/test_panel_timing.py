@@ -550,7 +550,7 @@ def test_the_preflight_verdict_reads_the_round_s_host_snapshot_not_path(monkeypa
     `panel.run` resolves that once — "read ONCE per round rather than per consumer
     … two independently-timed PATH reads can disagree, and a snapshot is what makes
     the consumers below describe one host" — and then hands the snapshot to the
-    budgets, the argv clamp, the prompt and the payload. `seat_ceilings` resolves
+    budgets, the prompt and the payload. `seat_ceilings` resolves
     the predicate in its own body when it is given none, so the verdict was the one
     consumer still outside that snapshot, reading PATH for itself.
 

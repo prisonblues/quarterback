@@ -110,4 +110,4 @@ def test_antigravity_binary_is_agy_not_the_reviewer_name():
     """The seat is named for the vendor; the executable is `agy`. A which() on
     the reviewer name would report every host as 'CLI absent'."""
     assert panel.CLI_BIN["antigravity"] == "agy"
-    assert panel.antigravity_args("", "", "p")[0] == "agy"
+    assert panel.antigravity_args("", "", timeout=600)[0] == "agy"

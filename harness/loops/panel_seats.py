@@ -3807,10 +3807,9 @@ _MALFORMED = object()
 
 
 def _antigravity_result(stdout: str | None):
-    """The stream's LAST `result` event body — authoritative whatever it holds — or
-    None if there was none. A result that is not an object, or a line that is not
-    JSON after one, makes it :data:`_MALFORMED`: an earlier success does not stand
-    once the stream says something it cannot read."""
+    """The stream's last word on its result, or None if it gave none: the last
+    `result` event's body, or :data:`_MALFORMED` when that body is not an object or
+    an unparsable line follows it."""
     found = None
     for line in (stdout or "").splitlines():
         try:

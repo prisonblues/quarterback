@@ -1464,10 +1464,6 @@ def test_a_partial_meta_dict_still_vetoes_its_declarations():
         "claude could not assess: the caller"]
 
 
-
-
-
-
 def test_a_panel_with_nothing_to_declare_vetoes_nothing():
     meta = {"claude": {"ran": True, "truncated": False, "could_not_assess": []}}
     assert panel.coverage_veto(meta, None, 0, 1_000, ci_status="PASS") == []
@@ -2143,8 +2139,6 @@ def test_a_seat_that_can_read_the_code_puts_its_gaps_back_in_the_veto(
     assert any("could not assess: migrations/versions/" in v for v in stop["veto"])
     # The reader-facing note belongs to the blind case and must not appear here.
     assert "did not cost the round its confidence" not in report
-
-
 
 
 # ------------------------------------------- #546: nothing executed vs a green suite

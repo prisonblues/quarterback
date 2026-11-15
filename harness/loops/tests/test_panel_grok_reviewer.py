@@ -39,7 +39,7 @@ def test_grok_is_a_panel_member():
 
 
 def test_the_prompt_travels_in_a_file_not_argv():
-    """The reason grok is not a second seat the kernel's argv limit binds. A
+    """The reason the kernel's argv limit does not bind grok. A
     change to `-p <prompt>` would put a whole diff in one argv element, which
     fails at execve with nothing in the error."""
     args = grok_args()
