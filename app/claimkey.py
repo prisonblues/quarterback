@@ -244,7 +244,7 @@ _BRANCH_BAD_SEQUENCES = (
 )
 
 
-def _branch(value: object) -> str:
+def canonical_branch(value: object) -> str:
     """A branch name, as git would accept it — :manpage:`git-check-ref-format`.
 
     Case is NOT folded. Repository names are case-insensitive on GitHub and
@@ -318,7 +318,7 @@ def derive(ref_kind: str, *, repo: str | None = None, value: object = None) -> t
     if kind in PR_KINDS:
         return WORK, f"{canonical_repo(repo or '')}{PR_SIGIL}{_number(value)}"
     if kind in MERGE_KINDS:
-        return MERGE, f"{canonical_repo(repo or '')}:{_branch(value)}"
+        return MERGE, f"{canonical_repo(repo or '')}:{canonical_branch(value)}"
     if kind in ("plan", "item"):
         # A plan and an item are board objects, not repo objects: their id is
         # already globally unique, so the repo adds nothing and would only give

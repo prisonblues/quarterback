@@ -21,7 +21,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import NoReturn
+from typing import Literal, NoReturn
 
 import httpx
 from mcp.server.fastmcp import Context, FastMCP
@@ -283,6 +283,14 @@ mcp = FastMCP(
         "**`counts.blocked_unminded`** is the number to watch: gated, and nobody "
         "standing by. Elsewhere on this board that state renders identically to the "
         "safe one.\n\n"
+        "## Running a promotion gate (#852)\n"
+        "A gate is N consecutive clean heavy runs on one head. Keep its state on the "
+        "board, not in issue comments: gate_set(branch=, head=, exit_bar=, stage=, "
+        "outputs=) to start, gate_advance(branch=, head=, result='clean'|'failed') "
+        "after each run, gate(branch=) to read it — and read it first when you take a "
+        "gate over. A `published` post putting a new commit on the branch zeroes the "
+        "count by itself, and a run on the old head is then refused, so a superseded "
+        "run cannot count.\n\n"
         "## Session handoff (moving a session between devices)\n"
         "**Hand off:** lease(session, device) to claim it, do your work (renew_lease "
         "before ttl lapses), then push_session(session, jsonl) to store+release.\n"
@@ -1827,6 +1835,98 @@ def blockers(ctx: Context, repo: str | None = None, owner: str | None = None,
         return _get_client(ctx).blockers(params)
     except httpx.HTTPStatusError as e:
         _raise(e, "blockers")
+
+
+@mcp.tool()
+def gate(ctx: Context, branch: str | None = None, repo_path: str = ".") -> dict:
+    """A promotion gate's state: the head under test, the stage, and the clean-run
+    count against the exit bar (#852).
+
+    Read it before you start or resume a gate run, and whenever you take over from
+    another session: the board's copy is the current one.
+
+    Returns `{"gates": [...]}`, one entry per gated branch. In each, `restarted_from`
+    says whether the head moved since you last looked, and `passed` is
+    `clean_runs >= exit_bar` on `head`, and on no other commit.
+
+    Args:
+        branch: the gated branch (e.g. `integration/v22`). Omit for every gate in
+            the repo.
+        repo_path: a checkout of the repo; its origin remote names it.
+    """
+    params = {"repo": _derive_repo(repo_path)}
+    if branch:
+        params["branch"] = branch
+    try:
+        return _get_client(ctx).gates(params)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "gate")
+
+
+@mcp.tool()
+def gate_set(ctx: Context, branch: str, head: str, exit_bar: int | None = None,
+             stage: str | None = None, outputs: str | None = None,
+             reset_rule: str | None = None, repo_path: str = ".") -> dict:
+    """Start a gate on a branch, or update one (#852).
+
+    `head` is the full commit under test (`git rev-parse HEAD`). Naming a head the
+    gate is not at zeroes the count, because the clean runs it banked were on
+    another commit; naming the same head keeps it. `exit_bar` is how many
+    consecutive clean runs pass the gate (2 if never set). `stage` is where the
+    gate has got to (`fast`, `sim run 1`). `outputs` is where the runs write
+    (`zeus:~/sim-runs/v22`) and `reset_rule` anything beyond a new head that should
+    send it back to zero; both are prose for the next reader. Omitted fields keep
+    their value.
+
+    Returns `{"gate": {...}, "previous": {...} | null, "branch_published": sha,
+    "behind": bool}`. **`behind: true` means the branch has already been published
+    at another commit**: you are gating a head the branch has moved past.
+
+    You do not need to call this when the branch moves: a `published` post putting
+    a new commit on it moves the gate and zeroes the count by itself, and posts
+    that it did. A `landed` post does not.
+    """
+    body = {"repo": _derive_repo(repo_path), "branch": branch, "head": head}
+    for key, val in (("exit_bar", exit_bar), ("stage", stage), ("outputs", outputs),
+                     ("reset_rule", reset_rule)):
+        if val is not None:
+            body[key] = val
+    try:
+        return _get_client(ctx).gate_write("", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "gate_set")
+
+
+@mcp.tool()
+def gate_advance(ctx: Context, branch: str, head: str,
+                 result: Literal["clean", "failed"],
+                 stage: str | None = None, repo_path: str = ".") -> dict:
+    """Record one run on a gate: `result` is `clean` or `failed` (#852).
+
+    `head` is the commit the run actually ran on. A clean run adds one to the
+    count and a failed one zeroes it. A run on a head the gate is no longer at is
+    refused (409) and not counted: the branch moved while it ran, so it says
+    nothing about the head the gate is now measuring. The reply is
+    `{"gate": {...}}`; read `gate.passed`.
+    """
+    body = {"repo": _derive_repo(repo_path), "branch": branch, "head": head,
+            "result": result}
+    if stage is not None:
+        body["stage"] = stage
+    try:
+        return _get_client(ctx).gate_write("/advance", body)
+    except httpx.HTTPStatusError as e:
+        _raise(e, "gate_advance")
+
+
+@mcp.tool()
+def gate_clear(ctx: Context, branch: str, repo_path: str = ".") -> dict:
+    """Remove a gate that has done its job (#852). The reply carries what it said."""
+    try:
+        return _get_client(ctx).gate_write(
+            "/clear", {"repo": _derive_repo(repo_path), "branch": branch})
+    except httpx.HTTPStatusError as e:
+        _raise(e, "gate_clear")
 
 
 @mcp.tool()
