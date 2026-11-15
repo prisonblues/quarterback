@@ -2380,15 +2380,17 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
 def kind_line(findings: list[Canonical]) -> str:
     """One summary line counting what the judge said the findings ARE (#623).
 
-    Recorded and nothing more: no rule reads the kind yet. ``""`` when the judge
-    typed nothing, so a round whose judge did not answer reads as it always did."""
+    Recorded and nothing more: no rule reads the kind yet. ``""`` when no finding
+    has a readable kind (the judge gave none, or gave a word outside
+    :data:`FINDING_KINDS`), so such a round reads as it always did."""
     tally = Counter(c.kind or "untyped" for c in findings)
     if len(findings) == tally["untyped"]:
         return ""
     parts = [f"{tally[k]} {k}" for k in (*FINDING_KINDS, "untyped") if tally[k]]
-    unbacked = sum(1 for c in findings if c.kind_said != c.kind)
-    tail = (f"; {unbacked} said to be a regression or claim_miss without evidence, so "
-            "counted as an observation" if unbacked else "")
+    unbacked = sum(1 for c in findings if c.kind and c.kind_said != c.kind)
+    tail = (f"; {unbacked} said to be {' or '.join(DEMONSTRATED_KINDS)} without "
+            f"evidence, so counted as {'observations' if unbacked > 1 else 'an observation'}"
+            if unbacked else "")
     return f"_Kinds: {', '.join(parts)}{tail}. Recorded only; nothing stops on it yet._"
 
 
@@ -9119,7 +9121,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     lines.append(f"\n### To fix ({len(for_fix)}) — {counted}"
                  + (f", {dials.fix_floor} and above"
                     if under_floor else ""))
-    if kinds := kind_line(to_fix):
+    if kinds := kind_line(for_fix):
         lines.append(kinds)
     # #624, said to the fixer and not only recorded about it. The budget note below is
     # conditional on a budget being in force; this is not, because the record is made

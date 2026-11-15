@@ -1505,7 +1505,7 @@ flagged by only ONE reviewer MUST be marked real — never dismiss it because th
 Mark real=false ONLY when the issue is a genuine FALSE POSITIVE — you re-examined and the code is
 actually correct, or the suggestion would make it worse. When unsure, mark it real.
 
-KIND. Separately from real and severity, say what each issue IS, in `kind` (#623):
+KIND. Separately from real and severity, say what each issue IS, in `kind`:
 - "regression" — something that worked before this change no longer works, AND it is
   DEMONSTRATED: a failing test or check, a command and its wrong output, or a concrete input whose
   result this diff changes for the worse. Put that demonstration in `evidence`. "This could break
@@ -1597,7 +1597,7 @@ JUDGE_SCHEMA = {
                 "synthesis": {"type": "string"},
                 "related": {"type": "array", "items": {"type": "string"}},
                 "kind": {"type": "string", "enum": list(FINDING_KINDS)},
-                "evidence": {"type": "string"},
+                "evidence": {"type": ["string", "null"]},
                 "reason": {"type": "string"},
             },
             "required": ["id", "members", "real", "severity", "synthesis", "reason"],
@@ -2720,6 +2720,7 @@ def _verdict_reading(v: dict) -> tuple:
         str(v.get("synthesis") or v.get("title") or "").strip(),
         tuple(str(r) for r in rel) if isinstance(rel, list) else (),
         str(v.get("reason") or v.get("rationale") or "").strip(),
+        _finding_kind(v.get("kind"), v.get("evidence")),
     )
 
 
