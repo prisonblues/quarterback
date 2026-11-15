@@ -63,11 +63,10 @@
           cp -r ${./harness/commands} repo/harness/commands
           # `harness_rules.check_status` reads the CI check vocabulary out of
           # `qbdata.py`, which lives in bin/ because the dashboards can only import a
-          # sibling of their own $0 (harness/package.nix says why). Two files, not the
-          # tree: qbdata is imported for #324's six-state classifier, and heavy-slot is
-          # the broker test_panel_slot.py runs a panel reservation against (#874).
+          # sibling of their own $0 (harness/package.nix says why). One file, not the
+          # tree: nothing here execs a worktree script, it is imported for #324's
+          # six-state classifier and nothing else.
           install -Dm644 ${./harness/bin/qbdata.py} repo/harness/bin/qbdata.py
-          install -Dm755 ${./harness/bin/heavy-slot} repo/harness/bin/heavy-slot
           # The rules baseline, because the panel refuses to review a repo that
           # configured nothing — so without it the cap guard's two tests get that
           # refusal instead of the cap they are asserting.

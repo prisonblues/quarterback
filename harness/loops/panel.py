@@ -117,7 +117,6 @@ import panel_propose  # noqa: F401
 import panel_rounds  # noqa: F401
 import panel_scope  # noqa: F401
 import panel_seats  # noqa: F401
-import panel_slot
 
 # #771's locality matcher, and the ONE import in this file that is allowed to
 # fail. Everything it is used for is a second opinion beside an answer this file
@@ -2551,9 +2550,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     if round_inferred_from is not None:
         notes.append(f"--round not given: this is round {round_no}, the round after "
                      f"--baseline's round {round_inferred_from}")
-    # #874: wait for memory before the PR is read, so a long wait cannot leave the round
-    # reviewing a head that has since moved. Held until the process exits.
-    panel_slot.reserve(notes, pr_number)
     # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.

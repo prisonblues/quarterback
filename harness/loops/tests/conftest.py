@@ -468,17 +468,6 @@ def _no_escalation_posts(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_memory_queue(monkeypatch):
-    """No round waits on this host's real `heavy-slot` queue (#874).
-
-    A round reserves memory before its seats start, and on a busy developer machine a
-    test round would sit in the queue behind a real CI run. `test_panel_slot.py`
-    exercises the reservation itself, against a queue of its own.
-    """
-    monkeypatch.setenv("QB_PANEL_MEMORY", "0")
-
-
-@pytest.fixture(autouse=True)
 def _no_board_reads(monkeypatch):
     """No test READS a real board either, and this is the read half of the two
     fixtures above.

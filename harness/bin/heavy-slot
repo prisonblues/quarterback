@@ -1,42 +1,17 @@
 #!/usr/bin/env python3
 """heavy-slot — one memory-aware admission queue for the heavy jobs on a host (#874).
 
-On 2026-11-15 zeus ran out of memory twice: four lexray CI runs at 6 xdist workers of
-~2 GB each, plus their postgres containers, left nothing for the desktop or a panel
-round, and the panel was killed both times. lexray's own queue counted runs, not memory,
-and nothing else on the box took part in it. This is the shared one.
+A job asks for memory and waits until it fits; see "heavy-slot" in harness/README.md.
 
-* **A job asks for memory, not a slot.** `--min` is what it cannot run without, `--max`
-  what it could use. It is granted as much as fits, up to max, in whole `--unit`s (an
-  xdist worker), and waits while even its min does not fit.
-* **What fits.** Live reservations plus the grant stay within the budget (MemTotal minus
-  `reserve`, unless `budget` is set), AND the grant stays below MemAvailable minus
-  `min_free`, so memory used by jobs that never asked still counts.
-* **First come, first served.** Waiters are admitted in the order they arrived; a small
-  job does not overtake a big one that is waiting for its min.
-* **The kernel ends a reservation.** Each holder keeps an flock on its file, so however
-  it exits the lock goes and a file nobody holds stops counting; a clean exit also
-  removes it. Under `run` the command holds the lock too, so killing the wrapper does
-  not free memory the command is still using. The directory is shared (mode 1777)
-  because the agents and the CI runners are different users, so every file in it is
-  made readable whatever the umask, and the admission lock is opened read-only.
-
-Config: KEY=VALUE lines in /etc/heavy-slot.conf, then ~/.config/heavy-slot.conf, then
-HEAVY_SLOT_<KEY> in the environment. Keys: dir, budget, reserve, min_free. Sizes take
-K/M/G suffixes.
-
-Commands:
   heavy-slot run  --min SIZE [--max SIZE] [--unit SIZE] [--label L] [--timeout MIN] -- CMD...
-      Runs CMD holding the grant; CMD sees HEAVY_SLOT_GRANT_BYTES and HEAVY_SLOT_UNITS.
-      Exits with CMD's status.
+      Becomes CMD (exec), which inherits the reservation and holds it until it exits.
+      CMD sees HEAVY_SLOT_GRANT_BYTES and HEAVY_SLOT_UNITS.
   heavy-slot hold --min SIZE [--max SIZE] [--unit SIZE] [--label L] [--timeout MIN]
-      Prints the grant as one JSON line, then holds it until its stdin closes. For a
-      caller that cannot be wrapped, such as pytest's controller.
+      Prints the grant as one JSON line and holds it until its stdin closes.
   heavy-slot status [--json]
 
-Exits: 0 granted, 2 usage or an unreadable config or meminfo, 3 the min can never fit
-the budget, 4 the wait timed out. `run` otherwise exits as CMD did (128+N for signal N,
-126/127 when it cannot be started).
+Exits: 0 granted, 2 usage or an unreadable meminfo, 3 the min can never fit the budget,
+4 the wait timed out, 126/127 CMD cannot be run. After the exec, `run` exits as CMD does.
 """
 
 from __future__ import annotations
@@ -46,10 +21,7 @@ import fcntl
 import json
 import math
 import os
-import pwd
 import re
-import signal
-import subprocess
 import sys
 import time
 
@@ -74,6 +46,7 @@ def fmt(n: int) -> str:
 
 
 def load_config(env: dict) -> dict:
+    """DEFAULTS, then each config file's KEY=VALUE lines, then HEAVY_SLOT_<KEY>."""
     cfg = dict(DEFAULTS)
     for path in CONFIG_FILES:
         try:
@@ -88,6 +61,9 @@ def load_config(env: dict) -> dict:
     for key in DEFAULTS:
         if env.get(f"HEAVY_SLOT_{key.upper()}"):
             cfg[key] = env[f"HEAVY_SLOT_{key.upper()}"]
+    for key in ("budget", "reserve", "min_free"):
+        if cfg[key]:
+            parse_size(cfg[key])
     return cfg
 
 
@@ -112,48 +88,47 @@ def budget_of(cfg: dict, total: int) -> int:
     return max(0, total - parse_size(cfg["reserve"]))
 
 
-def _held(path: str) -> bool:
-    """True while some process holds `path`'s lock. A file nobody holds stops counting,
-    and is removed when this user may remove it (its owner removes it on a clean exit)."""
+def _fields(raw: bytes) -> dict:
+    """An entry's recorded fields, or none when they are not a JSON object."""
     try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return False
-    try:
-        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return True
-    finally:
-        os.close(fd)
-    try:
-        os.unlink(path)
-    except OSError:
-        pass  # another user's file in a sticky dir: ignored, never counted
-    return False
+        entry = json.loads(raw)
+    except ValueError:
+        return {}
+    return entry if isinstance(entry, dict) else {}
 
 
 def live(d: str, prefix: str) -> list[dict]:
-    """Every held entry of one kind, oldest first, with its recorded fields."""
+    """Every entry of one kind that some process still holds the lock on, oldest first.
+    A file nobody holds does not count; this user removes it when it may."""
     out = []
     for name in sorted(os.listdir(d)):
+        if not name.startswith(prefix):
+            continue
         path = os.path.join(d, name)
-        if not name.startswith(prefix) or not _held(path):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
             continue
         try:
-            with open(path, encoding="utf-8") as f:
-                entry = json.loads(f.read() or "{}")
-        except (OSError, ValueError):
-            entry = {}
-        out.append({**entry, "file": name})
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            out.append({**_fields(os.pread(fd, 4096, 0)), "file": name})
+            continue
+        finally:
+            os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
     return out
 
 
 def _publish(d: str, name: str, fields: dict) -> int:
-    """Create `name` already locked: written and locked under a temp name, then renamed,
-    so no reader ever sees it unlocked and takes it for a dead holder's."""
+    """Create `name` locked and readable by everyone: written and locked under a temp
+    name, then renamed, so no reader sees it unlocked and takes it for a dead holder's."""
     tmp = os.path.join(d, f".tmp-{name}")
     fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
-    os.fchmod(fd, 0o644)  # past the umask: every user must be able to read and probe it
+    os.fchmod(fd, 0o644)
     fcntl.flock(fd, fcntl.LOCK_EX)
     os.write(fd, json.dumps(fields).encode())
     os.rename(tmp, os.path.join(d, name))
@@ -187,14 +162,10 @@ def open_dir(cfg: dict) -> str:
 def room(cfg: dict, env: dict, holders: list[dict]) -> tuple[int, dict]:
     total, available = meminfo(env)
     budget = budget_of(cfg, total)
-    reserved = sum(_bytes(h.get("bytes")) for h in holders)
+    reserved = sum(h["bytes"] for h in holders
+                   if isinstance(h.get("bytes"), int) and h["bytes"] > 0)
     free = min(budget - reserved, available - parse_size(cfg["min_free"]))
     return max(0, free), {"budget": budget, "reserved": reserved, "available": available}
-
-
-def _bytes(value) -> int:
-    """A recorded size, read as nothing when it is not a non-negative integer."""
-    return value if isinstance(value, int) and value >= 0 else 0
 
 
 def grant_for(want_min: int, want_max: int, unit: int, free: int) -> int:
@@ -215,9 +186,8 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
         sys.exit(EXIT_NEVER)
     # CLOCK_MONOTONIC is one clock for every process on the host, and never steps back.
     me = f"wait-{time.monotonic_ns():020d}-{os.getpid()}"
-    fields = {"pid": os.getpid(), "user": pwd.getpwuid(os.getuid()).pw_name,
-              "label": args.label, "min": args.min, "max": args.max,
-              "since": time.strftime("%H:%M:%S")}
+    fields = {"pid": os.getpid(), "uid": os.getuid(), "label": args.label, "min": args.min,
+              "max": args.max, "since": time.strftime("%H:%M:%S")}
     wait_fd = _publish(d, me, fields)
     deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
     said = False
@@ -233,9 +203,8 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
                 grant = grant_for(args.min, args.max, args.unit, free) if first else 0
                 if grant:
                     res = os.path.join(d, f"res-{me[5:]}")
-                    fd = _publish(d, os.path.basename(res), {**fields, "bytes": grant})
-                    os.unlink(os.path.join(d, me))
-                    return fd, res, grant
+                    return _publish(d, os.path.basename(res), {**fields, "bytes": grant}), \
+                        res, grant
                 if deadline and time.monotonic() > deadline:
                     print(f"heavy-slot: {args.label} gave up after {args.timeout:g} min",
                           file=sys.stderr)
@@ -252,57 +221,37 @@ def acquire(args, cfg: dict, env: dict) -> tuple[int, str, int]:
             time.sleep(POLL_SECONDS)
     finally:
         os.close(admit)
-        _remove(os.path.join(d, me))
+        try:
+            os.unlink(os.path.join(d, me))
+        except FileNotFoundError:
+            pass
         os.close(wait_fd)
-
-
-def _remove(path: str) -> None:
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
 
 
 def cmd_run(args, cfg, env) -> int:
     if not args.cmd:
         print("heavy-slot run: nothing to run after --", file=sys.stderr)
         return EXIT_USAGE
-    fd, res, grant = acquire(args, cfg, env)
-    child_env = {**env, "HEAVY_SLOT_GRANT_BYTES": str(grant),
-                 "HEAVY_SLOT_UNITS": str(grant // args.unit if args.unit else 0)}
-    # The child holds the lock too, so the reservation lasts as long as the work does,
-    # even if this wrapper is killed. ^C reaches the child from the terminal by itself.
+    fd, _, grant = acquire(args, cfg, env)
+    env["HEAVY_SLOT_GRANT_BYTES"] = str(grant)
+    env["HEAVY_SLOT_UNITS"] = str(grant // args.unit if args.unit else 0)
     os.set_inheritable(fd, True)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
-        child = subprocess.Popen(args.cmd, env=child_env, pass_fds=(fd,))
+        os.execvpe(args.cmd[0], args.cmd, env)
     except OSError as e:
         print(f"heavy-slot run: cannot run {args.cmd[0]}: {e.strerror}", file=sys.stderr)
-        _remove(res)
         return 127 if isinstance(e, FileNotFoundError) else 126
-
-    def forward(sig, _frame):
-        try:
-            child.send_signal(sig)
-        except ProcessLookupError:
-            pass
-
-    for sig in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(sig, forward)
-    status = child.wait()
-    _remove(res)
-    return 128 - status if status < 0 else status
 
 
 def cmd_hold(args, cfg, env) -> int:
     _, res, grant = acquire(args, cfg, env)
-    units = grant // args.unit if args.unit else 0
     try:
-        print(json.dumps({"grant_bytes": grant, "units": units}), flush=True)
+        print(json.dumps({"grant_bytes": grant,
+                          "units": grant // args.unit if args.unit else 0}), flush=True)
         while sys.stdin.buffer.read(4096):
             pass  # held until the caller closes our stdin, or dies and the pipe closes
     finally:
-        _remove(res)
+        os.unlink(res)
     return 0
 
 
@@ -315,12 +264,11 @@ def cmd_status(args, cfg, env) -> int:
         return 0
     print(f"budget {fmt(why['budget'])}  reserved {fmt(why['reserved'])}  "
           f"MemAvailable {fmt(why['available'])}  grantable {fmt(free)}")
-    for h in holders:
-        print(f"  holds  {fmt(_bytes(h.get('bytes'))):>7}  pid {h.get('pid')}  "
-              f"{h.get('user')}  {h.get('label')}  since {h.get('since')}")
-    for w in waiters:
-        print(f"  waits  {fmt(_bytes(w.get('min'))):>7}  pid {w.get('pid')}  "
-              f"{w.get('user')}  {w.get('label')}  since {w.get('since')}")
+    for kind, entries, size in (("holds", holders, "bytes"), ("waits", waiters, "min")):
+        for e in entries:
+            n = e.get(size) if isinstance(e.get(size), int) else 0
+            print(f"  {kind}  {fmt(n):>7}  pid {e.get('pid')}  uid {e.get('uid')}  "
+                  f"{e.get('label')}  since {e.get('since')}")
     return 0
 
 
@@ -347,18 +295,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = p.parse_args(argv)
     if args.command == "status":
         return args
-    cmd = getattr(args, "cmd", None) or []
-    if cmd[:1] == ["--"]:
-        cmd = cmd[1:]
-    args.cmd = cmd
+    args.cmd = getattr(args, "cmd", [])
+    if args.cmd[:1] == ["--"]:
+        args.cmd = args.cmd[1:]
     if args.unit and args.min % args.unit:
-        args.min += args.unit - args.min % args.unit  # a min is whole units, rounded up
+        args.min += args.unit - args.min % args.unit  # a min is whole units
     args.max = args.max if args.max is not None else args.min
-    if args.unit:
-        args.max -= args.max % args.unit  # and a max is whole units, rounded down
     if args.min <= 0 or args.max < args.min or not 0 <= args.timeout < math.inf:
         p.error("need 0 < --min <= --max (in whole --units), and a finite --timeout >= 0")
-    label = args.label or (cmd[0] if cmd else f"pid {os.getppid()}")
+    label = args.label or (args.cmd[0] if args.cmd else f"pid {os.getppid()}")
     args.label = "".join(c if c.isprintable() else "?" for c in label)
     return args
 
@@ -368,17 +313,9 @@ def main(argv: list[str]) -> int:
     env = dict(os.environ)
     try:
         cfg = load_config(env)
-        for key in ("reserve", "min_free"):
-            parse_size(cfg[key])
-        if cfg["budget"]:
-            parse_size(cfg["budget"])
-    except ValueError as e:
-        print(f"heavy-slot: bad config: {e}", file=sys.stderr)
-        return EXIT_USAGE
-    try:
         return {"run": cmd_run, "hold": cmd_hold, "status": cmd_status}[args.command](
             args, cfg, env)
-    except ValueError as e:  # an unreadable meminfo
+    except ValueError as e:  # a bad size in the config, or an unreadable meminfo
         print(f"heavy-slot: {e}", file=sys.stderr)
         return EXIT_USAGE
 
