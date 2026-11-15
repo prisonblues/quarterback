@@ -1460,6 +1460,11 @@ class ReviewFinding(Base):
     #: regression of the same shape in the same commit as a docstring stating the
     #: invariant it broke.
     premise_verdict: Mapped[str | None] = mapped_column(Text)
+    #: What the judge typed this finding as (#623): regression, claim_miss or
+    #: observation. A confirmed observation blocks nothing; NULL, every finding
+    #: recorded before the type existed, blocks by verdict as it always did.
+    kind: Mapped[str | None] = mapped_column(Text)
+    evidence: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         Index("ix_review_findings_run", "run_id"),

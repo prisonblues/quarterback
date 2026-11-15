@@ -844,6 +844,10 @@ RECURRENCE = ("revisited", "fix-site", "elsewhere", "unknown")
 #: keeping a self-report and an adjudication apart.
 PREMISE_VERDICTS = ("invalidates", "separate", "unclear")
 
+#: What the judge typed a finding as (#623). A confirmed ``observation`` blocks
+#: nothing; NULL (any finding recorded before the type existed) blocks as before.
+FINDING_KINDS = ("regression", "claim_miss", "observation")
+
 #: Every tally a run may carry, and the vocabulary its keys are read against. One
 #: table, so a validator, a drift report and a stored column cannot each hold
 #: their own idea of which words are legal.
@@ -1423,6 +1427,9 @@ class FindingIn(BaseModel):
     #: :data:`PREMISE_VERDICTS`, or None where it was never asked — the commonest
     #: case, and one the ``"unclear"`` bucket must not be allowed to absorb.
     premise_verdict: str | None = None
+    #: #623: one of :data:`FINDING_KINDS`, or None when the judge did not say.
+    kind: str | None = None
+    evidence: str = ""
     #: The same drift echo, for the same reason.
     premise_verdict_sent: str | None = None
 
@@ -1479,6 +1486,16 @@ class FindingIn(BaseModel):
     @classmethod
     def _premise_verdict(cls, v: object) -> str | None:
         return _bucket_or_none(v, PREMISE_VERDICTS)
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _kind(cls, v: object) -> str | None:
+        return _bucket_or_none(v, FINDING_KINDS)
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _evidence(cls, v: object) -> str:
+        return v.strip() if isinstance(v, str) else ""
 
     @field_validator("recurs_of", mode="before")
     @classmethod
@@ -4680,6 +4697,8 @@ async def record_review(
                 recurrence=p.f.recurrence,
                 recurs_of=p.f.recurs_of,
                 premise_verdict=p.f.premise_verdict,
+                kind=p.f.kind,
+                evidence=p.f.evidence or None,
             ),
             p.reports,
         )
@@ -6069,6 +6088,8 @@ def _finding_view(f: ReviewFinding, reports: list[ReviewFindingReport],
         "recurrence": f.recurrence,
         "recurs_of": f.recurs_of,
         "premise_verdict": f.premise_verdict,
+        "kind": f.kind,
+        "evidence": f.evidence,
         # What happened to the DEFECT afterwards (v2.37), null where nobody has
         # said yet. It is deliberately the same object on every observation of one
         # defect: the outcome is a fact about the defect, not about the round that

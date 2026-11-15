@@ -406,6 +406,9 @@ class LastRun:
     #: ``outstanding`` is what decides whether a fix pass is owed.
     outstanding: int
     cleared: int
+    #: Confirmed findings the judge typed ``observation`` (#623): counted in
+    #: ``confirmed``, never in ``outstanding``, because an observation blocks nothing.
+    observed: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -545,7 +548,8 @@ def _review_state(pr: PullRequest, run: LastRun | None) -> tuple[str, str, str]:
             "fix",
             f"{run.outstanding} confirmed finding(s) outstanding at the current head"
             + (f" ({run.confirmed} confirmed, {run.cleared} cleared)"
-               if run.cleared else ""),
+               if run.cleared else "")
+            + (f", {run.observed} observation(s) not counted" if run.observed else ""),
         )
     if run.stopped is True and run.stop_confident is not True:
         # `stop_confident` is the column that exists so a clean verdict can be
