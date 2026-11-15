@@ -161,7 +161,7 @@ def test_an_unusable_baseline_without_round_says_the_cycle_is_lost(
                                  "cycle": "c-other"}))
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--baseline", str(other))
     _assert_lost(err, r, "round 1 cannot continue this PR's cycle: none of its "
-                 "--baseline payloads was accepted (see the baseline notes), so it "
+                 "--baseline payloads was accepted, so it "
                  "starts a NEW panel cycle", 1, MINTED)
 
 
@@ -318,44 +318,81 @@ def test_no_message_tells_a_caller_round_is_required_beside_a_baseline():
         assert stale not in src, stale
 
 
-@pytest.mark.parametrize("round_flag", [[], ["--round", "2"]],
-                         ids=["inferred", "explicit"])
+@pytest.mark.parametrize("round_flag, expect", [
+    ([], {"github": "acme/board", "pr": 34}),
+    (["--round", "2"], {"github": "acme/board", "pr": 34, "round": 2}),
+], ids=["inferred", "explicit"])
 def test_every_run_reads_its_baseline_once_with_one_identity(
-        monkeypatch, capsys, tmp_path, round_flag):
-    """#868: the inferred-round run and the explicit-round run read the baseline ONCE
-    each, naming the review the same way, so the two cannot drift apart."""
+        monkeypatch, capsys, tmp_path, round_flag, expect):
+    """#868: each run reads `--baseline` through `load_baseline` once, naming the review
+    by exactly `BASELINE_IDENTITY`; an explicit round adds only its own bound."""
     _cli(monkeypatch, capsys, tmp_path / "r1.json", "--max-rounds", "4")
     seen = []
     real = panel.load_baseline
 
     def spy(paths, expect=None):
-        seen.append({k: v for k, v in (expect or {}).items() if k != "round"})
+        seen.append(dict(expect or {}))
         return real(paths, expect)
 
     monkeypatch.setattr(panel, "load_baseline", spy)
     _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json", *round_flag,
                     "--baseline", str(tmp_path / "r1.json"))
     assert r2["round"] == 2
-    assert seen == [{"repo": "board", "github": "acme/board", "pr": 34}]
+    assert seen == [expect]
+    assert set(seen[0]) - {"round"} == set(panel_rounds.BASELINE_IDENTITY)
 
 
-@pytest.mark.parametrize("extra", [[], ["refused"]], ids=["all-accepted", "one-refused"])
-def test_accepted_baselines_with_no_cycle_id_say_their_findings_still_count(
-        monkeypatch, capsys, tmp_path, extra):
-    """#868: payloads that were accepted but record no cycle id still carry their
-    findings, so the warning must not say nothing carries, nor send the caller to
-    re-pass them or drop them for --new-cycle, neither of which supplies the id."""
-    base = {"github": "acme/board", "pr": 34, "round": 1, "reviewed": True}
-    (tmp_path / "r1.json").write_text(json.dumps(base))
-    args = ["--baseline", str(tmp_path / "r1.json")]
-    if extra:
-        (tmp_path / "other.json").write_text(json.dumps({**base, "pr": 99}))
-        args += ["--baseline", str(tmp_path / "other.json")]
+FINDING = {"key": "k-1", "file": "a.py", "title": "an earlier finding"}
+NO_ID = {"github": "acme/board", "pr": 34, "round": 1, "reviewed": True,
+         "to_fix": [FINDING]}
+OTHER_PR = {**NO_ID, "pr": 99, "cycle": "c-other"}
+
+#: Every branch of `cycle_lost`: (id, payloads, extra flags, its `why`, round,
+#: cycle, prior_rounds, prior_findings, text that must appear, text that must not).
+BRANCHES = [
+    ("no-baseline", [], ["--round", "2", "--max-rounds", "3"],
+     "no --baseline was given", 2, None, 0, 0,
+     "pass every earlier round's payload with --baseline", "Their findings"),
+    ("all-refused", [OTHER_PR], [],
+     "none of its --baseline payloads was accepted", 1, MINTED, 0, 0,
+     "The baseline notes say why each payload was refused",
+     "pass every earlier round's payload"),
+    ("no-cycle-id", [NO_ID], [],
+     "its --baseline payloads record no cycle id", 2, None, 1, 1,
+     "Their findings still count as earlier rounds", "No earlier round's findings"),
+    ("no-cycle-id-one-refused", [NO_ID, OTHER_PR], [],
+     "its --baseline payloads record no cycle id", 2, None, 1, 1,
+     "Their findings still count as earlier rounds", "No earlier round's findings"),
+]
+
+
+@pytest.mark.parametrize("payloads, extra, why, round_no, cycle, rounds, findings, "
+                         "says, never", [b[1:] for b in BRANCHES],
+                         ids=[b[0] for b in BRANCHES])
+def test_every_lost_cycle_branch_says_what_its_state_is(
+        monkeypatch, capsys, tmp_path, payloads, extra, why, round_no, cycle, rounds,
+        findings, says, never):
+    """#868: one table over every branch, checking the state the message describes
+    (round, cycle, what carried) beside the message, so no branch can claim what its
+    state does not make true."""
+    args = list(extra)
+    for i, payload in enumerate(payloads):
+        (tmp_path / f"b{i}.json").write_text(json.dumps(payload))
+        args += ["--baseline", str(tmp_path / f"b{i}.json")]
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", *args)
-    _assert_lost(err, r, "its --baseline payloads record no cycle id, so it records "
-                 "cycle null", 2, None)
-    assert r["prior_rounds"] == 1
-    assert "Their findings still count as earlier rounds" in err
-    assert "No earlier round's findings" not in err
-    assert "pass every earlier round's payload" not in err
+    _assert_lost(err, r, f"cannot continue this PR's cycle: {why}", round_no, cycle)
+    assert (r["prior_rounds"], r["prior_findings"]) == (rounds, findings)
+    assert says in err and never not in err
     assert "--new-cycle" not in err
+
+
+def test_the_branch_table_covers_every_branch_of_cycle_lost():
+    """The guard on BRANCHES: every `why` `cycle_lost` can say has a row."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(panel.cycle_lost))
+    whys = {n.value.value for n in ast.walk(tree)
+            if isinstance(n, ast.Assign) and any(getattr(t, "id", "") == "why"
+                                                for t in n.targets)
+            and isinstance(n.value, ast.Constant)}
+    assert whys and whys == {b[3] for b in BRANCHES}
