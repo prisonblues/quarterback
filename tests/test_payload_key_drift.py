@@ -605,6 +605,7 @@ NESTED_DROPPED_BY_DESIGN = {
         "escalated_outstanding",   # == outstanding.escalated, from `blocking`
         "declined_outstanding",    # == outstanding.declined, from `unfixed`
         "narrowed",                # == outstanding.narrowed, from `narrowed_cleared`
+        "observed",                # == outstanding.observed (#623); kinds ride on to_fix
         # ---- Already on the row, by another route. `round` is sent at the TOP
         # level as well and `ReviewIn` binds it there into `review_runs.round`;
         # this is the same integer one indent in.

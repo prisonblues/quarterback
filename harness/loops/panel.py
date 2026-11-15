@@ -2388,7 +2388,7 @@ def kind_line(findings: list[Canonical]) -> str:
         return ""
     tally["downgraded"] = sum(1 for c in findings if c.kind and c.kind_said != c.kind)
     pairs = [f"{k} {tally[k]}" for k in KIND_LINE_LABELS if tally[k]]
-    return f"_Kinds: {' · '.join(pairs)} (recorded only)_"
+    return f"_Kinds: {' · '.join(pairs)}_"
 
 
 #: The labels :func:`kind_line` may print, in order.
@@ -5565,7 +5565,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # The property carries the argument; what matters here is that ONE floor answers
     # "may this be fixed" for the report, the payload and the mark.
     def below_floor(c: Canonical) -> bool:
-        return not severity_at_least(c.severity, dials.fix_floor)
+        # #623: a demonstrated regression or claim_miss is owed at any severity.
+        return (c.kind not in DEMONSTRATED_KINDS
+                and not severity_at_least(c.severity, dials.fix_floor))
 
     # #78's corroboration threshold: how many DISTINCT members raised this defect,
     # against how many its band requires. `c.reviewers` and not the LLM seats — a
@@ -5598,15 +5600,18 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # The fixer's list, minus BOTH ways a confirmed finding is deliberately not this
     # round's work. The two are independent questions — one about the band, one about
     # who raised it — and a finding can be under either or both.
-    for_fix = [c for c in to_fix if not below_floor(c) and not below_threshold(c)]
-    under_floor = [c for c in to_fix if below_floor(c)]
+    # #623: observations block nothing and are listed on their own, never as work.
+    observations = [c for c in to_fix if c.kind == "observation"]
+    work = [c for c in to_fix if c.kind != "observation"]
+    for_fix = [c for c in work if not below_floor(c) and not below_threshold(c)]
+    under_floor = [c for c in work if below_floor(c)]
     # Reported under its own heading, exactly as `under_floor` is and for the reason
     # #165 gives: the two lists are read by different readers, and an orchestrator
     # pasting "the To fix list" into a brief must not sweep these up with it. A
     # finding that is below the floor AS WELL is listed once, in `under_floor`, which
     # already says it is not this round's work — the payload flags both independently,
     # so nothing is lost and the report does not print the same defect twice.
-    under_threshold = [c for c in to_fix if below_threshold(c) and not below_floor(c)]
+    under_threshold = [c for c in work if below_threshold(c) and not below_floor(c)]
     # A threshold no answer can reach, said where the numbers are known. Every seat
     # that filed anything this round agreeing on one defect is the most corroboration
     # this round could ever have produced, so a threshold above that count stands down
@@ -6509,7 +6514,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # there were: its proposal has to say WHICH findings a revert would remove, and
     # re-deriving them would mean a second walk that could disagree with this one
     # about a finding's bucket.
-    placed = [(c, provenance_of(c)) for c in outstanding]
+    # #623: an observation blocks nothing, so it is not counted against the fix
+    # pass either. Untyped findings still count, as before.
+    placed = [(c, provenance_of(c)) for c in outstanding if c.kind != "observation"]
     tally = Counter(b for _, b in placed)
     provenance_counts = {b: tally.get(b, 0) for b in PROVENANCE} if attributable else {}
 
@@ -9344,6 +9351,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                          f"{c.synthesis}{conf(c)} — _{len(c.reviewers)} of "
                          f"{dials.threshold_for(c.severity)} seats_"
                          f"{escalation(c)}{declination(c)}")
+
+    if observations:
+        lines.append(f"\n### Observations, not blocking ({len(observations)})")
+        lines.append("_Typed `observation` by the judge (#623): recorded, optional to "
+                     "fix, never filed as an issue, and no reason for another round._")
+        for c in observations:
+            lines.append(f"- {c.severity} `{loc(c)}` [{c.id}] — {c.synthesis}")
 
     if sonar:
         lines.append(f"\n### SonarCloud issues ({len(sonar)}) — part of the gate")
