@@ -581,10 +581,9 @@ def seat_ceilings(budgets: dict[str, int | None], installed=None) -> tuple[Ceili
     makes at length, and for the same reason. `budgets` holds every CONFIGURED and
     selected seat, not every runnable one, and `agy` is a workstation package: on a
     headless box this repo's own rules enable a seat that records "antigravity: CLI
-    absent" and never runs. Counting its ceiling would refuse a round on
-    behalf of a reviewer that was never going to read anything, on exactly the
-    unattended hosts where nobody is watching to pass `--force` — while the seats
-    that DID run were reading off stdin with no cap at all.
+    absent" and never runs. Counting its ceiling would refuse a round on behalf of
+    a reviewer that was never going to read anything, on exactly the unattended
+    hosts where nobody is watching to pass `--force`.
 
     `installed` is injected so this stays a pure function of its arguments: a
     verdict that consults PATH is a verdict whose tests pass or fail depending on

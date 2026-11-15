@@ -934,16 +934,15 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   - **The board stores it, rather than dropping it at ingest.** `absent` and
     `code_blind` per reviewer (and `argv_capped`, for rows recorded before agy moved
     to stdin), plus `code_access` and `convention_files_removed` per run (migration
-    `0024`), read back out of
-    `GET /review/{id}` as well as written. `absent` had been sent since v2.32 and
-    silently discarded, because `ReviewerIn` inherits pydantic's `extra="ignore"` —
-    the same drop v2.26 records for `head_sha` and `unread_files` (#93). `code_blind`
-    is the one that matters most for anything ranking reviewers: a seat that could
-    open the caller and one that could not are not comparable on findings or on
-    `could_not_assess`, and a leaderboard averaging them measures two different jobs.
-    All columns nullable with no backfill — NULL is "the panel did not say", which is
-    the honest value for every round recorded before this, and inventing `false` would
-    assert coverage those rounds may not have had.
+    `0024`), read back out of `GET /review/{id}` as well as written. `absent` had been
+    sent since v2.32 and silently discarded, because `ReviewerIn` inherits pydantic's
+    `extra="ignore"` — the same drop v2.26 records for `head_sha` and `unread_files`
+    (#93). `code_blind` is the one that matters most for anything ranking reviewers: a
+    seat that could open the caller and one that could not are not comparable on
+    findings or on `could_not_assess`, and a leaderboard averaging them measures two
+    different jobs. All columns nullable with no backfill — NULL is "the panel did not
+    say", which is the honest value for every round recorded before this, and
+    inventing `false` would assert coverage those rounds may not have had.
 - **A short panel says so.** The report states seats filled against seats configured
   on every run, and calls the panel degraded above the findings when they differ — a
   weaker review, not a cleaner one. A CLI the host does not carry is exempt (it is a

@@ -2773,9 +2773,9 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
         # this cheaper round failed to re-read", it is the same constant arriving one
         # round later and standing for the rest of the cycle — `/panel-review-pr`
         # drives multiple rounds, so the loop would go right back to never stopping
-        # confidently. Truncation by a BUDGET still carries,
-        # which is the whole point of telling them apart: raise the number and the
-        # next round genuinely does read what this one could not.
+        # confidently. Truncation by a BUDGET still carries, which is the whole point
+        # of telling them apart: raise the number and the next round genuinely does
+        # read what this one could not.
         #
         # `absent` (#222): a seat that never ran cannot have been cut. Until #222 it
         # was recorded `truncated: True` anyway, because `budgets` was built from
@@ -3444,9 +3444,8 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     (:attr:`ReviewerRun.absent`), and a seat that cannot read the code it is
     reviewing (:attr:`ReviewerRun.code_blind`, whose `could_not_assess` entries are
     therefore reported and not counted). Both are facts about the HOST or about the
-    panel's DESIGN. Because `round_stop`
-    computes `confident` as `not veto`, leaving them in made a confident stop
-    unreachable — permanently on a headless box, and on any PR that so much as
+    panel's DESIGN. Because `round_stop` computes `confident` as `not veto`, leaving
+    them in made a confident stop unreachable — permanently on a headless box, and on any PR that so much as
     mentions a file it does not change. A signal that is never positive carries no
     information and trains its reader to ignore it, which is worse than not
     emitting it.

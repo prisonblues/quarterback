@@ -20,26 +20,36 @@ import panel_seats  # noqa: E402
 REPLY = '[{"severity": "P3", "file": "a.py", "line": 1, "title": "t", "detail": "d"}]'
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-#: OUT, STDOUT, STDERR and CODE are substituted by `_install`.
+#: CONF is the one substitution: a JSON file holding where to record what the fake
+#: saw and what it should print, so nothing it prints can collide with the script.
 FAKE_AGY = f"""#!{sys.executable}
 import json, sys
+conf = json.load(open(CONF))
 args = sys.argv[1:]
+if "-p" in args or "--print" in args:
+    sys.stderr.write("Error: --input-format stream-json reads prompts from stdin\\n")
+    sys.exit(2)
 for flag in ("--input-format", "--output-format"):
     if flag not in args or args[args.index(flag) + 1] != "stream-json":
         sys.stderr.write(f"Error: {{flag}} stream-json is required\\n")
         sys.exit(2)
 stdin = sys.stdin.read()
+lines = [line for line in stdin.splitlines() if line.strip()]
 try:
-    message = json.loads(stdin)
-    assert message["event"] == "user" and isinstance(message["message"]["content"], str)
+    message = json.loads(lines[0])
+    ok = (len(lines) == 1 and message["event"] == "user"
+          and isinstance(message["message"]["content"], str))
 except Exception:
-    sys.stderr.write("Error: stream input message is malformed\\n")
-    sys.exit(2)
-with open(OUT, "w") as f:
+    ok = False
+if not ok:
+    print(json.dumps({{"event": "result", "result": {{"status": "ERROR", "response": "",
+                      "error": "stream input message is malformed"}}}}))
+    sys.exit(1)
+with open(conf["out"], "w") as f:
     json.dump({{"argv": args, "stdin": stdin}}, f)
-sys.stdout.write(STDOUT)
-sys.stderr.write(STDERR)
-sys.exit(CODE)
+sys.stdout.write(conf["stdout"])
+sys.stderr.write(conf["stderr"])
+sys.exit(conf["code"])
 """
 
 
@@ -60,12 +70,13 @@ def agy(tmp_path, monkeypatch):
     out = tmp_path / "agy-saw.json"
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
+    conf = tmp_path / "agy-conf.json"
+
     def install(stdout: str = _stream("SUCCESS"), stderr: str = "", code: int = 0):
+        conf.write_text(json.dumps({"out": str(out), "stdout": stdout, "stderr": stderr,
+                                    "code": code}))
         exe = bin_dir / "agy"
-        exe.write_text(FAKE_AGY.replace("OUT", repr(str(out)), 1)
-                       .replace("STDOUT", repr(stdout), 1)
-                       .replace("STDERR", repr(stderr), 1)
-                       .replace("CODE", str(code), 1))
+        exe.write_text(FAKE_AGY.replace("CONF", repr(str(conf)), 1))
         exe.chmod(0o755)
         return lambda: json.loads(out.read_text()) if out.exists() else None
     return install
@@ -130,6 +141,8 @@ _SUCCESS = json.dumps({"event": "result", "result": {"status": "SUCCESS", "respo
 
 @pytest.mark.parametrize("stdout", [
     '{"event": "result", "result": "not an object"}',
+    # Malformed stays malformed: a later success does not rescue it.
+    f"{_SUCCESS}\ngarbage\n{_SUCCESS}",
     '{"event": "result", "result": {"status": "SUCCESS", "response": ["a", "list"]}}',
     "not json at all",
     "",
@@ -142,6 +155,12 @@ _SUCCESS = json.dumps({"event": "result", "result": {"status": "SUCCESS", "respo
 ])
 def test_only_a_final_successful_text_result_is_a_reply(stdout):
     assert panel_seats.antigravity_reply(stdout) == ""
+
+
+def test_a_failed_result_with_only_a_reason_code_still_says_why():
+    stream = json.dumps({"event": "result",
+                         "result": {"status": "CANCELLED", "finished_reason": "print_timeout"}})
+    assert "print_timeout" in panel_seats.error_text(stream)
 
 
 def test_a_success_with_trailing_blank_lines_is_still_a_reply():

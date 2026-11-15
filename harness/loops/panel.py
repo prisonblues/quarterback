@@ -7854,8 +7854,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # Every SELECTED seat still has a key here, as it always has — a seat this
         # box cannot run records `null` rather than vanishing (#222). The internal
         # `budgets` dict genuinely OMITS it, and has to: everything that iterates
-        # that dict (`composed`, `truncated_for`) reads a null as
-        # "uncapped" and would compose the whole diff for a seat that never ran.
+        # that dict (`composed`, `truncated_for`) reads a null as "uncapped" and
+        # would compose the whole diff for a seat that never ran.
         # The payload has no such reader and one shape to keep — a board or
         # dashboard doing `payload["diff_budgets"][name]` for a configured seat
         # must not start raising KeyError on exactly the unattended hosts this fix

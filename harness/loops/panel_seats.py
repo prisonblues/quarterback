@@ -280,8 +280,10 @@ def _error_body(value: object) -> dict | None:
         return inner
     result = value.get("result")
     if (value.get("event") == "result" and isinstance(result, dict)
-            and result.get("status") != "SUCCESS" and isinstance(result.get("error"), str)):
-        return {"message": result["error"]}
+            and result.get("status") != "SUCCESS"):
+        why = result.get("error") or result.get("finished_reason")
+        return {"message": f"status {result.get('status')}"
+                + (f": {why}" if isinstance(why, str) and why else "")}
     return value if value.get("type") == "error" else None
 
 
@@ -312,16 +314,16 @@ def error_events(stdout: str) -> list[dict]:
 
     Strict about what it lifts, so it is safe to run over EVERY seat's stdout
     including the seats whose stdout is their reply: a value counts only if it
-    parses as a JSON object that is an error envelope by one of `_error_body`'s two
+    parses as a JSON object that is an error envelope by one of `_error_body`'s three
     shapes. Reviewer prose does not, and a findings array does not. The cost of a
     false positive is bounded anyway — this is only ever consulted once a seat has
     already failed — a stdout that is nothing
     else.
     """
     text = stdout or ""
-    # The cheap gate first: with no `"error"` anywhere there is no envelope to
-    # find, and this runs over the whole stdout of every failed seat.
-    if '"error"' not in text:
+    # The cheap gate first: with neither key anywhere there is no envelope to find,
+    # and this runs over the whole stdout of every failed seat.
+    if '"error"' not in text and '"result"' not in text:
         return []
     return [value for _s, _e, value in _json_values(text)
             if _error_body(value) is not None]
@@ -3758,15 +3760,15 @@ def antigravity_stdin(prompt: str) -> str:
     return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
 
 
-#: What `_antigravity_result` returns for a final result that is not an object, or
-#: for anything that is not an event after a result.
+#: What `_antigravity_result` returns once a result is not an object, or a non-blank
+#: line after a result is not an event.
 _MALFORMED = object()
 
 
-def _antigravity_result(stdout: str | None) -> dict | object | None:
+def _antigravity_result(stdout: str | None) -> object:
     """The stream's last word on its result, or None if it gave none: the last
-    `result` event's body, or :data:`_MALFORMED` when that body is not an object or
-    a non-blank line that is not an event follows it."""
+    `result` event's body, or :data:`_MALFORMED` — for good — once a result body is not
+    an object or a non-blank line that is not an event follows a result."""
     found = None
     for line in (stdout or "").splitlines():
         if not line.strip():
@@ -3779,7 +3781,7 @@ def _antigravity_result(stdout: str | None) -> dict | object | None:
             if found is not None:
                 found = _MALFORMED
             continue
-        if event["event"] == "result":
+        if event["event"] == "result" and found is not _MALFORMED:
             body = event.get("result")
             found = body if isinstance(body, dict) else _MALFORMED
     return found
