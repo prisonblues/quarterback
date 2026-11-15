@@ -34,7 +34,8 @@ def queue(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", f"{fakes}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("HEAVY_SLOT_DIR", str(tmp_path / "q"))
     monkeypatch.setenv("HEAVY_SLOT_MEMINFO", str(meminfo))
-    monkeypatch.setenv("HEAVY_SLOT_RESERVE", "4G")
+    monkeypatch.setenv("HEAVY_SLOT_BUDGET", "12G")
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("QB_PANEL_MEMORY", "6G")
     monkeypatch.setattr(panel_slot, "_HELD", [])
     return fakes
@@ -76,14 +77,25 @@ def test_without_heavy_slot_the_round_runs_as_before_and_says_so_once(monkeypatc
     assert capsys.readouterr().err.count("does not wait for memory") == 1
 
 
-def test_qb_panel_memory_zero_turns_the_wait_off(queue, monkeypatch):
-    monkeypatch.setenv("QB_PANEL_MEMORY", "0")
-    assert panel_slot.reserve([], 861) is None
-    assert status()["holders"] == []
+@pytest.mark.parametrize("off", ["0", "0G", "0.0M"])
+def test_qb_panel_memory_zero_turns_the_wait_off(queue, monkeypatch, off):
+    monkeypatch.setenv("QB_PANEL_MEMORY", off)
+    notes: list[str] = []
+    assert panel_slot.reserve(notes, 861) is None
+    assert notes == [] and status()["holders"] == []
 
 
-def test_the_round_reserves_before_it_claims_the_pr_or_starts_a_seat():
+def test_a_holder_that_answers_with_anything_but_a_grant_is_not_a_reservation(queue):
+    (queue / "heavy-slot").write_text("#!/bin/sh\necho 'heavy-slot: something odd'\n")
+    notes: list[str] = []
+    assert panel_slot.reserve(notes, 861) is None
+    assert notes == ["memory: heavy-slot exited 0 before granting 6G, so this round ran "
+                     "without a reservation"]
+
+
+def test_the_round_reserves_before_it_reads_the_pr_claims_it_or_starts_a_seat():
     src = (LOOPS / "panel.py").read_text()
     reserve = src.index("panel_slot.reserve(notes, pr_number)")
+    assert reserve < src.index('head_sha = meta["headRefOid"]')
     assert reserve < src.index("hold_pr(cfg[\"path\"], pr_number, round_no)")
     assert reserve < src.index("with ThreadPoolExecutor(max_workers=len(ALL_REVIEWERS) + 1)")

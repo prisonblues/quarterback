@@ -43,9 +43,24 @@ def box(tmp_path):
 
     set_mem(16, 12)
     env = {k: v for k, v in os.environ.items() if not k.startswith("HEAVY_SLOT_")}
+    # The budget is pinned, not derived, so a real /etc/heavy-slot.conf cannot move it;
+    # HOME keeps ~/.config/heavy-slot.conf out too.
     env.update(HEAVY_SLOT_DIR=str(tmp_path / "q"), HEAVY_SLOT_MEMINFO=str(meminfo),
-               HEAVY_SLOT_RESERVE="4G", HEAVY_SLOT_MIN_FREE="2G")
+               HEAVY_SLOT_BUDGET="12G", HEAVY_SLOT_MIN_FREE="2G", HOME=str(tmp_path))
     return env, set_mem, tmp_path
+
+
+def wait_for(predicate, what: str, timeout: float = 15.0) -> None:
+    """Poll instead of sleeping a guess: the queue's own state says when to look."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.05)
+
+
+def waiters(tmp) -> int:
+    q = tmp / "q"
+    return len([f for f in os.listdir(q) if f.startswith("wait-")]) if q.exists() else 0
 
 
 def run(env, *args, timeout=20):
@@ -81,8 +96,9 @@ def test_the_grant_is_what_is_left_of_the_budget_not_the_max(box):
     first, grant = hold(env, "--min", "8G")
     try:
         assert grant["grant_bytes"] == 8 * G
-        _, second = hold(env, "--min", "2G", "--max", "10G", "--unit", "1G")
-        assert second == {"grant_bytes": 4 * G, "units": 4}  # budget 12 - 8 held
+        second, grant = hold(env, "--min", "2G", "--max", "10G", "--unit", "1G")
+        assert grant == {"grant_bytes": 4 * G, "units": 4}  # budget 12 - 8 held
+        release(second)
     finally:
         release(first)
 
@@ -94,7 +110,7 @@ def test_a_job_whose_min_does_not_fit_waits_says_so_once_and_runs_when_room_free
     waiter = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--min", "4G", "--label",
                                "suite", "--", "touch", str(done)], env=env,
                               stderr=subprocess.PIPE, text=True)
-    time.sleep(1.5)
+    wait_for(lambda: waiters(tmp) == 1, "the run to queue")
     assert waiter.poll() is None and not done.exists()
     release(first)
     assert waiter.wait(timeout=15) == 0 and done.exists()
@@ -108,10 +124,11 @@ def test_a_small_job_does_not_overtake_a_big_one_already_waiting(box):
     order = tmp / "order"
     big = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--min", "6G", "--", "sh", "-c",
                             f"echo big >> {order}; sleep 2"], env=env, stderr=subprocess.DEVNULL)
-    time.sleep(1)  # big is now first in the queue
+    wait_for(lambda: waiters(tmp) == 1, "big to queue")
     small = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--min", "2G", "--", "sh", "-c",
                               f"echo small >> {order}"], env=env, stderr=subprocess.DEVNULL)
-    time.sleep(2.5)
+    wait_for(lambda: waiters(tmp) == 2, "small to queue behind big")
+    time.sleep(2 * hs.POLL_SECONDS + 0.5)  # two full polls in which small could have gone
     assert not order.exists(), "2G was free, but small must wait behind big"
     release(first)
     assert big.wait(timeout=15) == 0 and small.wait(timeout=15) == 0
@@ -131,7 +148,8 @@ def test_a_killed_holder_stops_counting(box):
     first, _ = hold(env, "--min", "10G")
     first.send_signal(signal.SIGKILL)
     first.wait(timeout=10)
-    _, grant = hold(env, "--min", "2G", "--max", "12G")
+    second, grant = hold(env, "--min", "2G", "--max", "12G")
+    release(second)
     assert grant["grant_bytes"] == 10 * G  # MemAvailable 12 - 2 floor; the dead 10G is gone
 
 
@@ -172,7 +190,7 @@ def test_status_lists_holders_and_waiters(box):
                                "panel #861"], env=env, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     try:
-        time.sleep(1)
+        wait_for(lambda: waiters(box[2]) == 1, "the waiter to queue")
         out = run(env, "status").stdout
         assert "holds    10.0G" in out and "lexray zeus-1" in out
         assert "waits     4.0G" in out and "panel #861" in out
@@ -185,6 +203,7 @@ def test_status_lists_holders_and_waiters(box):
     ["run", "--min", "lots", "--", "true"],
     ["run", "--min", "4G", "--max", "2G", "--", "true"],
     ["run", "--min", "1G", "--"],
+    ["run", "--min", "1G", "--timeout", "nan", "--", "true"],
 ])
 def test_bad_requests_are_usage_errors(box, args):
     env, _, _ = box
@@ -214,3 +233,57 @@ def test_config_files_are_read_in_order_and_the_environment_wins(tmp_path, monke
 def test_the_budget_defaults_to_memtotal_minus_the_reserve():
     assert hs.budget_of({"budget": "", "reserve": "12G"}, 61 * G) == 49 * G
     assert hs.budget_of({"budget": "30G", "reserve": "12G"}, 61 * G) == 30 * G
+
+
+def test_queue_files_are_readable_by_other_users_whatever_the_umask(box):
+    env, _, tmp = box
+    old = os.umask(0o077)
+    try:
+        first, _ = hold(env, "--min", "2G")
+    finally:
+        os.umask(old)
+    try:
+        modes = {f: os.stat(tmp / "q" / f).st_mode & 0o777 for f in os.listdir(tmp / "q")}
+        assert modes and set(modes.values()) == {0o644}, modes
+    finally:
+        release(first)
+
+
+def test_a_clean_exit_removes_its_own_reservation_file(box):
+    env, _, tmp = box
+    first, _ = hold(env, "--min", "2G")
+    release(first)
+    assert run(env, "run", "--min", "2G", "--", "true").returncode == 0
+    assert not [f for f in os.listdir(tmp / "q") if f.startswith(("res-", "wait-"))]
+
+
+def test_killing_the_run_wrapper_does_not_free_memory_its_command_still_uses(box):
+    env, _, tmp = box
+    wrapper = subprocess.Popen([sys.executable, str(SCRIPT), "run", "--min", "4G", "--",
+                                "sleep", "30"], env=env, start_new_session=True)
+    wait_for(lambda: json.loads(run(env, "status", "--json").stdout)["reserved"] == 4 * G,
+             "the run to be granted")
+    wrapper.send_signal(signal.SIGKILL)
+    wrapper.wait(timeout=10)
+    try:
+        assert json.loads(run(env, "status", "--json").stdout)["reserved"] == 4 * G
+    finally:
+        os.killpg(wrapper.pid, signal.SIGKILL)
+
+
+@pytest.mark.parametrize(("cmd", "status"), [
+    (["sh", "-c", "kill -TERM $$"], 128 + signal.SIGTERM),
+    (["/nonexistent/tool"], 127),
+])
+def test_run_reports_a_signalled_or_missing_command_the_way_a_shell_does(box, cmd, status):
+    env, _, _ = box
+    r = run(env, "run", "--min", "1G", "--", *cmd)
+    assert r.returncode == status and "Traceback" not in r.stderr
+
+
+def test_an_unreadable_meminfo_is_a_usage_error_not_a_traceback(box):
+    env, _, tmp = box
+    env["HEAVY_SLOT_MEMINFO"] = str(tmp / "missing")
+    r = run(env, "run", "--min", "1G", "--", "true")
+    assert r.returncode == hs.EXIT_USAGE and "cannot read MemTotal" in r.stderr
+

@@ -12,7 +12,9 @@ before its seats start and waits for room instead of starting into a squeeze.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,8 +28,8 @@ _HELD: list[subprocess.Popen] = []
 def reserve(notes: list[str], pr_number: int) -> subprocess.Popen | None:
     """Wait for the round's reservation and hold it for the rest of the process."""
     size = os.environ.get("QB_PANEL_MEMORY") or DEFAULT_SIZE
-    if size == "0":
-        return None
+    if re.fullmatch(r"\s*0+(\.0*)?\s*[KMGT]?\s*", size, re.IGNORECASE):
+        return None  # 0, 0G, 0.0M: off
     exe = shutil.which("heavy-slot")
     if not exe:
         print("panel: heavy-slot is not on PATH, so this round does not wait for memory",
@@ -38,9 +40,13 @@ def reserve(notes: list[str], pr_number: int) -> subprocess.Popen | None:
         args += ["--timeout", os.environ["QB_PANEL_MEMORY_WAIT"]]
     # stderr is inherited, so heavy-slot's own "waiting for …" line reaches the caller.
     holder = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    if holder.stdout.readline():
-        _HELD.append(holder)
-        return holder
-    notes.append(f"memory: heavy-slot exited {holder.wait()} before granting {size}, so "
-                 "this round ran without a reservation")
-    return None
+    try:
+        json.loads(holder.stdout.readline())["grant_bytes"]
+    except (ValueError, KeyError, TypeError):
+        holder.stdin.close()
+        holder.stdout.close()
+        notes.append(f"memory: heavy-slot exited {holder.wait()} before granting {size}, so "
+                     "this round ran without a reservation")
+        return None
+    _HELD.append(holder)
+    return holder
