@@ -295,7 +295,8 @@ even where the rules disable it. Fewer reviewers means thinner coverage feeding
 the fixer — surface that in §6 rather than letting a one-vendor review read
 like a full panel.
 
-antigravity runs commands by default (`reviewers.antigravity.tools`), and the
+antigravity, where it is enabled and installed, runs commands when the round hands it
+the PR's tree (`reviewers.antigravity.tools`, true by default; code access on), and the
 summary's **Code access** line says when it did. What that protects and what it does
 not is in `harness/loops/README.md`, "The one seat that is given a shell".
 

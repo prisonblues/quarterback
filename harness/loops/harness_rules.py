@@ -472,9 +472,8 @@ DEFAULTS: dict = {
         # default budget on evidence — truncating when nothing forces it biases
         # toward false positives — and that stands. A budget says what to SEND;
         # these decide whether to START, and only ever against a ceiling that
-        # already exists: `max_diff_chars`, or the kernel's argv limit on the one
-        # seat whose prompt travels in argv. With `max_diff_chars` null and no
-        # argv-bound seat enabled there is no ceiling, so none of this fires and
+        # already exists: a seat's `max_diff_chars`. With it null there is no
+        # ceiling, so none of this fires and
         # no number invented here reaches anyone's diff. That is why they are ON by
         # default and still "the safe end of the switch": the default configuration
         # behaves exactly as it did before them.

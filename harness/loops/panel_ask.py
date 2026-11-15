@@ -698,7 +698,7 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
     prompts = dict.fromkeys(seats, base)
 
     answers: dict[str, SeatAnswer] = {}
-    to_run = [n for n in seats if n not in answers]
+    to_run = list(seats)
     if to_run:
         with ThreadPoolExecutor(max_workers=len(to_run)) as ex:
             tasks = {n: ex.submit(ask_llm, n, models[n], prompts[n], efforts.get(n, ""))

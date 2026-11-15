@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -36,7 +37,8 @@ with open(out, "w") as f:
 status = STATUS
 print(json.dumps({{"event": "init", "init": {{}}}}))
 print(json.dumps({{"event": "result",
-                  "result": {{"status": status, "response": {REPLY!r}}}}}))
+                  "result": {{"status": status, "response": {REPLY!r},
+                             "error": "" if status == "SUCCESS" else "model quota spent"}}}}))
 """
 
 
@@ -58,6 +60,7 @@ def agy(tmp_path, monkeypatch):
     monkeypatch.setenv("SSH_AUTH_SOCK", "/run/agent.sock")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.setenv("PGHOSTADDR", "10.0.0.1")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
     return lambda: json.loads(out.read_text()) if out.exists() else None
 
 
@@ -97,7 +100,7 @@ def test_with_tools_the_seat_runs_in_its_copy_with_a_stripped_environment(agy, t
     assert Path(saw["cwd"]).resolve() != tree.resolve(), "ran in the shared tree"
     assert _stdin_prompt(saw).endswith(f"YOUR COPY OF THE PR IS AT: {saw['cwd']}\n")
     env = saw["env"]
-    for gone in ("SSH_AUTH_SOCK", "OPENAI_API_KEY", "PGHOSTADDR"):
+    for gone in ("SSH_AUTH_SOCK", "OPENAI_API_KEY", "PGHOSTADDR", "XDG_RUNTIME_DIR"):
         assert gone not in env, gone
     assert ".invalid" in env["DATABASE_URL"] and ".invalid" in env["PGHOST"]
     assert saw["gh_empty"] is True
@@ -138,6 +141,53 @@ def test_a_failed_turn_is_no_reply_not_an_empty_review(agy, tmp_path):
     got = panel.review_llm("antigravity", "m", "PROMPT")
 
     assert got.findings == [] and "wrote no reply" in got.skip
+    assert "status ERROR: model quota spent" in got.skip, "agy's own reason was dropped"
+
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+def test_a_recorded_agy_stream_parses():
+    """Real agy 1.1.24 output, not an envelope these tests invented."""
+    ok = (FIXTURES / "agy-1.1.24-stream-success.ndjson").read_text()
+    assert panel_seats.antigravity_reply(ok).strip() == "The magic word is: banana"
+    assert panel_seats.antigravity_error(ok) == ""
+    bad = (FIXTURES / "agy-1.1.24-stream-error.ndjson").read_text()
+    assert panel_seats.antigravity_reply(bad) == ""
+    assert 'missing the "event" field' in panel_seats.antigravity_error(bad)
+
+
+@pytest.mark.parametrize("stdout", [
+    '{"event": "result", "result": "not an object"}',
+    '{"event": "result", "result": {"status": "SUCCESS", "response": ["a", "list"]}}',
+    '["not", "an", "event"]',
+    "not json at all",
+    "",
+])
+def test_a_malformed_result_is_no_reply_not_a_crash(stdout):
+    assert panel_seats.antigravity_reply(stdout) == ""
+    assert panel_seats.antigravity_error(stdout)
+
+
+def test_the_overlay_applies_even_without_a_cwd(monkeypatch):
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/inherited-agent")
+    out, err = panel_seats.run_cli(
+        ["sh", "-c", 'printf "%s" "${SSH_AUTH_SOCK-unset}"'], "probe", attempts=1,
+        env_extra={"SSH_AUTH_SOCK": None})
+    assert err is None and out == "unset"
+    assert os.environ["SSH_AUTH_SOCK"] == "/inherited-agent", "mutated the panel's env"
+
+
+def test_the_removed_argv_machinery_is_named_nowhere():
+    """agy's prompt left argv; nothing may still export, call or describe as current
+    what went with it. panel_rounds reads `argv_capped` off OLD payloads on purpose."""
+    loops = Path(__file__).resolve().parent.parent
+    gone = ("ARGV_PROMPT_MAX_BYTES", "fit_argv_budget", "argv_clamp", "_context_chars",
+            "kernel_cut")
+    for src in [*loops.glob("*.py"), loops / "README.md"]:
+        text = src.read_text()
+        for name in gone:
+            assert not re.search(rf"\b{name}\b", text), f"{src.name} still names {name}"
 
 
 @pytest.mark.parametrize("cfg, want", [
@@ -154,6 +204,15 @@ def test_only_an_exact_true_on_a_runs_code_seat_grants_the_tree(cfg, want):
 
 def test_the_shipped_default_is_on():
     assert harness_rules.DEFAULTS["reviewers"]["antigravity"]["tools"] is True
+
+
+def test_this_repos_rules_reach_dispatch_with_tools_on():
+    """Through the config loader, from a sample that never mentions `tools`."""
+    rules = panel.load_repo_cfg(str(Path(__file__).resolve().parents[3]))["reviewers"]
+    assert "tools" not in json.loads(
+        (Path(__file__).resolve().parents[3] / ".harness-rules.sample").read_text()
+    )["reviewers"]["antigravity"]
+    assert "antigravity" in panel_seats.tool_seats(rules)
 
 
 def test_a_tools_value_that_is_not_a_boolean_is_refused():

@@ -59,8 +59,8 @@ diff at all, and no amount of parsing recovers it from `gh pr diff` alone.
 (#49) refused a default budget on evidence — truncating when nothing forces it
 biases toward false positives — and that reasoning stands untouched here. A
 budget answers *what to send*; this answers *whether to start*, and only ever
-against a ceiling the repo or the kernel already declared. On a repo that sets no
-`max_diff_chars` and enables no argv-bound seat there is no cap, so nothing here
+against a ceiling the repo already declared. On a repo that sets no
+`max_diff_chars` there is no cap, so nothing here
 ever fires and no number this file invented is ever applied to anyone's diff.
 
 **Nor is it a silent skip.** A panel that quietly declines is #62's disease in a
@@ -291,16 +291,10 @@ class DiffShape:
     #: Files the diff touches, and the two one-sided subsets. A split shows up
     #: here as one file losing everything and several gaining it.
     files: int
-    #: The SAME diff in UTF-8 bytes, because one of the two ceilings this module
-    #: measures against is not expressed in characters. `max_diff_chars` is a
-    #: character count; agy's argv cap, until agy moved to stdin, was the kernel's
-    #: `MAX_ARG_STRLEN`, in bytes. Compared against `chars` an argv ceiling is
-    #: understated by exactly the diff's non-ASCII density — and this repo's own
-    #: diffs are full of em-dashes, arrows and box characters in comments and
-    #: reports, so the error is not theoretical and it runs in the direction that
-    #: lets an over-cap diff through. :func:`preflight` picks the reading that
-    #: matches the ceiling it found; both are serialised so the choice is checkable
-    #: rather than taken on trust.
+    #: The SAME diff in UTF-8 bytes, for a ceiling expressed in bytes. None is
+    #: declared today — agy's argv cap was the one, until agy moved to stdin — but
+    #: `Ceiling` keeps the unit, and both readings are serialised so a verdict's
+    #: unit stays checkable.
     #:
     #: Defaulted so a hand-built `DiffShape` in a test stays a two-line literal;
     #: :func:`diff_shape` always measures it.

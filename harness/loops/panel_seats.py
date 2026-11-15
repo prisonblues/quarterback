@@ -136,19 +136,22 @@ def tool_seats(reviewers: dict) -> frozenset[str]:
 
 
 #: The only inherited variables a tool-running seat starts with. An allowlist because
-#: a denylist of credential names leaks whatever it did not think of.
+#: a denylist of credential names leaks whatever it did not think of; the XDG names
+#: are spelled out because XDG_RUNTIME_DIR is where the session bus and agent
+#: sockets live.
 _SEAT_ENV_ALLOW = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TZ|TZDIR"
-                             r"|TMPDIR|XDG_\w+|LOCALE_ARCHIVE|\w*_CERT_(FILE|DIR))$")
+                             r"|TMPDIR|XDG_(CONFIG|DATA|CACHE|STATE)_(HOME|DIRS)"
+                             r"|LOCALE_ARCHIVE|\w*_CERT_(FILE|DIR))$")
 
 
-def runs_code_env(home: Path, base: dict[str, str] | None = None) -> dict[str, str | None]:
+def runs_code_env(scratch: Path, base: dict[str, str] | None = None) -> dict[str, str | None]:
     """`run_cli`'s `env_extra` for a tool-running seat; None removes a variable.
 
     Removes every inherited variable outside :data:`_SEAT_ENV_ALLOW` (SANDBOX_ENV is
     applied after inheritance, so it stays), then points the database variables at a
     host that cannot resolve — the tree has no `.env`, and a test suite's defaults
     here are a live database — and `gh` at an empty config."""
-    gh = home / "gh-config"
+    gh = scratch / "gh-config"
     gh.mkdir(exist_ok=True)
     env = os.environ if base is None else base
     removed: dict[str, str | None] = {
@@ -1144,9 +1147,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     the open question) and a freshly `git init`ed empty directory. The flag would
     buy nothing and would trade a guard for it.
 
-    `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
-    the only way to hand a reviewer a diff larger than the kernel's 128 KiB
-    per-argument limit. It does NOT weaken the guard that stdin
+    `stdin_text` is how a prompt reaches a CLI that accepts one there, and keeps
+    it clear of the kernel's 128 KiB per-argument limit. It does NOT weaken the guard that stdin
     is otherwise DEVNULL: subprocess writes the string and closes the pipe, so a
     CLI that decides to prompt for more reads EOF instead of hanging the panel
     on an inherited terminal.
@@ -1208,8 +1210,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     # Resolved once for the whole retry loop rather than per attempt: nothing
     # between attempts changes it, and building it three times would be three
     # copies of `os.environ` for one dict entry.
-    env = sandbox_env() if cwd is not None else None
-    for k, v in (env_extra or {}).items() if env is not None else ():
+    env = sandbox_env() if cwd is not None else (dict(os.environ) if env_extra else None)
+    for k, v in (env_extra or {}).items():
         if v is None:
             env.pop(k, None)
         else:
@@ -3803,20 +3805,39 @@ def antigravity_stdin(prompt: str) -> str:
     return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
 
 
-def antigravity_reply(stdout: str | None) -> str:
-    """The reply text of a stream-json agy run: the final `result` event's
-    `response` when its status is SUCCESS, else "" (which the caller reads as no
-    reply). Lines that are not JSON are skipped, not fatal."""
-    reply = ""
+def _antigravity_result(stdout: str | None) -> dict:
+    """The last well-formed `result` event's body, or {}. Anything malformed —
+    a line that is not JSON, a result that is not an object — counts as absent."""
+    found: dict = {}
     for line in (stdout or "").splitlines():
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        if isinstance(event, dict) and event.get("event") == "result":
-            result = event.get("result") or {}
-            reply = (result.get("response") or "") if result.get("status") == "SUCCESS" else ""
-    return reply
+        if (isinstance(event, dict) and event.get("event") == "result"
+                and isinstance(event.get("result"), dict)):
+            found = event["result"]
+    return found
+
+
+def antigravity_reply(stdout: str | None) -> str:
+    """The reply text of a stream-json agy run, or "" (no reply) unless the turn
+    ended in SUCCESS with a string response."""
+    result = _antigravity_result(stdout)
+    reply = result.get("response")
+    return reply if result.get("status") == "SUCCESS" and isinstance(reply, str) else ""
+
+
+def antigravity_error(stdout: str | None) -> str:
+    """Why a stream-json agy turn gave no reply, in agy's words, or ""."""
+    result = _antigravity_result(stdout)
+    if not result:
+        return "no result event"
+    if result.get("status") == "SUCCESS":
+        return "" if isinstance(result.get("response"), str) else "response is not text"
+    why = result.get("error") or result.get("finished_reason") or ""
+    return f"status {result.get('status')}" + (f": {why}" if isinstance(why, str) and why
+                                               else "")
 
 
 def pi_args(model: str, effort: str, session_id: str, session_dir: Path) -> list[str]:
@@ -4703,10 +4724,10 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: Does this seat get the PR's code, or an empty repo? Both conditions,
         #: because either alone is wrong: the caller must have prepared a tree
         #: (`reviewer_code_access` on, the fetch and the strip both succeeded), AND
-        #: this vendor must be able to express "read but do not execute" —
-        #: `SEAT_READS_CODE` records per vendor why four of the five cannot. A seat
-        #: that cannot read gains nothing from standing in the tree and still pays
-        #: the instruction-file channel for it, so it keeps the empty sandbox.
+        #: this vendor must be one that can read it: a SEAT_READS_CODE seat, or a
+        #: SEAT_RUNS_CODE seat the caller said may run tools. A seat that cannot read
+        #: gains nothing from standing in the tree and still pays the
+        #: instruction-file channel for it, so it keeps the empty sandbox.
         executes = code_tree is not None and runs_code and cmd_name in SEAT_RUNS_CODE
         reads_code = code_tree is not None and (cmd_name in SEAT_READS_CODE or executes)
         if reads_code:
@@ -4983,6 +5004,9 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # `model` and not `asked[0]`: the hint explains the PIN, and after a
             # failed fallback the thing worth naming is still what was configured.
             err += cli_hint(cmd_name, err, model)
+            if cmd_name == "antigravity" and outputs:
+                why = antigravity_error(outputs[-1])
+                err += f" (agy: {why})" if why else ""
             # A member that burned tokens and then failed still spent them, so
             # the usage is reported on this path too.
             return SeatTurn(skip=err, duration_ms=elapsed(), usage=usage_of(),
@@ -5882,7 +5906,7 @@ __all__ = [
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE", "SEAT_RUNS_CODE", "tool_seats", "runs_code_env",
-    "antigravity_stdin", "antigravity_reply", "CONVENTION_FILES", "CONVENTION_DIRS",
+    "antigravity_stdin", "antigravity_reply", "antigravity_error", "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "pr_claim_wanted", "history_wanted",
     "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",

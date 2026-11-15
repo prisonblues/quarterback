@@ -732,7 +732,7 @@ def propose(stop: dict | None, outstanding: list,
                                               findings=listing)
 
     answers: dict[str, SeatProposal] = {}
-    to_run = [n for n in seats if n not in answers]
+    to_run = list(seats)
     if to_run:
         with ThreadPoolExecutor(max_workers=len(to_run)) as ex:
             tasks = {n: ex.submit(propose_llm, n, models.get(n, ""), prompts[n],

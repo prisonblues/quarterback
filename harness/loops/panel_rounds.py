@@ -3438,8 +3438,8 @@ def coverage_veto(reviewer_meta: dict[str, dict], judge_skip: str | None,
     signal everything: a reviewer whose CLI this box does not carry
     (:attr:`ReviewerRun.absent`), a seat that cannot read the code it is reviewing
     (:attr:`ReviewerRun.code_blind`, whose `could_not_assess` entries are
-    therefore reported and not counted), and the one seat the kernel cannot hand a
-    whole diff to (`argv_capped` — `agy`'s prompt travels in argv). All three are
+    therefore reported and not counted), and `argv_capped`, recorded on payloads
+    from before agy's prompt moved from argv to stdin. All three are
     facts about the HOST or about the panel's DESIGN. Because `round_stop`
     computes `confident` as `not veto`, leaving them in made a confident stop
     unreachable — permanently on a headless box, and on any PR that so much as

@@ -1705,8 +1705,7 @@ evidence about the writer, not about the round.
 default budget on evidence — truncating when nothing forces it biases toward false
 positives — and that reasoning is untouched. A budget answers *what to send*; this answers
 *whether to start*, and only ever against a ceiling that already exists. **On a repo with
-`max_diff_chars` unset and no argv-bound seat enabled there is no ceiling, so none of this
-ever fires** and no number it invented reaches anyone's diff.
+`max_diff_chars` unset there is no ceiling, so none of this ever fires** and no number it invented reaches anyone's diff.
 
 **Nor is it a silent skip.** A panel that quietly declines is a merge gate trusting a proxy.
 A refusal:

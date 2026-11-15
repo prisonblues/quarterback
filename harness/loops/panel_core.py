@@ -1407,8 +1407,8 @@ coverage gap and none is a finding — they are how this checkout is built:
 #: CODE_ACCESS_BRIEF's counterpart for a SEAT_RUNS_CODE seat with `tools` on. The
 #: path goes on the prompt's LAST line, appended by `run_seat` once the copy exists.
 CODE_EXEC_BRIEF = """YOU HAVE THE CODE, AND A SHELL. A throwaway copy of this PR at its
-head commit is on disk; its path is the last line of this prompt. Run every command
-in it, and use no other checkout of this repository, even one you know of.
+head commit is on disk; its path is the last line of this prompt. Run each command
+from inside it, and use no other checkout of this repository, even one you know of.
 
 Read the callers, the siblings, the tests, the config. Run a targeted test or a
 small script to settle a claim the diff cannot. A question one file or one command

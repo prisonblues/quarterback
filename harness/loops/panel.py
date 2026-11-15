@@ -2410,7 +2410,7 @@ def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
 
 def shell_seats(reviewer_meta: dict) -> list[str]:
     """The seats that reviewed with a shell, read off what they did: a SEAT_RUNS_CODE
-    seat only sights the tree when `run_seat` launched it with one."""
+    seat only reads the tree when `run_seat` launched it with one."""
     return sorted(n for n, m in reviewer_meta.items()
                   if n in SEAT_RUNS_CODE and m.get("ran") and m.get("code_blind") is False)
 
@@ -3988,7 +3988,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     routing = route_seats(selected_seats, installed,
                           prior_dispatched=prior_dispatched,
                           prior_round=prior_dispatch_round,
-                          budget=seat_budget)
+                          budget=seat_budget, floor=tool_seats(rev))
     if routing.held:
         # Loud, in the same list every other policy that bound this round reports
         # through, and it names all three of the things a reader needs to check it:
@@ -4680,6 +4680,12 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
 
     def prompt_for(budget: int | None, reads_code: bool = False,
                    runs: bool = False) -> str:
+        if runs:
+            brief_code = CODE_EXEC_BRIEF
+        elif reads_code:
+            brief_code = CODE_ACCESS_BRIEF
+        else:
+            brief_code = NO_TOOLS_BRIEF
         # The slot is EITHER brief, never empty: a seat that gets the tree is told
         # to use it, and a seat that does not is told there is nothing to look at
         # and what to do instead (#458). Empty was the hole — it left the seats
@@ -4718,8 +4724,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text,
                             diff=history + claim + review.material(budget)[0],
-                            code=(CODE_EXEC_BRIEF if runs else CODE_ACCESS_BRIEF
-                                  if reads_code else NO_TOOLS_BRIEF)
+                            code=brief_code
                         ).replace(NEXT_DOOR_SLOT, next_door, 1
                         # #773's block, swapped after the render and bounded to one
                         # occurrence on exactly the argument above: it is built from
@@ -4822,9 +4827,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # header free to drift out of agreement with the header.
 
     # May the seats read the PR's code (#113)? A per-repo setting, ON by default,
-    # and the seats that can actually use it are `SEAT_READS_CODE` — three of the
-    # four vendors cannot express "read but do not execute", which is recorded
-    # there rather than here. `--no-code-access` turns it off for one run, the
+    # and the seats that can actually use it are `tool_seats(rev)`: SEAT_READS_CODE,
+    # plus a SEAT_RUNS_CODE seat whose `tools` is on. `--no-code-access` turns it off for one run, the
     # same shape as `--reviewers`: a switch this file honours over the config.
     want_code = code_access_wanted(panel, no_code_access, notes)
     # Read even when code access is off, so a misconfigured value is reported on
@@ -10157,7 +10161,7 @@ __all__ = [
     "panel_core", "panel_seats", "_RANGE", "ASK_CONTEXT_FILE_MAX_BYTES",
     "ASK_SECRET_DIRS", "ASK_SECRET_FILES", "ASK_SECRET_SUFFIXES", "AskContext",
     "ContextProblem", "_readable_file", "_context_spec", "_read_confined",
-    "_secret_context", "read_context", "_budgeted", "_context_chars",
+    "_secret_context", "read_context", "_budgeted",
     "NO_CONTEXT", "_context_block", "ASK_DEFAULTS", "_ask_rule",
     "ASKER_ENV", "asking_seat", "detected_asker", "ask",
     "main",
