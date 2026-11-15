@@ -6,8 +6,11 @@ Run: pytest harness/tests/test_qb_watch_board.py
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.machinery
 import importlib.util
+import io
+import json
 import sys
 import urllib.error
 from pathlib import Path
@@ -71,6 +74,45 @@ def test_instance_key_follows_the_label_then_the_session(monkeypatch):
     assert w.instance_key() == "seat-3"
     monkeypatch.setenv("QUARTERBACK_INSTANCE", " ")
     assert w.instance_key() == "f5ca7491"
+
+
+class _Resp(io.BytesIO):
+    headers = {"X-Board-Head": "7"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_every_board_request_carries_qbdatas_tls_context(monkeypatch):
+    """A bare urlopen fails every HTTPS read on an interpreter with no CA bundle of
+    its own, and the watch then reports an unreadable board that is up (#857). The
+    watcher's `_ssl_context` must BE qbdata's, not merely exist: patched without
+    `raising`, a missing import would be papered over by the patch itself."""
+    # Where it was defined, not object identity: other suites reload qbdata in this
+    # same process, so the function the watcher imported need not be the one a
+    # fresh `import qbdata` returns.
+    code = w._ssl_context.__code__
+    assert (code.co_name, Path(code.co_filename).resolve()) == (
+        "_ssl_context", SCRIPT.parent.joinpath("qbdata.py").resolve())
+    sentinel = object()
+    built, seen = [], []
+    monkeypatch.setattr(w, "_ssl_context", lambda: built.append(1) or sentinel)
+
+    def fake_urlopen(req, timeout=None, context=None):
+        seen.append(context)
+        return _Resp(json.dumps({"agent": "zeus/a"} if req.full_url.endswith("/whoami")
+                                else []).encode())
+
+    monkeypatch.setattr(w.urllib.request, "urlopen", fake_urlopen)
+    board = w.Board("https://qb.example", "tok", "t")
+    board.read({})
+    board.read({})
+    w.identities(board)
+    assert seen == [sentinel] * 3
+    assert len(built) == 1, "the context is built once per watch, not once per poll"
 
 
 class FakeBoard:
@@ -184,3 +226,32 @@ def test_a_timeout_says_the_watch_has_ended(run, capsys):
 def test_the_watch_names_who_it_is_listening_as(run, capsys):
     run([[post(1)], []])
     assert "zeus/amber-otter" in capsys.readouterr().out
+
+
+def _python_sources() -> list[Path]:
+    def first_line(p: Path) -> str:
+        return p.read_text(errors="replace").split("\n", 1)[0]
+
+    found = sorted(p for p in SCRIPT.parent.iterdir() if p.is_file() and (
+        p.suffix == ".py" or (first_line(p).startswith("#!") and "python" in first_line(p))))
+    assert found, "no python sources in harness/bin: this guard is asserting nothing"
+    return found
+
+
+def test_no_board_client_in_harness_bin_opens_a_url_without_the_tls_context():
+    """The class, not the one instance: qb-watch-board was the bin/ client that
+    skipped it. Parsed, not grepped, so a comment cannot trip it and `context=None`
+    (the default that fails) cannot satisfy it."""
+    bare = []
+    for path in _python_sources():
+        for node in ast.walk(ast.parse(path.read_text(), str(path))):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name != "urlopen":
+                continue
+            ctx = next((k.value for k in node.keywords if k.arg == "context"), None)
+            if ctx is None or (isinstance(ctx, ast.Constant) and ctx.value is None):
+                bare.append(f"{path.name}:{node.lineno}")
+    assert not bare, f"urlopen without a TLS context: {bare}"

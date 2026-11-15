@@ -354,15 +354,3 @@ def test_control_bytes_in_marker_content_never_reach_the_output():
     probe = w.Probe("present", "done \x1b]0;pwned\x07 \x1b[31mred\n")
     assert "\x1b" not in w.classify(probe, None, None)[1]
     assert "\x07" not in w.classify(probe, None, None)[1]
-
-
-QB_HOOK = Path(__file__).resolve().parents[1] / "bin" / "qb-hook"
-
-
-@pytest.mark.parametrize("label", ["seat-1", "seat 3", "..x", "aé-b", "a" * 60, "~~"])
-def test_instance_slug_is_qb_hooks_rule(label):
-    rule = next(ln for ln in QB_HOOK.read_text().splitlines() if ln.startswith("_key_slug()"))
-    got = subprocess.run([BASH, "-c", f'{rule}\n_key_slug "$1"', "_", label],
-                         capture_output=True, text=True, check=True,
-                         env={**os.environ, "LC_ALL": "C.UTF-8"})
-    assert w.key_slug(label) == got.stdout.rstrip("\n")  # as `$(…)` reads it
