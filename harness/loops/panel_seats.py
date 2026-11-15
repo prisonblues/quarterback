@@ -270,8 +270,8 @@ def _error_body(value: object) -> dict | None:
     error (`{"type":"error","message":…}`, which is codex's), the provider's own
     error body relayed verbatim under an `error` key (`{"error":{"param":…,"code":…}}`,
     which is the gateway's — the only one that carries `param`, the field that says
-    WHICH pin was refused), and agy's failed final result
-    (`{"event":"result","result":{"status":"ERROR","error":"…"}}`).
+    WHICH pin was refused), and agy's non-SUCCESS `result` event, whose `error` or
+    `finished_reason` is lifted as the message.
     """
     if not isinstance(value, dict):
         return None
@@ -281,9 +281,7 @@ def _error_body(value: object) -> dict | None:
     result = value.get("result")
     if (value.get("event") == "result" and isinstance(result, dict)
             and result.get("status") != "SUCCESS"):
-        why = result.get("error") or result.get("finished_reason")
-        return {"message": f"status {result.get('status')}"
-                + (f": {why}" if isinstance(why, str) and why else "")}
+        return {"message": result.get("error") or result.get("finished_reason")}
     return value if value.get("type") == "error" else None
 
 
@@ -315,14 +313,9 @@ def error_events(stdout: str) -> list[dict]:
     Strict about what it lifts, so it is safe to run over EVERY seat's stdout
     including the seats whose stdout is their reply: a value counts only if it
     parses as a JSON object that is an error envelope by one of `_error_body`'s three
-    shapes. Reviewer prose does not, and a findings array does not. The cost of a
-    false positive is bounded anyway — this is only ever consulted once a seat has
-    already failed — a stdout that is nothing
-    else.
+    shapes. Reviewer prose does not, and a findings array does not.
     """
     text = stdout or ""
-    # The cheap gate first: with neither key anywhere there is no envelope to find,
-    # and this runs over the whole stdout of every failed seat.
     if '"error"' not in text and '"result"' not in text:
         return []
     return [value for _s, _e, value in _json_values(text)

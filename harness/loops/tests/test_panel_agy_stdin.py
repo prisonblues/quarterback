@@ -21,29 +21,25 @@ REPLY = '[{"severity": "P3", "file": "a.py", "line": 1, "title": "t", "detail": 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 #: CONF is the one substitution: a JSON file holding where to record what the fake
-#: saw and what it should print, so nothing it prints can collide with the script.
+#: saw and what it should print. Its two refusals are the ones recorded from real
+#: agy 1.1.24: `-p` beside `--input-format stream-json` (exit 2) and a stdin message
+#: with no `event` field (an ERROR result, exit 1).
 FAKE_AGY = f"""#!{sys.executable}
 import json, sys
 conf = json.load(open(CONF))
 args = sys.argv[1:]
-if "-p" in args or "--print" in args:
-    sys.stderr.write("Error: --input-format stream-json reads prompts from stdin\\n")
+if "--input-format" in args and ("-p" in args or "--print" in args):
+    sys.stderr.write("Error: --input-format stream-json reads prompts from stdin, so a "
+                     "prompt given on the command line would be ignored\\n")
     sys.exit(2)
-for flag in ("--input-format", "--output-format"):
-    if flag not in args or args[args.index(flag) + 1] != "stream-json":
-        sys.stderr.write(f"Error: {{flag}} stream-json is required\\n")
-        sys.exit(2)
 stdin = sys.stdin.read()
-lines = [line for line in stdin.splitlines() if line.strip()]
 try:
-    message = json.loads(lines[0])
-    ok = (len(lines) == 1 and message["event"] == "user"
-          and isinstance(message["message"]["content"], str))
+    has_event = "event" in json.loads(stdin.splitlines()[0])
 except Exception:
-    ok = False
-if not ok:
+    has_event = False
+if not has_event:
     print(json.dumps({{"event": "result", "result": {{"status": "ERROR", "response": "",
-                      "error": "stream input message is malformed"}}}}))
+                      "error": 'stream input message is missing the "event" field'}}}}))
     sys.exit(1)
 with open(conf["out"], "w") as f:
     json.dump({{"argv": args, "stdin": stdin}}, f)
