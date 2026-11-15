@@ -44,6 +44,19 @@ NC='\033[0m'
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# The worker rule is shared with create-worktree and prune-worktrees (#854), so
+# the three cannot name a repo's worker container differently. Missing, the
+# teardown still runs — a partial install must still tear down, as with
+# worktree-lock — and records that it could not look for a worker by name.
+WORKTREE_WORKER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worktree-worker"
+WORKTREE_WORKER_MISSING=false
+if [[ -r "$WORKTREE_WORKER" ]]; then
+    # shellcheck source=worktree-worker
+    . "$WORKTREE_WORKER"
+else
+    WORKTREE_WORKER_MISSING=true
+fi
+
 # Steps that fail non-fatally record here instead of printing a yellow note and
 # being forgotten. The old behaviour ended every run with an unconditional
 # "Cleanup complete", so a database that was never dropped looked like a clean
@@ -709,15 +722,15 @@ DB_CONTAINER=$(cfg '.database.container' "auto")
 DB_USER_ENV=$(cfg '.database.user_env' "POSTGRES_USER")
 DB_NAME_ENV=$(cfg '.database.name_env' "POSTGRES_DB")
 DB_URL_ENV=$(cfg '.database.url_env' "")
-WORKER_TYPE=$(cfg '.worker.type' "none")
-WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
-
-if [[ -z "$WORKER_PREFIX" ]]; then
-    case "$WORKER_TYPE" in
-        huey) WORKER_PREFIX="huey-consumer" ;;
-        rq) WORKER_PREFIX="${PROJECT}-rq-worker" ;;
-        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
-    esac
+if [[ "$WORKTREE_WORKER_MISSING" = true ]]; then
+    # Not a guess at the rule: without the library there is no way to check a
+    # worker container is this worktree's (worker_owned), so none is removed by
+    # name. `docker compose down` in the directory still takes it.
+    WORKER_TYPE=unknown
+    WORKER_PREFIX=""
+    could_not_tell "worktree-worker is not beside this script ($WORKTREE_WORKER) — no worker container was looked for by name"
+else
+    resolve_worker "$MAIN_REPO" "$PROJECT"
 fi
 
 # If no DB engine in config, check .env
@@ -967,6 +980,16 @@ elif NAMES=$(docker_names); then
     for container in "${PROJECT}-${SAFE_NAME}" "${WORKER_PREFIX}-${SAFE_NAME}"; do
         [[ -z "$container" || "$container" = "-${SAFE_NAME}" ]] && continue
         listed "$NAMES" "$container" || continue
+        if [[ "$container" == "${WORKER_PREFIX}-${SAFE_NAME}" ]]; then
+            worker_owned "$container" "$WORKTREE_DIR"
+            case $? in
+                0) ;;
+                1) echo -e "${YELLOW}$container belongs to another checkout — left alone${NC}"
+                   continue ;;
+                *) could_not_tell "docker could not say whose $container is — left alone"
+                   continue ;;
+            esac
+        fi
         CONTAINERS_BEFORE=$((CONTAINERS_BEFORE + 1))
         docker rm -f "$container" >/dev/null 2>&1
         if ! after=$(docker_names); then

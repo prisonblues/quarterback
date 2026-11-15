@@ -60,6 +60,19 @@ NC='\033[0m'
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
+# The worker rule is shared with create-worktree and remove-worktree (#854), so
+# the three cannot name a repo's worker container differently. Missing, the sweep
+# still runs — the harness degrades, never blocks — and reports worker containers
+# as not checked.
+WORKTREE_WORKER="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/worktree-worker"
+WORKER_UNKNOWN=""
+if [[ -r "$WORKTREE_WORKER" ]]; then
+    # shellcheck source=worktree-worker
+    . "$WORKTREE_WORKER"
+else
+    WORKER_UNKNOWN="worktree-worker is not beside this script ($WORKTREE_WORKER)"
+fi
+
 env_val() {
     local var="$1" file="$2"
     [[ -f "$file" ]] || return 0
@@ -210,16 +223,13 @@ DB_CONTAINER=$(cfg '.database.container' "auto")
 DB_USER_ENV=$(cfg '.database.user_env' "POSTGRES_USER")
 DB_URL_ENV=$(cfg '.database.url_env' "")
 
-# Worker container prefix + nginx config, mirroring create-worktree/remove-worktree
-# so we can recognise per-worktree containers and nginx blocks.
-WORKER_PREFIX=$(cfg '.worker.container_prefix' "")
-WORKER_TYPE=$(cfg '.worker.type' "")
-if [[ -z "$WORKER_PREFIX" ]]; then
-    case "$WORKER_TYPE" in
-        huey)   WORKER_PREFIX="huey-consumer" ;;
-        rq)     WORKER_PREFIX="${PROJECT}-rq-worker" ;;
-        celery) WORKER_PREFIX="${PROJECT}-celery-worker" ;;
-    esac
+# Worker container prefix (worktree-worker's rule) + nginx config, so we can
+# recognise per-worktree containers and nginx blocks.
+if [[ -z "$WORKER_UNKNOWN" ]]; then
+    resolve_worker "$MAIN_REPO" "$PROJECT"
+else
+    WORKER_TYPE=unknown
+    WORKER_PREFIX=""
 fi
 NGINX_CONFIG=$(cfg '.nginx.config' "")
 NGINX_CONTAINER=$(cfg '.nginx.container' "auto")
@@ -559,10 +569,21 @@ if command -v docker >/dev/null 2>&1; then
                 [[ -z "$cname" ]] && continue
                 suf=""
                 [[ "$cname" == "${PROJECT}-"* ]] && suf="${cname#${PROJECT}-}"
-                [[ -n "$WORKER_PREFIX" && "$cname" == "${WORKER_PREFIX}-"* ]] && suf="${cname#${WORKER_PREFIX}-}"
+                worker=false
+                if [[ -n "$WORKER_PREFIX" && "$cname" == "${WORKER_PREFIX}-"* ]]; then
+                    suf="${cname#${WORKER_PREFIX}-}"; worker=true
+                fi
                 [[ -z "$suf" ]] && continue
                 is_live_suffix "$suf" && continue
-                [[ -n "${DEAD_SUFFIX[$suf]:-}" ]] && ORPHAN_CONTAINERS+=("$cname")
+                [[ -n "${DEAD_SUFFIX[$suf]:-}" ]] || continue
+                # A worker prefix need not encode the project (huey's does not),
+                # so a same-named branch in another repo matches it: take only one
+                # compose made in this repo's dead worktree.
+                if [[ "$worker" = true ]] \
+                   && ! worker_owned "$cname" "$(dirname "$MAIN_REPO")/${PROJECT}-${suf}"; then
+                    continue
+                fi
+                ORPHAN_CONTAINERS+=("$cname")
             done <<< "$DOCKER_PS"
         fi
     fi
@@ -797,6 +818,7 @@ report "Stale port entries"   "$PORTS_UNKNOWN"      "${#STALE_PORTS[@]}"       "
 # outright above rather than allowed to come back short.
 report "Leftover directories" ""                    "${#LEFTOVER_DIRS[@]}"     "${LEFTOVER_DIRS[@]:-}"
 report "Orphan containers"    "$CONTAINERS_UNKNOWN" "${#ORPHAN_CONTAINERS[@]}" "${ORPHAN_CONTAINERS[@]:-}"
+[[ -n "$WORKER_UNKNOWN" ]] && report "Orphan worker containers" "$WORKER_UNKNOWN" 0
 report "Orphan nginx blocks"  "$NGINX_UNKNOWN"      "${#ORPHAN_NGINX[@]}"      "${ORPHAN_NGINX[@]:-}"
 report "Orphan board claims"  "$CLAIMS_UNKNOWN"     "${#ORPHAN_CLAIMS[@]}"     "${ORPHAN_CLAIMS[@]:-}"
 report "Orphan bytecode caches" "$PYCACHE_UNKNOWN"  "${#ORPHAN_PYCACHE[@]}"    "${ORPHAN_PYCACHE[@]:-}"
@@ -829,6 +851,7 @@ note_unchecked() {
 note_unchecked "$DB_SCAN_UNKNOWN"    "orphan databases"
 note_unchecked "$PORTS_UNKNOWN"      "stale port entries"
 note_unchecked "$CONTAINERS_UNKNOWN" "orphan containers"
+note_unchecked "$WORKER_UNKNOWN"     "orphan worker containers"
 note_unchecked "$NGINX_UNKNOWN"      "orphan nginx blocks"
 note_unchecked "$CLAIMS_UNKNOWN"     "board claims"
 note_unchecked "$PYCACHE_UNKNOWN"    "orphan bytecode caches"

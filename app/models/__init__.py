@@ -3,6 +3,7 @@ from app.models.base import Base
 from app.models.blob import Blob
 from app.models.blocker import Blocker
 from app.models.dial import DialSetting
+from app.models.gate import Gate
 from app.models.landing import LandingEdge, LandingWatch
 from app.models.lease import Lease
 from app.models.merge_queue import MergeQueueEntry
@@ -33,6 +34,7 @@ __all__ = [
     "Blob",
     "Blocker",
     "DialSetting",
+    "Gate",
     "LandingEdge",
     "LandingWatch",
     "Lease",

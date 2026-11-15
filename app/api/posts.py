@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.gates import reset_on_publish
 from app.auth import author, optional_identity, reader
 from app.blob_gc import lock_blob_writes, touch_blob
 from app.db import get_session
@@ -176,6 +177,8 @@ async def create_post(
         refs=[r.model_dump(exclude_none=True) for r in body.refs] if body.refs else None,
     )
     session.add(post)
+    # A gate this publish moves (#852) answers it in this same transaction.
+    await reset_on_publish(session, post)
     await session.commit()
     await session.refresh(post)
     # The AFTER INSERT trigger has already fired pg_notify → SSE subscribers.

@@ -932,19 +932,20 @@ def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):  # UnicodeDecodeError too (#866)
             continue
         if not isinstance(payload, dict):
             continue
         if payload.get("github") != gh_repo or payload.get("pr") != pr_number:
             continue
-        try:
-            was = int(payload.get("round"))
-        except (TypeError, ValueError):
+        # `load_baseline`'s own reading of the round and the cycle (#866): a
+        # parser of its own here skipped a payload with no `round` that
+        # `load_baseline` had accepted as round 1.
+        was = panel_rounds.payload_round(payload)
+        if was is None or was >= round_no:
             continue
-        if not 1 <= was < round_no:
-            continue
-        if cycle and payload.get("cycle") and payload.get("cycle") != cycle:
+        got = panel_rounds.payload_cycle(payload)
+        if cycle and got and got != cycle:
             continue
         # Set HERE, past every identity check and beside the union rather than at
         # the top of the loop: "readable" has to mean an earlier round OF THIS
@@ -1035,19 +1036,20 @@ def earlier_round_registers(paths: list[str], gh_repo: str, pr_number: int,
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):  # UnicodeDecodeError too (#866)
             continue
         if not isinstance(payload, dict):
             continue
         if payload.get("github") != gh_repo or payload.get("pr") != pr_number:
             continue
-        try:
-            was = int(payload.get("round"))
-        except (TypeError, ValueError):
+        # `load_baseline`'s own reading of the round and the cycle (#866): a
+        # parser of its own here skipped a payload with no `round` that
+        # `load_baseline` had accepted as round 1.
+        was = panel_rounds.payload_round(payload)
+        if was is None or was >= round_no:
             continue
-        if not 1 <= was < round_no:
-            continue
-        if cycle and payload.get("cycle") and payload.get("cycle") != cycle:
+        got = panel_rounds.payload_cycle(payload)
+        if cycle and got and got != cycle:
             continue
         for row in payload.get("coverage_declarations") or []:
             if isinstance(row, dict) and row.get("key") and row.get("declaration"):
@@ -2385,6 +2387,37 @@ def shell_seats(reviewer_meta: dict) -> list[str]:
                   if n in SEAT_RUNS_CODE and m.get("ran") and m.get("code_blind") is False)
 
 
+def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
+               ledger_round: int, new_cycle: bool) -> str:
+    """Why this run cannot continue its PR's cycle, or "" when it can or need not.
+
+    Said on stderr and in the config notes (#866), because a cycle lost by accident
+    otherwise reads exactly like a first review. Whether the cycle continues is read
+    off what `load_baseline` accepted (`prior.cycle`), never off the flags: a
+    `--baseline` nobody could use loses the cycle as surely as none. The flags only
+    say whether a continuation was EXPECTED: a baseline given, a round past 1, or a
+    ledger with earlier rounds. `new_cycle` is the caller starting one on purpose,
+    and a round 1 with none of those is a cycle's real start."""
+    if new_cycle or prior.cycle:
+        return ""
+    if not (baseline_given or round_no > 1 or ledger_round > 1):
+        return ""
+    if not baseline_given:
+        why = "no --baseline was given"
+    elif not prior.rounds:
+        why = "none of its --baseline payloads was accepted (see the baseline notes)"
+    else:
+        why = "its --baseline payloads record no cycle id"
+    if ledger_round > 1:
+        why += f", though the class ledger is at round {ledger_round} of this PR"
+    then = ("so it starts a NEW panel cycle" if round_no == 1
+            else "so it records cycle null, and the board cannot chain it to the "
+            "rounds before it")
+    return (f"round {round_no} cannot continue this PR's cycle: {why}, {then}. No "
+            "earlier round's findings, provenance or fix_injection carry into it. To "
+            "continue the cycle, pass every earlier round's payload with --baseline")
+
+
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
         reviewers: str | None = None, json_file: str = "", record: bool = True,
         round_no: int = 1, baseline: list[str] | None = None,
@@ -2451,7 +2484,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
         # #846's owner override, named at the call site for the reason above.
         continue_cycle: bool = False,
         answered_by: str = "",
-        answered_why: str = "") -> int:
+        answered_why: str = "",
+        # #866: False when the caller left `--round` out, so a `--baseline` names
+        # the round instead. True (the old meaning of `round_no`) for every other
+        # caller, which passes the round it means.
+        round_named: bool = True) -> int:
     # A cycle is something the CALLER drives, and only /panel-review-pr does:
     # naming a cap (or a round, or a baseline) is what says this run is part of
     # one. A review-only /panel run left to the default is a single pass, and
@@ -2465,7 +2502,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # flag as evidence of a cycle (the shape this had for one round) produced
     # exactly what the comment above forbids: "round 1 of at most 2 — go again",
     # promising a re-review nothing will run.
-    in_cycle = max_rounds is not None or round_no > 1 or bool(baseline)
+    # A class ledger is one too (#866): it numbers this PR's rounds and spends a
+    # budget across them, so a ledger round that is not a cycle round records
+    # `cycle: null` and leaves its successor nothing to continue.
+    in_cycle = (max_rounds is not None or round_no > 1 or bool(baseline)
+                or bool(class_ledger))
     # Idempotency key for the board record, minted once per process so a retry of
     # the POST cannot double-count the run into the stats. A fresh panel run is a
     # genuinely new observation and gets a new key — re-reviewing a PR after a fix
@@ -2487,6 +2528,20 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # anyone who did not pass a flag they were never told to pass.
     repo_name = cfg.get("name") or repo_name
     gh_repo = cfg["github"]
+    # `--baseline` without `--round` is the round after the latest baseline (#866).
+    # Left at 1, `load_baseline` refused every baseline as "not earlier than this
+    # run's round 1", and each re-review started a new cycle with no history. The
+    # round is read off what `load_baseline` ACCEPTS, with no round to be earlier
+    # than, so the two cannot disagree about a payload's round or its cycle, and
+    # that same read is this run's baseline: every accepted round is earlier than
+    # the one after the latest of them.
+    inferred_prior = None
+    round_inferred_from = None
+    if not round_named and baseline:
+        inferred_prior = load_baseline(baseline, {"github": gh_repo, "pr": pr_number})
+        if inferred_prior.rounds:
+            round_inferred_from = max(inferred_prior.rounds)
+            round_no = round_inferred_from + 1
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
     # Every config diagnostic this run will report. Initialised HERE, not beside the
@@ -2500,6 +2555,9 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # because it is about where the dials came FROM and reads oddly after a
     # complaint about one of their values.
     notes: list[str] = board_dial_notes(cfg)
+    if round_inferred_from is not None:
+        notes.append(f"--round not given: this is round {round_no}, the round after "
+                     f"--baseline's round {round_inferred_from}")
     # The eight `review_panel` settings that trade thoroughness against convergence,
     # resolved once (`panel_seats.resolve_dials`) so the prompt, the report, the stop
     # rule and the payload cannot disagree about which policy this round ran under.
@@ -2758,8 +2816,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                   "repo being reviewed — clear or move the dial on the board"
                   if round_cap_ceiling is not None and cap == round_cap_ceiling
                   else "raise the cap")
-        sys.exit(f"panel: --round {round_no} is past the cap of {cap}, from {blame}: "
-                 f"{remedy}, or pass the round this run actually is")
+        if round_inferred_from is None:
+            said, tail = "--round", ", or pass the round this run actually is"
+        else:
+            said, tail = (f"--baseline (its latest round is {round_inferred_from}), "
+                          "so round", "")
+        sys.exit(f"panel: {said} {round_no} is past the cap of {cap}, from {blame}: "
+                 f"{remedy}{tail}")
 
     # #55's spend ceiling, RESOLVED here and CHECKED further down. The two halves
     # are split because they cost different things and want different moments: this
@@ -3136,9 +3199,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             # serialised a skipped round 2 as round 1 with a fresh id, which then
             # collided with the real round 1 over the round number and renamed
             # the cycle out from under every later round.
-            skip_prior = load_baseline(baseline or [],
-                                       {"repo": repo_name, "github": gh_repo,
-                                        "pr": pr_number, "round": round_no})
+            skip_prior = (inferred_prior if inferred_prior is not None else
+                          load_baseline(baseline or [],
+                                        {"repo": repo_name, "github": gh_repo,
+                                         "pr": pr_number, "round": round_no}))
             # A key this round was handed that the register does not already hold
             # is LOST here, and said so. The alternative — recording it — dates
             # the declaration to a round that reviewed nothing and writes it in
@@ -3457,7 +3521,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             raise SystemExit(
                 f"--continue-cycle answers a stop, and the board records none ending "
                 f"PR #{pr_number}'s cycle as it stands. Continue the cycle with "
-                "--round and --baseline alone")
+                "--baseline alone")
         # The board could not be asked. Best-effort, as every board read here is:
         # the round runs, and says it could not confirm what it was answering.
         stop_answered = {"by": answered_by, "why": answered_why,
@@ -3688,9 +3752,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the fixer wrote since the last round read it, with the PR behind it as
     # context. Decided here, before budgets, because scope is what the budgets are
     # then spent on.
-    prior = load_baseline(baseline or [],
-                          {"repo": repo_name, "github": gh_repo, "pr": pr_number,
-                           "round": round_no})
+    prior = inferred_prior if inferred_prior is not None else load_baseline(
+        baseline or [], {"repo": repo_name, "github": gh_repo, "pr": pr_number,
+                         "round": round_no})
+    lost = cycle_lost(prior, round_no, bool(baseline),
+                      ledger_round if class_ledger else 0, new_cycle)
+    if lost:
+        notes.append(lost)
+        print(f"[{repo_name}#{pr_number}] ⚠️ {lost}", file=sys.stderr)
     want_scope = resolve_round_scope(scope, panel, notes)
     # `--since` wins over the baseline, and it is checked here rather than trusted:
     # the anchor is interpolated into a REST path, and a value carrying `..` or a
@@ -9701,8 +9770,10 @@ def main() -> int:
     # accepted `--ask --round 1` silently, which is a caller believing it asked
     # for something this run does not do.
     ap.add_argument("--round", type=int, default=None, dest="round_no", metavar="N",
-                    help="which panel/fix cycle this is (default 1). Round 2+ is the "
-                         "re-review of the fix commit — the one nobody reads otherwise")
+                    help="which panel/fix cycle this is (default: the round after the "
+                         "latest --baseline payload that is accepted, else 1). Round 2+ "
+                         "is the re-review of the fix commit — the one nobody reads "
+                         "otherwise")
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
                     help="a previous round's --json-file payload, so this run can say "
                          "which findings no earlier round raised. Repeatable")
@@ -9816,7 +9887,8 @@ def main() -> int:
                     help="#846: the OWNER's answer to a stop. When the board says the "
                          "last round ENDED this cycle (a fix_injection stop, say), run "
                          "the NEXT round of the same cycle instead of refusing — pass "
-                         "its --round and --baseline as usual, so the baseline, "
+                         "its --baseline as usual (the round follows from it), so the "
+                         "baseline, "
                          "provenance and guards carry on. Needs --answered-by and "
                          "--why, recorded in the payload (`stop_answered`) and the "
                          "posted summary. It does not raise the round cap "
@@ -10047,7 +10119,8 @@ def main() -> int:
         if given:
             raise SystemExit(f"{flag} belongs to --ask — a PR review takes neither")
     # The sentinel has done its one job (telling `--ask --round 1` from `--ask`);
-    # from here down a round that was not named is round 1, exactly as before.
+    # from here down a round that was not named is round 1 until `run()` infers it
+    # from an accepted --baseline (`round_named`, #866).
     round_no = 1 if args.round_no is None else args.round_no
     if round_no < 1:
         raise SystemExit("--round: rounds are numbered from 1")
@@ -10148,8 +10221,7 @@ def main() -> int:
                              "pass --answered-by NAME and --why TEXT")
         if not args.baseline:
             raise SystemExit("--continue-cycle continues a cycle, which is carried by "
-                             "its --baseline (the stopped round's payload) — pass it, "
-                             "with --round")
+                             "its --baseline (the stopped round's payload) — pass it")
     elif args.answered_by or args.answered_why:
         raise SystemExit("--answered-by and --why go with --continue-cycle")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
@@ -10162,7 +10234,8 @@ def main() -> int:
                assessed_by=args.assessed_by, no_history=args.no_history,
                class_ledger=args.class_ledger, class_wave=args.class_wave,
                class_rounds=args.class_rounds, continue_cycle=args.continue_cycle,
-               answered_by=args.answered_by, answered_why=args.answered_why)
+               answered_by=args.answered_by, answered_why=args.answered_why,
+               round_named=args.round_no is not None)
 
 
 if __name__ == "__main__":

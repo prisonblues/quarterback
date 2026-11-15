@@ -868,6 +868,28 @@ def _ssl_context():
     return ssl.create_default_context(cafile=certifi.where())
 
 
+def key_slug(value: str) -> str:
+    """`qb-hook`'s `_key_slug`, which `tr` applies per BYTE, so every client that
+    sends `X-Agent-Instance` names the same agent the hooks do (#857).
+
+    `surrogateescape`, because a POSIX environment value is bytes and arrives here
+    with any undecodable byte as a lone surrogate; the hook sees the raw byte, so
+    that is what is slugged, rather than raising before the request is sent."""
+    allowed = re.compile(r"[A-Za-z0-9._~-]")
+    raw = value.encode("utf-8", "surrogateescape")
+    flat = "".join(chr(b) if allowed.fullmatch(chr(b)) else "-" for b in raw)
+    return re.sub(r"^[._~-]+", "", flat)[:40]
+
+
+def instance_key() -> str:
+    """This agent's instance label, as `qb-hook` derives it: the slugged explicit
+    label, or — when there is none, or it slugs to nothing — the slugged first 8
+    of the session id."""
+    explicit = os.environ.get("QUARTERBACK_INSTANCE", "")
+    session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    return key_slug(explicit) or key_slug(session[:8])
+
+
 #: The header a person's own key travels in — `app.auth.HUMAN_KEY_HEADER`. Named
 #: rather than spelled inline so the two halves of one contract are greppable as a
 #: pair; the board owns the name and this is the client that honours it.

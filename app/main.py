@@ -12,6 +12,7 @@ from app.api.blockers import router as blockers_router
 from app.api.board_view import router as board_view_router
 from app.api.claims import router as claims_router
 from app.api.dials import router as dials_router
+from app.api.gates import router as gates_router
 from app.api.landing import router as landing_router
 from app.api.leases import router as leases_router
 from app.api.merge_queue import router as merge_queue_router
@@ -83,6 +84,7 @@ app.include_router(plan_router)
 app.include_router(landing_router)
 app.include_router(blockers_router)
 app.include_router(dials_router)
+app.include_router(gates_router)
 
 
 @app.get("/health")

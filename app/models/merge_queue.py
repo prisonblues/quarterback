@@ -120,7 +120,7 @@ class MergeQueueEntry(Base):
     #: a new table.
     repo: Mapped[str] = mapped_column(Text, nullable=False)
     #: The branch being landed ONTO. Case is not folded: ``main`` and ``Main`` are
-    #: two refs, and :func:`app.claimkey._branch` says so for the merge key this
+    #: two refs, and :func:`app.claimkey.canonical_branch` says so for the merge key this
     #: queue sits beside.
     base: Mapped[str] = mapped_column(Text, nullable=False)
     pr: Mapped[int] = mapped_column(BigInteger, nullable=False)
