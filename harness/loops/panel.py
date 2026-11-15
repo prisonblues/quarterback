@@ -117,6 +117,7 @@ import panel_propose  # noqa: F401
 import panel_rounds  # noqa: F401
 import panel_scope  # noqa: F401
 import panel_seats  # noqa: F401
+import panel_slot
 
 # #771's locality matcher, and the ONE import in this file that is allowed to
 # fail. Everything it is used for is a second opinion beside an answer this file
@@ -5058,6 +5059,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # `--no-record` is a caller saying this run does not go on the board, and a
     # claim is a board write like any other. `hold_pr` never gates a round — its
     # refusals are notes — so nothing here can stop a review that was going to run.
+    # #874: wait for memory before anything is claimed or paid for; held to exit.
+    panel_slot.reserve(notes, pr_number)
     #: Did THIS round take the claim? The release below is gated on it, and
     #: nothing else is: a round that was told the PR is held by somebody else runs
     #: anyway (the claim is a record, not a gate) and must not then hand back the

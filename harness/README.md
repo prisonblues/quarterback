@@ -5760,6 +5760,37 @@ remote shell exiting with anything else.
 Exits: 0 done (ok), 1 done (failed), 2 usage, 3 could not ask, 4 `--timeout` reached, 5 the
 watcher itself failed (so a crash is never read as exit 1).
 
+### `heavy-slot` — one memory queue for the heavy jobs on a host (#874)
+
+On 2026-11-15 zeus ran out of memory twice, and each time a panel round was killed before it
+produced anything. Four lexray CI runs held the box at 6 xdist workers of about 2 GB each, plus
+their postgres containers. lexray's own queue counted runs, not memory, and nothing else took
+part. `heavy-slot` is the shared queue, and it counts memory.
+
+- **Ask for memory.** `--min` is what the job cannot run without and `--max` what it could
+  use. It gets as much as fits, up to max, in whole `--unit`s (an xdist worker), and waits
+  while even the min does not fit. A min bigger than the whole budget is exit 3 at once.
+- **What fits:** live reservations plus the grant stay within the budget (MemTotal minus
+  `reserve`, default 12G, unless `budget` is set), and the grant stays below MemAvailable minus
+  `min_free` (default 2G), so memory used by jobs that never asked still counts.
+- **First come, first served.** A small job does not overtake a big one waiting for its min.
+- **The kernel ends a reservation.** Each holder keeps an flock on its file in the queue
+  directory (default `/tmp/heavy-slot`, mode 1777, because the agents and the CI runners are
+  different users), so however it exits the lock goes and the file stops counting.
+
+`heavy-slot run --min 4G --max 24G --unit 2G -- CMD` runs CMD inside the grant, with
+`HEAVY_SLOT_GRANT_BYTES` and `HEAVY_SLOT_UNITS` set. `heavy-slot hold` prints the grant as one
+JSON line and holds it until its stdin closes, for a caller that cannot be wrapped (pytest's
+controller, a panel round). `heavy-slot status` lists holders and waiters. `--timeout MIN` bounds
+the wait (exit 4). Config is `KEY=VALUE` in `/etc/heavy-slot.conf`, then
+`~/.config/heavy-slot.conf`, then `HEAVY_SLOT_<KEY>`; keys `dir`, `budget`, `reserve`,
+`min_free`.
+
+**A panel round reserves before its seats start** (`harness/loops/panel_slot.py`), ahead of the
+PR claim, and holds it until the process exits. `QB_PANEL_MEMORY` sets the size (default 6G,
+`0` turns it off), and `QB_PANEL_MEMORY_WAIT` bounds the wait in minutes. A host without
+`heavy-slot` runs rounds as before, with one line on stderr.
+
 ### `qb-watch-pr` — hear about a PR instead of polling it (#822)
 
 `qb-watch-pr <pr>` is meant for the Monitor tool: one line per change, silence otherwise. State

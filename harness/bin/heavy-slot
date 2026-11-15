@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""heavy-slot — one memory-aware admission queue for the heavy jobs on a host (#874).
+
+On 2026-11-15 zeus ran out of memory twice: four lexray CI runs at 6 xdist workers of
+~2 GB each, plus their postgres containers, left nothing for the desktop or a panel
+round, and the panel was killed both times. lexray's own queue counted runs, not memory,
+and nothing else on the box took part in it. This is the shared one.
+
+* **A job asks for memory, not a slot.** `--min` is what it cannot run without, `--max`
+  what it could use. It is granted as much as fits, up to max, in whole `--unit`s (an
+  xdist worker), and waits while even its min does not fit.
+* **What fits.** Live reservations plus the grant stay within the budget (MemTotal minus
+  `reserve`, unless `budget` is set), AND the grant stays below MemAvailable minus
+  `min_free`, so memory used by jobs that never asked still counts.
+* **First come, first served.** Waiters are admitted in the order they arrived; a small
+  job does not overtake a big one that is waiting for its min.
+* **The kernel ends a reservation.** Each holder keeps an flock on its file, so however
+  it exits the lock goes, and a file nobody holds is ignored and removed. The directory
+  is shared (mode 1777) because the agents and the CI runners are different users.
+
+Config: KEY=VALUE lines in /etc/heavy-slot.conf, then ~/.config/heavy-slot.conf, then
+HEAVY_SLOT_<KEY> in the environment. Keys: dir, budget, reserve, min_free. Sizes take
+K/M/G suffixes.
+
+Commands:
+  heavy-slot run  --min SIZE [--max SIZE] [--unit SIZE] [--label L] [--timeout MIN] -- CMD...
+      Runs CMD holding the grant; CMD sees HEAVY_SLOT_GRANT_BYTES and HEAVY_SLOT_UNITS.
+      Exits with CMD's status.
+  heavy-slot hold --min SIZE [--max SIZE] [--unit SIZE] [--label L] [--timeout MIN]
+      Prints the grant as one JSON line, then holds it until its stdin closes. For a
+      caller that cannot be wrapped, such as pytest's controller.
+  heavy-slot status [--json]
+
+Exits: 0 granted (or run's own status), 2 usage, 3 the min can never fit the budget,
+4 the wait timed out.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+EXIT_USAGE, EXIT_NEVER, EXIT_TIMEOUT = 2, 3, 4
+DEFAULTS = {"dir": "/tmp/heavy-slot", "budget": "", "reserve": "12G", "min_free": "2G"}
+CONFIG_FILES = ("/etc/heavy-slot.conf", "~/.config/heavy-slot.conf")
+POLL_SECONDS = 2.0
+SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*$", re.IGNORECASE)
+SCALE = {"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
+
+
+def parse_size(text: str) -> int:
+    m = SIZE_RE.match(str(text))
+    if not m:
+        raise ValueError(f"not a size: {text!r}")
+    return int(float(m.group(1)) * SCALE[m.group(2).upper()])
+
+
+def fmt(n: int) -> str:
+    return f"{n / (1 << 30):.1f}G"
+
+
+def load_config(env: dict) -> dict:
+    cfg = dict(DEFAULTS)
+    for path in CONFIG_FILES:
+        try:
+            with open(os.path.expanduser(path), encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            key, sep, value = line.split("#", 1)[0].partition("=")
+            if sep and key.strip() in DEFAULTS:
+                cfg[key.strip()] = value.strip()
+    for key in DEFAULTS:
+        if env.get(f"HEAVY_SLOT_{key.upper()}"):
+            cfg[key] = env[f"HEAVY_SLOT_{key.upper()}"]
+    return cfg
+
+
+def meminfo(env: dict) -> tuple[int, int]:
+    """(MemTotal, MemAvailable) in bytes. HEAVY_SLOT_MEMINFO names another file (tests)."""
+    found = {}
+    with open(env.get("HEAVY_SLOT_MEMINFO", "/proc/meminfo"), encoding="ascii") as f:
+        for line in f:
+            key, _, rest = line.partition(":")
+            if key in ("MemTotal", "MemAvailable"):
+                found[key] = int(rest.split()[0]) * 1024
+    return found["MemTotal"], found["MemAvailable"]
+
+
+def budget_of(cfg: dict, total: int) -> int:
+    if cfg["budget"]:
+        return parse_size(cfg["budget"])
+    return max(0, total - parse_size(cfg["reserve"]))
+
+
+def _held(path: str) -> bool:
+    """True while some process holds `path`'s lock. A file nobody holds is removed."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass  # another user's file in a sticky dir: ignored, never counted
+    return False
+
+
+def live(d: str, prefix: str) -> list[dict]:
+    """Every held entry of one kind, oldest first, with its recorded fields."""
+    out = []
+    for name in sorted(os.listdir(d)):
+        path = os.path.join(d, name)
+        if not name.startswith(prefix) or not _held(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                entry = json.loads(f.read() or "{}")
+        except (OSError, ValueError):
+            entry = {}
+        out.append({**entry, "file": name})
+    return out
+
+
+def _publish(d: str, name: str, fields: dict) -> int:
+    """Create `name` already locked: written and locked under a temp name, then renamed,
+    so no reader ever sees it unlocked and takes it for a dead holder's."""
+    tmp = os.path.join(d, f".tmp-{name}")
+    fd = os.open(tmp, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    os.write(fd, json.dumps(fields).encode())
+    os.rename(tmp, os.path.join(d, name))
+    return fd
+
+
+def open_dir(cfg: dict) -> str:
+    d = cfg["dir"]
+    os.makedirs(d, exist_ok=True)
+    if os.stat(d).st_uid == os.getuid():
+        os.chmod(d, 0o1777)
+    return d
+
+
+def room(cfg: dict, env: dict, holders: list[dict]) -> tuple[int, dict]:
+    total, available = meminfo(env)
+    budget = budget_of(cfg, total)
+    reserved = sum(int(h.get("bytes", 0)) for h in holders)
+    free = min(budget - reserved, available - parse_size(cfg["min_free"]))
+    return max(0, free), {"budget": budget, "reserved": reserved, "available": available}
+
+
+def grant_for(want_min: int, want_max: int, unit: int, free: int) -> int:
+    """The grant for this request out of `free`, or 0 when its min does not fit."""
+    grant = min(want_max, free)
+    if unit:
+        grant -= grant % unit
+    return grant if grant >= want_min else 0
+
+
+def acquire(args, cfg: dict, env: dict) -> tuple[int, int]:
+    """Wait for and take a reservation. Returns (lock fd, granted bytes)."""
+    d = open_dir(cfg)
+    total, _ = meminfo(env)
+    if args.min > budget_of(cfg, total):
+        print(f"heavy-slot: {args.label} wants at least {fmt(args.min)}, more than the whole "
+              f"budget of {fmt(budget_of(cfg, total))}", file=sys.stderr)
+        sys.exit(EXIT_NEVER)
+    me = f"wait-{time.time_ns():020d}-{os.getpid()}"
+    fields = {"pid": os.getpid(), "user": os.environ.get("USER", ""), "label": args.label,
+              "min": args.min, "max": args.max, "since": time.strftime("%H:%M:%S")}
+    wait_fd = _publish(d, me, fields)
+    deadline = time.monotonic() + args.timeout * 60 if args.timeout else None
+    said = False
+    admit = os.open(os.path.join(d, ".admit"), os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        while True:
+            fcntl.flock(admit, fcntl.LOCK_EX)
+            try:
+                waiters = live(d, "wait-")
+                holders = live(d, "res-")
+                free, why = room(cfg, env, holders)
+                first = bool(waiters) and waiters[0]["file"] == me
+                grant = grant_for(args.min, args.max, args.unit, free) if first else 0
+                if grant:
+                    fd = _publish(d, f"res-{me[5:]}", {**fields, "bytes": grant})
+                    os.unlink(os.path.join(d, me))
+                    os.close(wait_fd)
+                    return fd, grant
+            finally:
+                fcntl.flock(admit, fcntl.LOCK_UN)
+            if not said:
+                ahead = next((i for i, w in enumerate(waiters) if w["file"] == me), 0)
+                print(f"heavy-slot: {args.label} waiting for {fmt(args.min)}: budget "
+                      f"{fmt(why['budget'])}, {fmt(why['reserved'])} reserved by "
+                      f"{len(holders)} holder(s), MemAvailable {fmt(why['available'])}, "
+                      f"{ahead} ahead", file=sys.stderr, flush=True)
+                said = True
+            if deadline and time.monotonic() > deadline:
+                print(f"heavy-slot: {args.label} gave up after {args.timeout:g} min",
+                      file=sys.stderr)
+                os.unlink(os.path.join(d, me))
+                sys.exit(EXIT_TIMEOUT)
+            time.sleep(POLL_SECONDS)
+    finally:
+        os.close(admit)
+
+
+def cmd_run(args, cfg, env) -> int:
+    if not args.cmd:
+        print("heavy-slot run: nothing to run after --", file=sys.stderr)
+        return EXIT_USAGE
+    _, grant = acquire(args, cfg, env)
+    child_env = {**env, "HEAVY_SLOT_GRANT_BYTES": str(grant),
+                 "HEAVY_SLOT_UNITS": str(grant // args.unit if args.unit else 0)}
+    child = subprocess.Popen(args.cmd, env=child_env)
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda s, _f: child.send_signal(s))
+    return child.wait()
+
+
+def cmd_hold(args, cfg, env) -> int:
+    _, grant = acquire(args, cfg, env)
+    units = grant // args.unit if args.unit else 0
+    print(json.dumps({"grant_bytes": grant, "units": units}), flush=True)
+    while sys.stdin.buffer.read(4096):
+        pass  # held until the caller closes our stdin, or dies and the pipe closes
+    return 0
+
+
+def cmd_status(args, cfg, env) -> int:
+    d = open_dir(cfg)
+    holders, waiters = live(d, "res-"), live(d, "wait-")
+    free, why = room(cfg, env, holders)
+    if args.json:
+        print(json.dumps({**why, "free": free, "holders": holders, "waiters": waiters}))
+        return 0
+    print(f"budget {fmt(why['budget'])}  reserved {fmt(why['reserved'])}  "
+          f"MemAvailable {fmt(why['available'])}  grantable {fmt(free)}")
+    for h in holders:
+        print(f"  holds  {fmt(int(h.get('bytes', 0))):>7}  pid {h.get('pid')}  "
+              f"{h.get('user')}  {h.get('label')}  since {h.get('since')}")
+    for w in waiters:
+        print(f"  waits  {fmt(int(w.get('min', 0))):>7}  pid {w.get('pid')}  "
+              f"{w.get('user')}  {w.get('label')}  since {w.get('since')}")
+    return 0
+
+
+def _size(text: str) -> int:
+    try:
+        return parse_size(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(prog="heavy-slot", description=__doc__.split("\n\n")[0])
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("run", "hold"):
+        s = sub.add_parser(name)
+        s.add_argument("--min", type=_size, required=True)
+        s.add_argument("--max", type=_size)
+        s.add_argument("--unit", type=_size, default=0)
+        s.add_argument("--label", default="")
+        s.add_argument("--timeout", type=float, default=0, help="minutes; 0 waits forever")
+        if name == "run":
+            s.add_argument("cmd", nargs=argparse.REMAINDER)
+    sub.add_parser("status").add_argument("--json", action="store_true")
+    args = p.parse_args(argv)
+    if args.command == "status":
+        return args
+    cmd = getattr(args, "cmd", None) or []
+    if cmd[:1] == ["--"]:
+        cmd = cmd[1:]
+    args.cmd = cmd
+    if args.unit and args.min % args.unit:
+        args.min += args.unit - args.min % args.unit  # a min is whole units
+    args.max = args.max if args.max is not None else args.min
+    if args.min <= 0 or args.max < args.min or args.timeout < 0:
+        p.error("need 0 < --min <= --max (in whole --units), and --timeout >= 0")
+    args.label = args.label or (cmd[0] if cmd else f"pid {os.getppid()}")
+    return args
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    env = dict(os.environ)
+    try:
+        cfg = load_config(env)
+        for key in ("reserve", "min_free"):
+            parse_size(cfg[key])
+        if cfg["budget"]:
+            parse_size(cfg["budget"])
+    except ValueError as e:
+        print(f"heavy-slot: bad config: {e}", file=sys.stderr)
+        return EXIT_USAGE
+    return {"run": cmd_run, "hold": cmd_hold, "status": cmd_status}[args.command](args, cfg, env)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
