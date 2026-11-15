@@ -73,7 +73,7 @@ def test_a_repo_missing_a_reviewer_block_entirely_is_fine():
     assert panel.select_reviewers({"claude": {"enabled": True}}, None)[0] == {"claude"}
 
 
-# ----------------------------------------------------------- antigravity argv
+# ----------------------------------------------------------- antigravity invocation
 
 def test_antigravity_runs_headless_with_the_prompt_on_stdin():
     """The prompt is not in argv at all: stream-json in and out is agy's one

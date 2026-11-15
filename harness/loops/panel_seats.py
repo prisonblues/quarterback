@@ -266,17 +266,22 @@ def _error_body(value: object) -> dict | None:
     """The part of one error envelope that carries the fields, or None if `value` is
     not an error envelope at all.
 
-    Two shapes, because two layers produce them: a stream event that IS the error
-    (`{"type":"error","message":…}`, which is codex's) and the provider's own error
-    body relayed verbatim under an `error` key (`{"error":{"param":…,"code":…}}`,
-    which is the gateway's). The second is the only one that carries `param`, and
-    `param` is the only field that says WHICH pin was refused.
+    Three shapes, because three layers produce them: a stream event that IS the
+    error (`{"type":"error","message":…}`, which is codex's), the provider's own
+    error body relayed verbatim under an `error` key (`{"error":{"param":…,"code":…}}`,
+    which is the gateway's — the only one that carries `param`, the field that says
+    WHICH pin was refused), and agy's failed final result
+    (`{"event":"result","result":{"status":"ERROR","error":"…"}}`).
     """
     if not isinstance(value, dict):
         return None
     inner = value.get("error")
     if isinstance(inner, dict):
         return inner
+    result = value.get("result")
+    if (value.get("event") == "result" and isinstance(result, dict)
+            and result.get("status") != "SUCCESS" and isinstance(result.get("error"), str)):
+        return {"message": result["error"]}
     return value if value.get("type") == "error" else None
 
 
@@ -3754,23 +3759,27 @@ def antigravity_stdin(prompt: str) -> str:
 
 
 #: What `_antigravity_result` returns for a final result that is not an object, or
-#: for output that stops parsing after a result was seen.
+#: for anything that is not an event after a result.
 _MALFORMED = object()
 
 
-def _antigravity_result(stdout: str | None):
+def _antigravity_result(stdout: str | None) -> dict | object | None:
     """The stream's last word on its result, or None if it gave none: the last
     `result` event's body, or :data:`_MALFORMED` when that body is not an object or
-    an unparsable line follows it."""
+    a non-blank line that is not an event follows it."""
     found = None
     for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue
         try:
             event = json.loads(line)
         except ValueError:
-            if found is not None and line.strip():
+            event = None
+        if not (isinstance(event, dict) and "event" in event):
+            if found is not None:
                 found = _MALFORMED
             continue
-        if isinstance(event, dict) and event.get("event") == "result":
+        if event["event"] == "result":
             body = event.get("result")
             found = body if isinstance(body, dict) else _MALFORMED
     return found
@@ -3784,20 +3793,6 @@ def antigravity_reply(stdout: str | None) -> str:
         return ""
     reply = result.get("response")
     return reply if isinstance(reply, str) else ""
-
-
-def antigravity_error(stdout: str | None) -> str:
-    """Why a stream-json agy turn gave no reply, in agy's words where it gave any."""
-    result = _antigravity_result(stdout)
-    if result is None:
-        return "no result event"
-    if result is _MALFORMED:
-        return "malformed final result"
-    if result.get("status") == "SUCCESS":
-        return "" if isinstance(result.get("response"), str) else "response is not text"
-    why = result.get("error") or result.get("finished_reason") or ""
-    return f"status {result.get('status')}" + (f": {why}" if isinstance(why, str) and why
-                                               else "")
 
 
 def pi_args(model: str, effort: str, session_id: str, session_dir: Path) -> list[str]:
@@ -4946,9 +4941,6 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # `model` and not `asked[0]`: the hint explains the PIN, and after a
             # failed fallback the thing worth naming is still what was configured.
             err += cli_hint(cmd_name, err, model)
-            if cmd_name == "antigravity" and outputs:
-                why = antigravity_error(outputs[-1])
-                err += f" (agy: {why})" if why else ""
             # A member that burned tokens and then failed still spent them, so
             # the usage is reported on this path too.
             return SeatTurn(skip=err, duration_ms=elapsed(), usage=usage_of(),
@@ -5846,7 +5838,7 @@ __all__ = [
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
     "SEAT_READS_CODE",
-    "antigravity_stdin", "antigravity_reply", "antigravity_error",
+    "antigravity_stdin", "antigravity_reply",
     "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "pr_claim_wanted", "history_wanted",

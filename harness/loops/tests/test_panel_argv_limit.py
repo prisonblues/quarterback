@@ -4,7 +4,7 @@ Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, so a prompt passed
 as `["claude", "-p", prompt]` dies before the CLI starts once the diff crosses
 it — and the panel used to report that as "LLM reviewers ran: none", which reads
 like a clean PR. These tests pin the fix: the prompt travels on stdin (agy's as one
-stream-json message — see test_panel_agy_tools.py).
+stream-json message — see test_panel_agy_stdin.py).
 """
 import json
 import subprocess
