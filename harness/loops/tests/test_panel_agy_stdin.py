@@ -1,8 +1,8 @@
 """The antigravity seat's transport: its prompt on stdin, its reply from the stream.
 
 Driven through the real `review_llm` → `run_seat` → `run_cli` path with a fake `agy`
-on PATH. The fake refuses what real agy refuses (a missing stream-json flag, a stdin
-that is not one user message), so a wrong invocation fails here rather than passing.
+on PATH. The fake refuses only what real agy 1.1.24 was recorded refusing (see
+FAKE_AGY's comment), so a wrong invocation fails here rather than passing.
 """
 from __future__ import annotations
 
@@ -157,6 +157,19 @@ def test_a_failed_result_with_only_a_reason_code_still_says_why():
     stream = json.dumps({"event": "result",
                          "result": {"status": "CANCELLED", "finished_reason": "print_timeout"}})
     assert "print_timeout" in panel_seats.error_text(stream)
+
+
+@pytest.mark.parametrize("result", [
+    {"status": "CANCELLED"},
+    {"status": "CANCELLED", "error": {"not": "a string"}, "finished_reason": "interrupted"},
+])
+def test_a_failed_result_always_reaches_the_diagnosis(result):
+    """A failure with no reason text still says what it was; a non-string `error`
+    neither becomes the message nor hides a usable `finished_reason`."""
+    stream = json.dumps({"event": "result", "result": result})
+    text = panel_seats.error_text(stream)
+    assert text, "the failed result was dropped from the diagnosis"
+    assert panel_seats._error_body(json.loads(stream))["message"] in ("CANCELLED", "interrupted")
 
 
 def test_a_success_with_trailing_blank_lines_is_still_a_reply():

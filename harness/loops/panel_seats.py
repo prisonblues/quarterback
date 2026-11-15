@@ -281,7 +281,9 @@ def _error_body(value: object) -> dict | None:
     result = value.get("result")
     if (value.get("event") == "result" and isinstance(result, dict)
             and result.get("status") != "SUCCESS"):
-        return {"message": result.get("error") or result.get("finished_reason")}
+        return {"message": next((v for v in (result.get(k) for k in
+                                             ("error", "finished_reason", "status"))
+                                 if isinstance(v, str) and v), "")}
     return value if value.get("type") == "error" else None
 
 
