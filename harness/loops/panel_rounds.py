@@ -2556,30 +2556,6 @@ def _inherit_assessed(into: dict[str, Assessment], raw: object, was: int, path,
                 else ASSESSED_UNATTESTED)
 
 
-def highest_baseline_round(paths: list[str], github: str, pr: int) -> int | None:
-    """The highest ``round`` among the ``--baseline`` payloads that are this
-    review's (same ``github`` and ``pr``), or None when none of them says.
-
-    For a run given ``--baseline`` and no ``--round`` (#866): it is the round
-    after the latest one it was handed. Defaulting it to 1 instead made
-    ``load_baseline`` refuse every baseline as "not earlier", so each re-review
-    started a new cycle. A payload that cannot be read or is another review's is
-    skipped in silence here; ``load_baseline`` reports it in the same run."""
-    rounds = []
-    for path in paths:
-        try:
-            payload = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(payload, dict) or payload.get("github") != github \
-                or payload.get("pr") != pr:
-            continue
-        was = payload.get("round")
-        if isinstance(was, int) and not isinstance(was, bool) and was >= 1:
-            rounds.append(was)
-    return max(rounds, default=None)
-
-
 def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     """Every finding earlier rounds of this PR already raised, from their
     ``--json-file`` payloads.
@@ -2652,7 +2628,9 @@ def load_baseline(paths: list[str], expect: dict | None = None) -> Baseline:
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError) as e:
+        # ValueError, not JSONDecodeError alone: a non-UTF-8 file raises
+        # UnicodeDecodeError, which is neither, and it killed the run (#866).
+        except (OSError, ValueError) as e:
             b.problems.append(f"baseline {path} unreadable ({e.__class__.__name__})")
             continue
         if not isinstance(payload, dict):
@@ -9470,7 +9448,7 @@ __all__ = [
     "_positive_int", "_nonneg_int", "_whole_pr_chars",
     "TREND_SEVERE", "RoundTrend", "attributed", "_countable",
     "_introduced", "_trend_row",
-    "_inherit", "DECLINED_COST", "_inherit_declined", "load_baseline", "highest_baseline_round", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
+    "_inherit", "DECLINED_COST", "_inherit_declined", "load_baseline", "coverage_veto", "CI_SETTLED", "CI_UNSETTLED",
     "CI_NOT_APPLICABLE", "round_stop",
     "CLAIM_KEY_PREFIX", "CLAIM_KEY_RE", "_claim_norm", "claim_key",
     "is_claim_key", "Obligation", "CoverageRuling", "_coverage_ruling",

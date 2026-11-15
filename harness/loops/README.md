@@ -1178,9 +1178,10 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
   that *could* have read the tree and still could not answer is describing the round.
 - **Rounds are mechanical.** `--round`/`--baseline` make each run say which findings no
   earlier round raised. With `--baseline` and no `--round`, the run is the round after
-  the latest baseline and continues its cycle (#866). A run that cannot continue its
-  PR's cycle says so on stderr and in `config_notes`: a later round with no usable
-  baseline, or a `--class-ledger` with earlier rounds and no `--baseline`. A
+  the latest baseline `load_baseline` accepts, and continues its cycle (#866). A run that
+  cannot continue its PR's cycle says so on stderr and in `config_notes`: a `--baseline`
+  none of whose payloads is accepted, a later round with no baseline, or a
+  `--class-ledger` with earlier rounds and no `--baseline`. A
   `--class-ledger` round is a cycle round, so its round 1 names the cycle. `round_stop`
   in the payload then says go-again (something new,
   a P1/P2 still outstanding, or a finding an earlier round raised that is still outstanding

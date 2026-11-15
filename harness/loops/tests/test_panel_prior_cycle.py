@@ -550,7 +550,7 @@ def _continue_cli(monkeypatch, *argv):
     (("--continue-cycle", "--round", "3", "--baseline", "/tmp/r2.json"),
      "pass --answered-by NAME and --why TEXT"),
     (("--continue-cycle", "--answered-by", "r", "--why", "w"),
-     "pass it, with --round"),
+     "carried by its --baseline (the stopped round's payload) — pass it"),
     (("--answered-by", "r", "--round", "2", "--baseline", "/tmp/r1.json"),
      "go with --continue-cycle"),
 ])

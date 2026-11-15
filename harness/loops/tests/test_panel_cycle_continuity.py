@@ -12,13 +12,10 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import panel  # noqa: E402
 import panel_classes  # noqa: E402
 import panel_core  # noqa: E402  — `sh`, the seam every stub here replaces
-import panel_rounds  # noqa: E402
 from conftest import gh_stub  # noqa: E402
 
 CFG = {"github": "acme/board", "path": "/nonexistent/acme-board",
@@ -68,19 +65,31 @@ def test_a_class_ledger_round_1_mints_a_cycle(monkeypatch, capsys, tmp_path):
     assert r1["cycle"], "a class-ledger round is a cycle round and must name its cycle"
 
 
-def test_a_baseline_without_round_continues_the_cycle_as_the_next_round(
+def _ledger_at(path: Path, *rounds: int) -> str:
+    ledger = panel_classes.new_ledger("acme/board", 34)
+    for r in rounds:
+        panel_classes.mark_round(ledger, r)
+    assert panel_classes.save_ledger(str(path), ledger) == 0
+    return str(path)
+
+
+def test_the_nix_fleet_sequence_continues_the_cycle_as_the_next_round(
         monkeypatch, capsys, tmp_path):
-    """The nix-fleet run exactly: round 1, then `--baseline r1.json` with no
-    `--round`. It is round 2 of round 1's cycle, and the baseline counts."""
-    _, _, r1 = _cli(monkeypatch, capsys, tmp_path / "r1.json",
-                    "--class-ledger", str(tmp_path / "classes.json"))
-    _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json",
-                    "--baseline", str(tmp_path / "r1.json"))
+    """nix-fleet#162 exactly: `--class-ledger` on every round, `mark` between them,
+    and round 2 given `--baseline r1.json` but no `--round`. It is round 2 of round
+    1's cycle, the baseline counts, and nothing warns."""
+    ledger = str(tmp_path / "classes.json")
+    _, _, r1 = _cli(monkeypatch, capsys, tmp_path / "r1.json", "--class-ledger", ledger)
+    _ledger_at(Path(ledger), 1)
+    _, err, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json", "--class-ledger", ledger,
+                      "--baseline", str(tmp_path / "r1.json"))
     assert r2["round"] == 2
     assert r2["cycle"] == r1["cycle"]
+    assert r2["class_ledger"]["round"] == 2
     assert NOT_EARLIER not in _notes(r2)
     assert "--round not given: this is round 2, the round after --baseline's round 1" \
         in _notes(r2)
+    assert "cannot continue this PR's cycle" not in err + _notes(r2)
 
 
 def test_the_round_follows_the_LATEST_baseline(monkeypatch, capsys, tmp_path):
@@ -101,64 +110,116 @@ def test_an_explicit_round_still_wins(monkeypatch, capsys, tmp_path):
     assert "--round not given" not in _notes(r3)
 
 
+LOST = "cannot continue this PR's cycle"
+
+
 def test_a_ledger_with_earlier_rounds_and_no_baseline_says_a_new_cycle_starts(
         monkeypatch, capsys, tmp_path):
     """Second acceptance point: the run that cannot continue the cycle says so on
-    stderr and in the payload's notes (which the posted summary prints)."""
-    ledger_path = tmp_path / "classes.json"
-    ledger = panel_classes.new_ledger("acme/board", 34)
-    panel_classes.mark_round(ledger, 1)
-    assert panel_classes.save_ledger(str(ledger_path), ledger) == 0
-    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
-                     "--class-ledger", str(ledger_path))
-    said = "the class ledger is at round 2 of this PR, but this panel run has no " \
-           "--baseline, so it starts a NEW panel cycle"
+    stderr and in the payload's notes (which the posted summary prints), and the
+    state it describes is the state recorded."""
+    ledger = _ledger_at(tmp_path / "classes.json", 1)
+    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--class-ledger", ledger)
+    said = ("round 1 cannot continue this PR's cycle: no --baseline was given, though "
+            "the class ledger is at round 2 of this PR, so it starts a NEW panel cycle")
     assert said in err
     assert said in _notes(r)
+    assert r["round"] == 1 and r["cycle"], "a new cycle, minted here"
 
 
-def test_a_later_round_with_no_cycle_to_continue_says_so(monkeypatch, capsys, tmp_path):
+def test_a_later_round_with_no_baseline_records_cycle_null_and_says_so(
+        monkeypatch, capsys, tmp_path):
     _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--round", "2",
                      "--max-rounds", "3")
-    said = "round 2 found no earlier round's cycle to continue (no --baseline was given)"
+    said = ("round 2 cannot continue this PR's cycle: no --baseline was given, so it "
+            "records cycle null")
     assert said in err
     assert said in _notes(r)
+    assert r["cycle"] is None
 
 
-def test_a_continued_round_says_nothing_about_a_lost_cycle(monkeypatch, capsys, tmp_path):
-    _cli(monkeypatch, capsys, tmp_path / "r1.json",
-         "--class-ledger", str(tmp_path / "classes.json"))
-    _, err, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json",
-                      "--class-ledger", str(tmp_path / "classes.json"),
-                      "--baseline", str(tmp_path / "r1.json"))
-    assert "NEW panel cycle" not in err
-    assert "no earlier round's cycle" not in err + _notes(r2)
-
-
-def _payload(tmp_path, name, **fields):
-    path = tmp_path / name
-    path.write_text(json.dumps({"github": "acme/board", "pr": 34, **fields}))
-    return str(path)
-
-
-@pytest.mark.parametrize("fields, expected", [
-    ({"round": 2}, 2),
-    ({"round": True}, None),
-    ({"round": "2"}, None),
-    ({"round": 0}, None),
-    ({}, None),
-])
-def test_highest_baseline_round_reads_only_a_whole_round(tmp_path, fields, expected):
-    assert panel_rounds.highest_baseline_round(
-        [_payload(tmp_path, "b.json", **fields)], "acme/board", 34) == expected
-
-
-def test_highest_baseline_round_ignores_another_reviews_and_unreadable_payloads(tmp_path):
+def test_an_unusable_baseline_without_round_says_the_cycle_is_lost(
+        monkeypatch, capsys, tmp_path):
+    """A `--baseline` flag is not a baseline: another PR's payload is refused, the
+    run is round 1, and it says it starts a new cycle instead of minting one quietly."""
     other = tmp_path / "other.json"
-    other.write_text(json.dumps({"github": "acme/other", "pr": 34, "round": 5}))
-    broken = tmp_path / "broken.json"
-    broken.write_text("{")
-    mine = _payload(tmp_path, "mine.json", round=2)
-    got = panel_rounds.highest_baseline_round(
-        [str(other), str(broken), str(tmp_path / "missing.json"), mine], "acme/board", 34)
-    assert got == 2
+    other.write_text(json.dumps({"github": "acme/board", "pr": 99, "round": 1,
+                                 "cycle": "c-other"}))
+    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--baseline", str(other))
+    said = ("round 1 cannot continue this PR's cycle: none of its --baseline payloads "
+            "was accepted (see the baseline notes), so it starts a NEW panel cycle")
+    assert said in err
+    assert r["round"] == 1 and r["cycle"] != "c-other"
+
+
+def test_a_non_utf8_baseline_is_reported_not_fatal(monkeypatch, capsys, tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b"\xff\xfe{")
+    code, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--baseline", str(bad))
+    assert code == 0
+    assert "unreadable (UnicodeDecodeError)" in _notes(r)
+    assert "none of its --baseline payloads was accepted" in err
+
+
+def test_a_baseline_with_no_round_field_is_round_1_for_inference_too(
+        monkeypatch, capsys, tmp_path):
+    """`load_baseline` reads a payload with no `round` as round 1, and the inferred
+    round is read off what it accepted, so the two cannot disagree."""
+    _cli(monkeypatch, capsys, tmp_path / "r1.json", "--max-rounds", "4")
+    r1 = json.loads((tmp_path / "r1.json").read_text())
+    del r1["round"]
+    (tmp_path / "r1.json").write_text(json.dumps(r1))
+    _, _, r2 = _cli(monkeypatch, capsys, tmp_path / "r2.json",
+                    "--baseline", str(tmp_path / "r1.json"))
+    assert r2["round"] == 2
+    assert r2["cycle"] == r1["cycle"]
+    assert NOT_EARLIER not in _notes(r2)
+
+
+def test_a_concurrent_cycles_rounds_do_not_set_the_round(monkeypatch, capsys, tmp_path):
+    """Cycle A's round 1 names the cycle, so cycle B's round 3 is refused and does
+    not make this round 4 of A."""
+    _cli(monkeypatch, capsys, tmp_path / "a1.json", "--max-rounds", "6")
+    b3 = json.loads((tmp_path / "a1.json").read_text())
+    b3.update(round=3, cycle="c-b", run_key="c-b")
+    (tmp_path / "b3.json").write_text(json.dumps(b3))
+    a1 = json.loads((tmp_path / "a1.json").read_text())
+    _, _, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
+                   "--baseline", str(tmp_path / "a1.json"),
+                   "--baseline", str(tmp_path / "b3.json"))
+    assert r["round"] == 2
+    assert r["cycle"] == a1["cycle"]
+
+
+def test_an_accepted_baseline_with_no_cycle_id_is_named_as_such(
+        monkeypatch, capsys, tmp_path):
+    base = {"github": "acme/board", "pr": 34, "round": 1, "reviewed": True}
+    (tmp_path / "r1.json").write_text(json.dumps(base))
+    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json",
+                     "--baseline", str(tmp_path / "r1.json"))
+    assert r["round"] == 2
+    assert "its --baseline payloads record no cycle id" in err
+    assert "see the baseline notes" not in err
+
+
+def test_one_lost_cycle_is_one_warning(monkeypatch, capsys, tmp_path):
+    ledger = _ledger_at(tmp_path / "classes.json", 1)
+    _, err, r = _cli(monkeypatch, capsys, tmp_path / "r.json", "--class-ledger", ledger,
+                     "--round", "2", "--max-rounds", "3")
+    assert err.count(LOST) == 1
+    assert _notes(r).count(LOST) == 1
+    assert "records cycle null" in err
+
+
+def test_a_round_inferred_past_the_cap_names_the_baseline_not_a_flag(
+        monkeypatch, capsys, tmp_path):
+    base = {"github": "acme/board", "pr": 34, "round": 3, "cycle": "c-1"}
+    (tmp_path / "r3.json").write_text(json.dumps(base))
+    try:
+        _cli(monkeypatch, capsys, tmp_path / "r.json", "--max-rounds", "3",
+             "--baseline", str(tmp_path / "r3.json"))
+    except SystemExit as stop:
+        said = str(stop)
+    else:
+        raise AssertionError("round 4 of a 3-round cap ran")
+    assert "--baseline (its latest round is 3), so round 4 is past the cap of 3" in said

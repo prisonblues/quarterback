@@ -932,7 +932,7 @@ def earlier_round_files(paths: list[str], gh_repo: str, pr_number: int,
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):  # UnicodeDecodeError too (#866)
             continue
         if not isinstance(payload, dict):
             continue
@@ -1035,7 +1035,7 @@ def earlier_round_registers(paths: list[str], gh_repo: str, pr_number: int,
     for path in paths:
         try:
             payload = json.loads(Path(path).read_text())
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):  # UnicodeDecodeError too (#866)
             continue
         if not isinstance(payload, dict):
             continue
@@ -2375,12 +2375,34 @@ def review_slop(diff: str, repo_path: str, head_sha: str) -> ReviewerRun:
                        duration_ms=elapsed())
 
 
-def warn_cycle_lost(notes: list[str], who: str, msg: str) -> None:
-    """A run that cannot continue its PR's cycle says so on stderr AND in the
-    config notes the report and the payload carry (#866): a cycle started by
-    accident otherwise reads exactly like a first review."""
-    notes.append(msg)
-    print(f"{who} ⚠️ {msg}", file=sys.stderr)
+def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
+               ledger_round: int, new_cycle: bool) -> str:
+    """Why this run cannot continue its PR's cycle, or "" when it can or need not.
+
+    Said on stderr and in the config notes (#866), because a cycle lost by accident
+    otherwise reads exactly like a first review. Decided from what `load_baseline`
+    accepted, not from which flags were passed: a `--baseline` nobody could use
+    loses the cycle as surely as none. `new_cycle` is the caller starting one on
+    purpose, and a round 1 with no baseline and no earlier ledger round is a cycle's
+    real start."""
+    if new_cycle or prior.cycle:
+        return ""
+    if not (baseline_given or round_no > 1 or ledger_round > 1):
+        return ""
+    if not baseline_given:
+        why = "no --baseline was given"
+    elif not prior.rounds:
+        why = "none of its --baseline payloads was accepted (see the baseline notes)"
+    else:
+        why = "its --baseline payloads record no cycle id"
+    if ledger_round > 1:
+        why += f", though the class ledger is at round {ledger_round} of this PR"
+    then = ("so it starts a NEW panel cycle" if round_no == 1
+            else "so it records cycle null, and the board cannot chain it to the "
+            "rounds before it")
+    return (f"round {round_no} cannot continue this PR's cycle: {why}, {then}. No "
+            "earlier round's findings, provenance or fix_injection carry into it. To "
+            "continue the cycle, pass every earlier round's payload with --baseline")
 
 
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
@@ -2495,12 +2517,17 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     gh_repo = cfg["github"]
     # `--baseline` without `--round` is the round after the latest baseline (#866).
     # Left at 1, `load_baseline` refused every baseline as "not earlier than this
-    # run's round 1", and each re-review started a new cycle with no history.
+    # run's round 1", and each re-review started a new cycle with no history. The
+    # round is read off what `load_baseline` ACCEPTS, with no round to be earlier
+    # than, so the two cannot disagree about a payload's round or its cycle, and
+    # that same read is this run's baseline: every accepted round is earlier than
+    # the one after the latest of them.
+    inferred_prior = None
     round_inferred_from = None
     if not round_named and baseline:
-        round_inferred_from = panel_rounds.highest_baseline_round(
-            baseline, gh_repo, pr_number)
-        if round_inferred_from is not None:
+        inferred_prior = load_baseline(baseline, {"github": gh_repo, "pr": pr_number})
+        if inferred_prior.rounds:
+            round_inferred_from = max(inferred_prior.rounds)
             round_no = round_inferred_from + 1
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
@@ -2686,16 +2713,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # round is the ledger's NEXT one, whatever the panel calls it, and the payload
     # carries that number for `panel_classes.py --payload` to record against.
     ledger_round = panel_classes.last_round(classes) + 1
-    if class_ledger and ledger_round > 1 and not baseline and not new_cycle:
-        # The ledger has earlier rounds of this PR and the panel was given none of
-        # them (#866): said out loud, because the panel then starts a NEW cycle and
-        # nothing in its own output would show the history it does not have.
-        warn_cycle_lost(notes, f"[{repo_name}#{pr_number}]",
-                        f"the class ledger is at round {ledger_round} of this PR, but "
-                        "this panel run has no --baseline, so it starts a NEW panel "
-                        "cycle: no earlier round's findings, provenance or fix_injection "
-                        "carry into it. To continue the cycle, pass --baseline <the last "
-                        "round's payload>")
     if class_ledger:
         class_refusal = panel_classes.budget_refusal(classes, ledger_round, class_strikes,
                                                      class_budget)
@@ -2786,7 +2803,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                   "repo being reviewed — clear or move the dial on the board"
                   if round_cap_ceiling is not None and cap == round_cap_ceiling
                   else "raise the cap")
-        sys.exit(f"panel: --round {round_no} is past the cap of {cap}, from {blame}: "
+        said = ("--round" if round_inferred_from is None
+                else "--baseline (its latest round is "
+                f"{round_inferred_from}), so round")
+        sys.exit(f"panel: {said} {round_no} is past the cap of {cap}, from {blame}: "
                  f"{remedy}, or pass the round this run actually is")
 
     # #55's spend ceiling, RESOLVED here and CHECKED further down. The two halves
@@ -3716,17 +3736,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # the fixer wrote since the last round read it, with the PR behind it as
     # context. Decided here, before budgets, because scope is what the budgets are
     # then spent on.
-    prior = load_baseline(baseline or [],
-                          {"repo": repo_name, "github": gh_repo, "pr": pr_number,
-                           "round": round_no})
-    if round_no > 1 and not prior.cycle:
-        warn_cycle_lost(notes, f"[{repo_name}#{pr_number}]",
-                        f"round {round_no} found no earlier round's cycle to continue ("
-                        + ("no --baseline was given" if not baseline
-                           else "no --baseline it was given is usable — see the "
-                           "baseline notes")
-                        + "), so it records cycle null: the board cannot chain it to "
-                        "the rounds before it")
+    prior = inferred_prior if inferred_prior is not None else load_baseline(
+        baseline or [], {"repo": repo_name, "github": gh_repo, "pr": pr_number,
+                         "round": round_no})
+    lost = cycle_lost(prior, round_no, bool(baseline),
+                      ledger_round if class_ledger else 0, new_cycle)
+    if lost:
+        notes.append(lost)
+        print(f"[{repo_name}#{pr_number}] ⚠️ {lost}", file=sys.stderr)
     want_scope = resolve_round_scope(scope, panel, notes)
     # `--since` wins over the baseline, and it is checked here rather than trusted:
     # the anchor is interpolated into a REST path, and a value carrying `..` or a
@@ -9702,7 +9719,8 @@ def main() -> int:
     # accepted `--ask --round 1` silently, which is a caller believing it asked
     # for something this run does not do.
     ap.add_argument("--round", type=int, default=None, dest="round_no", metavar="N",
-                    help="which panel/fix cycle this is (default 1). Round 2+ is the "
+                    help="which panel/fix cycle this is (default: the round after the "
+                         "latest --baseline, or 1 without one). Round 2+ is the "
                          "re-review of the fix commit — the one nobody reads otherwise")
     ap.add_argument("--baseline", action="append", default=[], metavar="PATH",
                     help="a previous round's --json-file payload, so this run can say "
@@ -10149,8 +10167,7 @@ def main() -> int:
                              "pass --answered-by NAME and --why TEXT")
         if not args.baseline:
             raise SystemExit("--continue-cycle continues a cycle, which is carried by "
-                             "its --baseline (the stopped round's payload) — pass it, "
-                             "with --round")
+                             "its --baseline (the stopped round's payload) — pass it")
     elif args.answered_by or args.answered_why:
         raise SystemExit("--answered-by and --why go with --continue-cycle")
     return run(args.repo, args.pr, args.post, args.json_out, args.reviewers,
