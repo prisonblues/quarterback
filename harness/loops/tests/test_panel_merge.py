@@ -1093,6 +1093,10 @@ def test_the_serialised_finding_is_the_canonical_record():
         # #67: the judge's answer to the recurrence question, `""` where it was
         # never asked — every round with no earlier round, and this one.
         "premise_verdict": "",
+        # #623: this verdict names no kind, so it is untyped.
+        "kind": "",
+        "kind_said": "",
+        "evidence": "",
     }
 
 
