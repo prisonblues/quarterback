@@ -72,7 +72,7 @@ import tempfile
 from pathlib import Path
 
 import harness_rules
-from panel_core import load_repo_cfg
+from panel_core import DEMONSTRATED_KINDS, FINDING_KINDS, load_repo_cfg
 from panel_rounds import _norm_title, same_premise
 
 LEDGER_VERSION = 1
@@ -167,8 +167,9 @@ def _clean_entry(entry: object) -> dict | None:
             continue
         if not str(s.get("path") or "").strip():
             continue
+        kind = s.get("kind") if s.get("kind") in FINDING_KINDS else ""
         sightings.append({"round": s["round"], "path": str(s["path"]).strip(),
-                          "finding": str(s.get("finding") or "")})
+                          "finding": str(s.get("finding") or ""), "kind": kind})
     if not sightings:
         return None
     enforcement = str(entry.get("enforcement") or "")
@@ -319,9 +320,14 @@ def strikes(entry: dict) -> int:
     in a LATER round is another strike, because the fix for that round's list did not
     cover it. The same path seen again later is a fix that did not hold, not a new
     strike."""
-    first = first_round(entry)
-    early = {_path_norm(s["path"]) for s in entry["sightings"] if s["round"] == first}
-    late = {_path_norm(s["path"]) for s in entry["sightings"] if s["round"] > first}
+    # #623: an observation is not a fix that failed, so it is no strike. An
+    # untyped sighting (no payload kind) still counts, as before.
+    seen = [s for s in entry["sightings"] if s.get("kind") != "observation"]
+    if not seen:
+        return 0
+    first = min(s["round"] for s in seen)
+    early = {_path_norm(s["path"]) for s in seen if s["round"] == first}
+    late = {_path_norm(s["path"]) for s in seen if s["round"] > first}
     return 1 + len(late - early)
 
 
@@ -340,12 +346,13 @@ def is_owed(entry: dict, limit: int | None) -> bool:
     fix = entry.get("structural")
     if not fix:
         return True
-    return any(s["round"] > fix["round"] for s in entry["sightings"])
+    return any(s["round"] > fix["round"] and s.get("kind") != "observation"
+               for s in entry["sightings"])
 
 
 def record(ledger: dict, name: str, round_no: int, path: str, *,
            finding: str = "", invariant: str = "", enforcement: str = "",
-           guard_test: str = "", limit: int | None = 2) -> dict:
+           guard_test: str = "", limit: int | None = 2, kind: str = "") -> dict:
     """Record one sighting of a class, creating the class on its first, and say
     whether the fix about to be written for it may be a per-path patch.
 
@@ -379,7 +386,10 @@ def record(ledger: dict, name: str, round_no: int, path: str, *,
                          ("guard_test", guard_test)):
         if value.strip() and not entry[field]:
             entry[field] = " ".join(value.split())
-    sighting = {"round": round_no, "path": path, "finding": str(finding or "")}
+    if kind and kind not in FINDING_KINDS:
+        raise ValueError(f"--kind {kind!r}: expected one of {', '.join(FINDING_KINDS)}")
+    sighting = {"round": round_no, "path": path, "finding": str(finding or ""),
+                "kind": kind}
     if not any(s["round"] == round_no and _path_norm(s["path"]) == _path_norm(path)
                for s in entry["sightings"]):
         entry["sightings"].append(sighting)
@@ -500,6 +510,13 @@ def file_class(ledger: dict, name: str, round_no: int, rule: str, github: str,
     if not github:
         raise ValueError("--github: no owner/name to file in, and the repo config "
                          "names none")
+    # #623: only a demonstrated failure becomes an issue. An observation, or a
+    # sighting nobody typed, is listed on the PR instead.
+    if not any(s.get("kind") in DEMONSTRATED_KINDS for s in entry["sightings"]):
+        raise ValueError(f"[{entry['key']}] has no sighting typed regression or "
+                         "claim_miss, so it is an observation: list it on the PR, do "
+                         "not file it (record the sighting with --kind or --payload "
+                         "--finding if the judge did type it)")
     body = issue_body(entry, pr, round_no, rule)
     found = gh("issue", "list", "--repo", github, "--state", "open", "--search",
                f'"class-key: {entry["key"]}" in:body', "--json", "number",
@@ -751,12 +768,30 @@ def _limits_for(repo: str | None) -> tuple[int | None, int | None, str]:
     return strikes_limit, rounds_limit, cfg.get("github") or ""
 
 
+def payload_kind(payload: str, finding: str) -> str:
+    """The kind the judge gave ``finding`` (an id or a key) in a round's payload,
+    or ``""`` when either is missing or the finding is not in it (#623)."""
+    if not (payload and finding):
+        return ""
+    try:
+        rows = json.loads(Path(payload).read_text()).get("to_fix") or []
+    except (OSError, ValueError, AttributeError):
+        return ""
+    for row in rows:
+        if isinstance(row, dict) and finding in (row.get("id"), row.get("key")):
+            kind = row.get("kind")
+            return kind if kind in FINDING_KINDS else ""
+    return ""
+
+
 def _cmd_record(args, strikes_limit, gh_repo) -> int:
     ledger, problems = load_ledger(args.ledger, gh_repo, args.pr)
     if refuse_unusable(problems, "panel_classes"):
         return LEDGER_FAILED_EXIT
     try:
+        kind = args.kind or payload_kind(args.payload, args.finding)
         verdict = record(ledger, args.cls, args.round, args.path, finding=args.finding,
+                         kind=kind,
                          invariant=args.invariant, enforcement=args.enforcement,
                          guard_test=args.guard_test, limit=strikes_limit)
     except ValueError as e:
@@ -929,7 +964,10 @@ def _parser() -> argparse.ArgumentParser:
     rec.add_argument("--class", dest="cls", required=True, metavar="NAME")
     rec.add_argument("--path", required=True,
                      help="file:line, or the route that reaches it")
-    rec.add_argument("--finding", default="", metavar="KEY")
+    rec.add_argument("--finding", default="", metavar="ID|KEY")
+    rec.add_argument("--kind", default="", choices=("", *FINDING_KINDS),
+                     help="what the judge typed this finding (default: read from "
+                          "--payload when --finding names one of its findings)")
     rec.add_argument("--invariant", default="")
     rec.add_argument("--enforcement", default="")
     rec.add_argument("--guard-test", default="", dest="guard_test")

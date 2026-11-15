@@ -78,7 +78,7 @@ def _canon(kind="", kind_said=""):
 def test_the_summary_counts_kinds_and_the_downgrades():
     line = panel.kind_line([_canon("regression"), _canon("observation"),
                             _canon("observation", "claim_miss"), _canon()])
-    assert line == "_Kinds: regression 1 · observation 2 · untyped 1 · downgraded 1 (recorded only)_"
+    assert line == "_Kinds: regression 1 · observation 2 · untyped 1 · downgraded 1_"
 
 
 def test_the_kinds_line_is_only_label_count_pairs():
@@ -86,7 +86,7 @@ def test_the_kinds_line_is_only_label_count_pairs():
     to drift from what it counted."""
     labels = "|".join(panel.KIND_LINE_LABELS)
     pair = rf"(?:{labels}) \d+"
-    shape = re.compile(rf"^_Kinds: {pair}(?: · {pair})* \(recorded only\)_$")
+    shape = re.compile(rf"^_Kinds: {pair}(?: · {pair})*_$")
     for kinds in (["regression"], ["observation"] * 3, ["claim_miss", ""],
                   ["observation", "regression", "claim_miss"]):
         line = panel.kind_line([_canon(k) for k in kinds])
@@ -158,5 +158,5 @@ def test_the_rendered_list_counts_only_the_rows_it_lists(monkeypatch, capsys, tm
                      round_no=1, baseline=[], max_rounds=2, scope="auto") == 0
     report = capsys.readouterr().out
     assert "### To fix (1)" in report
-    assert "_Kinds: regression 1 (recorded only)_" in report
+    assert "_Kinds: regression 1_" in report
     assert "**P2** _regression_" in report

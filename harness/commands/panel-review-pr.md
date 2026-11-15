@@ -630,9 +630,9 @@ board as confirmed.
 If `qb record-outcome` fails, say in the relay which outcomes are unrecorded; do not drop
 them — an outcome nobody records is the gap this whole feature exists to close.
 
-A finding the fix pass left as pre-existing or out of scope is not finished by saying
-so here: it is filed, with `panel_classes.py file --rule pre-existing` (or
-`outside-change`, `budget`), under the class ledger's fix-or-defer rule (#844).
+A demonstrated regression or claim_miss the fix pass left as pre-existing or out of scope
+is filed, with `panel_classes.py file --rule pre-existing` (or `outside-change`,
+`budget`), under the class ledger's fix-or-defer rule (#844). An observation is not.
 
 **Map the fixer's finding IDs to keys first — this is a step, not an aside.** The
 fixer reports the ID it was given (`236-F01`, exactly as the report prints it in
@@ -1052,8 +1052,11 @@ sighting, so without it the next round would reuse its number. It is idempotent.
     `budget` (fixing it would grow the change past the budget), `owner` (the owner
     said so).
 
-  Record a deferred finding against its class like any other (`record`), then file it:
-  `panel_classes.py file --payload … --class <key> --rule <rule>`.
+  Record a deferred finding against its class with `record --payload … --finding <id>`,
+  which reads the judge's kind, then file it:
+  `panel_classes.py file --payload … --class <key> --rule <rule>`. `file` refuses a class
+  with no sighting typed `regression` or `claim_miss`: an observation is listed in the PR
+  summary, not filed.
   That files ONE issue per class, carrying `class-key: <key>` in its body, or comments
   on the open issue already carrying that key, and records the deferral. A deferred
   class owes nothing, and later rounds are briefed that it is tracked elsewhere, so a
@@ -1173,13 +1176,11 @@ regression takes a demonstrated observable failure, not an argument that one is
 possible**; "this could break if X" is an observation with a story attached, and it is
 the story that fix passes spend their lines on.
 
-This is a different question from the floors and it does not overrule them: **the floors
-(`fix_severity_floor`, `low_severity_fix_lines`) decide what may be TOUCHED, this decides
-what may BLOCK.** An observation above the floor still gets fixed if the round asks for
-it and the budget reaches it. What it may not do is keep the cycle running, hold a
-landing, or turn a dry round into an open one on its own. A claim-miss is the class this
-distinction exists to keep visible, against a round's worth of observations priced
-identically to it.
+`round_stop` applies this mechanically (#623): a judge-typed `observation` is
+subtracted before every rule and listed in `round_stop.observed` and under
+**Observations, not blocking**; a typed `regression` or `claim_miss` blocks at any
+severity; an untyped finding keeps the severity floors. Fix an observation only if it is
+trivial, and never file one.
 
 Read `round_stop` from the JSON (`jq .round_stop`). It is mechanical and it is
 the decision — do not substitute your own judgement, and do not ask a reviewer
