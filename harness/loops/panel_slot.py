@@ -28,7 +28,11 @@ def reserve(pr_number: int) -> str | None:
     if os.environ.get("QB_PANEL_MEMORY_WAIT"):
         args += ["--timeout", os.environ["QB_PANEL_MEMORY_WAIT"]]
     # stderr is inherited, so heavy-slot's own "waiting for ..." line reaches the caller.
-    holder = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        holder = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  text=True)
+    except OSError as e:
+        return f"memory: heavy-slot could not start ({e}), so this round ran without one"
     try:
         json.loads(holder.stdout.readline())["grant_bytes"]
     except (ValueError, KeyError, TypeError):

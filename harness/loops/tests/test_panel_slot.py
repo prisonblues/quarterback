@@ -1,4 +1,4 @@
-"""A panel round reserves memory on `heavy-slot` before anything else (#874).
+"""A panel round reserves memory on `heavy-slot` before it reads the PR (#874).
 
 The reservation runs the real `heavy-slot` against a fake /proc/meminfo and a private
 queue directory, so "the round holds memory" is the broker's own answer, not a double's.
@@ -36,6 +36,7 @@ def queue(tmp_path, monkeypatch):
                        "MIN_FREE": "2G", "MEMINFO": str(meminfo)}.items():
         monkeypatch.setenv(f"HEAVY_SLOT_{key}", value)
     monkeypatch.setenv("QB_PANEL_MEMORY", "6G")
+    monkeypatch.delenv("QB_PANEL_MEMORY_WAIT", raising=False)
     monkeypatch.setattr(panel_slot, "_HELD", [])
     return fakes
 
@@ -62,6 +63,7 @@ def test_qb_panel_memory_zero_turns_the_wait_off(queue, monkeypatch, off):
 
 
 def test_without_heavy_slot_the_round_runs_as_before(monkeypatch):
+    monkeypatch.setenv("QB_PANEL_MEMORY", "6G")  # past the off switch, to the PATH check
     monkeypatch.setenv("PATH", "/nonexistent")
     assert panel_slot.reserve(861) is None and panel_slot._HELD == []
 
@@ -79,10 +81,12 @@ def test_no_grant_is_a_note_and_the_round_runs(queue, monkeypatch, size, script)
     assert panel_slot._HELD == []
 
 
-def test_the_round_reserves_before_the_board_the_dials_or_the_pr_are_read():
+def test_the_round_reserves_after_its_refusals_and_before_it_reads_the_pr():
     src = (LOOPS / "panel.py").read_text()
     reserve = src.index("panel_slot.reserve(pr_number)")
-    for later in ("board_dial_notes(cfg)", 'head_sha = meta["headRefOid"]',
-                  'hold_pr(cfg["path"], pr_number, round_no)'):
+    for earlier in ("panel_caps.enabled_refusal(cfg) or review_refusal(cfg)",
+                    "if round_no > cap:"):
+        assert src.index(earlier) < reserve, earlier
+    for later in ('head_sha = meta["headRefOid"]', 'hold_pr(cfg["path"], pr_number, round_no)'):
         assert reserve < src.index(later), later
     assert src.count("panel_slot.reserve(") == 1

@@ -2553,9 +2553,6 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             round_no = round_inferred_from + 1
     else:
         prior = load_baseline(baseline or [], {**identity, "round": round_no})
-    # #874: wait for memory first, before the board, the dials or the PR are read, so a
-    # long wait cannot leave the round on stale state. Held until the process exits.
-    memory_note = panel_slot.reserve(pr_number)
     rev = cfg["reviewers"]
     panel = cfg["review_panel"]
     # Every config diagnostic this run will report. Initialised HERE, not beside the
@@ -2568,7 +2565,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # a floor without a pull request. First, before the dial resolution below it,
     # because it is about where the dials came FROM and reads oddly after a
     # complaint about one of their values.
-    notes: list[str] = board_dial_notes(cfg) + ([memory_note] if memory_note else [])
+    notes: list[str] = board_dial_notes(cfg)
     if round_inferred_from is not None:
         notes.append(f"--round not given: this is round {round_no}, the round after "
                      f"--baseline's round {round_inferred_from}")
@@ -2854,6 +2851,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
     selected, override_note = select_reviewers(rev, reviewers)
+    # #874: wait for memory after every refusal that starts no seat, and before the PR is
+    # read, so a long wait cannot leave the round reviewing a head that has since moved.
+    # Held until the process exits.
+    if memory_note := panel_slot.reserve(pr_number):
+        notes.append(memory_note)
 
     try:
         meta = json.loads(panel_core.sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
