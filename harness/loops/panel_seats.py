@@ -122,6 +122,42 @@ FALLBACK_MIN_TIMEOUT_S = 120
 #: that mitigates it is a denylist.
 SEAT_READS_CODE = frozenset({"claude"})
 
+#: Seats given the tree AND a shell when `reviewers.<seat>.tools` is true. What that
+#: does and does not protect is stated once, in the loops README ("The one seat that
+#: is given a shell").
+SEAT_RUNS_CODE = frozenset({"antigravity"})
+
+
+def tool_seats(reviewers: dict) -> frozenset[str]:
+    """The seats that take the tree this round. `tools` must be exactly True: a
+    `"false"` string must not grant a shell."""
+    return SEAT_READS_CODE | frozenset(
+        n for n in SEAT_RUNS_CODE if (reviewers.get(n) or {}).get("tools") is True)
+
+
+#: The only inherited variables a tool-running seat starts with.
+_SEAT_ENV_ALLOW = re.compile(r"^(PATH|HOME|USER|LOGNAME|SHELL|LANG|LC_\w+|TERM|TZ|TZDIR"
+                             r"|TMPDIR|XDG_(CONFIG|DATA|CACHE|STATE)_(HOME|DIRS)"
+                             r"|LOCALE_ARCHIVE|\w*_CERT_(FILE|DIR))$")
+
+
+def runs_code_env(scratch: Path, base: dict[str, str] | None = None) -> dict[str, str | None]:
+    """`run_cli`'s `env_extra` for a tool-running seat; None removes a variable.
+
+    Removes every inherited variable outside :data:`_SEAT_ENV_ALLOW`, points the
+    database variables at a host that cannot resolve, and gives `gh` an empty
+    config. `base` is a parameter only so a test can hand in a known environment."""
+    gh = scratch / "gh-config"
+    gh.mkdir(exist_ok=True)
+    env = os.environ if base is None else base
+    removed: dict[str, str | None] = {
+        k: None for k in env if not _SEAT_ENV_ALLOW.match(k) and k not in SANDBOX_ENV}
+    return {**removed,
+            "DATABASE_URL": "postgresql://panel-seat-no-database.invalid/none",
+            "PGHOST": "panel-seat-no-database.invalid",
+            "PGDATABASE": "panel_seat_no_database",
+            "GH_CONFIG_DIR": str(gh)}
+
 #: Files and directories a vendor CLI loads as instructions from its working
 #: directory, removed from the tree before any seat is pointed at it.
 #:
@@ -1065,7 +1101,8 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
             attempts: int = 3, stdin_text: str | None = None,
             on_output: Callable[[str | None], None] | None = None,
             replied: Callable[[], bool] | None = None,
-            cwd: str | None = None) -> tuple[str | None, str | None]:
+            cwd: str | None = None,
+            env_extra: dict[str, str | None] | None = None) -> tuple[str | None, str | None]:
     """Run a headless CLI, returning (stdout, error_reason); error_reason is
     None on success. Retries transient failures (non-zero exits such as rate
     limits, and OS errors) up to `attempts` times with no delay — these fail
@@ -1172,7 +1209,12 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     # Resolved once for the whole retry loop rather than per attempt: nothing
     # between attempts changes it, and building it three times would be three
     # copies of `os.environ` for one dict entry.
-    env = sandbox_env() if cwd is not None else None
+    env = sandbox_env() if cwd is not None else (dict(os.environ) if env_extra else None)
+    for k, v in (env_extra or {}).items():
+        if v is None:
+            env.pop(k, None)
+        else:
+            env[k] = v
     for _ in range(max(1, attempts)):
         argv = args() if callable(args) else args
         started = time.monotonic()
@@ -3732,7 +3774,8 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     return args
 
 
-def antigravity_args(model: str, effort: str, timeout: int = CLI_TIMEOUT) -> list[str]:
+def antigravity_args(model: str, effort: str, timeout: int = CLI_TIMEOUT,
+                     tools: bool = False) -> list[str]:
     """`agy` argv. The prompt goes on stdin as one stream-json message (see
     :func:`antigravity_stdin`) and the reply comes back in the stream's final
     `result` event (:func:`antigravity_reply`). Text-mode `-p` takes the prompt in
@@ -3740,9 +3783,13 @@ def antigravity_args(model: str, effort: str, timeout: int = CLI_TIMEOUT) -> lis
 
     A tool call headless agy cannot prompt for is denied, which can end the session
     with no reply (#853); NO_TOOLS_BRIEF is what heads that off. `--mode plan` is not
-    a guard. `--print-timeout` because agy's own default is 5m."""
+    a guard. `--print-timeout` because agy's own default is 5m. `tools=True` adds
+    `--dangerously-skip-permissions`, for a SEAT_RUNS_CODE seat given its copy of the
+    tree."""
     args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s",
             "--input-format", "stream-json", "--output-format", "stream-json"]
+    if tools:
+        args.append("--dangerously-skip-permissions")
     if model:
         args += ["--model", model]
     if effort:
@@ -4604,7 +4651,8 @@ def seat_label(name: str, model: str, effort: str, ran: object = None) -> str:
 def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
              parse: Callable[[str], SeatParsed | None] | None = None,
              code_tree: Path | None = None,
-             budget_usd: float | None = None) -> SeatTurn:
+             budget_usd: float | None = None,
+             runs_code: bool = False) -> SeatTurn:
     """Put one question to a headless LLM CLI and return what came back.
 
     `parse` reads the reply, and returning None from it means "I could not read
@@ -4679,7 +4727,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: `SEAT_READS_CODE` records per vendor why four of the five cannot. A seat
         #: that cannot read gains nothing from standing in the tree and still pays
         #: the instruction-file channel for it, so it keeps the empty sandbox.
-        reads_code = code_tree is not None and cmd_name in SEAT_READS_CODE
+        executes = code_tree is not None and runs_code and cmd_name in SEAT_RUNS_CODE
+        reads_code = code_tree is not None and (cmd_name in SEAT_READS_CODE or executes)
         if reads_code:
             # Reassigned from what actually happened, never left as the intent: a
             # staging failure downgrades this seat to the empty sandbox, and every
@@ -4701,6 +4750,16 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 # is never empty, and a seat downgraded here is precisely one that
                 # will otherwise go looking for a checkout it was promised.
                 prompt = prompt.replace(CODE_ACCESS_BRIEF, NO_TOOLS_BRIEF)
+            if executes and not reads_code:
+                # Its prompt promises a shell in a copy that does not exist, and no
+                # swap is exact once untrusted text is in the prompt: it sits out.
+                return SeatTurn(skip=f"{label}: could not stage its copy of the PR "
+                                     "tree, so the tool-running seat did not run",
+                                duration_ms=elapsed(), code_blind=True)
+            if executes:
+                # Appended, never substituted, so nothing in the prompt can collide
+                # with it. agy's commands need not run in its cwd, so it is told.
+                prompt += f"\n\nYOUR COPY OF THE PR IS AT: {sandbox}\n"
         else:
             sandbox = member_sandbox(tmpdir / "seat")
         #: What that sandbox COSTS the seat, recorded at the line that causes it.
@@ -4717,6 +4776,9 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         #: could have read the answer and still could not give one is describing
         #: THIS round rather than the panel's design.
         blind = not reads_code
+        #: Only when set, so `run_cli`'s test doubles that name their keywords keep
+        #: working.
+        cli_env = {"env_extra": runs_code_env(tmpdir)} if executes else {}
         #: One reply path per codex ATTEMPT, in the order they were made; empty
         #: for every other seat. A single shared path let an attempt that wrote
         #: no `--output-last-message` serve the PREVIOUS attempt's text as its
@@ -4767,7 +4829,7 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         elif cmd_name == "antigravity":
             # Not instrumented: its usage arrives in the stream's `result` event,
             # which nothing reads yet, so the board shows "not recorded".
-            args = antigravity_args(model, effort)
+            args = antigravity_args(model, effort, tools=executes)
             stdin_text = antigravity_stdin(prompt)
         elif cmd_name == "grok":
             # In the private temp dir and NOT in `sandbox`: a seat must not be
@@ -4854,7 +4916,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             wrote_reply = (lambda: bool(replies) and replies[-1].exists()
                            and replies[-1].read_text().strip()) if replies_used else None
         out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
-                           replied=wrote_reply, cwd=sandbox)
+                           replied=wrote_reply, cwd=sandbox,
+                           **cli_env)
         #: Which pins this host could not serve, once we have stopped trying them.
         dropped_model = dropped_effort = ""
         #: Has the recovered seat already been given its one extra go? See the
@@ -4933,7 +4996,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             out, err = run_cli(args, label, attempts=1, stdin_text=stdin_text,
                                timeout=max(FALLBACK_MIN_TIMEOUT_S,
                                            FALLBACK_MAX_ELAPSED_S - spent),
-                               on_output=collect, replied=wrote_reply, cwd=sandbox)
+                               on_output=collect, replied=wrote_reply, cwd=sandbox,
+                               **cli_env)
         if err:
             # `model` and not `asked[0]`: the hint explains the PIN, and after a
             # failed fallback the thing worth naming is still what was configured.
@@ -4955,7 +5019,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             # turn, which `usage_of` already counts: it runs under its own fresh
             # session, and its stdout lands in `outputs` too.
             out2, err2 = run_cli(args, label, attempts=1, stdin_text=stdin_text,
-                                 on_output=collect, replied=wrote_reply, cwd=sandbox)
+                                 on_output=collect, replied=wrote_reply, cwd=sandbox,
+                                 **cli_env)
             retry_text = reply_of(out2) if not err2 else None
             if retry_text:
                 retried = parse(retry_text)
@@ -4974,7 +5039,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
 
 def review_llm(cmd_name: str, model: str, prompt: str, effort: str = "",
                code_tree: Path | None = None,
-               budget_usd: float | None = None) -> ReviewerRun:
+               budget_usd: float | None = None,
+               runs_code: bool = False) -> ReviewerRun:
     """Run a headless LLM CLI reviewer. Returns a :class:`ReviewerRun` — what it
     found, what it could not judge, and what it cost.
 
@@ -4983,7 +5049,8 @@ def review_llm(cmd_name: str, model: str, prompt: str, effort: str = "",
     an ask."""
     turn = run_seat(cmd_name, model, prompt, effort,
                     parse=lambda text: parse_reply(cmd_name, text),
-                    code_tree=code_tree, budget_usd=budget_usd)
+                    code_tree=code_tree, budget_usd=budget_usd,
+                    runs_code=runs_code)
     #: Threaded through EVERY return below as one value, not repeated as two kwargs
     #: per site. The version that repeated them missed one — the "produced no
     #: output" skip — and a seat that had lowered its pin and then said nothing
@@ -5834,7 +5901,7 @@ __all__ = [
     "run_cli", "record_run",
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
-    "SEAT_READS_CODE",
+    "SEAT_READS_CODE", "SEAT_RUNS_CODE", "tool_seats", "runs_code_env",
     "antigravity_stdin", "antigravity_reply",
     "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",

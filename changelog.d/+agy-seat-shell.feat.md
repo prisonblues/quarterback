@@ -1,0 +1,1 @@
+The antigravity panel seat can run commands. With `reviewers.antigravity.tools` (default true), it reviews from its own copy of the PR's tree with `agy --dangerously-skip-permissions` and an allowlisted environment. That prevents accidents but is not a sandbox; the loops README says what it does and does not protect. The summary's Code access line says when a seat had a shell.
