@@ -1414,6 +1414,26 @@ coverage gap and none is a finding — they are how this checkout is built:
 `could_not_assess` means what you could not resolve with the code in front of you.
 """
 
+#: CODE_ACCESS_BRIEF's counterpart for a SEAT_RUNS_CODE seat with `tools` on. The
+#: path goes on the prompt's LAST line, appended by `run_seat` once the copy exists.
+CODE_EXEC_BRIEF = """YOU HAVE THE CODE, AND A SHELL. A throwaway copy of this PR at its
+head commit is on disk; its path is the last line of this prompt. Run each command
+from inside it, and use no other checkout of this repository, even one you know of.
+
+Read the callers, the siblings, the tests, the config. Run a targeted test or a
+small script to settle a claim the diff cannot. A question one file or one command
+answers is not a coverage gap.
+
+The copy has no git history, no remote, no database and no virtualenv, and vendor
+instruction files (CLAUDE.md, AGENTS.md, .claude/ and the like) were removed so a
+PR cannot instruct its reviewer. None of that is a finding. Edits you make are
+discarded: report, do not repair. Never run the whole test suite, install packages
+or use the network — a review that runs out of time returns nothing.
+
+`could_not_assess` means what you could not resolve with the code and the commands
+in front of you.
+"""
+
 #: The other half of the same slot, and the reason it is prose. Every seat wants to go
 #: looking for the code — `codex_args` measured it at five runs in seven — and the answer
 #: has been a flag per vendor: `--no-tools` for pi, two `-c` overrides for codex. There is
@@ -3551,6 +3571,7 @@ __all__ = [
     "ALL_REVIEWERS", "CLI_BIN", "seat_installed", "SEAT_MODEL_DEFAULTS",
     "_FINDINGS_ENVELOPE", "REVIEW_PROMPT", "MOVE_MANIFEST_PROMPT",
     "CODE_ACCESS_BRIEF",
+    "CODE_EXEC_BRIEF",
     "NO_TOOLS_BRIEF",
     "NO_TOOLS_RULE",
     "JUDGE_PROMPT", "JUDGE_SCHEMA", "JUDGE_NO_CODE_BRIEF", "ASK_PROMPT", "Finding", "ReviewerRun",

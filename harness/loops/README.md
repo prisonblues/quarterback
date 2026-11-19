@@ -869,9 +869,19 @@ Read-only, so it runs in **any** repo — an unconfigured one just uses the defa
     boundary of its own; codex's `-c` knobs only REMOVE tools and its single read path
     is the shell, so granting reads grants execution and re-opens the tool-hunt that
     once spent 99% of a run; pi's `--no-tools` is all-or-nothing over read/bash/edit/
-    write; antigravity has no tool mechanism at all. A seat that cannot read keeps its
-    empty sandbox — standing in a checkout it cannot open buys the instruction-file
-    channel for nothing.
+    write; antigravity's one per-run switch grants every tool, so it reads only with
+    a shell (next point). A seat that cannot read keeps its empty sandbox — standing in
+    a checkout it cannot open buys the instruction-file channel for nothing.
+  - **The one seat that is given a shell: antigravity, when
+    `reviewers.antigravity.tools` is true** (the default; `SEAT_RUNS_CODE`). It runs
+    `agy --dangerously-skip-permissions` in its own stripped copy of the PR's tree,
+    and the prompt's last line gives that copy's path; a copy that fails to stage sits
+    the seat out. **This is accident prevention, not a sandbox.** Nothing confines the
+    seat's commands to the copy. Its environment is an allowlist (`_SEAT_ENV_ALLOW`);
+    the database variables name a host that cannot resolve and `gh` gets an empty
+    config. Files under HOME, the rest of the filesystem and the network stay
+    reachable. `"tools": false` keeps the seat diff-only, and
+    `reviewer_code_access: false` takes the tree from it as from claude.
   - **Vendor convention files are stripped before any CLI starts** — `CLAUDE.md`,
     `AGENTS.md`, `GEMINI.md`, `.claude/`, `.codex/` and the rest of
     `CONVENTION_FILES`/`CONVENTION_DIRS`, at every depth, because a nested one is

@@ -333,7 +333,9 @@ DEFAULTS: dict = {
         # model slug too — gemini-3.7-flash-high/-medium/-low are three separate
         # models. Pin it in the slug OR in `effort`, not both; two ways to say
         # the same thing is how they come to disagree.
-        "antigravity": {"enabled": False, "model": "", "effort": ""},
+        # `tools`: the seat reviews from its own copy of the PR's tree with a shell
+        # (SEAT_RUNS_CODE); `false` keeps it diff-only.
+        "antigravity": {"enabled": False, "model": "", "effort": "", "tools": True},
         # Off by default for the same reason as antigravity — `pi` is a workstation
         # package, not on every box. It is the widest-reach member when enabled:
         # it fronts many providers, so its `model` is a full provider/id pattern
@@ -3643,6 +3645,9 @@ def _check_seat_shape(rules: dict, provenance: str) -> None:
                              f"object, not {type(entry).__name__} — "
                              f'e.g. {{"{seat}": {{"enabled": true}}}}. `{_LOCAL_BLOCK}` '
                              f"is an object of objects")
+        if "tools" in entry and not isinstance(entry["tools"], bool):
+            raise SystemExit(f"{provenance}: `{_LOCAL_BLOCK}.{seat}.tools` must be true "
+                             f"or false, not {entry['tools']!r}")
 
 
 def _report(where: str, problems: list[str], repo: str = "") -> None:

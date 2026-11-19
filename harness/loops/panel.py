@@ -1944,7 +1944,7 @@ def _payload_defaults() -> dict:
         # round would read as "code access was available and no seat used it",
         # which is a finding about the panel rather than about a round that never
         # ran one.
-        "code_access": {"setting": None, "seats": None,
+        "code_access": {"setting": None, "seats": None, "shell_seats": None,
                         "convention_files_removed": None},
         # Nulls for `code_access`' reason one line up (#550): a round that dispatched
         # no seat did not decline to prime one, and `sent: false` there would put a
@@ -2424,6 +2424,13 @@ def cycle_lost(prior: Baseline, round_no: int, baseline_given: bool,
             else "so it records cycle null, and the board cannot chain it to the "
             "rounds before it")
     return f"round {round_no} cannot continue this PR's cycle: {why}, {then}. {carried}"
+
+
+def shell_seats(reviewer_meta: dict) -> list[str]:
+    """The seats that reviewed with a shell, read off what they did: a SEAT_RUNS_CODE
+    seat only reads the tree when `run_seat` launched it with one."""
+    return sorted(n for n, m in reviewer_meta.items()
+                  if n in SEAT_RUNS_CODE and m.get("ran") and m.get("code_blind") is False)
 
 
 def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = False,
@@ -4000,7 +4007,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     routing = route_seats(selected_seats, installed,
                           prior_dispatched=prior_dispatched,
                           prior_round=prior_dispatch_round,
-                          budget=seat_budget)
+                          budget=seat_budget, floor=tool_seats(rev))
     if routing.held:
         # Loud, in the same list every other policy that bound this round reports
         # through, and it names all three of the things a reader needs to check it:
@@ -4690,7 +4697,14 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                      "class(es) on this PR) and asked to verify its invariants rather "
                      "than hunt (#836)")
 
-    def prompt_for(budget: int | None, reads_code: bool = False) -> str:
+    def prompt_for(budget: int | None, reads_code: bool = False,
+                   runs: bool = False) -> str:
+        if runs:
+            brief_code = CODE_EXEC_BRIEF
+        elif reads_code:
+            brief_code = CODE_ACCESS_BRIEF
+        else:
+            brief_code = NO_TOOLS_BRIEF
         # The slot is EITHER brief, never empty: a seat that gets the tree is told
         # to use it, and a seat that does not is told there is nothing to look at
         # and what to do instead (#458). Empty was the hole — it left the seats
@@ -4729,7 +4743,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                             n=pr_number, repo=gh_repo, base=base,
                             ci=ci_text,
                             diff=history + claim + review.material(budget)[0],
-                            code=CODE_ACCESS_BRIEF if reads_code else NO_TOOLS_BRIEF
+                            code=brief_code
                         ).replace(NEXT_DOOR_SLOT, next_door, 1
                         # #773's block, swapped after the render and bounded to one
                         # occurrence on exactly the argument above: it is built from
@@ -4832,10 +4846,10 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # header free to drift out of agreement with the header.
 
     # May the seats read the PR's code (#113)? A per-repo setting, ON by default,
-    # and the seats that can actually use it are `SEAT_READS_CODE` — three of the
-    # four vendors cannot express "read but do not execute", which is recorded
-    # there rather than here. `--no-code-access` turns it off for one run, the
-    # same shape as `--reviewers`: a switch this file honours over the config.
+    # and the seats that can actually use it are `tool_seats(rev)`: SEAT_READS_CODE,
+    # plus a SEAT_RUNS_CODE seat whose `tools` is on. `--no-code-access` turns it
+    # off for one run, the same shape as `--reviewers`: a switch this file honours
+    # over the config.
     want_code = code_access_wanted(panel, no_code_access, notes)
     # Read even when code access is off, so a misconfigured value is reported on
     # the round that carries it rather than staying silent until someone turns
@@ -4855,7 +4869,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # first, precisely so that a round cannot route away the only eyes that could open
     # a file. Where it does empty, the seat was selected and not installed, and the
     # `elif` below already says so.
-    code_seats = sorted(n for n in routing.dispatched if n in SEAT_READS_CODE)
+    can_use_tree = tool_seats(rev)
+    code_seats = sorted(n for n in routing.dispatched if n in can_use_tree)
     code_tree: Path | None = None
     stripped: list[str] = []
     #: Where the round's single copy of the tree lives, or None when nothing needed
@@ -4888,8 +4903,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 code_tree = None
     elif want_code and not code_seats:
         notes.append("`reviewer_code_access` is on, but no seat on this panel can use "
-                     "it — see SEAT_READS_CODE; only claude can be given read tools "
-                     "without also being given a shell")
+                     "it — see SEAT_READS_CODE and SEAT_RUNS_CODE")
     if stripped:
         # Said out loud, per round. A silent strip makes a PR that shipped an
         # `AGENTS.md` indistinguishable from one that did not, on the single axis
@@ -5069,7 +5083,8 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # because the default frame is "here is a diff" and a reviewer
                 # following it faithfully declares gaps it could have opened a file
                 # to close. See CODE_ACCESS_BRIEF.
-                reads = code_tree is not None and name in SEAT_READS_CODE
+                reads = code_tree is not None and name in can_use_tree
+                runs = reads and name in SEAT_RUNS_CODE
                 # A seat this box cannot run gets NO prompt (#222). Every SELECTED
                 # seat is still dispatched, because `run_seat` is the single
                 # authority on absence and is not only a PATH check — it answers a
@@ -5078,12 +5093,15 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                 # `prompt_for(None, …)` means "uncapped", so rendering one would
                 # compose the entire diff — per absent seat, per round — for
                 # `run_seat` to discard a moment later.
-                prompt = (prompt_for(budgets[name], reads) if name in budgets
+                prompt = (prompt_for(budgets[name], reads, runs) if name in budgets
                           else "")
                 tasks[name] = ex.submit(review_llm, name, models[name], prompt,
                                         efforts.get(name, ""),
                                         code_tree=code_tree,
-                                        budget_usd=budget_usd if reads else None)
+                                        budget_usd=budget_usd if reads else None,
+                                        # Only when set, so review_llm's test doubles
+                                        # that name their keywords keep working.
+                                        **({"runs_code": True} if runs else {}))
         sonar_future = None
         sonar_filed = False
         if "sonarqube" in selected:
@@ -7950,6 +7968,7 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
             "setting": want_code,
             "seats": sorted(n for n, m in reviewer_meta.items()
                             if m.get("ran") and m.get("code_blind") is False),
+            "shell_seats": shell_seats(reviewer_meta),
             # What the strip took out of the reviewers' checkout. `[]` is "the PR
             # carried none", which is a different fact from the null a round that
             # never fetched a tree records.
@@ -9031,9 +9050,11 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
                        if m.get("ran") and m.get("code_blind") is False)
     diff_only = sorted(n for n, m in reviewer_meta.items()
                        if m.get("ran") and m.get("code_blind"))
+    shells = shell_seats(reviewer_meta)
     if read_code:
         lines.append(f"**Code access:** {', '.join(read_code)} read the PR's tree at "
                      f"{(meta.get('headRefOid') or '')[:8]}"
+                     + (f" ({', '.join(shells)} with a shell)" if shells else "")
                      + (f"; {', '.join(diff_only)} reviewed the diff alone"
                         if diff_only else "")
                      + " — a seat's own `could_not_assess` counts against the round "
