@@ -3,7 +3,7 @@ every other module here calls.
 
 Split out of `panel.py` (#129), which had reached 7,530 lines / 419,755 bytes —
 5.6x growth in two days, and 3.5x `antigravity`'s 120,000-byte argv cap, so the
-one seat whose prompt travels in argv could never be handed the file it was
+one seat whose prompt then travelled in argv could never be handed the file it was
 reviewing. Reviewers also kept spending `could_not_assess` entries on code a few
 thousand lines away in the same file.
 
@@ -199,14 +199,6 @@ BUDGET_MARKER = "Exceeded USD budget"
 #: says so.
 BUDGET_EXHAUSTED = "spend cap reached mid-review"
 
-# Linux caps ONE argv string at MAX_ARG_STRLEN = 131,072 bytes, independently of
-# the much larger total ARG_MAX; cross it and execve fails with E2BIG before the
-# CLI starts. Every reviewer whose prompt travels on stdin is free of this, and
-# that is all of them but one — `agy` has no stdin path (`-p ""` is "empty
-# prompt", `-p -` reviews the literal string "-"), so its prompt is clamped to
-# fit here and the truncation is reported like any other. The margin is for the
-# rest of the argv and the environment, which share the kernel's accounting.
-ARGV_PROMPT_MAX_BYTES = 120_000
 # The severities everything downstream counts in. A value outside this set is not
 # a stricter or a looser call, it is an unreadable one — it would reach the
 # board's leaderboard as a bucket nothing counts, and it sorts wherever its first
@@ -490,8 +482,8 @@ ROUNDS_HEADING = "**Rounds:**"
 # `selected`). This seat has none of those: it is `panel_slop.review_fix_pass`,
 # a pure function of the fix pass's diff and the rule files beside it, costing no
 # vendor call and no token. Putting it in LLM_REVIEWERS would hand it a diff
-# budget it cannot spend, an argv clamp it cannot hit and a `model` field naming a
-# brain that never ran — the contradictory pairing #222 exists to remove.
+# budget it cannot spend and a `model` field naming a brain that never ran — the
+# contradictory pairing #222 exists to remove.
 #
 # ALL_REVIEWERS is what `select_reviewers` resolves against and what `--reviewers`
 # validates against, so this is also the line that makes `--reviewers slop` a
@@ -520,9 +512,9 @@ def seat_installed(name: str) -> bool:
 
     It lives HERE, beside :data:`CLI_BIN`, because that exemption was applied to
     the veto and to nothing else — and the seats' budgets were built from the
-    CONFIGURED set, so a seat this box cannot run still acquired a diff budget, an
-    argv clamp, a `config_notes` line about how much diff it "gets", and a
-    `truncated: True` record. On a repo enabling a workstation-only vendor that
+    CONFIGURED set, so a seat this box cannot run still acquired a diff budget, a
+    `config_notes` line about how much diff it "gets", and a `truncated: True`
+    record. On a repo enabling a workstation-only vendor that
     made `diff_truncated` true on rounds where nothing that ran was cut, and
     `load_baseline` then banked it as a coverage gap the next round inherited
     (#222). One predicate, in the module both callers already import, is what
@@ -3551,7 +3543,7 @@ __all__ = [
     "REFUTED_SLOT", "CLASSES_SLOT", "REFUTED_HEADING", "_REFUTED_BRIEF", "REFUTED_MAX",
     "REFUTED_TITLE_CHARS", "REFUTED_REASON_CHARS",
     "refuted_rows", "_refutation_line", "refuted_brief", "refuted_note",
-    "CLI_ABSENT", "ARGV_PROMPT_MAX_BYTES", "SEVERITIES", "MAX_LISTING_CHARS",
+    "CLI_ABSENT", "SEVERITIES", "MAX_LISTING_CHARS",
     "LISTING_ACCOUNT_CHARS", "COMMENT_CHARS", "ROUNDS_HEADING", "LLM_REVIEWERS",
     "BUDGET_MARKER", "BUDGET_EXHAUSTED", "JUDGE_CODE_SLOT",
     "JUDGE_RECURRENCE_SLOT", "PREMISE_VERDICTS", "RECURRENCE_BRIEF",

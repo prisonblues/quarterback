@@ -2,10 +2,9 @@
 
 Two things here are unlike every other seat and are the reason this file exists.
 
-Its prompt travels in a FILE. `agy` is the only member whose prompt has nowhere
-to go but argv, and the whole argv-clamping path exists for it; grok looked like
-a second one (its `-p` wants a flag value and it reads no stdin) and is not, so
-these tests pin that it never becomes one.
+Its prompt travels in a FILE. Its `-p` wants a flag value and it reads no stdin,
+so it looks like a seat whose prompt has to go in argv; these tests pin that it
+never becomes one.
 
 And it is given read tools where codex and pi are stripped of them. That is a
 reversal of this file's usual answer, made because a toolless grok does not review
@@ -39,7 +38,7 @@ def test_grok_is_a_panel_member():
 
 
 def test_the_prompt_travels_in_a_file_not_argv():
-    """The reason grok is not a second seat the kernel's argv limit binds. A
+    """The reason the kernel's argv limit does not bind grok. A
     change to `-p <prompt>` would put a whole diff in one argv element, which
     fails at execve with nothing in the error."""
     args = grok_args()

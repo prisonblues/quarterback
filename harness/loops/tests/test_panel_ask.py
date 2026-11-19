@@ -627,29 +627,6 @@ def test_no_context_says_so_in_the_prompt():
     assert "None was given" in block and "cannot tell" in block
 
 
-def test_a_clamped_block_never_cuts_a_delimiter_in_half(repo):
-    """The argv clamp slices the file CONTENT section by section, never the
-    assembled block: slicing the finished string is how a seat gets a prompt
-    whose last section has half a `--- CONTEXT: … ---` header on it."""
-    read = panel.read_context(repo, ["sub/a.py", "odd:dir/b.py"], [])
-    block = panel._context_block(read, budget=10)
-    assert "--- CONTEXT: sub/a.py ---\nline 1\nlin\n" in block
-    # The second section had nothing left to carry, so it is not announced at all.
-    assert "odd:dir/b.py" not in block
-    for line in block.splitlines():
-        assert not line.startswith("--- CONTEXT") or line.endswith("---")
-
-
-@pytest.mark.parametrize("budget", [0, -1])
-def test_a_budget_that_leaves_nothing_still_says_there_is_nothing(repo, budget):
-    """It returned "" — no header, no sentence — so the prompt ended straight
-    after `--- PREMISE ---`. The seat was neither given material nor told there
-    was none, which is the one condition that invites an answer from memory."""
-    read = panel.read_context(repo, ["sub/a.py"], [])
-    assert panel._context_block(read, budget) == panel._context_block([])
-    assert "None was given" in panel._context_block(read, budget)
-
-
 # ---- one seat's turn --------------------------------------------------------
 
 def _seat(monkeypatch, *replies, err=None):
@@ -1206,68 +1183,15 @@ def test_an_unreadable_reply_keeps_its_quote_out_of_the_reason(monkeypatch, cfg,
     assert seat["gist"] == "I think it is probably fine" and seat["reason"] == ""
 
 
-def test_the_seat_whose_prompt_travels_in_argv_is_clamped_and_said(monkeypatch, cfg,
-                                                                   tmp_path, repo):
-    """`agy` has no stdin path, so its prompt goes in one argv element and the
-    kernel caps that at MAX_ARG_STRLEN whatever is in it. Nothing exercised the
-    clamp, which is how a seat could get an unbounded prompt and die at execve
-    with an opaque error."""
-    (repo / "big.py").write_text("z" * 4_000)
-    monkeypatch.setattr(panel_seats, "ARGV_PROMPT_MAX_BYTES", 2_000)
-    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
-    prompts = {}
-
-    def seat(name, model, prompt, effort=""):
-        prompts[name] = prompt
-        return panel.SeatAnswer("holds", "r")
-
-    monkeypatch.setattr(panel_ask, "ask_llm", seat)
-    out = tmp_path / "ask.json"
-    panel.ask(cfg["path"], "p", ["big.py"], reviewers="antigravity,claude",
-              json_file=str(out), asker="")
-    payload = json.loads(out.read_text())
-    assert len(prompts["antigravity"].encode()) <= 2_000
-    assert len(prompts["claude"]) > len(prompts["antigravity"])
-    assert any("antigravity gets" in n and "4,000 context chars" in n
-               for n in payload["config_notes"])
-    # Cut through the content, never through a delimiter.
-    assert "--- CONTEXT: big.py ---" in prompts["antigravity"]
-
-
-def test_a_prompt_that_cannot_fit_argv_at_all_skips_the_seat_rather_than_execve(
-        monkeypatch, cfg, tmp_path):
-    """The fitting only takes CONTEXT out, and the premise and the template have
-    no budget — so a long premise leaves a prompt over the ceiling with nothing
-    left to cut. `fit_argv_budget` returning 0 is not the same claim as "it
-    fits", and the oversized argv used to go to execve and die there with an
-    opaque error and no note at all."""
-    monkeypatch.setattr(panel_ask, "ARGV_PROMPT_MAX_BYTES", 200)
-    monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
-    ran = []
-
-    def seat(name, model, prompt, effort=""):
-        ran.append(name)
-        return panel.SeatAnswer("holds", "r")
-
-    monkeypatch.setattr(panel_ask, "ask_llm", seat)
-    out = tmp_path / "ask.json"
-    panel.ask(cfg["path"], "q" * 500, [], reviewers="antigravity,claude",
-              json_file=str(out), asker="")
-    # Not run at all: a CLI invocation on a prompt known not to survive exec.
-    assert ran == ["claude"]
-    seat_row = json.loads(out.read_text())["answers"]["antigravity"]
-    assert seat_row["verdict"] is None and "argv ceiling" in seat_row["skip"]
-
-
 def test_the_seat_that_could_not_be_run_is_shown_as_one(monkeypatch, cfg, capsys):
     """A skip is the panel's idiom for a seat that did not run, and the report
     shows it beside the seats that did rather than quietly dropping the column."""
-    monkeypatch.setattr(panel_ask, "ARGV_PROMPT_MAX_BYTES", 200)
     monkeypatch.setattr(panel_ask, "record_ask", lambda payload: None)
-    monkeypatch.setattr(panel_ask, "ask_llm", lambda *a, **k: panel.SeatAnswer("holds", "r"))
-    panel.ask(cfg["path"], "q" * 500, [], reviewers="antigravity", asker="")
+    monkeypatch.setattr(panel_ask, "ask_llm",
+                        lambda *a, **k: panel.SeatAnswer(skip="agy: CLI absent"))
+    panel.ask(cfg["path"], "q", [], reviewers="antigravity", asker="")
     out = capsys.readouterr().out
-    assert "did not answer" in out and "argv ceiling" in out
+    assert "did not answer" in out and "CLI absent" in out
     # It could not be run, so nothing was challenged.
     assert "UNCHALLENGED" in out
 

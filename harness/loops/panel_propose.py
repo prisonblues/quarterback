@@ -732,30 +732,10 @@ def propose(stop: dict | None, outstanding: list,
                                               findings=listing)
 
     answers: dict[str, SeatProposal] = {}
-    # `agy`'s prompt travels in argv and the kernel caps one element. Unlike an
-    # ask there is nothing here to CUT — the listing is already bounded by
-    # `PROPOSE_MAX_FINDINGS` and every line of it is one of this seat's own
-    # findings — so a prompt over the ceiling is a stated skip rather than a
-    # truncation that would ask the seat about a different set than the one the
-    # payload records. A stated skip is the panel's idiom for a seat that could
-    # not be run, and it keeps the absence in the report instead of in an opaque
-    # execve failure.
-    if "antigravity" in prompts:
-        over = len(prompts["antigravity"].encode()) - ARGV_PROMPT_MAX_BYTES
-        if over > 0:
-            label = reviewer_label("antigravity", models.get("antigravity", ""),
-                                   efforts.get("antigravity", ""))
-            answers["antigravity"] = SeatProposal(skip=(
-                f"{label}: its prompt is {over:,} bytes over the "
-                f"{ARGV_PROMPT_MAX_BYTES:,}-byte argv ceiling — `agy` takes a prompt "
-                "only as one argv element, and this seat's finding listing does not "
-                "fit in one"))
-
-    to_run = [n for n in seats if n not in answers]
-    if to_run:
-        with ThreadPoolExecutor(max_workers=len(to_run)) as ex:
+    if seats:
+        with ThreadPoolExecutor(max_workers=len(seats)) as ex:
             tasks = {n: ex.submit(propose_llm, n, models.get(n, ""), prompts[n],
-                                  efforts.get(n, "")) for n in to_run}
+                                  efforts.get(n, "")) for n in seats}
             for n, fut in tasks.items():
                 try:
                     answers[n] = fut.result()

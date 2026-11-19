@@ -446,10 +446,9 @@ def test_the_hint_numbers_match_the_listing_it_annotates():
     assert "[1], [2]" in listing
 
 
-def test_one_enormous_account_is_cut_rather_than_blowing_the_argv_limit():
-    """The whole prompt is ONE argv entry and Linux caps that at 128 KiB, so an
-    unparsed reply kept as a finding (RAW_DETAIL_CHARS each) used to be able to
-    fail the review outright with E2BIG."""
+def test_one_enormous_account_is_cut_rather_than_handed_over_whole():
+    """An unparsed reply kept as a finding (RAW_DETAIL_CHARS each) is cut rather
+    than handed to the judge whole."""
     huge = find(reviewer="codex", detail="x" * panel.RAW_DETAIL_CHARS)
     listing, flat = panel._judge_listing(clusters_of(huge))
     assert flat == [huge]

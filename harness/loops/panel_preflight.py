@@ -59,9 +59,9 @@ diff at all, and no amount of parsing recovers it from `gh pr diff` alone.
 (#49) refused a default budget on evidence — truncating when nothing forces it
 biases toward false positives — and that reasoning stands untouched here. A
 budget answers *what to send*; this answers *whether to start*, and only ever
-against a ceiling the repo or the kernel already declared. On a repo that sets no
-`max_diff_chars` and enables no argv-bound seat there is no cap, so nothing here
-ever fires and no number this file invented is ever applied to anyone's diff.
+against a ceiling the repo already declared. On a repo that sets no
+`max_diff_chars` there is no cap, so nothing here ever fires and no number this
+file invented is ever applied to anyone's diff.
 
 **Nor is it a silent skip.** A panel that quietly declines is #62's disease in a
 new place — a merge gate trusting a proxy. So a refusal prints, carries
@@ -71,7 +71,7 @@ as "clean".
 
 Split into its own module rather than added to `panel.py` for #129's reason. That
 file's seats section alone was over the argv cap, which meant the one seat whose
-prompt travels in argv could never be handed the file it was reviewing — the
+prompt then travelled in argv could never be handed the file it was reviewing — the
 irony this issue was filed about, and not one worth re-earning.
 """
 
@@ -81,7 +81,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 
-from panel_core import ARGV_PROMPT_MAX_BYTES, CLI_BIN, _diff_file_path, seat_installed
+from panel_core import CLI_BIN, _diff_file_path, seat_installed
 
 # `_ci_line` renders #548's states, so it names them rather than spelling the three
 # strings a second time — a state named in two places is a state the two places can
@@ -291,16 +291,10 @@ class DiffShape:
     #: Files the diff touches, and the two one-sided subsets. A split shows up
     #: here as one file losing everything and several gaining it.
     files: int
-    #: The SAME diff in UTF-8 bytes, because one of the two ceilings this module
-    #: measures against is not expressed in characters. `max_diff_chars` is a
-    #: character count; :data:`panel_core.ARGV_PROMPT_MAX_BYTES` is the kernel's
-    #: `MAX_ARG_STRLEN`, in bytes. Compared against `chars` an argv ceiling is
-    #: understated by exactly the diff's non-ASCII density — and this repo's own
-    #: diffs are full of em-dashes, arrows and box characters in comments and
-    #: reports, so the error is not theoretical and it runs in the direction that
-    #: lets an over-cap diff through. :func:`preflight` picks the reading that
-    #: matches the ceiling it found; both are serialised so the choice is checkable
-    #: rather than taken on trust.
+    #: The SAME diff in UTF-8 bytes, for a ceiling expressed in bytes. None is
+    #: declared today — agy's argv cap was the one, until agy moved to stdin — but
+    #: `Ceiling` keeps the unit, and both readings are serialised so a verdict's
+    #: unit stays checkable.
     #:
     #: Defaulted so a hand-built `DiffShape` in a test stays a two-line literal;
     #: :func:`diff_shape` always measures it.
@@ -501,7 +495,7 @@ class Ceiling:
     """One ceiling a round is under, CARRYING THE UNIT IT IS EXPRESSED IN.
 
     The unit is not decoration and it is not derivable from the number. A repo's
-    `max_diff_chars` is a count of CHARACTERS; :data:`ARGV_PROMPT_MAX_BYTES` is the
+    `max_diff_chars` is a count of CHARACTERS; agy's former argv cap was the
     kernel's `MAX_ARG_STRLEN`, a count of BYTES. For an all-ASCII diff the two
     readings of a size are the same integer and nothing about which one is meant
     can be observed; for this repo's own diffs — em-dashes, arrows and box
@@ -511,7 +505,7 @@ class Ceiling:
     This type exists because that fact was carried OUT of BAND and rebuilt by
     every reader. `smallest_cap`, which :func:`seat_ceilings` and
     :func:`tightest_ceiling` replace, returned a bare `(int, seat)` and its callers
-    worked the unit back out — `seat == "antigravity" and cap == ARGV_PROMPT_MAX_BYTES`
+    worked the unit back out — `seat == "antigravity" and cap == <the argv cap>`
     in :func:`preflight`, and nothing at all in `refusal_report` or in the three
     `panel.py` banners, which printed "chars" over a ratio computed in bytes.
     Worse, the SELECTION itself compared the two: `min()` over a dict holding a
@@ -580,35 +574,16 @@ def seat_ceilings(budgets: dict[str, int | None], installed=None) -> tuple[Ceili
     """Every ceiling the seats that can actually RUN here are under, each with its
     unit. Empty when there is none.
 
-    A seat's ceiling is its configured `max_diff_chars`, in characters. `antigravity`
-    is additionally under the kernel's, in bytes: that seat's prompt travels in
-    argv, so :data:`ARGV_PROMPT_MAX_BYTES` applies to it whether or not the repo set
-    a number. Compared against the constant rather than against
-    :func:`panel_seats.fit_argv_budget`'s exact answer, which is a few hundred
-    bytes lower once the template is counted — a verdict about whether a diff is
-    3x or 6x over does not turn on that, and depending on the render closure
-    would make this callable only after the prompt exists.
-
-    **Antigravity with a configured cap declares TWO ceilings, and that is the
-    correction rather than an elaboration.** This used to collapse them with
-    `min(cap, ARGV_PROMPT_MAX_BYTES)` — one number, chosen by comparing a character
-    budget against a byte limit. A repo setting `antigravity.max_diff_chars:
-    100_000` therefore hid the 120,000-BYTE argv ceiling behind the smaller
-    integer, and a 100,000-character diff at two bytes per character sailed past a
-    verdict that had measured 100,000 against 100,000 — into an `execve` that
-    cannot carry 200,000 bytes. Two ceilings, both real, both evaluated: whichever
-    binds first on THIS diff is the one that decides, and :func:`tightest_ceiling`
-    is where that is worked out.
+    A seat's ceiling is its configured `max_diff_chars`, in characters.
 
     **A seat whose CLI this box does not carry declares no ceiling here.** It is a
     fact about the HOST, not about the round — the same distinction `coverage_veto`
     makes at length, and for the same reason. `budgets` holds every CONFIGURED and
     selected seat, not every runnable one, and `agy` is a workstation package: on a
     headless box this repo's own rules enable a seat that records "antigravity: CLI
-    absent" and never runs. Counting its argv ceiling would refuse a round on
-    behalf of a reviewer that was never going to read anything, on exactly the
-    unattended hosts where nobody is watching to pass `--force` — while the seats
-    that DID run were reading off stdin with no cap at all.
+    absent" and never runs. Counting its ceiling would refuse a round on behalf of
+    a reviewer that was never going to read anything, on exactly the unattended
+    hosts where nobody is watching to pass `--force`.
 
     `installed` is injected so this stays a pure function of its arguments: a
     verdict that consults PATH is a verdict whose tests pass or fail depending on
@@ -653,8 +628,6 @@ def seat_ceilings(budgets: dict[str, int | None], installed=None) -> tuple[Ceili
         # sent anything, and `diff_budget` is the layer that says so.
         if budget is not None and budget > 0:
             out.append(Ceiling(budget, "chars", name))
-        if name == "antigravity":
-            out.append(Ceiling(ARGV_PROMPT_MAX_BYTES, "bytes", name))
     return tuple(out)
 
 
@@ -1062,7 +1035,7 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
 
     Sizes are measured in the ceiling's OWN unit, and the ceiling that binds is
     chosen by comparing those measurements rather than the ceilings themselves. A
-    configured `max_diff_chars` is characters; the kernel's argv limit is bytes;
+    configured `max_diff_chars` is characters; a byte ceiling would be bytes;
     they are the same number only for an all-ASCII diff. See :class:`Ceiling` and
     :func:`tightest_ceiling`.
     """
@@ -1081,7 +1054,7 @@ def preflight(diff: str, budgets: dict[str, int | None], panel: dict,
     # in. Nothing below asks what unit that is: `ceiling.of()` reads the shape,
     # `ceiling.of_text()` reads the manifest, and `ceiling.noun`/`.adjective` write
     # the words. This used to be a bare `(int, seat)` and a `by_bytes` flag
-    # reconstructed here by equality against ARGV_PROMPT_MAX_BYTES — a derivation
+    # reconstructed here by equality against the argv cap — a derivation
     # only this function made, which is why every other renderer of the verdict
     # went on printing "chars" over a ratio that was sometimes bytes.
     # The whole set, not only the tightest: the manifest branch has to re-rank
@@ -1761,26 +1734,13 @@ def refusal_report(repo_name: str, pr_number: int, title: str,
         f"  - tightest seat ceiling: {pre.cap:,} {pre.cap_unit} ({pre.cap_seat}), "
         f"exceeded {pre.over:.1f}x by this diff's {pre.measured:,} "
         f"{pre.cap_unit} — the refusal threshold is "
-        f"{pre.thresholds.get('refuse_over_cap_multiple'):g}x"
-        + (" (that seat's prompt travels in argv, so the kernel's ceiling is in "
-           "BYTES rather than characters)" if pre.cap_unit == "bytes" else ""),
+        f"{pre.thresholds.get('refuse_over_cap_multiple'):g}x",
         "",
         "**What to do,** in the order they are worth doing:",
         "  1. Split the PR. A diff this far over every seat's ceiling is a diff "
         "no reviewer reads in one sitting either.",
-        # Remedy 2 depends on WHOSE ceiling this was, and the byte case is the one
-        # where the obvious advice is wrong. `ARGV_PROMPT_MAX_BYTES` is the kernel's
-        # `MAX_ARG_STRLEN`: no key in `.harness-rules` raises it, and an operator
-        # who follows a "raise `max_diff_chars`" line here gets the same refusal
-        # back and no idea why. This case only became visible when the notice
-        # started saying which unit it measured in — before that it read as an
-        # ordinary configured ceiling, which is exactly the confusion.
-        ("  2. Drop the `antigravity` seat for this PR, or split it. This ceiling "
-         "is the kernel's argv limit rather than a configured budget, and no "
-         "setting raises it — that seat is the only one whose prompt cannot travel "
-         "on stdin." if pre.cap_unit == "bytes" else
-         "  2. Raise `review_panel.max_diff_chars` (or the cap of the one seat "
-         "holding the floor) if a model you run can genuinely take it."),
+        "  2. Raise `review_panel.max_diff_chars` (or the cap of the one seat "
+        "holding the floor) if a model you run can genuinely take it.",
         "  3. `--force` to review it anyway, and read the result knowing most of "
         "each seat's budget went on text it could not usefully judge.",
     ]

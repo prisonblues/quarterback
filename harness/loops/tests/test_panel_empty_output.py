@@ -13,6 +13,7 @@ reviewer leaderboard is fed a false zero — the datum a reviewer comparison mos
 has to be able to trust.
 """
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -310,13 +311,19 @@ def test_review_llm_keeps_its_own_guard_against_a_blank_raw_finding(monkeypatch)
     assert "produced no output" in got.skip
 
 
+def _agy_said(text: str) -> str:
+    """agy's stream-json stdout for a turn whose reply was `text`."""
+    return json.dumps({"event": "result",
+                       "result": {"status": "SUCCESS", "response": text}}) + "\n"
+
+
 def test_prose_is_still_kept_as_a_raw_finding(monkeypatch):
     """The regression guard on the above: output that isn't JSON but IS a review
     still reaches the judge rather than being discarded as unparseable — and is
     flagged `unstructured`, because nothing it might have declared about its own
     coverage survived the parse."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
-    _fake_cli(monkeypatch, ("The retry loop double-counts on line 12.", "", 0))
+    _fake_cli(monkeypatch, (_agy_said("The retry loop double-counts on line 12."), "", 0))
     got = panel.review_llm("antigravity", "m", "p")
     assert got.skip is None and len(got.findings) == 1
     assert "double-counts" in got.findings[0].detail
@@ -343,7 +350,7 @@ def test_narration_passes_the_emptiness_guard_but_is_still_not_a_clean_review(mo
     into a stated reason the round is not evidence of a quiet PR, and the judge
     rules on the text rather than the panel silently counting it."""
     monkeypatch.setattr(panel.shutil, "which", lambda _: "/usr/bin/agy")
-    _fake_cli(monkeypatch, (NARRATION, "", 0))
+    _fake_cli(monkeypatch, (_agy_said(NARRATION), "", 0))
     got = panel.review_llm("antigravity", "m", "p")
     assert got.unstructured is True
     # None of its own coverage survived the parse, so it declared nothing — which

@@ -410,13 +410,6 @@ def _budgeted(ctx: AskContext, budget: int | None, used: int,
     return ctx
 
 
-def _context_chars(contexts: list[AskContext]) -> int:
-    """How much CONTENT the seats are being handed — the quantity a budget is
-    about, and the one :func:`_context_block` cuts. Not the length of the
-    assembled block, which also counts delimiters that no clamp may touch."""
-    return sum(len(c.text) for c in contexts)
-
-
 #: What goes where the context would have been when there is none — and it is a
 #: sentence rather than an empty string on purpose. See :func:`_context_block`.
 NO_CONTEXT = ("\n--- CONTEXT ---\nNone was given. Answer from the premise's own terms, "
@@ -424,18 +417,9 @@ NO_CONTEXT = ("\n--- CONTEXT ---\nNone was given. Answer from the premise's own 
               "nothing to check it against and must not answer from memory.\n")
 
 
-def _context_block(contexts: list[AskContext], budget: int | None = None) -> str:
+def _context_block(contexts: list[AskContext]) -> str:
     """The context as the seats see it, or the sentence that goes where it would
     have been.
-
-    `budget` cuts the FILE CONTENT, section by section, and never the assembled
-    block: slicing the finished string is how a clamp lands in the middle of a
-    `--- CONTEXT: path ---` line and hands a seat a prompt whose last section has
-    a half-written header on it. Every delimiter that is emitted is whole, and a
-    section the budget leaves nothing for is dropped with its header rather than
-    announced as a file that was supplied. A budget that leaves nothing of ANY
-    of them falls through to the no-context sentence below, because that is what
-    the seat is looking at.
 
     An ask with no context is legitimate — some premises are settled by their own
     terms — but a model handed a bare assertion and no material will reach for
@@ -444,21 +428,9 @@ def _context_block(contexts: list[AskContext], budget: int | None = None) -> str
     makes `cannot tell` the available answer rather than a gap it has to invent
     its way across."""
     out = []
-    left = budget
     for c in contexts:
-        if left is not None and left <= 0:
-            break
-        text = c.text if left is None else c.text[:left]
-        if left is not None:
-            left -= len(text)
         where = f"{c.path}:{c.first}-{c.last}" if c.first else c.path
-        out.append(f"\n--- CONTEXT: {where} ---\n{text}\n")
-    # No sections is no sections, whether nothing was given or the budget left
-    # nothing of what was. Returning "" for the second ended the prompt straight
-    # after `--- PREMISE ---`: no material, and — worse — not the sentence above
-    # either, so the one seat that can reach a zero budget (antigravity, whose
-    # prompt travels in argv) was invited to answer from memory by a prompt that
-    # never told it there was nothing to read.
+        out.append(f"\n--- CONTEXT: {where} ---\n{c.text}\n")
     return "".join(out) or NO_CONTEXT
 
 
@@ -719,66 +691,16 @@ def ask(repo_name: str | None, premise: str, contexts: list[str] | None = None,
               for n in LLM_REVIEWERS}
     efforts = {n: rev.get(n, {}).get("effort", "") for n in EFFORTS}
 
-    def prompt_for(budget: int | None) -> str:
-        # The budget cuts the file CONTENT inside the block, never the assembled
-        # block — see _context_block. Slicing the finished string is how a clamp
-        # lands halfway through a `--- CONTEXT: … ---` delimiter.
-        # `no_tools` inside the render, for the reason the diff path puts it there:
-        # `fit_argv_budget` below measures whatever this returns, and a brief added
-        # after that measurement is a kilobyte past the cap it just cleared. This
-        # path is why the claim "NO_TOOLS_BRIEF is this seat's --no-tools" was not
-        # yet true when it was written — an ask reached antigravity with the older,
-        # milder sentence, which says it has no tools and not that reaching for one
-        # ends the session (#459).
-        return ASK_PROMPT.format(premise=premise, no_tools=NO_TOOLS_RULE,
-                                 context=context if budget is None
-                                 else _context_block(read, budget))
-
-    # One prompt, shared: it is the same string for every seat, and building it
-    # per seat made N copies of every context file to no end.
-    base = prompt_for(None)
-    prompts = dict.fromkeys(seats, base)
+    # One prompt, shared: it is the same string for every seat. `no_tools` because
+    # an ask reaching antigravity must also say that reaching for a tool ends the
+    # session (#459).
+    base = ASK_PROMPT.format(premise=premise, no_tools=NO_TOOLS_RULE, context=context)
 
     answers: dict[str, SeatAnswer] = {}
-    # `agy`'s prompt travels in argv and the kernel caps one element, whatever is
-    # in it — a premise is small but a `--context` file need not be. Same clamp,
-    # same report, as the diff gets on a round. The seat is `antigravity`
-    # everywhere it is named; `agy` is only the command it runs (see CLI_BIN).
-    if "antigravity" in prompts:
-        whole = _context_chars(read)
-        fitted = fit_argv_budget(prompt_for, whole)
-        if fitted < whole:
-            notes.append(f"antigravity gets {fitted:,} of {whole:,} context chars "
-                         "— its prompt travels in argv and the kernel caps one element "
-                         f"at {ARGV_PROMPT_MAX_BYTES:,} bytes")
-            prompts["antigravity"] = prompt_for(fitted)
-        # The fitting only ever takes CONTEXT out, and the premise and the
-        # ASK_PROMPT template have no budget at all — so a long premise leaves a
-        # prompt still over the ceiling with nothing left to cut, and
-        # `fit_argv_budget` returning 0 is not the same claim as "it fits". Asked
-        # of the RENDERED prompt rather than inferred from the reduction, because
-        # the alternative is what used to happen: the oversized argv went to
-        # execve, `agy` died there with an opaque error, and no note said why.
-        # A stated skip is the panel's idiom for a seat that could not be run,
-        # and it keeps the seat's absence in the tally instead of in a traceback.
-        over = len(prompts["antigravity"].encode()) - ARGV_PROMPT_MAX_BYTES
-        if over > 0:
-            label = reviewer_label("antigravity", models["antigravity"],
-                                   efforts.get("antigravity", ""))
-            answers["antigravity"] = SeatAnswer(skip=(
-                f"{label}: its prompt is {over:,} bytes over the "
-                f"{ARGV_PROMPT_MAX_BYTES:,}-byte argv ceiling with no context left to cut "
-                "— `agy` takes a prompt only as one argv element, and the premise alone "
-                "does not fit in one"))
-
-    # Only the seats that still need running. A seat the argv check above already
-    # settled has its answer, and starting a CLI for a prompt known not to
-    # survive exec would spend a turn to arrive at the same skip.
-    to_run = [n for n in seats if n not in answers]
-    if to_run:
-        with ThreadPoolExecutor(max_workers=len(to_run)) as ex:
-            tasks = {n: ex.submit(ask_llm, n, models[n], prompts[n], efforts.get(n, ""))
-                     for n in to_run}
+    if seats:
+        with ThreadPoolExecutor(max_workers=len(seats)) as ex:
+            tasks = {n: ex.submit(ask_llm, n, models[n], base, efforts.get(n, ""))
+                     for n in seats}
             for n, fut in tasks.items():
                 try:
                     answers[n] = fut.result()
@@ -932,7 +854,7 @@ __all__ = [
     "panel_core", "panel_seats", "_RANGE", "ASK_CONTEXT_FILE_MAX_BYTES",
     "ASK_SECRET_DIRS", "ASK_SECRET_FILES", "ASK_SECRET_SUFFIXES", "AskContext",
     "ContextProblem", "_readable_file", "_context_spec", "_read_confined",
-    "_secret_context", "read_context", "_budgeted", "_context_chars",
+    "_secret_context", "read_context", "_budgeted",
     "NO_CONTEXT", "_context_block", "ASK_DEFAULTS", "_ask_rule",
     "ASKER_ENV", "asking_seat", "detected_asker", "ask",
 ]

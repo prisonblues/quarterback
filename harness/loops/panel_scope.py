@@ -1830,13 +1830,9 @@ def _fit_parts(parts: list[str], budget: int | None) -> list[str]:
     tail quietly removed.
 
     The summed allocation is monotone non-decreasing in ``budget``.
-    :func:`fit_argv_budget` shrinks a budget until the RENDERED prompt fits, and
-    the rendered prompt is this plus :func:`_compose`'s frame, where a section's
-    ``[cut: …]`` marker disappears once that section becomes whole — so the
-    rendered length can fall by one marker's width as the budget rises.
-    :meth:`ReviewScope._compose` reserves each marker's width out of the budget
-    before spending it, which bounds that wobble to what a marker occupies and
-    keeps the rendered prompt inside the budget it was given."""
+    :meth:`ReviewScope._compose` reserves each ``[cut: …]`` marker's width out of
+    the budget before spending it, which keeps the rendered prompt inside the
+    budget it was given."""
     if budget is None:
         return list(parts)
     out: list[str] = []

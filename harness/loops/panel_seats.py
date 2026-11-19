@@ -1,8 +1,8 @@
 """The seats: every reviewer CLI the panel can run, and the plumbing around them.
 
 Split out of `panel.py` (#129). At 154,462 bytes this section was the only one
-over `antigravity`'s 120,000-byte argv cap on its own — that seat's prompt travels
-in argv, so it could never be handed the file it was reviewing, and on PR #115's
+over `antigravity`'s 120,000-byte argv cap on its own — that seat's prompt then
+travelled in argv, so it could never be handed the file it was reviewing, and on PR #115's
 round it silently read 83% of the diff and said so only in `config_notes`.
 
 A MOVE, not a rewrite: nothing here was retyped. Shared foundation comes from
@@ -266,17 +266,24 @@ def _error_body(value: object) -> dict | None:
     """The part of one error envelope that carries the fields, or None if `value` is
     not an error envelope at all.
 
-    Two shapes, because two layers produce them: a stream event that IS the error
-    (`{"type":"error","message":…}`, which is codex's) and the provider's own error
-    body relayed verbatim under an `error` key (`{"error":{"param":…,"code":…}}`,
-    which is the gateway's). The second is the only one that carries `param`, and
-    `param` is the only field that says WHICH pin was refused.
+    Three shapes, because three layers produce them: a stream event that IS the
+    error (`{"type":"error","message":…}`, which is codex's), the provider's own
+    error body relayed verbatim under an `error` key (`{"error":{"param":…,"code":…}}`,
+    which is the gateway's — the only one that carries `param`, the field that says
+    WHICH pin was refused), and agy's non-SUCCESS `result` event, whose `error` or
+    `finished_reason` is lifted as the message.
     """
     if not isinstance(value, dict):
         return None
     inner = value.get("error")
     if isinstance(inner, dict):
         return inner
+    result = value.get("result")
+    if (value.get("event") == "result" and isinstance(result, dict)
+            and result.get("status") != "SUCCESS"):
+        return {"message": next((v.strip() for v in (result.get(k) for k in
+                                                     ("error", "finished_reason", "status"))
+                                 if isinstance(v, str) and v.strip()), "failed")}
     return value if value.get("type") == "error" else None
 
 
@@ -307,16 +314,11 @@ def error_events(stdout: str) -> list[dict]:
 
     Strict about what it lifts, so it is safe to run over EVERY seat's stdout
     including the seats whose stdout is their reply: a value counts only if it
-    parses as a JSON object that is an error envelope by one of `_error_body`'s two
-    shapes. Reviewer prose does not, and a findings array does not. The cost of a
-    false positive is bounded anyway — this is only ever consulted once a seat has
-    already failed — a stdout that is nothing
-    else.
+    parses as a JSON object that is an error envelope by one of `_error_body`'s three
+    shapes. Reviewer prose does not, and a findings array does not.
     """
     text = stdout or ""
-    # The cheap gate first: with no `"error"` anywhere there is no envelope to
-    # find, and this runs over the whole stdout of every failed seat.
-    if '"error"' not in text:
+    if '"error"' not in text and '"result"' not in text:
         return []
     return [value for _s, _e, value in _json_values(text)
             if _error_body(value) is not None]
@@ -1106,9 +1108,9 @@ def run_cli(args: list[str] | Callable[[], list[str]], label: str, timeout: int 
     the open question) and a freshly `git init`ed empty directory. The flag would
     buy nothing and would trade a guard for it.
 
-    `stdin_text` is how a prompt reaches a CLI that accepts one there, which is
-    the only way to hand a reviewer a diff larger than the kernel's per-argument
-    limit (see ARGV_PROMPT_MAX_BYTES). It does NOT weaken the guard that stdin
+    `stdin_text` is how a prompt reaches a CLI that accepts one there, and keeps
+    it clear of the kernel's 128 KiB per-argument limit. It does NOT weaken the
+    guard that stdin
     is otherwise DEVNULL: subprocess writes the string and closes the pipe, so a
     CLI that decides to prompt for more reads EOF instead of hanging the panel
     on an inherited terminal.
@@ -1746,12 +1748,7 @@ def diff_budget(block: dict, key: str, fallback: int | None,
     Only what cannot be a budget at all is refused: a non-number, or <= 0 (which
     would send an empty diff and produce a confident review of nothing). Those
     fall back and SAY so — silently honouring them reviews a fragment, silently
-    dropping them leaves you believing a budget you never got.
-
-    There is one ceiling this cannot see, and it belongs to the caller: `agy`'s
-    prompt travels in argv, so the kernel caps it however large a budget says
-    (see fit_argv_budget). That clamp is applied per reviewer, after this, and
-    reported the same way — as truncation with a reason, not as a refusal."""
+    dropping them leaves you believing a budget you never got."""
     raw = block.get(key)
     if raw is None or raw == "":
         return fallback
@@ -3536,97 +3533,6 @@ def resolve_dials(panel: dict, asked_max_rounds: int | None,
     return dials
 
 
-def fit_argv_budget(render, budget: int) -> int:
-    """The largest diff budget <= `budget` whose rendered prompt still fits in one
-    argv element, for the seat whose prompt has nowhere else to go.
-
-    This is the same rule diff_budget follows and the reason it can now keep it:
-    a budget over the kernel's limit USED to be honoured right up to execve and
-    then kill the reviewer with an opaque error. Here it becomes ordinary
-    truncation with the consequence surfaced — the config still wins as far as
-    the machine allows, and the report says where the machine stopped it.
-
-    `render` renders the whole prompt from a budget, because the ceiling applies
-    to the prompt, not the diff: the template counts, and so does the difference
-    between characters and the bytes they encode to (this repo's own comments are
-    full of em dashes, each of which is three bytes and one char).
-
-    `budget` is counted in CHARACTERS and the ceiling in BYTES, deliberately and
-    safely: subtracting a byte overflow from a character budget over-shrinks (a
-    char is never fewer than one byte, so dropping N chars drops at least N
-    bytes), which converges in one pass and errs on the side of a prompt that
-    fits. The loop is kept for the pathological case where the template alone is
-    near the limit, and for a `render` whose length is not linear in its budget —
-    an ask's is not, since a budget below a section's length drops the sections
-    after it whole.
-
-    **The result is always between 0 and `budget`, and 0 does not mean "it
-    fits".** When the template and the premise are over the ceiling on their own
-    there is nothing left to take out, and this returns 0 having failed — so a
-    caller must measure the rendered prompt rather than trust the reduction.
-    `ask()` does exactly that, and skips the seat with the reason said."""
-    for _ in range(8):
-        over = len(render(budget).encode()) - ARGV_PROMPT_MAX_BYTES
-        if over <= 0:
-            return budget
-        budget = max(0, budget - over)
-    return budget
-
-
-def argv_clamp(render, sendable: int, asked: int | None) -> tuple[int, bool]:
-    """The budget the kernel will actually carry for the argv-bound seat, and
-    whether the KERNEL is what cut it.
-
-    Returns ``(fitted, kernel_cut)``. `fitted` is what to hand the seat.
-    `kernel_cut` is half of what :func:`coverage_veto` needs — this function can say
-    who did the cutting, and deliberately does not try to say whether the cut cost
-    the seat any of the review TARGET. See below.
-
-    Two conditions on `kernel_cut`, both load-bearing:
-
-    * ``fitted < want`` — the clamp actually cut what was asked for, so the kernel
-      is the binding constraint. A repo that pins antigravity a smaller
-      ``max_diff_chars`` than this box could carry is truncated by a number
-      somebody typed; that is fixable, so it is evidence about the round and still
-      vetoes. A dropped zero (60_000 -> 6_000) is the exact slip
-      :func:`diff_budget` declines to guard against, on the grounds that the
-      CONSEQUENCE gets surfaced instead — so the consequence has to keep arriving.
-    * ``0 < fitted`` — the seat was partly served rather than not served at all.
-      Not hypothetical: :func:`fit_argv_budget` subtracts a BYTE overflow from a
-      CHARACTER budget, over-shrinking on purpose to converge in one pass, and on
-      three-byte characters it over-shrinks to **zero** — a 200,000 em-dash diff
-      hands this seat an empty prompt. A seat given no diff has not "structurally
-      seen part of it"; it reviewed nothing, which is a stronger reason to withhold
-      confidence rather than a weaker one, so it falls through to the ordinary
-      truncation veto exactly as it did before this exemption existed.
-
-    **Whether the target was actually cut is the caller's half, and it must be
-    measured by COMPOSING the material rather than by comparing this budget against
-    the target's length.** They are different numbers under increment scope: the
-    budget also pays for the brief and the section headers, which are over a
-    kilobyte, so a budget a little OVER the target's size still cuts it. `run`
-    already computes that properly for every seat (`truncated_for`), and the
-    exemption is the intersection — a seat that is truncated by measurement AND was
-    cut by the kernel. Comparing against a raw `target_len` here instead classified
-    exactly that overhead case as a budget truncation, quietly keeping the standing
-    veto this change exists to remove on precisely the rounds that run scoped.
-
-    Note also what this does NOT do: compute a config-independent "ceiling" from
-    `sendable` and compare budgets against it. That reads better and is wrong,
-    because `fit_argv_budget` is not composable — its overshoot depends on the
-    budget it starts from, so ``min(asked, fit(sendable))`` is not ``fit(asked)``.
-    On multibyte material the ceiling collapses to 0 and every budget, however
-    small and deliverable, would be clamped to nothing.
-
-    Extracted from ``run`` so the rule has a name and a test. Inline it was
-    conditions buried in a thousand-line function, reachable only by standing up a
-    whole panel — which is how a classification that decides whether a round can
-    stop confidently ends up with no test at all."""
-    want = sendable if asked is None else asked
-    fitted = fit_argv_budget(render, want)
-    return fitted, 0 < fitted < want
-
-
 def reviewer_label(name: str, model: str, effort: str = "") -> str:
     """`codex (gpt-5.6-luna, high)` — the report says WHICH brain reviewed.
 
@@ -3744,7 +3650,7 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     Takes no prompt: `codex exec` with no positional argument reads its
     instructions from stdin, which is where the diff goes. The parameter is gone
     rather than ignored so the argv-limit bug cannot be reintroduced by passing
-    one (see ARGV_PROMPT_MAX_BYTES).
+    one.
 
     `reply_file` turns on the pair that gets usage out of this seat WITHOUT
     wrapping the findings: `--json` puts the event stream (which carries
@@ -3826,71 +3732,64 @@ def codex_args(model: str, effort: str, reply_file: Path | None = None) -> list[
     return args
 
 
-def antigravity_args(model: str, effort: str, prompt: str,
-                     timeout: int = CLI_TIMEOUT) -> list[str]:
-    """`agy` argv — Google's Antigravity CLI, which replaced gemini-cli in this
-    seat. `-p` is its non-interactive print mode.
+def antigravity_args(model: str, effort: str, timeout: int = CLI_TIMEOUT) -> list[str]:
+    """`agy` argv. The prompt goes on stdin as one stream-json message (see
+    :func:`antigravity_stdin`) and the reply comes back in the stream's final
+    `result` event (:func:`antigravity_reply`). Text-mode `-p` takes the prompt in
+    argv instead, which the kernel caps at 128 KiB.
 
-    This is the ONE seat whose prompt travels in argv: `agy` has no way to read
-    one from anywhere else — not stdin, not a `@file`, not a `--prompt-file`.
-    So it is also the one seat that can hit the kernel's per-argument limit, and
-    the caller clamps its diff to ARGV_PROMPT_MAX_BYTES before rendering.
-
-    `--mode plan` is NOT a sandbox, despite reading like one: with permissions
-    granted, plan mode writes files. What keeps this reviewer off the tree is that
-    headless print mode cannot prompt for a tool permission, so any tool needing
-    one is auto-denied. Plan mode is kept for the narrower thing it does do
-    (biasing it away from proposing edits), not as the guarantee. Anyone adding
-    `--dangerously-skip-permissions` here removes the real guard: measured, that
-    turns the reviewer into an agent that runs the test suite against the dev
-    database and reviews the checkout instead of the diff.
-
-    **THAT AUTO-DENIAL IS FATAL, AND USED TO BE DOCUMENTED HERE AS BENIGN** — the
-    reasoning being that the diff is in the prompt, so the seat needs no tool
-    anyway. The first half is true and the conclusion does not follow: `agy` does
-    not shrug and carry on reviewing, it exits 1 with `permission check failed for
-    command "pwd && ls -la": user denied permission` and returns nothing. The guard
-    works exactly as described and costs the whole seat, which is how this reviewer
-    came to be recorded as skipped on both rounds of one PR (#458).
-
-    It reaches because every seat reaches — `codex_args` measured five runs in
-    seven — and this is the seat with no flag to stop it: pi has `--no-tools`,
-    codex has its two `-c` overrides, `agy --help` offers only
-    `--dangerously-skip-permissions`, pointing the other way. `--sandbox` does not
-    help either; it restricts what a tool may do, not whether asking is fatal.
-    `NO_TOOLS_BRIEF` in the prompt is this seat's `--no-tools`, and it is measured:
-    on the same failing prompt it is the difference between exit 1 and a findings
-    array that names the gap instead of hunting for it.
-
-    **In BOTH prompts that reach this function**, which is the correction #459 made
-    to this paragraph: it was written as a fact about the seat while only the review
-    path had been given the brief, so an `--ask` still reached `agy` with the older,
-    milder sentence — no tools, but not that reaching for one ends the session — and
-    could still lose the seat on every invocation. `ASK_PROMPT` carries
-    `NO_TOOLS_RULE` now, which is the half of the brief that is not about findings.
-
-    `--print-timeout` is passed because `agy` otherwise aborts itself at 5m0s
-    while run_cli is still patiently waiting out its own much longer bound — a
-    reviewer that reads as dead when it was only slow. It takes a Go duration,
-    hence the `s` suffix.
-
-    Left on the default `--output-format text` rather than `json`: the JSON mode
-    wraps the reply in {response, status, usage, ...}, which would hide the
-    findings array inside an escaped string where parse_reply's balanced-bracket
-    scan cannot see it. Text mode puts the array straight on stdout, which is what
-    every other seat here produces and what the parser is written against.
-
-    Unlike gemini-cli, `agy` fails loudly on an unknown model instead of silently
-    serving a different one, so a pinned slug that stops existing shows up as a
-    dead reviewer rather than a quietly wrong one. Its effort scale is only
-    low/medium/high (see EFFORTS) — narrower than codex's or pi's.
-    """
-    args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s", "-p", prompt]
+    A tool call headless agy cannot prompt for is denied, which can end the session
+    with no reply (#853); NO_TOOLS_BRIEF is what heads that off. `--mode plan` is not
+    a guard. `--print-timeout` because agy's own default is 5m."""
+    args = ["agy", "--mode", "plan", "--print-timeout", f"{timeout}s",
+            "--input-format", "stream-json", "--output-format", "stream-json"]
     if model:
         args += ["--model", model]
     if effort:
         args += ["--effort", effort]
     return args
+
+
+def antigravity_stdin(prompt: str) -> str:
+    """The one stream-json message that carries `prompt` to agy."""
+    return json.dumps({"event": "user", "message": {"content": prompt}}) + "\n"
+
+
+#: What `_antigravity_result` returns once a result is not an object, or a non-blank
+#: line after a result is not an event.
+_MALFORMED = object()
+
+
+def _antigravity_result(stdout: str | None) -> object:
+    """The stream's last word on its result, or None if it gave none: the last
+    `result` event's body, or :data:`_MALFORMED` — for good — once a result body is not
+    an object or a non-blank line that is not an event follows a result."""
+    found = None
+    for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            event = None
+        if not (isinstance(event, dict) and "event" in event):
+            if found is not None:
+                found = _MALFORMED
+            continue
+        if event["event"] == "result" and found is not _MALFORMED:
+            body = event.get("result")
+            found = body if isinstance(body, dict) else _MALFORMED
+    return found
+
+
+def antigravity_reply(stdout: str | None) -> str:
+    """The reply text of a stream-json agy run, or "" (no reply) unless the final
+    result is SUCCESS with a string response."""
+    result = _antigravity_result(stdout)
+    if not isinstance(result, dict) or result.get("status") != "SUCCESS":
+        return ""
+    reply = result.get("response")
+    return reply if isinstance(reply, str) else ""
 
 
 def pi_args(model: str, effort: str, session_id: str, session_dir: Path) -> list[str]:
@@ -3931,12 +3830,8 @@ def grok_args(model: str, effort: str, prompt_file: Path) -> list[str]:
     """grok argv — xAI's CLI, the panel's fifth vendor.
 
     `--prompt-file` is its headless mode. grok's `-p/--single` wants the prompt as
-    a flag VALUE and reads nothing from stdin, so on the face of it this looked
-    like a second `antigravity` — the one member the kernel's argv limit binds. It
-    is not: `--prompt-file` takes a path, so the diff travels in a file and there
-    is no ceiling on it. That is why nothing in the argv-clamping path
-    (ARGV_PROMPT_MAX_BYTES, argv_clamp, the "truncated for antigravity" note) grew
-    a second member when this seat was added.
+    a flag VALUE and reads nothing from stdin; `--prompt-file` takes a path, so
+    the diff travels in a file and the kernel's argv limit does not bind it.
 
     The file lives in the member's private temp dir, NOT in the sandbox repo it is
     given as a cwd, and that is load-bearing rather than tidy — same rule as
@@ -4845,14 +4740,9 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             sessions.append(str(uuid.uuid4()))
             return sessions[-1]
 
-        # The prompt goes on stdin wherever the CLI will take it there — which is
-        # everywhere but `agy` and `grok`. That is not a style choice: a diff big
-        # enough to be worth a panel is big enough to exceed the kernel's
-        # per-argument limit, and in argv that failure lands at execve, before the
-        # reviewer exists, as an error with nothing in it. On stdin there is no such
-        # ceiling — and neither is there in a FILE, which is how `grok` takes one
-        # and why it is not a second seat the argv clamp has to know about. `agy`
-        # remains the only member with nowhere but argv to put it.
+        # The prompt goes on stdin everywhere but `grok`, which takes a file. Not a
+        # style choice: a diff worth a panel can exceed the kernel's per-argument
+        # limit, and in argv that fails at execve with nothing in the error.
         stdin_text: str | None = prompt
         #: What this seat actually asks for — the pins until a fallback lowers one.
         #: One-element lists because the argv thunk below closes over them and a
@@ -4875,11 +4765,10 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
                 return claude_args(model, new_session(), reads_code=reads_code,
                                    budget_usd=budget_usd, effort=asked_effort[0])
         elif cmd_name == "antigravity":
-            # Not instrumented: `agy` has no session-id to pin, and its usage
-            # lives only in the JSON mode this design declines. It reviews
-            # exactly as before and reports no tokens, which the board renders as
-            # "not recorded" rather than as zero.
-            args, stdin_text = antigravity_args(model, effort, prompt), None
+            # Not instrumented: its usage arrives in the stream's `result` event,
+            # which nothing reads yet, so the board shows "not recorded".
+            args = antigravity_args(model, effort)
+            stdin_text = antigravity_stdin(prompt)
         elif cmd_name == "grok":
             # In the private temp dir and NOT in `sandbox`: a seat must not be
             # able to find its own prompt as a file in the tree it is reviewing.
@@ -4944,6 +4833,8 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
             attempt's stdout. Reading a fixed path instead meant a failed final
             attempt inherited an earlier one's reply.
             """
+            if cmd_name == "antigravity":
+                return antigravity_reply(stdout)
             if not replies:
                 return stdout
             try:
@@ -4954,8 +4845,14 @@ def run_seat(cmd_name: str, model: str, prompt: str, effort: str = "",
         # `replied` only for the seat whose stdout is not its reply. For every
         # other seat `cli_outcome`'s stdout test is still exactly right, and
         # passing a predicate would be a second way to ask one question.
-        wrote_reply = (lambda: bool(replies) and replies[-1].exists()
-                       and replies[-1].read_text().strip()) if replies_used else None
+        if cmd_name == "antigravity":
+            # `outputs` already holds this attempt's stdout: run_cli hands it over
+            # before asking.
+            def wrote_reply():
+                return bool(outputs) and bool(antigravity_reply(outputs[-1]).strip())
+        else:
+            wrote_reply = (lambda: bool(replies) and replies[-1].exists()
+                           and replies[-1].read_text().strip()) if replies_used else None
         out, err = run_cli(args, label, stdin_text=stdin_text, on_output=collect,
                            replied=wrote_reply, cwd=sandbox)
         #: Which pins this host could not serve, once we have stopped trying them.
@@ -5937,7 +5834,9 @@ __all__ = [
     "run_cli", "record_run",
     # The round-start claim (#253) and the release that ends it.
     "PR_HOLD_TTL", "CLAIM_TAKEN", "CLAIM_HELD", "hold_pr", "release_pr",
-    "SEAT_READS_CODE", "CONVENTION_FILES", "CONVENTION_DIRS",
+    "SEAT_READS_CODE",
+    "antigravity_stdin", "antigravity_reply",
+    "CONVENTION_FILES", "CONVENTION_DIRS",
     "strip_convention_files", "fetch_pr_tree", "seat_checkout",
     "code_access_wanted", "pr_claim_wanted", "history_wanted",
     "_fetch_tarball", "TREE_RETRY_STATUSES", "code_budget",
@@ -5959,7 +5858,7 @@ __all__ = [
     "panel_flag",
     "resolve_max_rounds", "Dials", "resolve_dials", "_FALSEY", "_ABSENT",
     "_refuse_value",
-    "fit_argv_budget", "argv_clamp", "reviewer_label", "fallback_label",
+    "reviewer_label", "fallback_label",
     "seat_label", "error_events", "error_text",
     "is_model_unavailable", "is_effort_unsupported", "codex_args",
     "antigravity_args",
