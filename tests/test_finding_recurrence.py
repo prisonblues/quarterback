@@ -442,3 +442,18 @@ async def test_the_run_list_carries_the_tallies_without_fetching_the_findings(cl
     [row] = [x for x in r.json() if x["id"] == got["id"]]
     assert row["recurrence_counts"] == {"revisited": 3}
     assert row["premise_counts"] == {"separate": 3}
+
+
+async def test_the_judges_kind_and_evidence_are_stored_and_an_unknown_kind_is_not(client):
+    """#623. `kind` is stored only when it is one of the three, so a typo cannot
+    become a fourth kind that the land gate would read as blocking or not."""
+    got = await record(
+        client, 6623, round=1, cycle="c623", head_sha=SHA,
+        to_fix=[finding("breaks y", key="aaaa000000000623", kind="regression",
+                        evidence="  test_y fails  "),
+                finding("typo kind", key="aaaa000000000624", kind="regresion")])
+    run = await detail(client, got["id"])
+    by_title = {f["title"]: f for f in run["findings"]}
+    assert by_title["breaks y"]["kind"] == "regression"
+    assert by_title["breaks y"]["evidence"] == "test_y fails"
+    assert by_title["typo kind"]["kind"] is None

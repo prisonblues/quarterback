@@ -117,6 +117,7 @@ import panel_propose  # noqa: F401
 import panel_rounds  # noqa: F401
 import panel_scope  # noqa: F401
 import panel_seats  # noqa: F401
+import panel_slot
 
 # #771's locality matcher, and the ONE import in this file that is allowed to
 # fail. Everything it is used for is a second opinion beside an answer this file
@@ -2850,6 +2851,13 @@ def run(repo_name: str | None, pr_number: int, post: bool, json_out: bool = Fals
     # Resolved before anything is fetched, so a typo'd --reviewers fails on the
     # spot rather than after a PR read and a diff download.
     selected, override_note = select_reviewers(rev, reviewers)
+    # #874: wait for memory here, after the refusals that need no PR (enabled, unconfigured,
+    # the round cap) and before the PR is read, so a long wait cannot leave the round on a
+    # head that has since moved. Refusals decided FROM the PR (the title skip, the spend
+    # ceiling, mergeability, preflight) come after it, so such a round waits first and then
+    # reviews nothing. Held until the process exits.
+    if memory_note := panel_slot.reserve(pr_number):
+        notes.append(memory_note)
 
     try:
         meta = json.loads(panel_core.sh(["gh", "pr", "view", str(pr_number), "--repo", gh_repo,
