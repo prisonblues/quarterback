@@ -313,3 +313,38 @@ def test_a_round_that_could_not_be_saved_does_not_report_itself(round_env, monke
     assert cr.main(["--ledger", ledger]) == pc.LEDGER_FAILED_EXIT
     out = capsys.readouterr()
     assert "CONVERGED" not in out.out and "NOT recorded" in out.err
+
+
+REFUSAL = ('{"type":"turn.failed","error":{"message":"The \'gpt-5.5\' model is not '
+           'supported when using Codex with a ChatGPT account."}}')
+
+
+def _fake_runs(monkeypatch, outcomes):
+    calls = []
+
+    def ask(prompt, model, effort, top, network):
+        calls.append((model, effort))
+        return outcomes[len(calls) - 1]
+
+    monkeypatch.setattr(cr, "_ask_once", ask)
+    return calls
+
+
+def test_a_refused_pin_retries_once_on_the_cli_default(monkeypatch, capsys):
+    reply = {"violations": [], "new_classes": []}
+    calls = _fake_runs(monkeypatch, [(None, REFUSAL), (reply, "")])
+    assert cr.run_codex("p", "gpt-5.5", "high") == reply
+    assert calls == [("gpt-5.5", "high"), ("", "")]
+    assert "refused the pin" in capsys.readouterr().err
+
+
+def test_an_unpinned_seat_that_fails_is_not_retried(monkeypatch):
+    calls = _fake_runs(monkeypatch, [(None, REFUSAL)])
+    assert cr.run_codex("p", "", "") is None
+    assert calls == [("", "")]
+
+
+def test_a_pinned_seat_failing_for_another_reason_is_not_retried(monkeypatch):
+    calls = _fake_runs(monkeypatch, [(None, "stream disconnected before completion")])
+    assert cr.run_codex("p", "gpt-5.5", "high") is None
+    assert len(calls) == 1

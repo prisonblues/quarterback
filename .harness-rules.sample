@@ -12,15 +12,12 @@
   },
 
   "reviewers": {
-    "_": "claude stays on the default `opus`, a floating alias that always resolves to the current model and so cannot rot. The other three are pinned, because their slugs are versioned build names.",
+    "_": "claude stays on the default `opus`, a floating alias that always resolves to the current model and so cannot rot. codex is left on each box's CLI default (see its note); the other two are pinned, because their slugs are versioned build names.",
 
     "codex": {
-      "model": "gpt-5.6-luna",
-      "effort": "max",
-      "_": "Pinned rather than left on the CLI's own default, which is whatever that install happens to ship and therefore differs between boxes — the panel is a controlled comparison, and an unpinned seat makes 'codex found more than claude' unattributable to a model.",
-      "_deliberate_override": "This pin argues WITH the DEFAULTS comment in harness_rules.py, which declines to pin codex globally on the grounds that a slug is a versioned build name that gets retired and takes a whole vendor with it. That reasoning is right for the fleet default and is overridden here on purpose: this repo IS the panel's test bench, so an unattributable comparison costs it more than a rotted pin, and the pin's failure is loud (see _precondition) rather than a silently thinner review. The liability is real and per-box — a machine on codex < 0.144 loses the seat entirely until the pin is cleared — so the answer when that happens is to bump the slug or drop this key, not to wonder why codex went quiet. Verified on one machine on one date; treat it as a claim about that box, not about the fleet.",
-      "_effort": "luna accepts low|medium|high|xhigh|max but NOT ultra, so `max` is the top of its range. Spelled `model_reasoning_effort` via `-c` on this CLI, `--thinking` on pi — same config key here, different word there.",
-      "_precondition": "Needs codex >= 0.144; an older CLI is refused by the API with a 400 'requires a newer version of Codex'. That failure is loud rather than silent — `is_rejection` short-circuits the retries and the report names the model that was refused — so a rotted pin costs a reviewer visibly. Verified 2026-08-15 on codex-cli 0.147.0: the exact panel argv (`codex exec … --model gpt-5.6-luna -c model_reasoning_effort=max`) returned a well-formed findings array at exit 0."
+      "model": "",
+      "effort": "",
+      "_": "Unpinned: the seat runs whatever this box's own `~/.codex/config.toml` defaults to, because which model a box may use is a fact about its account, not about the repo. zeus and daedalus run codex on the ChatGPT subscription, which refuses `gpt-5.5`; the work laptop and sisyphus go through the API gateway, which serves only `gpt-5.5` (`codex-simmons-setup` in nix-fleet writes it, at `high`, as their CLI default). No committed pin suits both, and the old `gpt-5.6-luna`/`max` pin was refused or hung on both. To name the model in a box's review records, pin it in that box's untracked `.harness-rules` overlay, never here. `codex_round.py` retries once on the CLI default if a pin is refused anyway."
     },
 
     "antigravity": {
