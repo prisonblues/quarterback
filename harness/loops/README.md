@@ -518,6 +518,10 @@ python3 appetite.py file --title "..." --run $SESSION --record   # I did
   `model` and `effort` (`low|medium|high|xhigh|max|ultra`) both default to empty,
   meaning *the codex CLI's own defaults*. Pin them per repo to experiment, e.g.
   `"codex": {"enabled": true, "model": "gpt-5.6-luna", "effort": "high"}`.
+  Pin in the tracked file only if every box's account serves the slug: a
+ChatGPT subscription and an API gateway serve different models, so a pin that
+differs per box belongs in that box's untracked `.harness-rules` overlay.
+`codex_round.py` retries once on the CLI default when a pin is refused.
   Unlike `opus` (a floating alias), codex slugs are versioned build names that
   get retired, and a slug the **installed** CLI is too old for is refused by the
   API — so check `codex --version` before pinning a new one. That failure is

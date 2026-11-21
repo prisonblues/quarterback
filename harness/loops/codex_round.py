@@ -56,7 +56,7 @@ from pathlib import Path
 
 import panel_classes as pc
 from panel_core import load_repo_cfg
-from panel_seats import codex_args
+from panel_seats import codex_args, is_effort_unsupported, is_model_unavailable
 
 UNAVAILABLE_EXIT = 2
 CODEX_TIMEOUT = 1800
@@ -229,25 +229,49 @@ def tree_state(top: str) -> str:
                       git("stash", "list", cwd=top)])
 
 
-def run_codex(prompt: str, model: str, effort: str, top: str = "",
-              network: bool = False) -> dict | None:
-    """One seat's reply. ``top`` set means the seat runs IN that worktree with a
-    shell; empty means the read-only, shell-less panel seat in a scratch dir."""
+def _ask_once(prompt: str, model: str, effort: str, top: str,
+              network: bool) -> tuple[dict | None, str]:
+    """One codex run: its parsed reply, and what it said on both streams. Under
+    `--json` a refusal arrives on STDOUT as a `turn.failed` event, so the diagnosis
+    has to read both."""
     with tempfile.TemporaryDirectory() as tmp:
         reply_file = Path(tmp) / "reply.txt"
         argv = (exec_args(model, effort, reply_file, network) if top
                 else codex_args(model, effort, reply_file))
         try:
-            subprocess.run(argv, input=prompt,
-                           capture_output=True, text=True, timeout=CODEX_TIMEOUT,
-                           cwd=top or tmp, check=False)
+            done = subprocess.run(argv, input=prompt,
+                                  capture_output=True, text=True, timeout=CODEX_TIMEOUT,
+                                  cwd=top or tmp, check=False)
         except (OSError, subprocess.TimeoutExpired) as e:
             print(f"codex_round: codex did not finish ({e.__class__.__name__})",
                   file=sys.stderr)
-            return None
+            return None, ""
+        diag = f"{done.stdout}\n{done.stderr}"
         if not reply_file.exists():
-            return None
-        return parse_reply(reply_file.read_text())
+            return None, diag
+        return parse_reply(reply_file.read_text()), diag
+
+
+def run_codex(prompt: str, model: str, effort: str, top: str = "",
+              network: bool = False) -> dict | None:
+    """One seat's reply. ``top`` set means the seat runs IN that worktree with a
+    shell; empty means the read-only, shell-less panel seat in a scratch dir.
+
+    A pin this box's account cannot serve is retried ONCE on the CLI's own default
+    rather than costing the round. Which model a box may use is a fact about its
+    account, not the repo: the ChatGPT subscription refuses `gpt-5.5` while the API
+    gateway boxes serve only that, so no committed pin suits every box. The refusal
+    takes seconds, so the retry is cheap, and the note names what was dropped."""
+    reply, diag = _ask_once(prompt, model, effort, top, network)
+    pinned = bool(model or effort)
+    if reply is not None or not pinned or not (
+            is_model_unavailable(diag) or is_effort_unsupported(diag)):
+        return reply
+    print(f"codex_round: this box's codex refused the pin "
+          f"(model {model or 'default'}, effort {effort or 'default'}) — retrying on "
+          f"the CLI default. Clear reviewers.codex in .harness-rules, or pin this "
+          f"box's model in its untracked .harness-rules overlay", file=sys.stderr)
+    return _ask_once(prompt, "", "", top, network)[0]
 
 
 def _where(item: dict) -> str:
