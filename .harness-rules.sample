@@ -17,7 +17,7 @@
     "codex": {
       "model": "",
       "effort": "",
-      "_": "Unpinned: the seat runs whatever this box's own `~/.codex/config.toml` defaults to, because which model a box may use is a fact about its account, not about the repo. zeus and daedalus run codex on the ChatGPT subscription, which refuses `gpt-5.5`; the work laptop and sisyphus go through the API gateway, which serves only `gpt-5.5` (`codex-simmons-setup` in nix-fleet writes it, at `high`, as their CLI default). No committed pin suits both, and the old `gpt-5.6-luna`/`max` pin was refused or hung on both. To name the model in a box's review records, pin it in that box's untracked `.harness-rules` overlay, never here. `codex_round.py` retries once on the CLI default if a pin is refused anyway."
+      "_": "Unpinned: the seat runs whatever this box's own `~/.codex/config.toml` defaults to, because which model a box may use is a fact about its account, not about the repo. zeus and daedalus run codex on the ChatGPT subscription, which refuses `gpt-5.5`; the work laptop and sisyphus go through the API gateway, which serves only `gpt-5.5` (each of those boxes sets it, at `high`, as the default in its own `~/.codex/config.toml`). No committed pin suits both, and the old `gpt-5.6-luna`/`max` pin was refused or hung on both. To name the model in a box's review records, pin it in that box's untracked `.harness-rules` overlay, never here. `codex_round.py` retries once on the CLI default if a pin is refused anyway."
     },
 
     "antigravity": {
